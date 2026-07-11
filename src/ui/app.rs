@@ -157,6 +157,10 @@ impl DuocbApp {
             NetEvent::PeerDisconnected => {
                 self.peer_node_id = None;
                 self.conn_path = None;
+                // A send in flight when the link dropped will never be
+                // confirmed; drop it so it can't be promoted later and so it
+                // doesn't block sends after a reconnect.
+                self.pending_outbox = None;
             }
             NetEvent::ConnPath(paths) => {
                 self.conn_path = Some(paths);
@@ -175,6 +179,10 @@ impl DuocbApp {
                 self.sent_flash = Some(Instant::now());
             }
             NetEvent::Error(message) => {
+                // A rejected send (e.g. oversize) reports an error instead of
+                // ItemSent, so drop its pending text — it must never be promoted
+                // to the outbox as "sent".
+                self.pending_outbox = None;
                 self.error = Some(message);
             }
         }
@@ -185,6 +193,11 @@ impl DuocbApp {
         match self.clipboard.read_text() {
             Ok(text) if text.is_empty() => {
                 self.error = Some("The clipboard is empty".to_string());
+            }
+            Ok(_) if self.pending_outbox.is_some() => {
+                // A previous send is still unconfirmed. Ignore this one so the
+                // outbox tracks exactly one in-flight item — otherwise the next
+                // ItemSent could promote the wrong (possibly rejected) text.
             }
             Ok(text) => {
                 // Stash it; it becomes the outbox item once ItemSent confirms.
