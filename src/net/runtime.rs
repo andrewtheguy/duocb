@@ -20,7 +20,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::auth::is_token_valid;
 use crate::net::endpoint::{
-    connect_to_server, create_client_endpoint, create_server_endpoint, watch_connection_paths,
+    connect_to_server, connection_paths, create_client_endpoint, create_server_endpoint,
+    watch_connection_paths,
 };
 use crate::net::{ConnStatus, DialSpec, EventSender, NetEvent, ServerMode, UiCommand};
 use crate::protocol::{
@@ -184,25 +185,34 @@ enum SessionKind {
     Client(DialSpec),
 }
 
-/// A running server or client session: its cancel token, task handle, and the
-/// channel that feeds outbound clipboard items into the active connection.
+/// Shared slot holding a clone of the currently-paired connection (or `None`
+/// when unpaired), so the command loop can snapshot its paths on demand without
+/// interrupting the session task's pump. iroh's `Connection` is a cheap handle.
+type ConnSlot = Arc<parking_lot::Mutex<Option<iroh::endpoint::Connection>>>;
+
+/// A running server or client session: its cancel token, task handle, the
+/// channel that feeds outbound clipboard items into the active connection, and
+/// the shared connection slot for on-demand path queries.
 struct Session {
     cancel: CancellationToken,
     handle: JoinHandle<()>,
     clip_tx: mpsc::UnboundedSender<String>,
+    conn: ConnSlot,
 }
 
 fn start_session(kind: SessionKind, events: EventSender) -> Session {
     let cancel = CancellationToken::new();
     let (clip_tx, clip_rx) = mpsc::unbounded_channel();
     let task_cancel = cancel.clone();
+    let conn: ConnSlot = Arc::new(parking_lot::Mutex::new(None));
+    let task_conn = conn.clone();
     let handle = tokio::spawn(async move {
         match kind {
             SessionKind::Server(mode) => {
-                run_server_session(mode, events, task_cancel, clip_rx).await
+                run_server_session(mode, events, task_cancel, clip_rx, task_conn).await
             }
             SessionKind::Client(spec) => {
-                run_client_session(spec, events, task_cancel, clip_rx).await
+                run_client_session(spec, events, task_cancel, clip_rx, task_conn).await
             }
         }
     });
@@ -210,6 +220,7 @@ fn start_session(kind: SessionKind, events: EventSender) -> Session {
         cancel,
         handle,
         clip_tx,
+        conn,
     }
 }
 
@@ -248,6 +259,15 @@ pub async fn net_main(mut cmd_rx: mpsc::UnboundedReceiver<UiCommand>, events: Ev
                     events.error("Not connected — start or join a session first");
                 }
             }
+            UiCommand::QueryConnPath => {
+                // Point-in-time snapshot from the live connection, if any.
+                let paths = session
+                    .as_ref()
+                    .and_then(|s| s.conn.lock().clone())
+                    .map(|conn| connection_paths(&conn))
+                    .unwrap_or_default();
+                events.send(NetEvent::ConnPath(paths));
+            }
             UiCommand::Shutdown => break,
         }
     }
@@ -273,6 +293,7 @@ async fn run_server_session(
     events: EventSender,
     cancel: CancellationToken,
     mut clip_rx: mpsc::UnboundedReceiver<String>,
+    conn_slot: ConnSlot,
 ) {
     events.status(ConnStatus::Starting);
 
@@ -378,15 +399,15 @@ async fn run_server_session(
             peer_node_id: remote_id.to_string(),
         });
 
-        let _paths = watch_connection_paths(&conn, {
-            let events = events.clone();
-            move |display| events.send(NetEvent::PathUpdate(display))
-        });
+        // Debug-only path logging; on-demand status reads `conn_slot` directly.
+        let _paths = watch_connection_paths(&conn);
+        *conn_slot.lock() = Some(conn.clone());
 
         match serve_clip_connection(&conn, &events, &mut clip_rx, &cancel).await {
             Ok(()) => log::info!("Clipboard session with {remote_id} ended"),
             Err(e) => log::warn!("Clipboard session with {remote_id} ended: {e:#}"),
         }
+        *conn_slot.lock() = None;
 
         if cancel.is_cancelled() {
             conn.close(SHUTDOWN_CODE.into(), b"shutdown");
@@ -445,6 +466,7 @@ async fn run_client_session(
     events: EventSender,
     cancel: CancellationToken,
     mut clip_rx: mpsc::UnboundedReceiver<String>,
+    conn_slot: ConnSlot,
 ) {
     events.status(ConnStatus::Starting);
 
@@ -565,10 +587,10 @@ async fn run_client_session(
                                     peer_node_id: remote_id.to_string(),
                                 });
                                 events.status(ConnStatus::Connected);
-                                let _paths = watch_connection_paths(&conn, {
-                                    let events = events.clone();
-                                    move |display| events.send(NetEvent::PathUpdate(display))
-                                });
+                                // Debug-only path logging; on-demand status reads
+                                // `conn_slot` directly.
+                                let _paths = watch_connection_paths(&conn);
+                                *conn_slot.lock() = Some(conn.clone());
                                 connected_once = true;
                                 attempts = 0;
                                 backoff = Duration::from_secs(1);
@@ -579,6 +601,7 @@ async fn run_client_session(
                                     Ok(()) => log::info!("Clipboard session ended"),
                                     Err(e) => log::warn!("Clipboard session ended: {e:#}"),
                                 }
+                                *conn_slot.lock() = None;
                                 if cancel.is_cancelled() {
                                     conn.close(SHUTDOWN_CODE.into(), b"shutdown");
                                     endpoint.close().await;

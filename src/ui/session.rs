@@ -11,13 +11,16 @@ pub fn show_session(app: &mut DuocbApp, ui: &mut Ui) {
     ui.add_space(8.0);
     ui.separator();
 
-    if let Some(path) = &app.path_display {
-        ui.label(RichText::new(path.clone()).small().weak());
-    }
-
     ui.horizontal(|ui| {
         if ui.button("📤 Send clipboard (Ctrl+S)").clicked() {
             app.send_clipboard();
+        }
+        if ui
+            .button("🌐 Connection path")
+            .on_hover_text("Show how this session is currently routed (direct vs. relay)")
+            .clicked()
+        {
+            app.query_conn_path();
         }
         if app.sent_flash_active() {
             ui.colored_label(egui::Color32::from_rgb(0x2e, 0xa0, 0x43), "sent ✓");

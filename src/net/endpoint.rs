@@ -12,7 +12,7 @@ use iroh::{
     endpoint::{Builder as EndpointBuilder, PathList, QuicTransportConfig, presets},
 };
 use iroh_mdns_address_lookup::MdnsAddressLookup;
-use log::info;
+use log::{debug, info};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
@@ -132,7 +132,62 @@ pub async fn connect_to_server(
     }
 }
 
-/// Format connection path info for display, showing selected paths with RTT.
+/// Whether a connection path is a direct hole-punched route or via a relay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnPathKind {
+    Direct,
+    Relay,
+    Other,
+}
+
+/// A single connection path snapshot for status display, decoupled from iroh's
+/// borrowed [`PathList`] so it can be handed to the UI and shown on demand (the
+/// "connection path" button), needing no background watcher.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConnPath {
+    pub kind: ConnPathKind,
+    /// Human line like `Direct 1.2.3.4:52186 (rtt 1ms)` or
+    /// `Relay https://… (rtt 42ms)`.
+    pub display: String,
+    /// Whether iroh currently routes traffic over this path.
+    pub selected: bool,
+}
+
+/// Snapshot the current path(s) of a live connection for a status UI, showing
+/// *all* paths (not just the selected one) so a direct path iroh has discovered
+/// but not yet selected is still visible. [`Connection::paths`] is itself a
+/// point-in-time snapshot, so this needs no background watcher.
+pub fn connection_paths(conn: &iroh::endpoint::Connection) -> Vec<ConnPath> {
+    snapshot_paths(&conn.paths())
+}
+
+/// Convert a borrowed [`PathList`] snapshot into owned [`ConnPath`]s.
+fn snapshot_paths(paths: &PathList<'_>) -> Vec<ConnPath> {
+    paths
+        .iter()
+        .map(|path| {
+            let rtt = path.rtt();
+            let selected = path.is_selected();
+            let (kind, display) = match path.remote_addr() {
+                TransportAddr::Ip(addr) => {
+                    (ConnPathKind::Direct, format!("Direct {addr} (rtt {rtt:.0?})"))
+                }
+                TransportAddr::Relay(url) => {
+                    (ConnPathKind::Relay, format!("Relay {url} (rtt {rtt:.0?})"))
+                }
+                other => (ConnPathKind::Other, format!("{other:?} (rtt {rtt:.0?})")),
+            };
+            ConnPath {
+                kind,
+                display,
+                selected,
+            }
+        })
+        .collect()
+}
+
+/// Format the selected path(s) of a connection for logging, e.g.
+/// `Direct [2607:…]:52186 (rtt 1ms)` or `Relay https://… (rtt 42ms)`.
 fn format_paths(paths: &PathList<'_>) -> String {
     if paths.is_empty() {
         return "establishing...".to_string();
@@ -156,36 +211,50 @@ fn format_paths(paths: &PathList<'_>) -> String {
     }
 }
 
-/// RAII guard that aborts the background path watcher task on drop.
-pub struct PathWatcherGuard(JoinHandle<()>);
+/// Key identifying the selected-path topology, excluding the volatile RTT, so
+/// the watcher only logs when the path actually changes (not every RTT update).
+fn paths_key(paths: &PathList<'_>) -> (bool, Vec<String>) {
+    let selected = paths
+        .iter()
+        .filter(|p| p.is_selected())
+        .map(|p| format!("{:?}", p.remote_addr()))
+        .collect();
+    (paths.is_empty(), selected)
+}
+
+/// RAII guard that aborts the background path-watcher task on drop.
+pub struct PathWatcherGuard(Option<JoinHandle<()>>);
 
 impl Drop for PathWatcherGuard {
     fn drop(&mut self) {
-        self.0.abort();
+        if let Some(handle) = &self.0 {
+            handle.abort();
+        }
     }
 }
 
-/// Spawn a background task that reports the connection's selected path (and
-/// changes to it, e.g. relay -> direct) through `on_update`. The returned guard
-/// aborts the task when dropped; callers keep it alive for the connection's life.
-pub fn watch_connection_paths(
-    conn: &iroh::endpoint::Connection,
-    on_update: impl Fn(String) + Send + 'static,
-) -> PathWatcherGuard {
+/// Spawn a background task that logs the connection's selected path and any
+/// changes to it (e.g. relay -> direct). Logging is its only purpose, so when
+/// debug logging is disabled the task is not spawned and the returned guard is
+/// inert. The guard aborts the task on drop; callers keep it alive for the
+/// connection's life. On-demand status uses [`connection_paths`] instead.
+pub fn watch_connection_paths(conn: &iroh::endpoint::Connection) -> PathWatcherGuard {
+    if !log::log_enabled!(log::Level::Debug) {
+        return PathWatcherGuard(None);
+    }
     let conn = conn.clone();
-    PathWatcherGuard(tokio::spawn(async move {
+    PathWatcherGuard(Some(tokio::spawn(async move {
         // The stream yields the current snapshot on the first poll, then a
         // fresh snapshot whenever the open or selected paths change; it ends
         // when the connection closes.
         let mut stream = conn.paths_stream();
-        let mut last: Option<String> = None;
+        let mut last_key = None;
         while let Some(paths) = stream.next().await {
-            let display = format_paths(&paths);
-            if last.as_deref() != Some(display.as_str()) {
-                info!("Connection: {display}");
-                on_update(display.clone());
-                last = Some(display);
+            let key = paths_key(&paths);
+            if last_key.as_ref() != Some(&key) {
+                debug!("Connection: {}", format_paths(&paths));
+                last_key = Some(key);
             }
         }
-    }))
+    })))
 }

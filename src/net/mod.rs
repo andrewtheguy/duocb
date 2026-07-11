@@ -57,6 +57,9 @@ pub enum UiCommand {
     Connect { spec: DialSpec },
     Disconnect,
     SendClipboard { text: String },
+    /// Request a point-in-time snapshot of the live connection's paths, answered
+    /// with [`NetEvent::ConnPath`]. Empty if no connection is up.
+    QueryConnPath,
     Shutdown,
 }
 
@@ -101,8 +104,9 @@ pub enum NetEvent {
     Status(ConnStatus),
     PeerPaired { peer_node_id: String },
     PeerDisconnected,
-    /// Human-readable selected-path description ("Direct 192.168.1.5:… (rtt 2ms)").
-    PathUpdate(String),
+    /// Answer to [`UiCommand::QueryConnPath`]: a point-in-time snapshot of the
+    /// connection's paths (empty if no connection is currently up).
+    ConnPath(Vec<endpoint::ConnPath>),
     ItemReceived { text: String },
     ItemSent,
     Error(String),
