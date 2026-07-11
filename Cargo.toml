@@ -42,3 +42,11 @@ jiff = "0.2"
 strip = true
 lto = "thin"
 codegen-units = 1
+
+# Installer packaging (`cargo packager`): .dmg on macOS, .msi (WiX) on Windows.
+# Icons live in icons/ (icon.png is also baked into the binary as the window/Dock
+# icon; see src/main.rs).
+[package.metadata.packager]
+product-name = "duocb"
+identifier = "com.andrewtheguy.duocb"
+icons = ["icons/icon.icns", "icons/icon.ico", "icons/icon.png"]

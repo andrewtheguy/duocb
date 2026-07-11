@@ -132,10 +132,27 @@ jobs:
         run: |
           mv target/aarch64-apple-darwin/release/duocb target/release/duocb-macos-arm64
 
+      - uses: cargo-bins/cargo-binstall@main
+
+      - name: Package desktop app (.dmg, unsigned)
+        # Unsigned: browser downloads get the quarantine attribute; users clear it
+        # with `xattr -dr com.apple.quarantine duocb.app`. The dmg format wraps the
+        # .app in a drag-to-Applications disk image (cargo-packager builds the .app
+        # bundle first as a prerequisite).
+        run: |
+          cargo binstall -y --force cargo-packager@0.11.8
+          cargo packager --release --formats dmg --target aarch64-apple-darwin
+          mv target/aarch64-apple-darwin/release/*.dmg target/release/duocb-macos-arm64.dmg
+
       - uses: actions/upload-artifact@v4
         with:
           name: release-macos-arm64
           path: target/release/duocb-macos-arm64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-desktop-macos-arm64
+          path: target/release/duocb-macos-arm64.dmg
 
   build-windows:
     needs: setup
@@ -154,10 +171,25 @@ jobs:
         run: |
           move target\x86_64-pc-windows-msvc\release\duocb.exe target\release\duocb-windows-amd64.exe
 
+      - uses: cargo-bins/cargo-binstall@main
+
+      - name: Package desktop installer (.msi, unsigned)
+        # cargo-packager downloads the WiX toolset itself. Unsigned: users see
+        # the SmartScreen "unknown publisher" prompt.
+        run: |
+          cargo binstall -y --force cargo-packager@0.11.8
+          cargo packager --release --formats wix --target x86_64-pc-windows-msvc
+          Move-Item target/x86_64-pc-windows-msvc/release/*.msi target/release/duocb-windows-amd64.msi
+
       - uses: actions/upload-artifact@v4
         with:
           name: release-windows-amd64
           path: target/release/duocb-windows-amd64.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-desktop-windows-amd64
+          path: target/release/duocb-windows-amd64.msi
 
   publish-release:
     needs: [setup, build-linux, build-macos, build-windows]
