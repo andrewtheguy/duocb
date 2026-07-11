@@ -47,8 +47,8 @@ pub struct ClipItem {
     pub text: String,
     /// When it was received (inbox) or sent (outbox).
     pub timestamp: jiff::Zoned,
-    /// CRC-16 of the payload, computed once on creation (see [`crc16`]).
-    pub crc16: u16,
+    /// CRC-32 of the payload, computed once on creation (see [`crc32`]).
+    pub crc32: u32,
     /// When the peek view was opened, or `None` if collapsed. The peek
     /// auto-hides [`PEEK_TIMEOUT`] after this (see [`tick_peek`](Self::tick_peek)).
     peeked_at: Option<Instant>,
@@ -56,11 +56,11 @@ pub struct ClipItem {
 
 impl ClipItem {
     pub fn new(text: String, timestamp: jiff::Zoned) -> Self {
-        let crc16 = crc16(text.as_bytes());
+        let crc32 = crc32(text.as_bytes());
         Self {
             text,
             timestamp,
-            crc16,
+            crc32,
             peeked_at: None,
         }
     }
@@ -97,6 +97,11 @@ impl ClipItem {
         }
     }
 
+    /// CRC-32 fingerprint formatted as two four-hex groups for readability.
+    pub fn crc32_display(&self) -> String {
+        format!("{:04X}-{:04X}", self.crc32 >> 16, self.crc32 & 0xFFFF)
+    }
+
     /// The text to show while peeking, truncated to [`PEEK_LIMIT`] chars.
     /// The bool is whether truncation occurred (borrowed, so the common
     /// small-payload case allocates nothing).
@@ -108,22 +113,22 @@ impl ClipItem {
     }
 }
 
-/// CRC-16/CCITT-FALSE (poly `0x1021`, init `0xFFFF`) over the payload bytes — a
-/// short fingerprint the user can eyeball to tell inbox items apart, or to
-/// confirm a paste matches, without peeking at (and thus revealing) the content.
-fn crc16(data: &[u8]) -> u16 {
-    let mut crc: u16 = 0xFFFF;
+/// CRC-32/ISO-HDLC over the payload bytes — a short fingerprint the user can
+/// eyeball to tell inbox items apart, or to confirm a paste matches, without
+/// peeking at (and thus revealing) the content.
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
     for &byte in data {
-        crc ^= (byte as u16) << 8;
+        crc ^= byte as u32;
         for _ in 0..8 {
-            crc = if crc & 0x8000 != 0 {
-                (crc << 1) ^ 0x1021
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
             } else {
-                crc << 1
+                crc >> 1
             };
         }
     }
-    crc
+    !crc
 }
 
 #[cfg(test)]
@@ -131,10 +136,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn crc16_matches_known_check_value() {
-        // CRC-16/CCITT-FALSE check value for the ASCII string "123456789".
-        assert_eq!(crc16(b"123456789"), 0x29B1);
-        assert_eq!(crc16(b""), 0xFFFF);
+    fn crc32_matches_known_check_value() {
+        // CRC-32/ISO-HDLC check value for the ASCII string "123456789".
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+        assert_eq!(crc32(b""), 0);
+    }
+
+    #[test]
+    fn crc32_display_uses_middle_dash() {
+        let item = ClipItem::new("123456789".to_string(), jiff::Zoned::now());
+
+        assert_eq!(item.crc32_display(), "CBF4-3926");
     }
 
     #[test]
