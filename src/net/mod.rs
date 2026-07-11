@@ -33,11 +33,11 @@ pub enum ServerMode {
 /// What the client dials.
 #[derive(Debug, Clone)]
 pub enum DialSpec {
-    /// Resolve the peer's node id by name via nostr (token-derived keys), then
-    /// authenticate with the same shared token.
+    /// Resolve the other device under the shared token-derived nostr author,
+    /// excluding this device's own named record, then authenticate with the token.
     NostrToken {
         token: String,
-        peer_name: String,
+        own_name: String,
         relays: Vec<String>,
     },
     /// Resolve via the rotating-PIN rendezvous, then prove PIN possession in-band.

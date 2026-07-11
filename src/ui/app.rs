@@ -3,6 +3,7 @@
 //! touches disk).
 
 use std::time::{Duration, Instant};
+use std::path::PathBuf;
 
 use eframe::egui;
 
@@ -19,6 +20,7 @@ const SENT_FLASH: Duration = Duration::from_secs(2);
 const MAX_INBOX_ITEMS: usize = 5;
 
 pub struct DuocbApp {
+    pub(crate) config_path: PathBuf,
     pub(crate) net: NetHandle,
     pub(crate) clipboard: SystemClipboard,
 
@@ -46,7 +48,6 @@ pub struct DuocbApp {
     // Form inputs.
     pub(crate) in_token: String,
     pub(crate) in_my_name: String,
-    pub(crate) in_peer_name: String,
     pub(crate) in_pin: String,
     pub(crate) in_node_id: String,
     pub(crate) in_manual_token: String,
@@ -68,10 +69,11 @@ pub struct DuocbApp {
 }
 
 impl DuocbApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, config_path: PathBuf) -> Self {
         let net = spawn_net_runtime(cc.egui_ctx.clone());
-        let config = crate::config::Config::load();
+        let config = crate::config::Config::load(&config_path);
         Self {
+            config_path,
             net,
             clipboard: SystemClipboard::new(),
             screen: Screen::Home,
@@ -88,7 +90,6 @@ impl DuocbApp {
             client_active: false,
             in_token: config.auth_token.unwrap_or_default(),
             in_my_name: config.my_name.unwrap_or_default(),
-            in_peer_name: config.peer_name.unwrap_or_default(),
             in_pin: String::new(),
             in_node_id: String::new(),
             in_manual_token: String::new(),
@@ -227,9 +228,8 @@ impl DuocbApp {
         let cfg = crate::config::Config {
             auth_token: Some(self.in_token.trim().to_string()).filter(|s| !s.is_empty()),
             my_name: Some(self.in_my_name.trim().to_string()).filter(|s| !s.is_empty()),
-            peer_name: Some(self.in_peer_name.trim().to_string()).filter(|s| !s.is_empty()),
         };
-        if let Err(e) = cfg.save() {
+        if let Err(e) = cfg.save(&self.config_path) {
             self.error = Some(format!("Could not save the settings: {e:#}"));
         }
     }
@@ -298,11 +298,11 @@ impl DuocbApp {
         match self.mode {
             PairMode::NostrToken => {
                 let token = self.in_token.trim();
-                let peer = self.in_peer_name.trim();
-                (crate::auth::validate_token(token).is_ok() && !peer.is_empty()).then(|| {
+                let name = self.in_my_name.trim();
+                (crate::auth::validate_token(token).is_ok() && !name.is_empty()).then(|| {
                     DialSpec::NostrToken {
                         token: token.to_string(),
-                        peer_name: peer.to_string(),
+                        own_name: name.to_string(),
                         relays: crate::ui::screens::default_relays(),
                     }
                 })

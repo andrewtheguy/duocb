@@ -7,14 +7,14 @@
 //! id is encrypted in the event content (NIP-44; see below), and the `auth_token`
 //! still gates the actual connection.
 //!
-//! Several peers may share one `auth_token`, so each is distinguished by a short
-//! **identifier** (its name): the kind-30078 `d` tag is `duocb:nodeid:<sha256(auth||id)>`.
-//! A server publishes under its own identifier; a client hashes the identifier it was
-//! given into the same `d` tag and fetches that one record. The hash is salted with
-//! the `auth_token` so a short, low-entropy identifier cannot be guessed or
-//! enumerated on relays without the shared token. Because the `d` tag is keyed on the
-//! stable identifier (not the volatile node id), a server restart replaces its own
-//! record — no stale accumulation.
+//! Each device has its own short **identifier** (name), while all devices in the
+//! pairing share one `auth_token` and therefore one nostr author key. A device
+//! publishes under a kind-30078 `d` tag of
+//! `duocb:nodeid:<sha256(auth||its-own-name)>`. A joining device queries by the
+//! shared author key alone, excludes the record for its own name, and dials the
+//! newest other-device record. The user never has to know or enter the other
+//! device's name. The hash is salted with the token so names cannot be enumerated
+//! without it, and a restart replaces that device's own stable record.
 //!
 //! The node id in the event content is **encrypted** (NIP-44) under the shared
 //! auth-token-derived keypair — the server encrypts to its own derived public key
@@ -176,21 +176,55 @@ pub async fn lookup_node_id_opt(
     Ok(Some(node_id))
 }
 
-/// Look up the node id published under `identifier`, erroring if no record exists.
-/// Used by the client, which needs a concrete node id to dial.
-pub async fn lookup_node_id(
+fn peer_node_id_from_events<'a>(
+    keys: &Keys,
+    own_dtag: &str,
+    events: impl IntoIterator<Item = &'a Event>,
+) -> Option<EndpointId> {
+    let dtag_prefix = format!("{NODEID_DTAG_BASE}:");
+    let mut candidates: Vec<_> = events
+        .into_iter()
+        .filter(|event| {
+            event.tags.identifier().is_some_and(|dtag| {
+                dtag.starts_with(&dtag_prefix) && dtag != own_dtag
+            })
+        })
+        .collect();
+    candidates.sort_by_key(|event| std::cmp::Reverse(event.created_at));
+    for event in candidates {
+        let Ok(plaintext) =
+            nip44::decrypt(keys.secret_key(), &keys.public_key(), &event.content)
+        else {
+            continue;
+        };
+        if let Ok(node_id) = plaintext.trim().parse::<EndpointId>() {
+            return Some(node_id);
+        }
+    }
+    None
+}
+
+/// Look up the other device under the shared auth-derived author key. `own_identifier`
+/// is this joining device's name; its record is excluded so the field never means
+/// "the name to look up." The newest valid other-device record wins, which also
+/// leaves stale records from older device runs behind the active publisher.
+pub async fn lookup_peer_node_id(
     auth_token: &str,
-    identifier: &str,
+    own_identifier: &str,
     relays: &[String],
 ) -> Result<EndpointId> {
-    lookup_node_id_opt(auth_token, identifier, relays)
-        .await?
-        .with_context(|| {
-            format!(
-                "no node-id record found on nostr for name '{}' (is that peer running and sharing the same auth token?)",
-                identifier.trim()
-            )
-        })
+    let keys = derive_keys(auth_token)?;
+    let own_dtag = identifier_dtag(auth_token, own_identifier);
+    let client = connect_client(relays).await?;
+    let filter = Filter::new()
+        .kind(nodeid_kind())
+        .author(keys.public_key());
+    let events = client.fetch_events(filter, LOOKUP_TIMEOUT).await;
+    client.disconnect().await;
+    let events = events.context("querying nostr relays for the other device's node id")?;
+    peer_node_id_from_events(&keys, &own_dtag, events.iter()).with_context(|| {
+        "no other-device record found on nostr (is the other device running with the same auth token and a different name?)"
+    })
 }
 
 // ============================================================================
@@ -407,6 +441,46 @@ mod tests {
     }
 
     #[test]
+    fn peer_lookup_excludes_own_name_and_selects_other_device() {
+        let token = "shared-token";
+        let keys = derive_keys(token).unwrap();
+        let own_node_id = iroh::SecretKey::generate().public();
+        let peer_node_id = iroh::SecretKey::generate().public();
+
+        let event_for = |name: &str, node_id: EndpointId| {
+            let content = nip44::encrypt(
+                keys.secret_key(),
+                &keys.public_key(),
+                node_id.to_string(),
+                nip44::Version::V2,
+            )
+            .unwrap();
+            EventBuilder::new(nodeid_kind(), content)
+                .tags([Tag::identifier(identifier_dtag(token, name))])
+                .sign_with_keys(&keys)
+                .unwrap()
+        };
+        let own_event = event_for("mac2", own_node_id);
+        let peer_event = event_for("mac1", peer_node_id);
+        let events = [&own_event, &peer_event];
+
+        let found = peer_node_id_from_events(
+            &keys,
+            &identifier_dtag(token, "mac2"),
+            events,
+        );
+        assert_eq!(found, Some(peer_node_id));
+        assert_eq!(
+            peer_node_id_from_events(
+                &keys,
+                &identifier_dtag(token, "mac2"),
+                [&own_event],
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn wrong_auth_token_cannot_decrypt_node_id() {
         let node_id = iroh::SecretKey::generate().public();
         let publisher = derive_keys("the-real-token").unwrap();
@@ -466,5 +540,26 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "uses public nostr relays"]
+    async fn public_relay_token_record_round_trip() {
+        let relays: Vec<String> = DEFAULT_NOSTR_RELAYS
+            .iter()
+            .map(|relay| relay.to_string())
+            .collect();
+        let token = crate::auth::generate_token();
+        let peer_name = "relay-round-trip-peer";
+        let own_name = "relay-round-trip-self";
+        let node_id = iroh::SecretKey::generate().public();
+
+        publish_node_id(&token, peer_name, &node_id, &relays)
+            .await
+            .expect("publish token record");
+        let found = lookup_peer_node_id(&token, own_name, &relays)
+            .await
+            .expect("look up the other device without its name");
+        assert_eq!(found, node_id);
     }
 }

@@ -52,7 +52,7 @@ pub fn show_home(app: &mut DuocbApp, ui: &mut Ui) {
         ui.radio_value(
             &mut app.mode,
             PairMode::NostrToken,
-            "2  Token + name — standing pairing with a shared token (internet)",
+            "2  Token + names — standing pairing with a shared token (internet)",
         );
         ui.radio_value(
             &mut app.mode,
@@ -130,11 +130,14 @@ pub fn show_server(app: &mut DuocbApp, ui: &mut Ui) {
                         app.in_token = crate::auth::generate_token();
                     }
                 });
-                ui.label("This device's name (the other device looks it up by this):");
+                ui.label("This device's unique name:");
                 ui.add(TextEdit::singleline(&mut app.in_my_name).hint_text("e.g. desktop"));
                 if ui
                     .button("Remember these settings")
-                    .on_hover_text("Saves the token and names to ~/.config/duocb/config.toml")
+                    .on_hover_text(format!(
+                        "Saves the token and this device's name to {}",
+                        app.config_path.display()
+                    ))
                     .clicked()
                 {
                     app.remember_token_settings();
@@ -185,7 +188,7 @@ pub fn show_server(app: &mut DuocbApp, ui: &mut Ui) {
                 });
             }
             if let Some(name) = Some(app.in_my_name.trim().to_string()).filter(|s| !s.is_empty()) {
-                ui.label(format!("The other device connects using the name “{name}”."));
+                ui.label(format!("This device is “{name}”. The other device must use a different name."));
             }
         }
         PairMode::NostrPin => {
@@ -255,11 +258,14 @@ pub fn show_client(app: &mut DuocbApp, ui: &mut Ui) {
                         .desired_width(f32::INFINITY)
                         .hint_text("d…"),
                 );
-                ui.label("The other device's name:");
-                ui.add(TextEdit::singleline(&mut app.in_peer_name).hint_text("e.g. desktop"));
+                ui.label("This device's unique name:");
+                ui.add(TextEdit::singleline(&mut app.in_my_name).hint_text("e.g. laptop"));
                 if ui
                     .button("Remember these settings")
-                    .on_hover_text("Saves the token and names to ~/.config/duocb/config.toml")
+                    .on_hover_text(format!(
+                        "Saves the token and this device's name to {}",
+                        app.config_path.display()
+                    ))
                     .clicked()
                 {
                     app.remember_token_settings();
