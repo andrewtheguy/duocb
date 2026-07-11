@@ -2,11 +2,10 @@
 //! or client), adapted from duopipe's peer runtime with the SOCKS payload
 //! replaced by a single long-lived clipboard stream.
 //!
-//! Per connection (client = dialer):
-//! 1. The client opens the auth stream and authenticates (token or PIN).
-//! 2. The client opens the clipboard stream; both sides exchange a
-//!    [`ClipMsg::Hello`], then pump [`ClipMsg::Item`] frames in both directions
-//!    until the connection dies or the session is cancelled.
+//! Per connection (client = dialer): the client opens a single bidirectional
+//! stream and authenticates on it (token or PIN); on success that same stream
+//! stays open and both sides pump [`ClipMsg`] frames in both directions until
+//! the connection dies or the session is cancelled.
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
@@ -20,7 +19,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::auth::is_token_valid;
 use crate::net::endpoint::{
-    connect_to_server, create_client_endpoint, create_server_endpoint, watch_connection_paths,
+    connect_to_server, connection_paths, create_client_endpoint, create_server_endpoint,
+    watch_connection_paths,
 };
 use crate::net::{ConnStatus, DialSpec, EventSender, NetEvent, ServerMode, UiCommand};
 use crate::protocol::{
@@ -35,9 +35,6 @@ const RECENT_PIN_CACHE: usize = 3;
 
 /// Timeout for the authentication handshake.
 const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Timeout for the clipboard stream's opening Hello exchange.
-const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Connection close code for authentication failure (invalid token/PIN).
 const AUTH_FAILED_CODE: u32 = 1;
@@ -184,25 +181,38 @@ enum SessionKind {
     Client(DialSpec),
 }
 
-/// A running server or client session: its cancel token, task handle, and the
-/// channel that feeds outbound clipboard items into the active connection.
+/// Shared slot holding a clone of the currently-paired connection (or `None`
+/// when unpaired), so the command loop can snapshot its paths on demand without
+/// interrupting the session task's pump. iroh's `Connection` is a cheap handle.
+type ConnSlot = Arc<parking_lot::Mutex<Option<iroh::endpoint::Connection>>>;
+
+/// The single bidirectional session stream: auth runs on it first, then it
+/// carries clipboard frames both ways for the life of the connection.
+type Bi = (iroh::endpoint::SendStream, iroh::endpoint::RecvStream);
+
+/// A running server or client session: its cancel token, task handle, the
+/// channel that feeds outbound clipboard items into the active connection, and
+/// the shared connection slot for on-demand path queries.
 struct Session {
     cancel: CancellationToken,
     handle: JoinHandle<()>,
     clip_tx: mpsc::UnboundedSender<String>,
+    conn: ConnSlot,
 }
 
 fn start_session(kind: SessionKind, events: EventSender) -> Session {
     let cancel = CancellationToken::new();
     let (clip_tx, clip_rx) = mpsc::unbounded_channel();
     let task_cancel = cancel.clone();
+    let conn: ConnSlot = Arc::new(parking_lot::Mutex::new(None));
+    let task_conn = conn.clone();
     let handle = tokio::spawn(async move {
         match kind {
             SessionKind::Server(mode) => {
-                run_server_session(mode, events, task_cancel, clip_rx).await
+                run_server_session(mode, events, task_cancel, clip_rx, task_conn).await
             }
             SessionKind::Client(spec) => {
-                run_client_session(spec, events, task_cancel, clip_rx).await
+                run_client_session(spec, events, task_cancel, clip_rx, task_conn).await
             }
         }
     });
@@ -210,6 +220,7 @@ fn start_session(kind: SessionKind, events: EventSender) -> Session {
         cancel,
         handle,
         clip_tx,
+        conn,
     }
 }
 
@@ -248,6 +259,15 @@ pub async fn net_main(mut cmd_rx: mpsc::UnboundedReceiver<UiCommand>, events: Ev
                     events.error("Not connected — start or join a session first");
                 }
             }
+            UiCommand::QueryConnPath => {
+                // Point-in-time snapshot from the live connection, if any.
+                let paths = session
+                    .as_ref()
+                    .and_then(|s| s.conn.lock().clone())
+                    .map(|conn| connection_paths(&conn))
+                    .unwrap_or_default();
+                events.send(NetEvent::ConnPath(paths));
+            }
             UiCommand::Shutdown => break,
         }
     }
@@ -273,6 +293,7 @@ async fn run_server_session(
     events: EventSender,
     cancel: CancellationToken,
     mut clip_rx: mpsc::UnboundedReceiver<String>,
+    conn_slot: ConnSlot,
 ) {
     events.status(ConnStatus::Starting);
 
@@ -366,27 +387,31 @@ async fn run_server_session(
         log::info!("Peer connected: {remote_id} (awaiting auth)");
         events.status(ConnStatus::Authenticating);
 
-        match auth_as_listener(&conn, &tokens, pin_cache.as_ref(), &claim).await {
-            Ok(()) => {}
+        // Auth runs on the single session stream; on success the same stream
+        // stays open for clipboard frames (no separate data stream / handshake).
+        let (send, recv) = match auth_as_listener(&conn, &tokens, pin_cache.as_ref(), &claim).await
+        {
+            Ok(streams) => streams,
             Err(e) => {
                 log::warn!("Auth failed for {remote_id}: {e:#}");
                 events.status(ConnStatus::Listening);
                 continue;
             }
-        }
+        };
         events.send(NetEvent::PeerPaired {
             peer_node_id: remote_id.to_string(),
         });
 
-        let _paths = watch_connection_paths(&conn, {
-            let events = events.clone();
-            move |display| events.send(NetEvent::PathUpdate(display))
-        });
+        // Debug-only path logging; on-demand status reads `conn_slot` directly.
+        let _paths = watch_connection_paths(&conn);
+        *conn_slot.lock() = Some(conn.clone());
 
-        match serve_clip_connection(&conn, &events, &mut clip_rx, &cancel).await {
+        events.status(ConnStatus::Connected);
+        match pump_clipboard(send, recv, &events, &mut clip_rx, &cancel).await {
             Ok(()) => log::info!("Clipboard session with {remote_id} ended"),
             Err(e) => log::warn!("Clipboard session with {remote_id} ended: {e:#}"),
         }
+        *conn_slot.lock() = None;
 
         if cancel.is_cancelled() {
             conn.close(SHUTDOWN_CODE.into(), b"shutdown");
@@ -400,42 +425,6 @@ async fn run_server_session(
     log::info!("Server session stopped");
 }
 
-/// Server side of the clipboard stream: accept the client's post-auth stream,
-/// answer its Hello, then pump items both ways.
-async fn serve_clip_connection(
-    conn: &iroh::endpoint::Connection,
-    events: &EventSender,
-    clip_rx: &mut mpsc::UnboundedReceiver<String>,
-    cancel: &CancellationToken,
-) -> Result<()> {
-    let accept = async {
-        let (mut send, mut recv) = conn
-            .accept_bi()
-            .await
-            .context("accepting clipboard stream")?;
-        let frame = read_length_prefixed(&mut recv, MAX_CLIP_MESSAGE_SIZE)
-            .await
-            .context("reading clipboard hello")?;
-        match decode_clip_msg(&frame)? {
-            ClipMsg::Hello { .. } => {}
-            other => anyhow::bail!("expected Hello, got {other:?}"),
-        }
-        send.write_all(&encode_clip_msg(&ClipMsg::hello())?)
-            .await
-            .context("writing clipboard hello")?;
-        Ok::<_, anyhow::Error>((send, recv))
-    };
-    let (send, recv) = tokio::select! {
-        _ = cancel.cancelled() => return Ok(()),
-        r = tokio::time::timeout(HELLO_TIMEOUT, accept) => {
-            r.context("timed out waiting for the clipboard stream")??
-        }
-    };
-
-    events.status(ConnStatus::Connected);
-    pump_clipboard(send, recv, events, clip_rx, cancel).await
-}
-
 // ============================================================================
 // Client session
 // ============================================================================
@@ -445,6 +434,7 @@ async fn run_client_session(
     events: EventSender,
     cancel: CancellationToken,
     mut clip_rx: mpsc::UnboundedReceiver<String>,
+    conn_slot: ConnSlot,
 ) {
     events.status(ConnStatus::Starting);
 
@@ -542,6 +532,8 @@ async fn run_client_session(
         match connect {
             Ok(conn) => {
                 events.status(ConnStatus::Authenticating);
+                // Auth runs on the single session stream; on success the same
+                // stream stays open for clipboard frames.
                 let auth_result = match &spec {
                     DialSpec::Manual { token, .. } => auth_as_dialer(&conn, token).await,
                     DialSpec::NostrToken { token, .. } => auth_as_dialer(&conn, token).await,
@@ -550,44 +542,38 @@ async fn run_client_session(
                     }
                 };
                 match auth_result {
-                    Ok(()) => {
+                    Ok((send, recv)) => {
                         // Auth succeeded, so the server has committed us as its pair and
-                        // (PIN mode) stopped publishing PINs. Pin the node id NOW — even
-                        // if opening the clipboard stream fails below, a fresh relay
-                        // lookup could never succeed again; reconnects must dial this id.
+                        // (PIN mode) stopped publishing PINs. Pin the node id NOW so
+                        // reconnects dial this id — a fresh relay lookup could never
+                        // succeed again.
                         if matches!(spec, DialSpec::Pin { .. }) && pinned_pin_id.is_none() {
                             pinned_pin_id = attempt_id;
                         }
-                        match open_clip_stream(&conn).await {
-                            Ok((send, recv)) => {
-                                let remote_id = conn.remote_id();
-                                events.send(NetEvent::PeerPaired {
-                                    peer_node_id: remote_id.to_string(),
-                                });
-                                events.status(ConnStatus::Connected);
-                                let _paths = watch_connection_paths(&conn, {
-                                    let events = events.clone();
-                                    move |display| events.send(NetEvent::PathUpdate(display))
-                                });
-                                connected_once = true;
-                                attempts = 0;
-                                backoff = Duration::from_secs(1);
+                        let remote_id = conn.remote_id();
+                        events.send(NetEvent::PeerPaired {
+                            peer_node_id: remote_id.to_string(),
+                        });
+                        events.status(ConnStatus::Connected);
+                        // Debug-only path logging; on-demand status reads
+                        // `conn_slot` directly.
+                        let _paths = watch_connection_paths(&conn);
+                        *conn_slot.lock() = Some(conn.clone());
+                        connected_once = true;
+                        attempts = 0;
+                        backoff = Duration::from_secs(1);
 
-                                match pump_clipboard(send, recv, &events, &mut clip_rx, &cancel)
-                                    .await
-                                {
-                                    Ok(()) => log::info!("Clipboard session ended"),
-                                    Err(e) => log::warn!("Clipboard session ended: {e:#}"),
-                                }
-                                if cancel.is_cancelled() {
-                                    conn.close(SHUTDOWN_CODE.into(), b"shutdown");
-                                    endpoint.close().await;
-                                    return;
-                                }
-                                events.send(NetEvent::PeerDisconnected);
-                            }
-                            Err(e) => log::warn!("Failed to open clipboard stream: {e:#}"),
+                        match pump_clipboard(send, recv, &events, &mut clip_rx, &cancel).await {
+                            Ok(()) => log::info!("Clipboard session ended"),
+                            Err(e) => log::warn!("Clipboard session ended: {e:#}"),
                         }
+                        *conn_slot.lock() = None;
+                        if cancel.is_cancelled() {
+                            conn.close(SHUTDOWN_CODE.into(), b"shutdown");
+                            endpoint.close().await;
+                            return;
+                        }
+                        events.send(NetEvent::PeerDisconnected);
                     }
                     Err(e) => {
                         // Auth failures are fatal for this target (the credential
@@ -627,30 +613,6 @@ async fn run_client_session(
         }
         backoff = (backoff * 2).min(MAX_RECONNECT_BACKOFF);
     }
-}
-
-/// Client side of the clipboard stream: open it post-auth, send our Hello, and
-/// wait for the server's.
-async fn open_clip_stream(
-    conn: &iroh::endpoint::Connection,
-) -> Result<(iroh::endpoint::SendStream, iroh::endpoint::RecvStream)> {
-    let open = async {
-        let (mut send, mut recv) = conn.open_bi().await.context("opening clipboard stream")?;
-        send.write_all(&encode_clip_msg(&ClipMsg::hello())?)
-            .await
-            .context("writing clipboard hello")?;
-        let frame = read_length_prefixed(&mut recv, MAX_CLIP_MESSAGE_SIZE)
-            .await
-            .context("reading clipboard hello")?;
-        match decode_clip_msg(&frame)? {
-            ClipMsg::Hello { .. } => {}
-            other => anyhow::bail!("expected Hello, got {other:?}"),
-        }
-        Ok((send, recv))
-    };
-    tokio::time::timeout(HELLO_TIMEOUT, open)
-        .await
-        .context("timed out opening the clipboard stream")?
 }
 
 // ============================================================================
@@ -697,10 +659,8 @@ async fn pump_clipboard(
             let frame = read_length_prefixed(&mut qrecv, MAX_CLIP_MESSAGE_SIZE)
                 .await
                 .context("clipboard stream closed")?;
-            match decode_clip_msg(&frame)? {
-                ClipMsg::Item { text, .. } => events.send(NetEvent::ItemReceived { text }),
-                ClipMsg::Hello { .. } => anyhow::bail!("unexpected Hello mid-stream"),
-            }
+            let msg = decode_clip_msg(&frame)?;
+            events.send(NetEvent::ItemReceived { text: msg.text });
         }
     };
 
@@ -852,13 +812,14 @@ fn auth_close_reason(conn: &iroh::endpoint::Connection) -> Option<String> {
     }
 }
 
-/// Authenticate as the dialer with a pre-shared token.
-async fn auth_as_dialer(conn: &iroh::endpoint::Connection, auth_token: &str) -> Result<()> {
-    let (mut send, mut recv) = conn.open_bi().await.context("opening auth stream")?;
+/// Authenticate as the dialer with a pre-shared token. On success the opened
+/// stream is returned (send side *not* finished): the same stream carries the
+/// clipboard afterward.
+async fn auth_as_dialer(conn: &iroh::endpoint::Connection, auth_token: &str) -> Result<Bi> {
+    let (mut send, mut recv) = conn.open_bi().await.context("opening session stream")?;
 
     let request = AuthRequest::new(auth_token);
     send.write_all(&encode_auth_request(&request)?).await?;
-    send.finish()?;
 
     let response_bytes = match tokio::time::timeout(
         AUTH_TIMEOUT,
@@ -885,14 +846,15 @@ async fn auth_as_dialer(conn: &iroh::endpoint::Connection, auth_token: &str) -> 
     }
 
     log::info!("Authenticated with peer successfully");
-    Ok(())
+    Ok((send, recv))
 }
 
 /// Authenticate as the dialer using the quick-mode PIN (in-band challenge-response). No token
 /// crosses the wire. The whole exchange is bounded by [`AUTH_TIMEOUT`] and any failure is an
-/// [`AuthFailure`] — fatal for this target, exactly like a wrong token.
-async fn auth_as_dialer_pin(conn: &iroh::endpoint::Connection, pin: &str) -> Result<()> {
-    let (mut send, mut recv) = conn.open_bi().await.context("opening auth stream")?;
+/// [`AuthFailure`] — fatal for this target, exactly like a wrong token. On success the opened
+/// stream is returned (not finished) for the clipboard.
+async fn auth_as_dialer_pin(conn: &iroh::endpoint::Connection, pin: &str) -> Result<Bi> {
+    let (mut send, mut recv) = conn.open_bi().await.context("opening session stream")?;
     match tokio::time::timeout(
         AUTH_TIMEOUT,
         crate::pin_auth::dialer_handshake(&mut send, &mut recv, pin),
@@ -908,9 +870,8 @@ async fn auth_as_dialer_pin(conn: &iroh::endpoint::Connection, pin: &str) -> Res
         }
         Ok(Ok(())) => {}
     }
-    let _ = send.finish();
     log::info!("Authenticated with peer via PIN");
-    Ok(())
+    Ok((send, recv))
 }
 
 /// Authenticate as the listener. Accepts either a pre-shared token or (PIN mode) a PIN proof;
@@ -926,7 +887,7 @@ async fn auth_as_listener(
     auth_tokens: &HashSet<String>,
     pin_cache: Option<&RecentPins>,
     claim: &PairClaim,
-) -> Result<()> {
+) -> Result<Bi> {
     let remote_id = conn.remote_id();
 
     // Pre-auth gate: this endpoint pairs with one peer at a time. `existing` is the current
@@ -944,11 +905,14 @@ async fn auth_as_listener(
         log::warn!("Refusing {remote_id}: already paired with another device");
     }
 
+    // Auth runs on the single session stream; on success that same stream (send
+    // side left open) is returned for the clipboard. Rejection paths finish the
+    // send side to flush the reason before the connection is closed below.
     let auth_result = tokio::time::timeout(AUTH_TIMEOUT, async {
         let (mut send, mut recv) = conn
             .accept_bi()
             .await
-            .context("Failed to accept auth stream")?;
+            .context("Failed to accept session stream")?;
 
         let request_bytes = read_length_prefixed(&mut recv, MAX_CONTROL_MESSAGE_SIZE)
             .await
@@ -978,8 +942,7 @@ async fn auth_as_listener(
                 }
                 let response = AuthResponse::accepted();
                 send.write_all(&encode_auth_response(&response)?).await?;
-                send.finish()?;
-                Ok::<(), anyhow::Error>(())
+                Ok::<Bi, anyhow::Error>((send, recv))
             }
             AuthRequest::Pin { nonce, .. } => {
                 // Verify the dialer's PIN proof against the recent-bucket keys, plus (for a
@@ -1005,16 +968,15 @@ async fn auth_as_listener(
                     |key| claim.commit(remote_id, Some(key.clone())),
                 )
                 .await?;
-                let _ = send.finish();
                 log::info!("Peer {remote_id} authenticated via PIN");
-                Ok(())
+                Ok((send, recv))
             }
         }
     })
     .await;
 
     match auth_result {
-        Ok(Ok(())) => Ok(()),
+        Ok(Ok(streams)) => Ok(streams),
         Ok(Err(e)) => {
             conn.close(AUTH_FAILED_CODE.into(), b"auth_failed");
             Err(e.context("auth failed"))

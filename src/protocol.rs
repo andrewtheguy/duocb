@@ -1,14 +1,14 @@
 //! Wire protocol: auth/PIN control messages, clipboard messages, and the
 //! length-prefixed JSON framing shared by both.
 //!
-//! Stream layout per connection (client = dialer):
-//! 1. The first bidirectional stream the client opens carries auth: an
-//!    [`AuthRequest`] answered by an [`AuthResponse`] (token method) or the
-//!    PIN challenge-response ([`PinChallenge`] / [`PinResponse`] / [`PinConfirm`],
-//!    see `crate::pin_auth`).
-//! 2. After auth succeeds the client opens one long-lived bidirectional stream
-//!    carrying [`ClipMsg`] frames in both directions for the life of the
-//!    connection.
+//! A connection uses a **single** bidirectional stream, opened by the client
+//! (dialer):
+//! 1. Auth runs first on it: an [`AuthRequest`] answered by an [`AuthResponse`]
+//!    (token method), or the PIN challenge-response (see `crate::pin_auth`).
+//! 2. Once auth succeeds the same stream stays open and carries [`ClipMsg`]
+//!    frames in both directions for the life of the connection. (A clipboard
+//!    app has exactly one data stream, so no separate control channel is
+//!    warranted — unlike the multiplexed tunnel this transport was ported from.)
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -226,31 +226,20 @@ impl AuthResponse {
     }
 }
 
-/// A message on the post-auth clipboard stream, flowing in both directions.
+/// A shared clipboard payload on the post-auth session stream, flowing in both
+/// directions. Text only.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind")]
-pub enum ClipMsg {
-    /// First frame in each direction on the clipboard stream; version handshake.
-    Hello { version: u16 },
-    /// One shared clipboard payload. Text only.
-    Item {
-        version: u16,
-        text: String,
-        /// Sender's wall clock at send time, milliseconds since the Unix epoch.
-        /// Informational — receivers display their own received-at time.
-        sent_at_ms: u64,
-    },
+pub struct ClipMsg {
+    pub version: u16,
+    pub text: String,
+    /// Sender's wall clock at send time, milliseconds since the Unix epoch.
+    /// Informational — receivers display their own received-at time.
+    pub sent_at_ms: u64,
 }
 
 impl ClipMsg {
-    pub fn hello() -> Self {
-        ClipMsg::Hello {
-            version: DUOCB_PROTO_VERSION,
-        }
-    }
-
     pub fn item(text: impl Into<String>, sent_at_ms: u64) -> Self {
-        ClipMsg::Item {
+        ClipMsg {
             version: DUOCB_PROTO_VERSION,
             text: text.into(),
             sent_at_ms,
@@ -258,9 +247,7 @@ impl ClipMsg {
     }
 
     fn version(&self) -> u16 {
-        match self {
-            ClipMsg::Hello { version } | ClipMsg::Item { version, .. } => *version,
-        }
+        self.version
     }
 }
 
@@ -642,30 +629,12 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_clip_msg_hello_roundtrip() {
-        let decoded = decode_clip_msg(&encode_clip_msg(&ClipMsg::hello()).unwrap()).unwrap();
-        match decoded {
-            ClipMsg::Hello { version } => assert_eq!(version, DUOCB_PROTO_VERSION),
-            other => panic!("expected Hello, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn test_clip_msg_item_roundtrip() {
         let msg = ClipMsg::item("hello 🔐 world\nline two", 1_720_000_000_123);
         let decoded = decode_clip_msg(&encode_clip_msg(&msg).unwrap()).unwrap();
-        match decoded {
-            ClipMsg::Item {
-                version,
-                text,
-                sent_at_ms,
-            } => {
-                assert_eq!(version, DUOCB_PROTO_VERSION);
-                assert_eq!(text, "hello 🔐 world\nline two");
-                assert_eq!(sent_at_ms, 1_720_000_000_123);
-            }
-            other => panic!("expected Item, got {other:?}"),
-        }
+        assert_eq!(decoded.version, DUOCB_PROTO_VERSION);
+        assert_eq!(decoded.text, "hello 🔐 world\nline two");
+        assert_eq!(decoded.sent_at_ms, 1_720_000_000_123);
     }
 
     #[test]
@@ -695,7 +664,7 @@ mod tests {
 
     #[test]
     fn test_clip_msg_wrong_version_rejected() {
-        let json = br#"{"kind":"Hello","version":99}"#;
+        let json = br#"{"version":99,"text":"x","sent_at_ms":0}"#;
         let len = (json.len() as u32).to_be_bytes();
         let mut buf = Vec::from(len);
         buf.extend_from_slice(json);

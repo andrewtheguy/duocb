@@ -1,8 +1,14 @@
-//! Home / server / client screens.
+//! Home / start / join screens.
+//!
+//! The two roles are only about who sets up the connection — once paired, both
+//! devices can send and receive. One device *starts* a connection and shows a
+//! PIN/code (the transport server/listener); the other *joins* by entering it
+//! (the client/dialer).
 //!
 //! Keyboard shortcuts (also listed in the UI): home selects mode with 1/2/3
-//! and role with S/C; Ctrl+Enter starts/connects; Esc goes back; the manual
-//! server screen copies its credentials with Ctrl+I (node id) / Ctrl+T (token).
+//! and role with S (start) / C (join); Ctrl+Enter starts/joins; Esc goes back;
+//! the manual start screen copies its credentials with Ctrl+I (node id) /
+//! Ctrl+T (token).
 
 use eframe::egui::{self, RichText, TextEdit, Ui};
 
@@ -27,6 +33,13 @@ pub fn show_home(app: &mut DuocbApp, ui: &mut Ui) {
     ui.add_space(8.0);
     ui.heading("duocb");
     ui.label("Peer-to-peer clipboard sharing between two devices.");
+    ui.label(
+        RichText::new(
+            "Both devices can send and receive. One device starts a connection \
+             and shows a code; the other joins by entering it.",
+        )
+        .weak(),
+    );
     ui.add_space(16.0);
 
     ui.group(|ui| {
@@ -53,7 +66,7 @@ pub fn show_home(app: &mut DuocbApp, ui: &mut Ui) {
         if ui
             .add_sized(
                 [0.0, 40.0],
-                egui::Button::new("📋 Share my clipboard (server)  —  S"),
+                egui::Button::new("🚀 Start a connection  —  S"),
             )
             .clicked()
         {
@@ -63,7 +76,7 @@ pub fn show_home(app: &mut DuocbApp, ui: &mut Ui) {
         if ui
             .add_sized(
                 [0.0, 40.0],
-                egui::Button::new("🔗 Connect to a device (client)  —  C"),
+                egui::Button::new("🔗 Join a connection  —  C"),
             )
             .clicked()
         {
@@ -97,7 +110,7 @@ fn copyable_value(app: &mut DuocbApp, ui: &mut Ui, label: &str, copy_label: &str
 pub fn show_server(app: &mut DuocbApp, ui: &mut Ui) {
     ui.horizontal(|ui| {
         back_button(app, ui);
-        ui.heading("Share my clipboard");
+        ui.heading("Start a connection");
     });
     ui.label(format!("Status: {}", app.status_text()));
     ui.add_space(8.0);
@@ -117,7 +130,7 @@ pub fn show_server(app: &mut DuocbApp, ui: &mut Ui) {
                         app.in_token = crate::auth::generate_token();
                     }
                 });
-                ui.label("This device's name (the client looks it up by this):");
+                ui.label("This device's name (the other device looks it up by this):");
                 ui.add(TextEdit::singleline(&mut app.in_my_name).hint_text("e.g. desktop"));
                 if ui
                     .button("Remember these settings")
@@ -146,7 +159,7 @@ pub fn show_server(app: &mut DuocbApp, ui: &mut Ui) {
         if ui
             .add_enabled(
                 app.server_mode_spec().is_some(),
-                egui::Button::new("▶ Start sharing (Ctrl+Enter)"),
+                egui::Button::new("▶ Start (Ctrl+Enter)"),
             )
             .clicked()
         {
@@ -172,7 +185,7 @@ pub fn show_server(app: &mut DuocbApp, ui: &mut Ui) {
                 });
             }
             if let Some(name) = Some(app.in_my_name.trim().to_string()).filter(|s| !s.is_empty()) {
-                ui.label(format!("The client connects to the name “{name}”."));
+                ui.label(format!("The other device connects using the name “{name}”."));
             }
         }
         PairMode::NostrPin => {
@@ -189,7 +202,20 @@ pub fn show_server(app: &mut DuocbApp, ui: &mut Ui) {
                 });
                 ui.add_space(8.0);
             } else if app.pin_paired {
-                ui.label("Paired — the PIN is no longer needed.");
+                // Paired: the PIN is spent. Show this device's node id — the
+                // same value the other device displays as "Paired with:" — so
+                // the user can eyeball that the two match.
+                if let Some(node_id) = app.node_id.clone() {
+                    ui.horizontal(|ui| {
+                        ui.label("This device's id:");
+                        ui.monospace(short_id(&node_id));
+                    });
+                    ui.label(
+                        RichText::new("Confirm this matches “Paired with” on the other device.")
+                            .weak()
+                            .small(),
+                    );
+                }
             }
         }
         PairMode::Manual => {
@@ -214,7 +240,7 @@ pub fn show_server(app: &mut DuocbApp, ui: &mut Ui) {
 pub fn show_client(app: &mut DuocbApp, ui: &mut Ui) {
     ui.horizontal(|ui| {
         back_button(app, ui);
-        ui.heading("Connect to a device");
+        ui.heading("Join a connection");
     });
     ui.label(format!("Status: {}", app.status_text()));
     ui.add_space(8.0);
