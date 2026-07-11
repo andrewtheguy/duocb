@@ -4,7 +4,7 @@
 
 duocb links **two devices belonging to the same person** (desktop ↔ laptop, workstation ↔ homelab box) so they can share clipboard text directly, without accounts, servers that see your data, public IPs, or port forwarding. The two roles are only about setup: one device **starts a connection** (displays pairing credentials), the other **joins** it (enters them). Once paired, **both** sides can send and receive — either can push its clipboard to the other over a single encrypted QUIC connection.
 
-Received content never touches the receiving machine's clipboard (or disk) by itself: it lands in an **in-memory inbox** where you can **peek** at the full text first, and only an explicit **Copy** click puts it into the system clipboard.
+Received content never touches the receiving machine's clipboard (or disk) by itself: it lands in an **in-memory inbox** where you can **peek** at a truncated preview of the text first, and only an explicit **Copy** click puts the full content into the system clipboard.
 
 > [!IMPORTANT]
 > **Project goal:** let a **single user link two of their own devices** for ad-hoc clipboard sharing. Both ends are expected to be machines you own (or fully trust) — it is not a public service, not multi-tenant, and one connection pairs with exactly **one** peer.
