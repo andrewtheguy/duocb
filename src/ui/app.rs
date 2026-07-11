@@ -2,8 +2,8 @@
 //! all UI state (including the in-memory inbox — clipboard content never
 //! touches disk).
 
-use std::time::{Duration, Instant};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 
@@ -149,6 +149,12 @@ impl DuocbApp {
             }
             NetEvent::PeerPaired { peer_node_id } => {
                 self.peer_node_id = Some(peer_node_id);
+                // A token-mode connector only becomes standing configuration
+                // after it has authenticated successfully. Failed connection
+                // attempts must not overwrite its saved identity.
+                if self.client_active && self.mode == PairMode::NostrToken {
+                    self.persist_token_settings();
+                }
                 // The manual-mode one-time token is consumed by pairing: stop
                 // displaying/copying it on the server and drop the client's
                 // typed copy. (A new server session mints a fresh one anyway.)
@@ -223,14 +229,19 @@ impl DuocbApp {
         self.net.send(UiCommand::QueryConnPath);
     }
 
-    /// Persist the token-mode form fields (explicit "Remember" action only).
-    pub(crate) fn remember_token_settings(&mut self) {
+    /// Persist the validated token-mode identity to this process's active config.
+    /// Returns false and surfaces the error when the save fails.
+    fn persist_token_settings(&mut self) -> bool {
         let cfg = crate::config::Config {
             auth_token: Some(self.in_token.trim().to_string()).filter(|s| !s.is_empty()),
             my_name: Some(self.in_my_name.trim().to_string()).filter(|s| !s.is_empty()),
         };
-        if let Err(e) = cfg.save(&self.config_path) {
-            self.error = Some(format!("Could not save the settings: {e:#}"));
+        match cfg.save(&self.config_path) {
+            Ok(()) => true,
+            Err(e) => {
+                self.error = Some(format!("Could not save the settings: {e:#}"));
+                false
+            }
         }
     }
 
@@ -329,6 +340,13 @@ impl DuocbApp {
     /// Start the server session if the inputs validate.
     pub(crate) fn start_server(&mut self) {
         if let Some(mode) = self.server_mode_spec() {
+            // The initiator owns the discoverable standing record, so its token
+            // and name must be durable before the session is allowed to start.
+            if matches!(&mode, crate::net::ServerMode::NostrToken { .. })
+                && !self.persist_token_settings()
+            {
+                return;
+            }
             self.server_running = true;
             self.net.send(UiCommand::StartServer { mode });
         }

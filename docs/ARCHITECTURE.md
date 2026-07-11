@@ -176,7 +176,7 @@ Connection-path status is **pulled on demand**, not watched: `connection_paths(c
 
 ## Persistence
 
-The default optional file is `~/.config/duocb/config.toml` (`auth_token`, `my_name`), written **only** by the explicit "Remember these settings" button and used to prefill the token-mode forms. `--config`/`-c` or `DUOCB_CONFIG` selects an alternative file; the CLI wins over the environment. The process holds an exclusive `<config-path>.lock` sidecar for its lifetime, so one resolved config cannot back two simultaneous local instances while two E2E instances with distinct config paths run independently. A malformed config is ignored with a warning. Nothing else is stored: no identity keys, no peer list, no clipboard content, no inbox or outbox.
+The default optional file is `~/.config/duocb/config.toml` (`auth_token`, `my_name`) and is used to prefill the token-mode forms. The initiator persists validated settings before a token-mode server session starts; a save failure blocks startup and is surfaced in the UI. The connector persists validated settings only when `PeerPaired` confirms successful authentication, so failed attempts do not overwrite its prior pairing. `--config`/`-c` or `DUOCB_CONFIG` selects an alternative file; the CLI wins over the environment. The process holds an exclusive `<config-path>.lock` sidecar for its lifetime, so one resolved config cannot back two simultaneous local instances while two E2E instances with distinct config paths run independently. A malformed config is ignored with a warning. Nothing else is stored: no identity keys, no peer list, no clipboard content, no inbox or outbox.
 
 ## Security model
 

@@ -1,7 +1,7 @@
 //! Minimal config persistence: pre-fills the nostr token-mode forms so a
 //! standing pairing's 47-char token and device name don't have to be retyped every
-//! launch. Written only via the explicit "Remember" button — never
-//! automatically. Clipboard content and the inbox are never persisted.
+//! launch. The initiator saves before starting; the connector saves only after
+//! successful authentication. Clipboard content and the inbox are never persisted.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};

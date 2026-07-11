@@ -132,16 +132,11 @@ pub fn show_server(app: &mut DuocbApp, ui: &mut Ui) {
                 });
                 ui.label("This device's unique name:");
                 ui.add(TextEdit::singleline(&mut app.in_my_name).hint_text("e.g. desktop"));
-                if ui
-                    .button("Remember these settings")
-                    .on_hover_text(format!(
-                        "Saves the token and this device's name to {}",
-                        app.config_path.display()
-                    ))
-                    .clicked()
-                {
-                    app.remember_token_settings();
-                }
+                ui.label(
+                    RichText::new("Token and name are saved automatically when you start.")
+                        .weak()
+                        .small(),
+                );
                 if !app.in_token.trim().is_empty()
                     && crate::auth::validate_token(app.in_token.trim()).is_err()
                 {
@@ -260,16 +255,11 @@ pub fn show_client(app: &mut DuocbApp, ui: &mut Ui) {
                 );
                 ui.label("This device's unique name:");
                 ui.add(TextEdit::singleline(&mut app.in_my_name).hint_text("e.g. laptop"));
-                if ui
-                    .button("Remember these settings")
-                    .on_hover_text(format!(
-                        "Saves the token and this device's name to {}",
-                        app.config_path.display()
-                    ))
-                    .clicked()
-                {
-                    app.remember_token_settings();
-                }
+                ui.label(
+                    RichText::new("Token and name are saved after a successful connection.")
+                        .weak()
+                        .small(),
+                );
                 if !app.in_token.trim().is_empty()
                     && crate::auth::validate_token(app.in_token.trim()).is_err()
                 {

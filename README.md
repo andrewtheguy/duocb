@@ -36,7 +36,7 @@ Chosen on the home screen; the **starting** device displays credentials, the **j
 | **Manual / offline** | none | the starting device's node id + a generated one-time token | one-time token | **not required** on the same LAN (mDNS) |
 
 - **PIN quick pair** is the fastest ad-hoc pairing: the starting device shows a short code, you type it on the joining device. The PIN both locates the starting device (an encrypted rendezvous record on public nostr relays) and authenticates the connection in-band — no token ever exists, and nothing offline-crackable crosses the wire. Because it carries no shared standing state — just a fresh ephemeral identity and a rotating PIN — this mode is **conflict-free**: it works just as well for pairing two devices owned by two *different* people as for your own two. That's a supported side effect, not the project's primary focus (which remains linking your own devices).
-- **Token + names** is for a standing pairing: both devices share one auth token (generate it in the app), and each enters its own distinct name. The joining device queries the shared token-derived nostr identity and automatically selects the newest record belonging to a different name; you never enter the other device's name. A restarted starting device is re-resolved automatically. "Remember these settings" saves the token and this device's name to the active config so you don't retype them.
+- **Token + names** is for a standing pairing: both devices share one auth token (generate it in the app), and each enters its own distinct name. The joining device queries the shared token-derived nostr identity and automatically selects the newest record belonging to a different name; you never enter the other device's name. A restarted starting device is re-resolved automatically. The initiator always saves its valid token and name before starting; the connector saves them automatically only after a connection authenticates successfully.
 - If two devices accidentally use the same name, the current join flow cannot distinguish that live collision from a stale self record. The planned actionable detection and resolution flow is documented in [docs/ROADMAP.md](docs/ROADMAP.md).
 - **Manual / offline** needs no signaling at all: the starting device displays its node id and a freshly generated one-time token; enter both on the joining device. On the same LAN the node id resolves via mDNS, so it works with the internet down.
 
@@ -81,7 +81,7 @@ The joining device reconnects automatically with backoff if the connection drops
 
 ## Configuration
 
-Optional, only for the token+name mode: `~/.config/duocb/config.toml` (written by the explicit **Remember these settings** button, never automatically):
+Optional, only for the token+name mode: `~/.config/duocb/config.toml`. Starting a token-mode connection writes the valid initiator settings before launch. Joining writes the connector settings only after successful authentication, so failed attempts never replace the saved pairing:
 
 ```toml
 auth_token = "d…"       # shared 47-char token
