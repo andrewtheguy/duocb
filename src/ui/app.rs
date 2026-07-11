@@ -163,7 +163,10 @@ impl DuocbApp {
                 // A token-mode connector only becomes standing configuration
                 // after it has authenticated successfully. Failed connection
                 // attempts must not overwrite its saved identity.
-                if self.client_active && self.mode == PairMode::NostrToken {
+                if self.client_active
+                    && self.mode == PairMode::NostrToken
+                    && !self.token_settings_saved
+                {
                     self.token_settings_saved = self.persist_token_settings();
                 }
                 // The manual-mode one-time token is consumed by pairing: stop
