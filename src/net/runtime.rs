@@ -461,6 +461,14 @@ async fn run_client_session(
         }
     };
     let own_id = endpoint.id();
+    let token_fingerprint = match &spec {
+        DialSpec::NostrToken { token, .. } => Some(crate::auth::token_fingerprint(token)),
+        DialSpec::Pin { .. } | DialSpec::Manual { .. } => None,
+    };
+    events.send(NetEvent::ClientReady {
+        node_id: own_id.to_string(),
+        token_fingerprint,
+    });
 
     let mut backoff = Duration::from_secs(1);
     let mut attempts: u32 = 0;

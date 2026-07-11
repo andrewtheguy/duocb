@@ -94,6 +94,12 @@ pub enum NetEvent {
         manual_token: Option<String>,
         token_fingerprint: Option<String>,
     },
+    /// Client endpoint is online. Token mode includes the fingerprint so the
+    /// connector retains the same identity details as the initiator screen.
+    ClientReady {
+        node_id: String,
+        token_fingerprint: Option<String>,
+    },
     /// PIN quick mode: a fresh PIN was minted (display form, `XXXX-XXXX`).
     PinRotated {
         pin_display: String,

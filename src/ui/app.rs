@@ -37,6 +37,8 @@ pub struct DuocbApp {
     pub(crate) node_id: Option<String>,
     pub(crate) manual_token: Option<String>,
     pub(crate) token_fingerprint: Option<String>,
+    /// Whether the active token-mode identity has been persisted to `config_path`.
+    pub(crate) token_settings_saved: bool,
     pub(crate) pin_display: Option<String>,
     pub(crate) pin_deadline: Option<Instant>,
     /// PIN cleared because a peer paired (vs. never shown).
@@ -84,6 +86,7 @@ impl DuocbApp {
             node_id: None,
             manual_token: None,
             token_fingerprint: None,
+            token_settings_saved: false,
             pin_display: None,
             pin_deadline: None,
             pin_paired: false,
@@ -113,6 +116,13 @@ impl DuocbApp {
                 self.manual_token = manual_token;
                 self.token_fingerprint = token_fingerprint;
             }
+            NetEvent::ClientReady {
+                node_id,
+                token_fingerprint,
+            } => {
+                self.node_id = Some(node_id);
+                self.token_fingerprint = token_fingerprint;
+            }
             NetEvent::PinRotated {
                 pin_display,
                 seconds_left,
@@ -138,6 +148,7 @@ impl DuocbApp {
                     self.node_id = None;
                     self.manual_token = None;
                     self.token_fingerprint = None;
+                    self.token_settings_saved = false;
                     self.pin_display = None;
                     self.pin_deadline = None;
                     self.pin_paired = false;
@@ -153,7 +164,7 @@ impl DuocbApp {
                 // after it has authenticated successfully. Failed connection
                 // attempts must not overwrite its saved identity.
                 if self.client_active && self.mode == PairMode::NostrToken {
-                    self.persist_token_settings();
+                    self.token_settings_saved = self.persist_token_settings();
                 }
                 // The manual-mode one-time token is consumed by pairing: stop
                 // displaying/copying it on the server and drop the client's
@@ -342,10 +353,11 @@ impl DuocbApp {
         if let Some(mode) = self.server_mode_spec() {
             // The initiator owns the discoverable standing record, so its token
             // and name must be durable before the session is allowed to start.
-            if matches!(&mode, crate::net::ServerMode::NostrToken { .. })
-                && !self.persist_token_settings()
-            {
-                return;
+            if matches!(&mode, crate::net::ServerMode::NostrToken { .. }) {
+                if !self.persist_token_settings() {
+                    return;
+                }
+                self.token_settings_saved = true;
             }
             self.server_running = true;
             self.net.send(UiCommand::StartServer { mode });
@@ -355,6 +367,7 @@ impl DuocbApp {
     /// Start the client session if the inputs validate.
     pub(crate) fn connect_client(&mut self) {
         if let Some(spec) = self.client_dial_spec() {
+            self.token_settings_saved = false;
             self.client_active = true;
             self.net.send(UiCommand::Connect { spec });
         }

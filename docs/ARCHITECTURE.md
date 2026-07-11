@@ -178,6 +178,8 @@ Connection-path status is **pulled on demand**, not watched: `connection_paths(c
 
 The default optional file is `~/.config/duocb/config.toml` (`auth_token`, `my_name`) and is used to prefill the token-mode forms. The initiator persists validated settings before a token-mode server session starts; a save failure blocks startup and is surfaced in the UI. The connector persists validated settings only when `PeerPaired` confirms successful authentication, so failed attempts do not overwrite its prior pairing. `--config`/`-c` or `DUOCB_CONFIG` selects an alternative file; the CLI wins over the environment. The process holds an exclusive `<config-path>.lock` sidecar for its lifetime, so one resolved config cannot back two simultaneous local instances while two E2E instances with distinct config paths run independently. A malformed config is ignored with a warning. Nothing else is stored: no identity keys, no peer list, no clipboard content, no inbox or outbox.
 
+Once a token-mode form is submitted, both role screens retain a shared identity summary: this device's name, the token fingerprint, both local and paired node ids once available, and the active saved-config path. The runtime emits endpoint-ready information for both server and client roles. This mirrors duopipe's persistent config-mode header while deliberately omitting the raw auth token.
+
 ## Security model
 
 - **Trust boundary:** the two devices. The pairing secret (token or PIN) is assumed to be transferred between your own devices over a channel you already trust.
