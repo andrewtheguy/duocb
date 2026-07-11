@@ -202,7 +202,20 @@ pub fn show_server(app: &mut DuocbApp, ui: &mut Ui) {
                 });
                 ui.add_space(8.0);
             } else if app.pin_paired {
-                ui.label("Paired — the PIN is no longer needed.");
+                // Paired: the PIN is spent. Show this device's node id — the
+                // same value the other device displays as "Paired with:" — so
+                // the user can eyeball that the two match.
+                if let Some(node_id) = app.node_id.clone() {
+                    ui.horizontal(|ui| {
+                        ui.label("This device's id:");
+                        ui.monospace(short_id(&node_id));
+                    });
+                    ui.label(
+                        RichText::new("Confirm this matches “Paired with” on the other device.")
+                            .weak()
+                            .small(),
+                    );
+                }
             }
         }
         PairMode::Manual => {
