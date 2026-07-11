@@ -13,6 +13,11 @@ use crate::ui::{InboxItem, PairMode, Screen, screens, session};
 /// How long the "sent ✓" flash stays visible.
 const SENT_FLASH: Duration = Duration::from_secs(2);
 
+/// Retention cap for the in-memory inbox: newest-first, the oldest items are
+/// dropped once this many are held (each item is already ≤ ~1 MiB by the wire
+/// cap, so a hostile or chatty peer can't grow memory without bound).
+const MAX_INBOX_ITEMS: usize = 100;
+
 pub struct DuocbApp {
     pub(crate) net: NetHandle,
     pub(crate) clipboard: SystemClipboard,
@@ -130,6 +135,11 @@ impl DuocbApp {
             }
             NetEvent::PeerPaired { peer_node_id } => {
                 self.peer_node_id = Some(peer_node_id);
+                // The manual-mode one-time token is consumed by pairing: stop
+                // displaying/copying it on the server and drop the client's
+                // typed copy. (A new server session mints a fresh one anyway.)
+                self.manual_token = None;
+                self.in_manual_token.clear();
             }
             NetEvent::PeerDisconnected => {
                 self.peer_node_id = None;
@@ -147,6 +157,8 @@ impl DuocbApp {
                         expanded: false,
                     },
                 );
+                // Bounded retention (see MAX_INBOX_ITEMS): drop the oldest.
+                self.inbox.truncate(MAX_INBOX_ITEMS);
             }
             NetEvent::ItemSent => {
                 self.sent_flash = Some(Instant::now());
@@ -357,7 +369,10 @@ impl DuocbApp {
             }
         }
 
-        if self.status == ConnStatus::Connected {
+        // Session shortcuts are also gated on no text field having focus, so
+        // TextEdit editing shortcuts (e.g. Ctrl+Y redo) and destructive actions
+        // like clearing the inbox can't fire while typing or selecting text.
+        if self.status == ConnStatus::Connected && focus_free {
             if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::S)) {
                 self.send_clipboard();
             }

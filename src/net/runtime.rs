@@ -551,6 +551,13 @@ async fn run_client_session(
                 };
                 match auth_result {
                     Ok(()) => {
+                        // Auth succeeded, so the server has committed us as its pair and
+                        // (PIN mode) stopped publishing PINs. Pin the node id NOW — even
+                        // if opening the clipboard stream fails below, a fresh relay
+                        // lookup could never succeed again; reconnects must dial this id.
+                        if matches!(spec, DialSpec::Pin { .. }) && pinned_pin_id.is_none() {
+                            pinned_pin_id = attempt_id;
+                        }
                         match open_clip_stream(&conn).await {
                             Ok((send, recv)) => {
                                 let remote_id = conn.remote_id();
@@ -562,10 +569,6 @@ async fn run_client_session(
                                     let events = events.clone();
                                     move |display| events.send(NetEvent::PathUpdate(display))
                                 });
-                                if matches!(spec, DialSpec::Pin { .. }) && pinned_pin_id.is_none()
-                                {
-                                    pinned_pin_id = attempt_id;
-                                }
                                 connected_once = true;
                                 attempts = 0;
                                 backoff = Duration::from_secs(1);
