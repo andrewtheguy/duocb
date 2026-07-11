@@ -76,13 +76,13 @@ pub fn show_session(app: &mut DuocbApp, ui: &mut Ui) {
     }
 }
 
-/// Render one clipboard item: a metadata row (time, size, CRC-16) plus Peek and
+/// Render one clipboard item: a metadata row (time, size, CRC-32) plus Peek and
 /// Copy buttons, and — when peeked — a read-only view of the content, truncated
 /// if it exceeds [`PEEK_LIMIT`]. Returns the text to copy if Copy was clicked.
 fn show_item(ui: &mut Ui, item: &mut ClipItem) -> Option<String> {
     let mut copy_text = None;
     ui.group(|ui| {
-        // Metadata only until the user peeks: time, size, and CRC-16 — enough
+        // Metadata only until the user peeks: time, size, and CRC-32 — enough
         // to identify an item, or compare it against the peer, without
         // revealing its content.
         ui.horizontal(|ui| {
@@ -93,7 +93,7 @@ fn show_item(ui: &mut Ui, item: &mut ClipItem) -> Option<String> {
             );
             ui.label(RichText::new(item.size_hint()).weak().small());
             ui.label(
-                RichText::new(format!("CRC {:04X}", item.crc16))
+                RichText::new(format!("CRC {}", item.crc32_display()))
                     .weak()
                     .small()
                     .monospace(),

@@ -18,7 +18,7 @@ Received content never touches the receiving machine's clipboard (or disk) by it
 - **No public IPs or port forwarding** — automatic NAT hole punching with relay fallback (iroh)
 - **End-to-end encryption** via QUIC/TLS 1.3; the connection is bound to the peer's node id (its public key)
 - **Every connection authenticates in-band** — a pre-shared token or a PIN challenge-response; knowing a node id is never enough to pair
-- **Peek before copy** — received items show size, a CRC-16 fingerprint, and arrival time; the content is only revealed on an explicit **Peek** (which auto-hides after a few seconds), and only **Copy** ever writes your clipboard
+- **Peek before copy** — received items show size, a CRC-32 fingerprint, and arrival time; the content is only revealed on an explicit **Peek** (which auto-hides after a few seconds), and only **Copy** ever writes your clipboard
 - **Compare what you sent** — the last item you sent is shown in an outbox with its size/CRC so the other device can confirm it matches what arrived
 - **Memory only** — clipboard content, the inbox, and the outbox are never written to disk
 - **Works offline on a LAN** — the manual mode resolves the typed node id via mDNS with zero internet

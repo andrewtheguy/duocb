@@ -36,7 +36,7 @@ src/
     endpoint.rs    iroh endpoint builders, connect, ConnPath snapshot + debug path logger (ALPN duocb/1)
     runtime.rs     command loop, server/client sessions, PairClaim, auth, clip pump
   ui/
-    mod.rs         Screen / PairMode / ClipItem (CRC-16, peek + auto-hide)
+    mod.rs         Screen / PairMode / ClipItem (CRC-32, peek + auto-hide)
     app.rs         eframe::App: event drain, state, keyboard shortcuts, connection-path modal
     screens.rs     home / start / join screens
     session.rs     paired panel: send + connection-path buttons, outbox, inbox with peek/copy/clear
@@ -171,7 +171,7 @@ Connection-path status is **pulled on demand**, not watched: `connection_paths(c
 
 - One **long-lived, lazily created** `arboard::Clipboard` lives on the UI thread for the whole process. On X11, clipboard ownership belongs to the providing connection — a per-operation instance would lose the copied text the moment it dropped.
 - Reads/writes happen directly on the UI thread on button press (text selections are sub-millisecond IPC); failures (e.g. a huge INCR transfer) surface as a dismissible error banner and never affect the connection.
-- **Receive side:** items go into a `Vec<ClipItem>` in app memory, newest first, capped at the **last 5** (older ones drop). Each item shows metadata only until peeked — size hint, a CRC-16 fingerprint (computed once on arrival), and the received time — so the two devices can compare an item without revealing it. *Peek* renders the text read-only, truncated past 4096 chars and auto-hidden after 15 s; *Copy* is the **only** code path that writes the system clipboard (and always yields the full, untruncated text). There is no auto-copy and no persistence.
+- **Receive side:** items go into a `Vec<ClipItem>` in app memory, newest first, capped at the **last 5** (older ones drop). Each item shows metadata only until peeked — size hint, a CRC-32 fingerprint (computed once on arrival), and the received time — so the two devices can compare an item without revealing it. *Peek* renders the text read-only, truncated past 4096 chars and auto-hidden after 15 s; *Copy* is the **only** code path that writes the system clipboard (and always yields the full, untruncated text). There is no auto-copy and no persistence.
 - **Send side:** explicit action only (`Ctrl+S`/button reads the clipboard and sends). There is no clipboard watcher. The **last item sent** is kept in a one-slot outbox (same `ClipItem`, promoted from a pending buffer once `ItemSent` confirms it left the wire) and shown above the inbox with its size/CRC, so the receiver can confirm a match.
 
 ## Persistence
