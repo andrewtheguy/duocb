@@ -1,6 +1,6 @@
 [package]
 name = "duocb"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
 description = "P2P clipboard sharing between two devices over iroh"
 
@@ -10,7 +10,7 @@ eframe = "0.35"
 arboard = "3.6.1"
 
 # P2P transport
-iroh = "1.0.0"
+iroh = "1.0.2"
 iroh-mdns-address-lookup = "0.4.0"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 futures = "0.3"
