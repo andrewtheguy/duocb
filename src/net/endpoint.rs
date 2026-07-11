@@ -32,8 +32,14 @@ pub const QUIC_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
 /// QUIC idle timeout. Connections without activity (no data or keep-alive
 /// pings) for this duration are considered dead and closed. With keep-alive
-/// enabled, this only triggers for truly unresponsive connections.
-pub const QUIC_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+/// enabled, this only triggers for truly unresponsive connections — and it is
+/// the detection time for an ungracefully dropped peer (crash, network loss):
+/// the pump's stream read fails when it fires, letting the server reap the
+/// dead session and accept the peer's reconnect, and the client start its
+/// reconnect loop. Kept short (2× the keep-alive interval; lost keep-alives
+/// retransmit at sub-second PTO, so transient loss won't trip it) because a
+/// clipboard link, unlike a long-idle tunnel, wants prompt dead-peer reaping.
+pub const QUIC_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Create a base endpoint builder with common configuration: default relays,
 /// keep-alive/idle transport tuning, and discovery via n0 DNS/pkarr **plus mDNS**.

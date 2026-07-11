@@ -100,7 +100,7 @@ Clipboard content and the inbox are never persisted anywhere.
 
 - **Two devices, one pairing per server session.** By design.
 - **Text only** (UTF-8). No images or files.
-- A **crashed** peer (vs. a clean disconnect) is only detected at the QUIC idle timeout (up to ~5 minutes); clean disconnects are instant.
+- A **crashed** peer (vs. a clean disconnect) is detected at the QUIC idle timeout (~30 s), after which the server accepts its reconnect and the client starts retrying; clean disconnects are instant.
 - Very large X11 clipboards transferred via INCR (multi-megabyte) may fail to read; you get an error banner and the connection is unaffected.
 - On X11 without a clipboard manager, text copied *from* duocb disappears when duocb exits (standard X11 selection semantics).
 

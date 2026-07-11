@@ -96,7 +96,7 @@ Per connection (client = dialer), two QUIC bidirectional streams:
 
 **Framing** (both streams): 4-byte big-endian length prefix + JSON body, with a `version` field validated on decode (`DUOCB_PROTO_VERSION = 1`) and strict frame boundaries (trailing bytes rejected). Two size caps: control frames 16 KiB, clipboard frames **1 MiB** (checked against the *encoded* frame). Oversize on send is rejected locally with an error event — nothing hits the wire and the session lives on; an oversize length prefix on receive is a protocol error that drops the connection.
 
-There is no application-level keepalive: QUIC keep-alives (15 s) and the idle timeout (300 s) provide liveness, and the pump ends when the stream read fails.
+There is no application-level keepalive: QUIC keep-alives (15 s) and the idle timeout (30 s) provide liveness, and the pump ends when the stream read fails — so an ungracefully dropped peer is reaped within ~30 s and the reconnect path takes over.
 
 The pump (`pump_clipboard`) runs the writer (drain `clip_rx` → encode → write) and reader (read frame → `ItemReceived`) as two independent futures over the stream's send/recv halves — no `select!` over a partial frame read, so framing can't be corrupted by cancellation.
 
@@ -158,7 +158,7 @@ Argon2id makes the ~35-bit PIN expensive to brute-force offline from a captured 
 `net/endpoint.rs` builds both endpoints identically (`Endpoint::builder(presets::Empty)` with an explicit ring crypto provider — required by iroh 1.0 on the Empty preset):
 
 - ALPN `duocb/1` (server side only; a mismatch fails the QUIC handshake).
-- Transport: idle timeout 300 s, keep-alive 15 s; default congestion control.
+- Transport: idle timeout 30 s (prompt dead-peer reaping), keep-alive 15 s; default congestion control.
 - Relays: `RelayMode::Default` (n0 public relays as fallback path).
 - Discovery/address lookup: n0 pkarr publisher + DNS resolver, **plus mDNS always** — the offline path. The client dials a **bare `EndpointAddr::new(node_id)`**; iroh resolves actual addresses via these services and hole-punches, falling back to a relay.
 - The identity is never persisted: every session is a fresh Ed25519 key, so node ids (and everything derived from them) are per-run.
@@ -187,6 +187,6 @@ Exactly one optional file, `~/.config/duocb/config.toml` (`auth_token`, `my_name
 
 - Two devices, one pairing per server session — by design (duopipe's model).
 - Text only; 1 MiB cap per item.
-- A crashed peer is detected at the QUIC idle timeout (up to 300 s); clean disconnects propagate immediately.
+- A crashed peer is detected at the QUIC idle timeout (~30 s); clean disconnects propagate immediately.
 - Multi-megabyte X11 INCR clipboard reads may fail (clean error, connection unaffected).
 - The strict-offline path (manual mode with no internet) relies on mDNS being usable on the local network segment.
