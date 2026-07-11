@@ -445,31 +445,67 @@ mod tests {
         let token = "shared-token";
         let keys = derive_keys(token).unwrap();
         let own_node_id = iroh::SecretKey::generate().public();
-        let peer_node_id = iroh::SecretKey::generate().public();
+        let older_peer_node_id = iroh::SecretKey::generate().public();
+        let newest_valid_peer_node_id = iroh::SecretKey::generate().public();
 
-        let event_for = |name: &str, node_id: EndpointId| {
-            let content = nip44::encrypt(
-                keys.secret_key(),
-                &keys.public_key(),
-                node_id.to_string(),
+        let encrypt_with = |event_keys: &Keys, plaintext: String| {
+            nip44::encrypt(
+                event_keys.secret_key(),
+                &event_keys.public_key(),
+                plaintext,
                 nip44::Version::V2,
             )
-            .unwrap();
+            .unwrap()
+        };
+        let event_for = |name: &str, content: String, created_at: u64| {
             EventBuilder::new(nodeid_kind(), content)
                 .tags([Tag::identifier(identifier_dtag(token, name))])
+                .custom_created_at(Timestamp::from_secs(created_at))
                 .sign_with_keys(&keys)
                 .unwrap()
         };
-        let own_event = event_for("mac2", own_node_id);
-        let peer_event = event_for("mac1", peer_node_id);
-        let events = [&own_event, &peer_event];
+        let own_event = event_for(
+            "mac2",
+            encrypt_with(&keys, own_node_id.to_string()),
+            600,
+        );
+        let undecryptable_event = event_for(
+            "mac5",
+            encrypt_with(&derive_keys("wrong-token").unwrap(), "not ours".to_string()),
+            500,
+        );
+        let invalid_node_event = event_for(
+            "mac4",
+            encrypt_with(&keys, "not-a-node-id".to_string()),
+            400,
+        );
+        let newest_valid_peer_event = event_for(
+            "mac3",
+            encrypt_with(&keys, newest_valid_peer_node_id.to_string()),
+            300,
+        );
+        let older_peer_event = event_for(
+            "mac1",
+            encrypt_with(&keys, older_peer_node_id.to_string()),
+            200,
+        );
+        // Deliberately unsorted: selection must use created_at, exclude our own
+        // record, and skip newer candidates that cannot decrypt or parse.
+        let events = [
+            &older_peer_event,
+            &invalid_node_event,
+            &own_event,
+            &newest_valid_peer_event,
+            &undecryptable_event,
+        ];
 
         let found = peer_node_id_from_events(
             &keys,
             &identifier_dtag(token, "mac2"),
             events,
         );
-        assert_eq!(found, Some(peer_node_id));
+        assert_eq!(found, Some(newest_valid_peer_node_id));
+        assert_ne!(found, Some(own_node_id), "our own record must be excluded");
         assert_eq!(
             peer_node_id_from_events(
                 &keys,
