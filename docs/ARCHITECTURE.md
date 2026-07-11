@@ -30,7 +30,7 @@ src/
   pin_auth.rs      in-band mutual PIN challenge-response (NIP-44 sealed proofs)
   nostr.rs         kind-30078 token/name discovery; kind-9421 PIN rendezvous
   clipboard.rs     arboard wrapper (one long-lived instance, lazy init)
-  config.rs        optional ~/.config/duocb/config.toml (token-mode form prefill)
+  config.rs        config resolution/persistence + process-lifetime config lock
   net/
     mod.rs         UiCommand / NetEvent / ConnStatus enums; EventSender; runtime spawn
     endpoint.rs    iroh endpoint builders, connect, ConnPath snapshot + debug path logger (ALPN duocb/1)
@@ -83,7 +83,7 @@ The `EventSender`'s repaint context is optional, so the whole runtime runs headl
 
 **Client session** (`run_client_session`) — resolve/connect/auth loop with reconnect:
 
-1. Resolve the target **each attempt**: manual = the typed node id; token mode = nostr lookup by name (so a restarted server with a fresh node id self-heals); PIN mode = nostr rendezvous lookup, with a **pinned node id fast path** after the first pairing (the PIN has rotated off the relays, but the server retains our pairing key, so reconnects dial the remembered id and re-prove the same PIN in-band).
+1. Resolve the target **each attempt**: manual = the typed node id; token mode = query the shared auth-derived nostr author and select the newest record whose name is not this device's own (so a restarted server with a fresh node id self-heals); PIN mode = nostr rendezvous lookup, with a **pinned node id fast path** after the first pairing (the PIN has rotated off the relays, but the server retains our pairing key, so reconnects dial the remembered id and re-prove the same PIN in-band).
 2. Self-dial guard, then connect (10 s timeout) → open the single session stream, auth on it → `Connected` → pump on the same stream.
 3. On a drop: reconnect with exponential backoff (1 s → ×2 → 30 s cap), unlimited after the first success, 10 attempts before it. **Auth failures are fatal** — the credential won't get better on its own; the session ends and the error is surfaced.
 
@@ -106,12 +106,12 @@ The pump (`pump_clipboard`) runs the writer (drain `clip_rx` → encode → writ
 
 Both nostr schemes publish only the server's **ephemeral node id**, NIP-44 (v2) self-encrypted; no token is ever placed on a relay. Default relays: `nos.lol`, `relay.nostr.net`, `relay.primal.net`, `relay.snort.social`.
 
-### Token + name (kind 30078, parameterized-replaceable)
+### Token + names (kind 30078, parameterized-replaceable)
 
 - Both peers derive the **same nostr keypair** from the shared auth token: `SecretKey = SHA-256("duocb:nostr-rendezvous:v1" ‖ token)`.
-- The `d` tag namespaces peers sharing one token: `duocb:nodeid:<hex SHA-256("duocb:peer-id:v1" ‖ token ‖ name)>` — salted with the token so short names can't be enumerated.
+- Each device enters its **own** unique name. The `d` tag namespaces its record under the shared author: `duocb:nodeid:<hex SHA-256("duocb:peer-id:v1" ‖ token ‖ own_name)>` — salted with the token so short names can't be enumerated.
 - The server publishes on start, re-checks/republishes quickly for the first ~minute, then every 300 s (replaceable events can be dropped by relays). If a lookup shows a **different live node id** under our name, another device took the name: the publisher stops and surfaces an error (the existing connection is unaffected).
-- The client looks the record up **on every connect attempt** and decrypts with the same derived key.
+- The client queries by **author key alone** on every connect attempt, excludes its own name's `d` tag, chooses the newest valid other-device record, and decrypts it with the shared derived key. The client never asks for the other device's name.
 
 ### PIN quick pair (kind 9421, regular events with NIP-40 expiry)
 
@@ -176,7 +176,9 @@ Connection-path status is **pulled on demand**, not watched: `connection_paths(c
 
 ## Persistence
 
-Exactly one optional file, `~/.config/duocb/config.toml` (`auth_token`, `my_name`, `peer_name`), written **only** by the explicit "Remember these settings" button and used to prefill the token-mode forms. A malformed config is ignored with a warning. Nothing else is stored: no identity keys, no peer list, no clipboard content, no inbox or outbox.
+The default optional file is `~/.config/duocb/config.toml` (`auth_token`, `my_name`) and is used to prefill the token-mode forms. The initiator persists validated settings before a token-mode server session starts; a save failure blocks startup and is surfaced in the UI. The connector persists validated settings only when `PeerPaired` confirms successful authentication, so failed attempts do not overwrite its prior pairing. `--config`/`-c` or `DUOCB_CONFIG` selects an alternative file; the CLI wins over the environment. The process holds an exclusive `<config-path>.lock` sidecar for its lifetime, so one resolved config cannot back two simultaneous local instances while two E2E instances with distinct config paths run independently. A malformed config is ignored with a warning. Nothing else is stored: no identity keys, no peer list, no clipboard content, no inbox or outbox.
+
+Once a token-mode form is submitted, both role screens retain a shared identity summary: this device's name, the token fingerprint, both local and paired node ids once available, and the active saved-config path. The runtime emits endpoint-ready information for both server and client roles. This mirrors duopipe's persistent config-mode header while deliberately omitting the raw auth token.
 
 ## Security model
 

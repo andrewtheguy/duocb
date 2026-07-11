@@ -2,6 +2,7 @@
 //! all UI state (including the in-memory inbox — clipboard content never
 //! touches disk).
 
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -19,6 +20,7 @@ const SENT_FLASH: Duration = Duration::from_secs(2);
 const MAX_INBOX_ITEMS: usize = 5;
 
 pub struct DuocbApp {
+    pub(crate) config_path: PathBuf,
     pub(crate) net: NetHandle,
     pub(crate) clipboard: SystemClipboard,
 
@@ -35,6 +37,8 @@ pub struct DuocbApp {
     pub(crate) node_id: Option<String>,
     pub(crate) manual_token: Option<String>,
     pub(crate) token_fingerprint: Option<String>,
+    /// Whether the active token-mode identity has been persisted to `config_path`.
+    pub(crate) token_settings_saved: bool,
     pub(crate) pin_display: Option<String>,
     pub(crate) pin_deadline: Option<Instant>,
     /// PIN cleared because a peer paired (vs. never shown).
@@ -46,7 +50,6 @@ pub struct DuocbApp {
     // Form inputs.
     pub(crate) in_token: String,
     pub(crate) in_my_name: String,
-    pub(crate) in_peer_name: String,
     pub(crate) in_pin: String,
     pub(crate) in_node_id: String,
     pub(crate) in_manual_token: String,
@@ -68,10 +71,11 @@ pub struct DuocbApp {
 }
 
 impl DuocbApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, config_path: PathBuf) -> Self {
         let net = spawn_net_runtime(cc.egui_ctx.clone());
-        let config = crate::config::Config::load();
+        let config = crate::config::Config::load(&config_path);
         Self {
+            config_path,
             net,
             clipboard: SystemClipboard::new(),
             screen: Screen::Home,
@@ -82,13 +86,13 @@ impl DuocbApp {
             node_id: None,
             manual_token: None,
             token_fingerprint: None,
+            token_settings_saved: false,
             pin_display: None,
             pin_deadline: None,
             pin_paired: false,
             client_active: false,
             in_token: config.auth_token.unwrap_or_default(),
             in_my_name: config.my_name.unwrap_or_default(),
-            in_peer_name: config.peer_name.unwrap_or_default(),
             in_pin: String::new(),
             in_node_id: String::new(),
             in_manual_token: String::new(),
@@ -110,6 +114,13 @@ impl DuocbApp {
             } => {
                 self.node_id = Some(node_id);
                 self.manual_token = manual_token;
+                self.token_fingerprint = token_fingerprint;
+            }
+            NetEvent::ClientReady {
+                node_id,
+                token_fingerprint,
+            } => {
+                self.node_id = Some(node_id);
                 self.token_fingerprint = token_fingerprint;
             }
             NetEvent::PinRotated {
@@ -137,6 +148,7 @@ impl DuocbApp {
                     self.node_id = None;
                     self.manual_token = None;
                     self.token_fingerprint = None;
+                    self.token_settings_saved = false;
                     self.pin_display = None;
                     self.pin_deadline = None;
                     self.pin_paired = false;
@@ -148,6 +160,15 @@ impl DuocbApp {
             }
             NetEvent::PeerPaired { peer_node_id } => {
                 self.peer_node_id = Some(peer_node_id);
+                // A token-mode connector only becomes standing configuration
+                // after it has authenticated successfully. Failed connection
+                // attempts must not overwrite its saved identity.
+                if self.client_active
+                    && self.mode == PairMode::NostrToken
+                    && !self.token_settings_saved
+                {
+                    self.token_settings_saved = self.persist_token_settings();
+                }
                 // The manual-mode one-time token is consumed by pairing: stop
                 // displaying/copying it on the server and drop the client's
                 // typed copy. (A new server session mints a fresh one anyway.)
@@ -222,15 +243,19 @@ impl DuocbApp {
         self.net.send(UiCommand::QueryConnPath);
     }
 
-    /// Persist the token-mode form fields (explicit "Remember" action only).
-    pub(crate) fn remember_token_settings(&mut self) {
+    /// Persist the validated token-mode identity to this process's active config.
+    /// Returns false and surfaces the error when the save fails.
+    fn persist_token_settings(&mut self) -> bool {
         let cfg = crate::config::Config {
             auth_token: Some(self.in_token.trim().to_string()).filter(|s| !s.is_empty()),
             my_name: Some(self.in_my_name.trim().to_string()).filter(|s| !s.is_empty()),
-            peer_name: Some(self.in_peer_name.trim().to_string()).filter(|s| !s.is_empty()),
         };
-        if let Err(e) = cfg.save() {
-            self.error = Some(format!("Could not save the settings: {e:#}"));
+        match cfg.save(&self.config_path) {
+            Ok(()) => true,
+            Err(e) => {
+                self.error = Some(format!("Could not save the settings: {e:#}"));
+                false
+            }
         }
     }
 
@@ -298,11 +323,11 @@ impl DuocbApp {
         match self.mode {
             PairMode::NostrToken => {
                 let token = self.in_token.trim();
-                let peer = self.in_peer_name.trim();
-                (crate::auth::validate_token(token).is_ok() && !peer.is_empty()).then(|| {
+                let name = self.in_my_name.trim();
+                (crate::auth::validate_token(token).is_ok() && !name.is_empty()).then(|| {
                     DialSpec::NostrToken {
                         token: token.to_string(),
-                        peer_name: peer.to_string(),
+                        own_name: name.to_string(),
                         relays: crate::ui::screens::default_relays(),
                     }
                 })
@@ -329,6 +354,14 @@ impl DuocbApp {
     /// Start the server session if the inputs validate.
     pub(crate) fn start_server(&mut self) {
         if let Some(mode) = self.server_mode_spec() {
+            // The initiator owns the discoverable standing record, so its token
+            // and name must be durable before the session is allowed to start.
+            if matches!(&mode, crate::net::ServerMode::NostrToken { .. }) {
+                if !self.persist_token_settings() {
+                    return;
+                }
+                self.token_settings_saved = true;
+            }
             self.server_running = true;
             self.net.send(UiCommand::StartServer { mode });
         }
@@ -337,6 +370,7 @@ impl DuocbApp {
     /// Start the client session if the inputs validate.
     pub(crate) fn connect_client(&mut self) {
         if let Some(spec) = self.client_dial_spec() {
+            self.token_settings_saved = false;
             self.client_active = true;
             self.net.send(UiCommand::Connect { spec });
         }

@@ -29,6 +29,64 @@ fn short_id(id: &str) -> String {
     }
 }
 
+/// Keep the standing-pairing identity visible after the editable form is gone.
+/// Mirrors duopipe's persistent config-mode header without ever showing the token.
+fn show_token_pairing_summary(app: &DuocbApp, ui: &mut Ui) {
+    let token = app.in_token.trim();
+    let fingerprint = app.token_fingerprint.clone().or_else(|| {
+        crate::auth::validate_token(token)
+            .is_ok()
+            .then(|| crate::auth::token_fingerprint(token))
+    });
+
+    ui.group(|ui| {
+        ui.label(RichText::new("Token pairing").strong());
+        if let Some(name) = Some(app.in_my_name.trim()).filter(|name| !name.is_empty()) {
+            ui.horizontal(|ui| {
+                ui.label("This device:");
+                ui.label(RichText::new(name).strong());
+            });
+        }
+        if let Some(node_id) = &app.node_id {
+            ui.horizontal(|ui| {
+                ui.label("This node:");
+                ui.monospace(short_id(node_id));
+            });
+        }
+        if let Some(peer) = &app.peer_node_id {
+            ui.horizontal(|ui| {
+                ui.label("Paired with:");
+                ui.monospace(short_id(peer));
+            });
+        }
+        if let Some(fingerprint) = fingerprint {
+            ui.horizontal(|ui| {
+                ui.label("Token fingerprint:");
+                ui.monospace(fingerprint);
+                ui.label("(must match on both devices)");
+            });
+        }
+        if app.token_settings_saved {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Saved settings:");
+                ui.monospace(app.config_path.display().to_string());
+            });
+        } else if app.status == crate::net::ConnStatus::Connected {
+            ui.label(
+                RichText::new("Settings could not be saved; see the error above.")
+                    .weak()
+                    .small(),
+            );
+        } else if app.client_active {
+            ui.label(
+                RichText::new("Settings will be saved after a successful connection.")
+                    .weak()
+                    .small(),
+            );
+        }
+    });
+}
+
 pub fn show_home(app: &mut DuocbApp, ui: &mut Ui) {
     ui.add_space(8.0);
     ui.heading("duocb");
@@ -52,7 +110,7 @@ pub fn show_home(app: &mut DuocbApp, ui: &mut Ui) {
         ui.radio_value(
             &mut app.mode,
             PairMode::NostrToken,
-            "2  Token + name — standing pairing with a shared token (internet)",
+            "2  Token + names — standing pairing with a shared token (internet)",
         );
         ui.radio_value(
             &mut app.mode,
@@ -130,15 +188,13 @@ pub fn show_server(app: &mut DuocbApp, ui: &mut Ui) {
                         app.in_token = crate::auth::generate_token();
                     }
                 });
-                ui.label("This device's name (the other device looks it up by this):");
+                ui.label("This device's unique name:");
                 ui.add(TextEdit::singleline(&mut app.in_my_name).hint_text("e.g. desktop"));
-                if ui
-                    .button("Remember these settings")
-                    .on_hover_text("Saves the token and names to ~/.config/duocb/config.toml")
-                    .clicked()
-                {
-                    app.remember_token_settings();
-                }
+                ui.label(
+                    RichText::new("Token and name are saved automatically when you start.")
+                        .weak()
+                        .small(),
+                );
                 if !app.in_token.trim().is_empty()
                     && crate::auth::validate_token(app.in_token.trim()).is_err()
                 {
@@ -171,22 +227,12 @@ pub fn show_server(app: &mut DuocbApp, ui: &mut Ui) {
     // Server running: mode-specific credentials display.
     match app.mode {
         PairMode::NostrToken => {
-            if let Some(node_id) = app.node_id.clone() {
-                ui.horizontal(|ui| {
-                    ui.label("Node id:");
-                    ui.monospace(short_id(&node_id));
-                });
-            }
-            if let Some(fp) = app.token_fingerprint.clone() {
-                ui.horizontal(|ui| {
-                    ui.label("Token fingerprint:");
-                    ui.monospace(fp);
-                    ui.label("(must match on both devices)");
-                });
-            }
-            if let Some(name) = Some(app.in_my_name.trim().to_string()).filter(|s| !s.is_empty()) {
-                ui.label(format!("The other device connects using the name “{name}”."));
-            }
+            show_token_pairing_summary(app, ui);
+            ui.label(
+                RichText::new("The other device must use a different name.")
+                    .weak()
+                    .small(),
+            );
         }
         PairMode::NostrPin => {
             if let Some(pin) = app.pin_display.clone() {
@@ -255,15 +301,13 @@ pub fn show_client(app: &mut DuocbApp, ui: &mut Ui) {
                         .desired_width(f32::INFINITY)
                         .hint_text("d…"),
                 );
-                ui.label("The other device's name:");
-                ui.add(TextEdit::singleline(&mut app.in_peer_name).hint_text("e.g. desktop"));
-                if ui
-                    .button("Remember these settings")
-                    .on_hover_text("Saves the token and names to ~/.config/duocb/config.toml")
-                    .clicked()
-                {
-                    app.remember_token_settings();
-                }
+                ui.label("This device's unique name:");
+                ui.add(TextEdit::singleline(&mut app.in_my_name).hint_text("e.g. laptop"));
+                ui.label(
+                    RichText::new("Token and name are saved after a successful connection.")
+                        .weak()
+                        .small(),
+                );
                 if !app.in_token.trim().is_empty()
                     && crate::auth::validate_token(app.in_token.trim()).is_err()
                 {
@@ -320,7 +364,9 @@ pub fn show_client(app: &mut DuocbApp, ui: &mut Ui) {
         return;
     }
 
-    if let Some(peer) = app.peer_node_id.clone() {
+    if app.mode == PairMode::NostrToken {
+        show_token_pairing_summary(app, ui);
+    } else if let Some(peer) = app.peer_node_id.clone() {
         ui.horizontal(|ui| {
             ui.label("Paired with:");
             ui.monospace(short_id(&peer));

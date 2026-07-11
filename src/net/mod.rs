@@ -33,11 +33,11 @@ pub enum ServerMode {
 /// What the client dials.
 #[derive(Debug, Clone)]
 pub enum DialSpec {
-    /// Resolve the peer's node id by name via nostr (token-derived keys), then
-    /// authenticate with the same shared token.
+    /// Resolve the other device under the shared token-derived nostr author,
+    /// excluding this device's own named record, then authenticate with the token.
     NostrToken {
         token: String,
-        peer_name: String,
+        own_name: String,
         relays: Vec<String>,
     },
     /// Resolve via the rotating-PIN rendezvous, then prove PIN possession in-band.
@@ -92,6 +92,12 @@ pub enum NetEvent {
     ServerReady {
         node_id: String,
         manual_token: Option<String>,
+        token_fingerprint: Option<String>,
+    },
+    /// Client endpoint is online. Token mode includes the fingerprint so the
+    /// connector retains the same identity details as the initiator screen.
+    ClientReady {
+        node_id: String,
         token_fingerprint: Option<String>,
     },
     /// PIN quick mode: a fresh PIN was minted (display form, `XXXX-XXXX`).

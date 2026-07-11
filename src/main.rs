@@ -9,10 +9,33 @@ mod protocol;
 mod ui;
 
 use eframe::egui;
+use std::path::PathBuf;
 
-fn main() -> eframe::Result {
+fn config_override() -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
+    let mut explicit = None;
+    let mut args = std::env::args_os().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--config" || arg == "-c" {
+            let path = args.next().ok_or("--config requires a path")?;
+            explicit = Some(PathBuf::from(path));
+        } else if let Some(value) = arg.to_str().and_then(|s| s.strip_prefix("--config=")) {
+            if value.is_empty() {
+                return Err("--config requires a path".into());
+            }
+            explicit = Some(PathBuf::from(value));
+        }
+    }
+    Ok(explicit.or_else(|| std::env::var_os("DUOCB_CONFIG").map(PathBuf::from)))
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("duocb=info"))
         .init();
+
+    let config_path = config::resolve_path(config_override()?)?;
+    // Held until the GUI exits. A second process may run only with another
+    // explicit config path, which gives same-machine E2E tests isolated state.
+    let _config_lock = config::acquire_lock(&config_path)?;
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([520.0, 680.0])
@@ -32,6 +55,12 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "duocb",
         options,
-        Box::new(|cc| Ok(Box::new(ui::app::DuocbApp::new(cc)))),
-    )
+        Box::new(move |cc| {
+            Ok(Box::new(ui::app::DuocbApp::new(
+                cc,
+                config_path.clone(),
+            )))
+        }),
+    )?;
+    Ok(())
 }

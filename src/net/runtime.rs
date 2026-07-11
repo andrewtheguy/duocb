@@ -461,6 +461,14 @@ async fn run_client_session(
         }
     };
     let own_id = endpoint.id();
+    let token_fingerprint = match &spec {
+        DialSpec::NostrToken { token, .. } => Some(crate::auth::token_fingerprint(token)),
+        DialSpec::Pin { .. } | DialSpec::Manual { .. } => None,
+    };
+    events.send(NetEvent::ClientReady {
+        node_id: own_id.to_string(),
+        token_fingerprint,
+    });
 
     let mut backoff = Duration::from_secs(1);
     let mut attempts: u32 = 0;
@@ -473,19 +481,19 @@ async fn run_client_session(
     let mut pinned_pin_id: Option<EndpointId> = None;
 
     loop {
-        // Resolve the target each attempt: a nostr name re-resolves so a server
-        // that restarted with a fresh ephemeral id self-heals on the next try.
+        // Resolve the target each attempt: token mode re-queries the shared nostr
+        // author (excluding our own name), so a restarted server's fresh id is found.
         let resolved: Result<EndpointId> = match &spec {
             DialSpec::Manual { .. } => Ok(manual_id.expect("validated above")),
             DialSpec::NostrToken {
                 token,
-                peer_name,
+                own_name,
                 relays,
             } => {
                 events.status(ConnStatus::Resolving);
                 tokio::select! {
                     _ = cancel.cancelled() => return,
-                    r = crate::nostr::lookup_node_id(token, peer_name, relays) => r,
+                    r = crate::nostr::lookup_peer_node_id(token, own_name, relays) => r,
                 }
             }
             DialSpec::Pin { .. } if pinned_pin_id.is_some() => Ok(pinned_pin_id.unwrap()),
