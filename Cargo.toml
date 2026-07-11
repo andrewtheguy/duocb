@@ -49,4 +49,5 @@ codegen-units = 1
 [package.metadata.packager]
 product-name = "duocb"
 identifier = "com.andrewtheguy.duocb"
+category = "Utility"
 icons = ["icons/icon.icns", "icons/icon.ico", "icons/icon.png"]
