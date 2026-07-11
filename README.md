@@ -1,6 +1,6 @@
 # duocb
 
-**P2P clipboard sharing between two devices you own — end-to-end encrypted over iroh, signaled over nostr, driven by a small egui desktop app.**
+**P2P clipboard sharing between two devices you own — clipboard content is end-to-end encrypted over iroh; with optional nostr for signaling.**
 
 duocb links **two devices belonging to the same person** (desktop ↔ laptop, workstation ↔ homelab box) so they can share clipboard text directly, without accounts, servers that see your data, public IPs, or port forwarding. The two roles are only about setup: one device **starts a connection** (displays pairing credentials), the other **joins** it (enters them). Once paired, **both** sides can send and receive — either can push its clipboard to the other over a single encrypted QUIC connection.
 
