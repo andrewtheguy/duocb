@@ -391,7 +391,7 @@ impl DuocbApp {
             if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::P))
                 && let Some(item) = self.inbox.first_mut()
             {
-                item.expanded = !item.expanded;
+                item.toggle_peek();
             }
             // Ctrl+Y ("yank"): Ctrl+C / Ctrl+Shift+C are intercepted by egui's
             // winit layer as the built-in Copy event and never reach key handling.
@@ -441,8 +441,15 @@ impl eframe::App for DuocbApp {
 
         self.handle_shortcuts(ctx);
 
-        // Keep the PIN countdown and the "sent" flash ticking without user input.
-        if self.pin_display.is_some() || self.sent_flash_active() {
+        // Auto-hide peeked items after PEEK_TIMEOUT (see ClipItem::tick_peek).
+        let mut any_peeked = false;
+        for item in self.inbox.iter_mut().chain(self.outbox.iter_mut()) {
+            any_peeked |= item.tick_peek();
+        }
+
+        // Keep the PIN countdown, "sent" flash, and peek auto-hide ticking
+        // without user input.
+        if self.pin_display.is_some() || self.sent_flash_active() || any_peeked {
             ctx.request_repaint_after(Duration::from_millis(500));
         }
     }

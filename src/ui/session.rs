@@ -99,13 +99,13 @@ fn show_item(ui: &mut Ui, item: &mut ClipItem) -> Option<String> {
                 if ui.small_button("Copy").clicked() {
                     copy_text = Some(item.text.clone());
                 }
-                let peek_label = if item.expanded { "Hide" } else { "Peek" };
+                let peek_label = if item.expanded() { "Hide" } else { "Peek" };
                 if ui.small_button(peek_label).clicked() {
-                    item.expanded = !item.expanded;
+                    item.toggle_peek();
                 }
             });
         });
-        if item.expanded {
+        if item.expanded() {
             // Read-only, selectable, never touches the system clipboard unless
             // the user selects + copies deliberately. Large payloads are
             // truncated (see PEEK_LIMIT); Copy still yields the full content.

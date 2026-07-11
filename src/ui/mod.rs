@@ -1,5 +1,7 @@
 //! egui user interface: screen routing and shared UI types.
 
+use std::time::{Duration, Instant};
+
 pub mod app;
 pub mod screens;
 pub mod session;
@@ -34,6 +36,10 @@ pub enum PairMode {
 /// multi-MB string is expensive, and a peek is a glance, not a full viewer.
 pub const PEEK_LIMIT: usize = 4096;
 
+/// How long a peeked item stays open before auto-hiding, so revealed content
+/// doesn't linger on screen after a glance.
+pub const PEEK_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// A clipboard item that passed through the session — a received item in the
 /// inbox, or the last item sent in the outbox. Lives only in memory, never
 /// written to disk.
@@ -43,8 +49,9 @@ pub struct ClipItem {
     pub timestamp: jiff::Zoned,
     /// CRC-16 of the payload, computed once on creation (see [`crc16`]).
     pub crc16: u16,
-    /// Whether the peek view is expanded in the UI.
-    pub expanded: bool,
+    /// When the peek view was opened, or `None` if collapsed. The peek
+    /// auto-hides [`PEEK_TIMEOUT`] after this (see [`tick_peek`](Self::tick_peek)).
+    peeked_at: Option<Instant>,
 }
 
 impl ClipItem {
@@ -54,8 +61,28 @@ impl ClipItem {
             text,
             timestamp,
             crc16,
-            expanded: false,
+            peeked_at: None,
         }
+    }
+
+    /// Whether the peek view is currently expanded.
+    pub fn expanded(&self) -> bool {
+        self.peeked_at.is_some()
+    }
+
+    /// Toggle the peek view. Opening stamps the time so it auto-hides.
+    pub fn toggle_peek(&mut self) {
+        self.peeked_at = self.peeked_at.is_none().then(Instant::now);
+    }
+
+    /// Collapse the peek if it has been open longer than [`PEEK_TIMEOUT`].
+    /// Returns whether it is still expanded afterward, so the caller can keep
+    /// requesting repaints while any peek is counting down.
+    pub fn tick_peek(&mut self) -> bool {
+        if self.peeked_at.is_some_and(|t| t.elapsed() >= PEEK_TIMEOUT) {
+            self.peeked_at = None;
+        }
+        self.peeked_at.is_some()
     }
 
     /// Human-readable size of the text payload.
