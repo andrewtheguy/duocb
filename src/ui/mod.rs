@@ -23,24 +23,33 @@ pub enum PairMode {
     Manual,
 }
 
-/// A received clipboard item. Lives only in memory — never written to disk.
-pub struct InboxItem {
+/// Max characters shown in the peek view. Larger payloads are truncated to
+/// this many chars so the read-only editor stays responsive — laying out a
+/// multi-MB string is expensive, and a peek is a glance, not a full viewer.
+pub const PEEK_LIMIT: usize = 4096;
+
+/// A clipboard item that passed through the session — a received item in the
+/// inbox, or the last item sent in the outbox. Lives only in memory, never
+/// written to disk.
+pub struct ClipItem {
     pub text: String,
-    pub received_at: jiff::Zoned,
+    /// When it was received (inbox) or sent (outbox).
+    pub timestamp: jiff::Zoned,
+    /// CRC-16 of the payload, computed once on creation (see [`crc16`]).
+    pub crc16: u16,
     /// Whether the peek view is expanded in the UI.
     pub expanded: bool,
 }
 
-impl InboxItem {
-    /// One-line preview: the first line, truncated to a sane width.
-    pub fn preview(&self) -> String {
-        const MAX_CHARS: usize = 80;
-        let first = self.text.lines().next().unwrap_or("");
-        let mut out: String = first.chars().take(MAX_CHARS).collect();
-        if first.chars().count() > MAX_CHARS || self.text.lines().nth(1).is_some() {
-            out.push('…');
+impl ClipItem {
+    pub fn new(text: String, timestamp: jiff::Zoned) -> Self {
+        let crc16 = crc16(text.as_bytes());
+        Self {
+            text,
+            timestamp,
+            crc16,
+            expanded: false,
         }
-        out
     }
 
     /// Human-readable size of the text payload.
@@ -53,5 +62,59 @@ impl InboxItem {
         } else {
             format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
         }
+    }
+
+    /// The text to show while peeking, truncated to [`PEEK_LIMIT`] chars.
+    /// The bool is whether truncation occurred (borrowed, so the common
+    /// small-payload case allocates nothing).
+    pub fn peek_text(&self) -> (&str, bool) {
+        match self.text.char_indices().nth(PEEK_LIMIT) {
+            Some((byte_idx, _)) => (&self.text[..byte_idx], true),
+            None => (&self.text, false),
+        }
+    }
+}
+
+/// CRC-16/CCITT-FALSE (poly `0x1021`, init `0xFFFF`) over the payload bytes — a
+/// short fingerprint the user can eyeball to tell inbox items apart, or to
+/// confirm a paste matches, without peeking at (and thus revealing) the content.
+fn crc16(data: &[u8]) -> u16 {
+    let mut crc: u16 = 0xFFFF;
+    for &byte in data {
+        crc ^= (byte as u16) << 8;
+        for _ in 0..8 {
+            crc = if crc & 0x8000 != 0 {
+                (crc << 1) ^ 0x1021
+            } else {
+                crc << 1
+            };
+        }
+    }
+    crc
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crc16_matches_known_check_value() {
+        // CRC-16/CCITT-FALSE check value for the ASCII string "123456789".
+        assert_eq!(crc16(b"123456789"), 0x29B1);
+        assert_eq!(crc16(b""), 0xFFFF);
+    }
+
+    #[test]
+    fn peek_text_truncates_past_limit() {
+        let long = "a".repeat(PEEK_LIMIT + 100);
+        let item = ClipItem::new(long, jiff::Zoned::now());
+        let (shown, truncated) = item.peek_text();
+        assert!(truncated);
+        assert_eq!(shown.chars().count(), PEEK_LIMIT);
+
+        let item = ClipItem::new("short".to_string(), jiff::Zoned::now());
+        let (shown, truncated) = item.peek_text();
+        assert!(!truncated);
+        assert_eq!(shown, "short");
     }
 }

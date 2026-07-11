@@ -8,15 +8,14 @@ use eframe::egui;
 
 use crate::clipboard::SystemClipboard;
 use crate::net::{ConnStatus, NetEvent, NetHandle, UiCommand, spawn_net_runtime};
-use crate::ui::{InboxItem, PairMode, Screen, screens, session};
+use crate::ui::{ClipItem, PairMode, Screen, screens, session};
 
 /// How long the "sent ✓" flash stays visible.
 const SENT_FLASH: Duration = Duration::from_secs(2);
 
-/// Retention cap for the in-memory inbox: newest-first, the oldest items are
-/// dropped once this many are held (each item is already ≤ ~1 MiB by the wire
-/// cap, so a hostile or chatty peer can't grow memory without bound).
-const MAX_INBOX_ITEMS: usize = 100;
+/// Retention cap for the in-memory inbox: newest-first, only the last few
+/// received items are kept and older ones are dropped.
+const MAX_INBOX_ITEMS: usize = 5;
 
 pub struct DuocbApp {
     pub(crate) net: NetHandle,
@@ -54,7 +53,14 @@ pub struct DuocbApp {
     // Live session state.
     pub(crate) peer_node_id: Option<String>,
     pub(crate) path_display: Option<String>,
-    pub(crate) inbox: Vec<InboxItem>,
+    pub(crate) inbox: Vec<ClipItem>,
+    /// The last item successfully sent, shown above the inbox so the receiver
+    /// can compare its size/CRC against what arrived.
+    pub(crate) outbox: Option<ClipItem>,
+    /// Text handed to the runtime, promoted to `outbox` once the send is
+    /// confirmed by `NetEvent::ItemSent` (so a rejected/oversize send never
+    /// shows up as sent).
+    pub(crate) pending_outbox: Option<String>,
     pub(crate) sent_flash: Option<Instant>,
 }
 
@@ -86,6 +92,8 @@ impl DuocbApp {
             peer_node_id: None,
             path_display: None,
             inbox: Vec::new(),
+            outbox: None,
+            pending_outbox: None,
             sent_flash: None,
         }
     }
@@ -118,8 +126,9 @@ impl DuocbApp {
             NetEvent::Status(status) => {
                 if status == ConnStatus::Idle {
                     // Session ended (stopped, or failed fatally): reset the
-                    // presentation state. The inbox is kept — items are only
-                    // discarded via the explicit Clear button.
+                    // presentation state. The inbox and outbox are kept — items
+                    // are only discarded via the explicit Clear button; a
+                    // never-confirmed pending send is dropped.
                     self.server_running = false;
                     self.client_active = false;
                     self.node_id = None;
@@ -130,6 +139,7 @@ impl DuocbApp {
                     self.pin_paired = false;
                     self.peer_node_id = None;
                     self.path_display = None;
+                    self.pending_outbox = None;
                 }
                 self.status = status;
             }
@@ -149,18 +159,16 @@ impl DuocbApp {
                 self.path_display = Some(path);
             }
             NetEvent::ItemReceived { text, .. } => {
-                self.inbox.insert(
-                    0,
-                    InboxItem {
-                        text,
-                        received_at: jiff::Zoned::now(),
-                        expanded: false,
-                    },
-                );
+                self.inbox.insert(0, ClipItem::new(text, jiff::Zoned::now()));
                 // Bounded retention (see MAX_INBOX_ITEMS): drop the oldest.
                 self.inbox.truncate(MAX_INBOX_ITEMS);
             }
             NetEvent::ItemSent => {
+                // The send is confirmed on the wire: promote the pending text
+                // to the outbox so its size/CRC reflect what actually left.
+                if let Some(text) = self.pending_outbox.take() {
+                    self.outbox = Some(ClipItem::new(text, jiff::Zoned::now()));
+                }
                 self.sent_flash = Some(Instant::now());
             }
             NetEvent::Error(message) => {
@@ -175,7 +183,11 @@ impl DuocbApp {
             Ok(text) if text.is_empty() => {
                 self.error = Some("The clipboard is empty".to_string());
             }
-            Ok(text) => self.net.send(UiCommand::SendClipboard { text }),
+            Ok(text) => {
+                // Stash it; it becomes the outbox item once ItemSent confirms.
+                self.pending_outbox = Some(text.clone());
+                self.net.send(UiCommand::SendClipboard { text });
+            }
             Err(e) => self.error = Some(format!("Could not read the clipboard: {e:#}")),
         }
     }
