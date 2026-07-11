@@ -33,13 +33,13 @@ src/
   config.rs        optional ~/.config/duocb/config.toml (token-mode form prefill)
   net/
     mod.rs         UiCommand / NetEvent / ConnStatus enums; EventSender; runtime spawn
-    endpoint.rs    iroh endpoint builders, connect, path watcher (ALPN duocb/1)
+    endpoint.rs    iroh endpoint builders, connect, ConnPath snapshot + debug path logger (ALPN duocb/1)
     runtime.rs     command loop, server/client sessions, PairClaim, auth, clip pump
   ui/
-    mod.rs         Screen / PairMode / InboxItem
-    app.rs         eframe::App: event drain, state, keyboard shortcuts
-    screens.rs     home / server / client screens
-    session.rs     paired panel: send button, inbox with peek/copy/clear
+    mod.rs         Screen / PairMode / ClipItem (CRC-16, peek + auto-hide)
+    app.rs         eframe::App: event drain, state, keyboard shortcuts, connection-path modal
+    screens.rs     home / start / join screens
+    session.rs     paired panel: send + connection-path buttons, outbox, inbox with peek/copy/clear
 ```
 
 ## Threading model: UI ↔ runtime
@@ -49,7 +49,7 @@ eframe owns the main thread; a dedicated thread runs a tokio multi-thread runtim
 ```mermaid
 graph LR
     subgraph "UI thread (eframe)"
-        A[DuocbApp<br/>screens, inbox, inputs]
+        A[DuocbApp<br/>screens, inbox/outbox, inputs]
         CB[SystemClipboard<br/>arboard, UI thread only]
     end
     subgraph "net thread (tokio)"
@@ -63,9 +63,9 @@ graph LR
     S --> P
 ```
 
-- **UI → runtime:** `tokio::sync::mpsc::unbounded_channel<UiCommand>` — `StartServer{mode}`, `StopServer`, `Connect{spec}`, `Disconnect`, `SendClipboard{text}`, `Shutdown`. Unbounded senders are synchronous, so the UI thread never blocks.
+- **UI → runtime:** `tokio::sync::mpsc::unbounded_channel<UiCommand>` — `StartServer{mode}`, `StopServer`, `Connect{spec}`, `Disconnect`, `SendClipboard{text}`, `QueryConnPath`, `Shutdown`. Unbounded senders are synchronous, so the UI thread never blocks.
 - **Runtime → UI:** `std::sync::mpsc::channel<NetEvent>`; every send is followed by `egui::Context::request_repaint()` so the GUI wakes even when idle. `DuocbApp` drains the receiver at the top of each frame.
-- **Events:** `ServerReady{node_id, manual_token?, token_fingerprint?}`, `PinRotated{pin_display, seconds_left}` / `PinCleared`, `Status(ConnStatus)`, `PeerPaired` / `PeerDisconnected`, `PathUpdate(display)`, `ItemReceived{text}` / `ItemSent`, `Error(message)`.
+- **Events:** `ServerReady{node_id, manual_token?, token_fingerprint?}`, `PinRotated{pin_display, seconds_left}` / `PinCleared`, `Status(ConnStatus)`, `PeerPaired` / `PeerDisconnected`, `ConnPath(paths)`, `ItemReceived{text}` / `ItemSent`, `Error(message)`.
 - **Shutdown:** window close → `UiCommand::Shutdown` → the runtime cancels its session (connection closed with code 0, endpoints closed) and returns; the UI joins the thread.
 
 The `EventSender`'s repaint context is optional, so the whole runtime runs headless in integration tests (`net/runtime.rs` tests pair two real endpoints in-process).
@@ -78,23 +78,25 @@ The `EventSender`'s repaint context is optional, so the whole runtime runs headl
 
 1. Create the listening endpoint (fresh ephemeral identity) → emit `ServerReady` (manual mode generates its one-time token here) → `Listening`.
 2. Spawn the mode's signaling publisher (see below); manual mode has none.
-3. Accept loop, **one connection served at a time**: accept → `auth_as_listener` → `PeerPaired` → accept the clipboard stream (Hello exchange) → pump until the connection dies → `PeerDisconnected`, keep listening.
+3. Accept loop, **one connection served at a time**: accept → accept the single session stream and `auth_as_listener` on it → `PeerPaired` → pump clipboard on that same stream until the connection dies → `PeerDisconnected`, keep listening.
 4. A `PairClaim` (below) restricts the whole session to one peer identity.
 
 **Client session** (`run_client_session`) — resolve/connect/auth loop with reconnect:
 
 1. Resolve the target **each attempt**: manual = the typed node id; token mode = nostr lookup by name (so a restarted server with a fresh node id self-heals); PIN mode = nostr rendezvous lookup, with a **pinned node id fast path** after the first pairing (the PIN has rotated off the relays, but the server retains our pairing key, so reconnects dial the remembered id and re-prove the same PIN in-band).
-2. Self-dial guard, then connect (10 s timeout) → auth → open the clipboard stream → `Connected` → pump.
+2. Self-dial guard, then connect (10 s timeout) → open the single session stream, auth on it → `Connected` → pump on the same stream.
 3. On a drop: reconnect with exponential backoff (1 s → ×2 → 30 s cap), unlimited after the first success, 10 attempts before it. **Auth failures are fatal** — the credential won't get better on its own; the session ends and the error is surfaced.
 
 ## Wire protocol
 
-Per connection (client = dialer), two QUIC bidirectional streams:
+Per connection (client = dialer), a **single** QUIC bidirectional stream carries both phases in order:
 
-1. **Auth stream** — the first bi-stream the client opens. Carries `AuthRequest` (`method` tag selects `Token{auth_token}` or `Pin{nonce}`) and the corresponding response flow. 10 s timeout, close codes: `1` auth failed, `2` auth timeout, `0` clean shutdown.
-2. **Clipboard stream** — opened by the client after auth succeeds; lives for the connection. Each direction first sends `ClipMsg::Hello{version}`, then any number of `ClipMsg::Item{text, sent_at_ms}` frames.
+1. **Auth** runs first: `AuthRequest` (`method` tag selects `Token{auth_token}` or `Pin{nonce}`) and the corresponding response flow. 10 s timeout, close codes: `1` auth failed, `2` auth timeout, `0` clean shutdown.
+2. **Clipboard** — on success the *same* stream stays open (the send side is never `finish`ed) and carries any number of `ClipMsg{text, sent_at_ms}` frames in both directions for the life of the connection.
 
-**Framing** (both streams): 4-byte big-endian length prefix + JSON body, with a `version` field validated on decode (`DUOCB_PROTO_VERSION = 1`) and strict frame boundaries (trailing bytes rejected). Two size caps: control frames 16 KiB, clipboard frames **1 MiB** (checked against the *encoded* frame). Oversize on send is rejected locally with an error event — nothing hits the wire and the session lives on; an oversize length prefix on receive is a protocol error that drops the connection.
+There is no separate control channel and no `Hello` handshake: a clipboard app has exactly one data stream, so the two-stream split inherited from the multiplexed duopipe/flextunnel tunnel earns nothing here (auth succeeding already proves the stream is open and bidirectional). Collapsing to one stream saves a stream-open and a round-trip per connection.
+
+**Framing:** 4-byte big-endian length prefix + JSON body, with a `version` field validated on decode (`DUOCB_PROTO_VERSION = 1`) and strict frame boundaries (trailing bytes rejected). Two size caps applied per read by phase: auth/control frames 16 KiB, clipboard frames **1 MiB** (checked against the *encoded* frame). Oversize on send is rejected locally with an error event — nothing hits the wire and the session lives on; an oversize length prefix on receive is a protocol error that drops the connection.
 
 There is no application-level keepalive: QUIC keep-alives (15 s) and the idle timeout (30 s) provide liveness, and the pump ends when the stream read fails — so an ungracefully dropped peer is reaped within ~30 s and the reconnect path takes over.
 
@@ -124,11 +126,11 @@ No signaling. The server displays its node id + a generated one-time token; the 
 
 ## Authentication
 
-Knowing a node id never suffices; every connection authenticates on the first stream.
+Knowing a node id never suffices; every connection authenticates on the session stream before any clipboard frame flows.
 
 **Token method** (token + manual modes): the client sends `AuthRequest::Token{auth_token}`; the server checks membership in its accepted set and replies `AuthResponse{accepted, reason}`. Tokens are 47 chars: `d` + base64url(32 random bytes + CRC16-CCITT-FALSE), with an 8-hex-digit SHA-256 fingerprint shown in the UI so both devices can confirm they hold the same token without re-revealing it.
 
-**PIN method**: a 4-message mutual challenge-response on the auth stream —
+**PIN method**: a 4-message mutual challenge-response on the session stream —
 
 ```text
 C→S: AuthRequest::Pin { nonce_c }
@@ -163,18 +165,18 @@ Argon2id makes the ~35-bit PIN expensive to brute-force offline from a captured 
 - Discovery/address lookup: n0 pkarr publisher + DNS resolver, **plus mDNS always** — the offline path. The client dials a **bare `EndpointAddr::new(node_id)`**; iroh resolves actual addresses via these services and hole-punches, falling back to a relay.
 - The identity is never persisted: every session is a fresh Ed25519 key, so node ids (and everything derived from them) are per-run.
 
-A per-connection path watcher streams the selected path (direct address or relay + RTT) to the UI.
+Connection-path status is **pulled on demand**, not watched: `connection_paths(conn)` returns a point-in-time snapshot of the connection's paths (`ConnPath { kind, display, selected }`) — `Connection::paths()` is itself a snapshot, so no background task is involved. The UI's "Connection path" button issues `QueryConnPath`, the runtime answers with `ConnPath(paths)` read from the live connection, and the result is shown in a dismissible modal. A separate background watcher exists **only for logging** the selected path and its changes (relay → direct); it is spawned only when debug logging is enabled (`RUST_LOG=duocb=debug`) and logs at `debug!`, so normal runs are quiet.
 
 ## Clipboard handling
 
 - One **long-lived, lazily created** `arboard::Clipboard` lives on the UI thread for the whole process. On X11, clipboard ownership belongs to the providing connection — a per-operation instance would lose the copied text the moment it dropped.
 - Reads/writes happen directly on the UI thread on button press (text selections are sub-millisecond IPC); failures (e.g. a huge INCR transfer) surface as a dismissible error banner and never affect the connection.
-- **Receive side:** items go into `Vec<InboxItem>` in app memory, newest first. *Peek* renders the full text read-only in the UI; *Copy* is the **only** code path that writes the system clipboard. There is no auto-copy and no persistence.
-- **Send side:** explicit action only (`Ctrl+S`/button reads the clipboard and sends). There is no clipboard watcher.
+- **Receive side:** items go into a `Vec<ClipItem>` in app memory, newest first, capped at the **last 5** (older ones drop). Each item shows metadata only until peeked — size hint, a CRC-16 fingerprint (computed once on arrival), and the received time — so the two devices can compare an item without revealing it. *Peek* renders the text read-only, truncated past 4096 chars and auto-hidden after 15 s; *Copy* is the **only** code path that writes the system clipboard (and always yields the full, untruncated text). There is no auto-copy and no persistence.
+- **Send side:** explicit action only (`Ctrl+S`/button reads the clipboard and sends). There is no clipboard watcher. The **last item sent** is kept in a one-slot outbox (same `ClipItem`, promoted from a pending buffer once `ItemSent` confirms it left the wire) and shown above the inbox with its size/CRC, so the receiver can confirm a match.
 
 ## Persistence
 
-Exactly one optional file, `~/.config/duocb/config.toml` (`auth_token`, `my_name`, `peer_name`), written **only** by the explicit "Remember these settings" button and used to prefill the token-mode forms. A malformed config is ignored with a warning. Nothing else is stored: no identity keys, no peer list, no clipboard content, no inbox.
+Exactly one optional file, `~/.config/duocb/config.toml` (`auth_token`, `my_name`, `peer_name`), written **only** by the explicit "Remember these settings" button and used to prefill the token-mode forms. A malformed config is ignored with a warning. Nothing else is stored: no identity keys, no peer list, no clipboard content, no inbox or outbox.
 
 ## Security model
 
