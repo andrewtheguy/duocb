@@ -463,7 +463,8 @@ impl eframe::App for DuocbApp {
     }
 }
 
-/// Render the shared "paired" session panel (send button + inbox) when connected.
+/// Render the shared "paired" session panel (send button + outbox + inbox),
+/// used by both connection roles, when connected.
 pub(crate) fn session_panel_if_connected(app: &mut DuocbApp, ui: &mut egui::Ui) {
     if app.status == ConnStatus::Connected {
         session::show_session(app, ui);

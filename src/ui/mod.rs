@@ -4,11 +4,17 @@ pub mod app;
 pub mod screens;
 pub mod session;
 
-/// Which screen is showing.
+/// Which screen is showing. The two non-home screens are the two connection
+/// roles; both peers send and receive once paired — the role only decides who
+/// sets the connection up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
     Home,
+    /// Start a connection: this device shows the PIN/auth code and listens
+    /// (the transport server).
     Server,
+    /// Join a connection: this device enters the PIN/auth code and dials
+    /// (the transport client).
     Client,
 }
 

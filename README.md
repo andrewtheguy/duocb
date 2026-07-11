@@ -2,12 +2,12 @@
 
 **P2P clipboard sharing between two devices you own — end-to-end encrypted over iroh, signaled over nostr, driven by a small egui desktop app.**
 
-duocb links **two devices belonging to the same person** (desktop ↔ laptop, workstation ↔ homelab box) so they can share clipboard text directly, without accounts, servers that see your data, public IPs, or port forwarding. One device acts as the **server** (displays pairing credentials), the other as the **client** (enters them); once paired, **both** sides can push their clipboard to the other over a single encrypted QUIC connection.
+duocb links **two devices belonging to the same person** (desktop ↔ laptop, workstation ↔ homelab box) so they can share clipboard text directly, without accounts, servers that see your data, public IPs, or port forwarding. The two roles are only about setup: one device **starts a connection** (displays pairing credentials), the other **joins** it (enters them). Once paired, **both** sides can send and receive — either can push its clipboard to the other over a single encrypted QUIC connection.
 
 Received content never touches the receiving machine's clipboard (or disk) by itself: it lands in an **in-memory inbox** where you can **peek** at the full text first, and only an explicit **Copy** click puts it into the system clipboard.
 
 > [!IMPORTANT]
-> **Project goal:** let a **single user link two of their own devices** for ad-hoc clipboard sharing. Both ends are expected to be machines you own (or fully trust) — it is not a public service, not multi-tenant, and one server session pairs with exactly **one** peer.
+> **Project goal:** let a **single user link two of their own devices** for ad-hoc clipboard sharing. Both ends are expected to be machines you own (or fully trust) — it is not a public service, not multi-tenant, and one connection pairs with exactly **one** peer.
 
 > [!WARNING]
 > **No backward compatibility (pre-1.0):** during initial development no compatibility or migration path is provided between versions. Expect to regenerate tokens and update both devices together.
@@ -26,19 +26,19 @@ Received content never touches the receiving machine's clipboard (or disk) by it
 
 ## Pairing modes
 
-Chosen on the home screen; the server displays credentials, the client types them.
+Chosen on the home screen; the **starting** device displays credentials, the **joining** device types them.
 
 | Mode | Signaling | What you transfer by hand | Auth | Internet |
 |---|---|---|---|---|
 | **PIN quick pair** | nostr relays | an 8-character PIN that rotates every 60 s | Argon2id PIN challenge-response (mutual, in-band) | required |
 | **Token + name** | nostr relays | a shared 47-char token + device names (once; can be remembered) | pre-shared token | required |
-| **Manual / offline** | none | the server's node id + a generated one-time token | one-time token | **not required** on the same LAN (mDNS) |
+| **Manual / offline** | none | the starting device's node id + a generated one-time token | one-time token | **not required** on the same LAN (mDNS) |
 
-- **PIN quick pair** is the fastest ad-hoc pairing: the server shows a short code, you type it on the client. The PIN both locates the server (an encrypted rendezvous record on public nostr relays) and authenticates the connection in-band — no token ever exists, and nothing offline-crackable crosses the wire.
-- **Token + name** is for a standing pairing: both devices share one auth token (generate it in the app), each has a name, and the client resolves the server's current ephemeral node id by name via nostr. A restarted server is re-resolved automatically. "Remember these settings" saves the token and names to `~/.config/duocb/config.toml` so you don't retype them.
-- **Manual / offline** needs no signaling at all: the server displays its node id and a freshly generated one-time token; enter both on the client. On the same LAN the node id resolves via mDNS, so it works with the internet down.
+- **PIN quick pair** is the fastest ad-hoc pairing: the starting device shows a short code, you type it on the joining device. The PIN both locates the starting device (an encrypted rendezvous record on public nostr relays) and authenticates the connection in-band — no token ever exists, and nothing offline-crackable crosses the wire.
+- **Token + name** is for a standing pairing: both devices share one auth token (generate it in the app), each has a name, and the joining device resolves the starting device's current ephemeral node id by name via nostr. A restarted starting device is re-resolved automatically. "Remember these settings" saves the token and names to `~/.config/duocb/config.toml` so you don't retype them.
+- **Manual / offline** needs no signaling at all: the starting device displays its node id and a freshly generated one-time token; enter both on the joining device. On the same LAN the node id resolves via mDNS, so it works with the internet down.
 
-The iroh identity is **ephemeral** — a fresh node id (and manual-mode token, and PIN sequence) is minted every time the server starts. Stopping and restarting the server invalidates the previous credentials.
+The iroh identity is **ephemeral** — a fresh node id (and manual-mode token, and PIN sequence) is minted every time a connection is started. Stopping and restarting invalidates the previous credentials.
 
 ## Install / build
 
@@ -57,21 +57,21 @@ On Linux CI/minimal systems, eframe needs: `libxkbcommon-dev libwayland-dev libx
 Run `duocb` on both devices.
 
 1. **Both devices:** pick the same pairing mode on the home screen (`1`/`2`/`3`).
-2. **Server device:** press `S`, fill the form if any (token mode), then `Ctrl+Enter` to start sharing. The screen shows the credentials to transfer.
-3. **Client device:** press `C`, type the credentials, `Ctrl+Enter` to connect.
-4. **Paired:** both sides now show the session panel — `Ctrl+S` (or the button) reads your clipboard and sends it; received items appear in the inbox where you can **Peek** (view without copying) and **Copy** (the only action that writes your clipboard).
+2. **Starting device:** press `S`, fill the form if any (token mode), then `Ctrl+Enter` to start the connection. The screen shows the credentials to transfer.
+3. **Joining device:** press `C`, type the credentials, `Ctrl+Enter` to connect.
+4. **Paired:** both sides now show the same session panel — `Ctrl+S` (or the button) reads your clipboard and sends it; received items appear in the inbox where you can **Peek** (view without copying) and **Copy** (the only action that writes your clipboard). Either device can send at any time; the outbox above the inbox shows the last item you sent (size + CRC) so the other side can confirm it matches what arrived.
 
-The client reconnects automatically with backoff if the connection drops. A server stays listening after its peer disconnects, but only the **same** peer may reconnect — a *restarted* client has a new identity and is refused; stop and start the server to pair a fresh session.
+The joining device reconnects automatically with backoff if the connection drops. The starting device stays listening after its peer disconnects, but only the **same** peer may reconnect — a *restarted* joining device has a new identity and is refused; restart the connection to pair a fresh session.
 
 ### Keyboard shortcuts
 
 | Key | Where | Action |
 |---|---|---|
 | `1` / `2` / `3` | home | select PIN / token+name / manual mode |
-| `S` / `C` | home | open the server / client screen |
-| `Ctrl+Enter` | server / client form | start sharing / connect |
+| `S` / `C` | home | start a connection / join a connection |
+| `Ctrl+Enter` | start / join form | start the connection / connect |
 | `Esc` | any screen (no field focused) | back to home, stopping the session |
-| `Ctrl+I` / `Ctrl+T` | manual server screen | copy the node id / the one-time token |
+| `Ctrl+I` / `Ctrl+T` | manual start screen | copy the node id / the one-time token |
 | `Ctrl+S` | connected | send the current clipboard |
 | `Ctrl+P` | connected | peek/hide the newest inbox item |
 | `Ctrl+Y` | connected | copy the newest inbox item to the clipboard |
@@ -83,24 +83,24 @@ Optional, only for the token+name mode: `~/.config/duocb/config.toml` (written b
 
 ```toml
 auth_token = "d…"       # shared 47-char token
-my_name = "desktop"     # this device's name (server side)
-peer_name = "laptop"    # the other device's name (client side)
+my_name = "desktop"     # this device's name (set on the starting device)
+peer_name = "laptop"    # the other device's name (set on the joining device)
 ```
 
 Clipboard content and the inbox are never persisted anywhere.
 
 ## Security model
 
-- The transport is iroh QUIC (TLS 1.3); the server's node id **is** its public key, so the client always talks to the endpoint it typed/resolved, end to end.
-- Signaling records on public nostr relays contain only the server's **ephemeral node id**, NIP-44-encrypted under keys derived from the shared secret (token or PIN+time-bucket via Argon2id). Relay operators see ciphertext under rotating keys.
-- The node id is not a credential: every connection must pass in-band auth (token match or mutual PIN proof) before the clipboard channel opens, and the first authenticated peer claims the server for the whole session.
+- The transport is iroh QUIC (TLS 1.3); the starting device's node id **is** its public key, so the joining device always talks to the endpoint it typed/resolved, end to end.
+- Signaling records on public nostr relays contain only the starting device's **ephemeral node id**, NIP-44-encrypted under keys derived from the shared secret (token or PIN+time-bucket via Argon2id). Relay operators see ciphertext under rotating keys.
+- The node id is not a credential: every connection must pass in-band auth (token match or mutual PIN proof) before the clipboard channel opens, and the first authenticated peer claims the connection for the whole session.
 - Clipboard payloads are capped at 1 MiB per item, text only.
 
 ## Limitations
 
-- **Two devices, one pairing per server session.** By design.
+- **Two devices, one pairing per connection.** By design.
 - **Text only** (UTF-8). No images or files.
-- A **crashed** peer (vs. a clean disconnect) is detected at the QUIC idle timeout (~30 s), after which the server accepts its reconnect and the client starts retrying; clean disconnects are instant.
+- A **crashed** peer (vs. a clean disconnect) is detected at the QUIC idle timeout (~30 s), after which the starting device accepts its reconnect and the joining device starts retrying; clean disconnects are instant.
 - Very large X11 clipboards transferred via INCR (multi-megabyte) may fail to read; you get an error banner and the connection is unaffected.
 - On X11 without a clipboard manager, text copied *from* duocb disappears when duocb exits (standard X11 selection semantics).
 
