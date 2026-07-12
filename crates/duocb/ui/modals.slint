@@ -18,6 +18,8 @@ export component ClearSecretModal inherits Rectangle {
     Rectangle {
         width: min(root.width - 2 * Theme.pad-xl, 420px);
         height: content.preferred-height;
+        x: (root.width - self.width) / 2;
+        y: (root.height - self.height) / 2;
         background: Palette.background;
         border-radius: Theme.radius;
         border-width: 1px;
@@ -45,6 +47,8 @@ export component ConnPathModal inherits Rectangle {
     Rectangle {
         width: min(root.width - 2 * Theme.pad-xl, 460px);
         height: content.preferred-height;
+        x: (root.width - self.width) / 2;
+        y: (root.height - self.height) / 2;
         background: Palette.background;
         border-radius: Theme.radius;
         border-width: 1px;

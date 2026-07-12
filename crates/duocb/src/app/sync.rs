@@ -3,7 +3,7 @@
 //! tick); idempotent, so nothing tracks *what* changed. Secrets are never
 //! pushed in full — only masked hints and fingerprints.
 
-use slint::{ComponentHandle, Color, ModelRc, SharedString, VecModel};
+use slint::{Color, ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use std::time::Instant;
 
 use super::{App, ago, item::ClipItem, item::PEEK_LIMIT, masked_secret_hint, now_unix, short_id};
@@ -117,7 +117,9 @@ impl App {
                 }
             })
             .collect();
-        s.set_peers(ModelRc::new(VecModel::from(rows)));
+        if let Some(model) = diffed_model(&s.get_peers(), rows) {
+            s.set_peers(model);
+        }
         s.set_peers_updated(
             self.peers_refreshed_at
                 .map(|at| format!("updated {}", ago(at.elapsed().as_secs())))
@@ -198,7 +200,9 @@ impl App {
         s.set_outbox(self.outbox.as_ref().map(clip_row).unwrap_or_default());
         let inbox: Vec<ClipRow> = self.inbox.iter().map(clip_row).collect();
         s.set_inbox_title(format!("Inbox ({})", inbox.len()).into());
-        s.set_inbox(ModelRc::new(VecModel::from(inbox)));
+        if let Some(model) = diffed_model(&s.get_inbox(), inbox) {
+            s.set_inbox(model);
+        }
 
         // Modals.
         s.set_show_clear_secret(self.confirm_clear_secret);
@@ -218,7 +222,9 @@ impl App {
                 display: p.display.clone().into(),
             })
             .collect();
-        s.set_conn_paths(ModelRc::new(VecModel::from(paths)));
+        if let Some(model) = diffed_model(&s.get_conn_paths(), paths) {
+            s.set_conn_paths(model);
+        }
 
         // Field texts: the Rust mirrors are authoritative (updated on every
         // edit), so writing them back is a no-op while typing and applies
@@ -234,6 +240,31 @@ impl App {
 
 fn str_or_empty(value: &Option<String>) -> SharedString {
     value.clone().unwrap_or_default().into()
+}
+
+/// Update a list property in place: rows are diffed against the existing
+/// `VecModel` so unchanged rows don't re-instantiate their elements (the
+/// heartbeat re-syncs twice a second — wholesale model replacement would
+/// reset hover/press state and flicker). Returns a fresh model only on the
+/// first sync, when the property still holds the compiler default.
+fn diffed_model<T: Clone + PartialEq + 'static>(
+    current: &ModelRc<T>,
+    rows: Vec<T>,
+) -> Option<ModelRc<T>> {
+    let Some(vec) = current.as_any().downcast_ref::<VecModel<T>>() else {
+        return Some(ModelRc::new(VecModel::from(rows)));
+    };
+    while vec.row_count() > rows.len() {
+        vec.remove(rows.len());
+    }
+    for (i, row) in rows.into_iter().enumerate() {
+        if i >= vec.row_count() {
+            vec.push(row);
+        } else if vec.row_data(i).as_ref() != Some(&row) {
+            vec.set_row_data(i, row);
+        }
+    }
+    None
 }
 
 /// Project one inbox/outbox item. The content is only shipped while expanded
