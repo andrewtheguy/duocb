@@ -238,28 +238,34 @@ pub fn show_server(app: &mut DuocbApp, ui: &mut Ui) {
         // form is token-only.
         if app.mode == PairMode::NostrToken {
             ui.label("Shared auth token (same on both devices):");
+            ui.add(
+                TextEdit::singleline(&mut app.in_token)
+                    .font(egui::TextStyle::Monospace)
+                    .password(true)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("…"),
+            );
+            ui.label(
+                RichText::new("Paste an existing token, or generate a new one.")
+                    .weak()
+                    .small(),
+            );
+            token_entry_feedback(ui, &app.in_token);
             let token = app.in_token.trim().to_string();
             let token_valid = duocb_core::auth::validate_token(&token).is_ok();
-            if token_valid {
-                token_copy_action(app, ui, &token);
-                ui.horizontal(|ui| {
-                    ui.label("Token fingerprint:");
-                    ui.monospace(duocb_core::auth::token_fingerprint(&token));
-                });
-            } else if !token.is_empty() {
-                ui.colored_label(
-                    ui.visuals().warn_fg_color,
-                    "The saved token is invalid; generate a new one",
-                );
-            }
-            let generate_label = if token_valid {
-                "Generate new token"
-            } else {
-                "Generate token"
-            };
-            if ui.button(generate_label).clicked() {
-                app.in_token = duocb_core::auth::generate_token();
-            }
+            ui.horizontal(|ui| {
+                let generate_label = if token_valid {
+                    "Generate new token"
+                } else {
+                    "Generate token"
+                };
+                if ui.button(generate_label).clicked() {
+                    app.in_token = duocb_core::auth::generate_token();
+                }
+                if token_valid && ui.button("Copy token (Ctrl/⌘+T)").clicked() {
+                    app.copy_to_clipboard(&token);
+                }
+            });
             ui.label("This device's unique name:");
             ui.add(TextEdit::singleline(&mut app.in_my_name).hint_text("e.g. desktop"));
             ui.label(
