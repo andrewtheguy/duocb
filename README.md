@@ -51,7 +51,7 @@ From source:
 cargo build --release        # binary at target/release/duocb
 ```
 
-On Linux CI/minimal systems, eframe needs: `libxkbcommon-dev libwayland-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev`.
+On Linux CI/minimal systems, the Slint UI needs: `libxkbcommon-dev libwayland-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libfontconfig1-dev` plus OpenGL (mesa).
 
 ## Usage
 
@@ -148,3 +148,5 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design: threading 
 ## Acknowledgements
 
 duocb's transport, signaling, and authentication stack is ported from [duopipe](../duopipe), which tunnels SOCKS5 over the same iroh + nostr foundation.
+
+The desktop UI is made with [Slint](https://slint.dev), used under the Slint Royalty-Free License.

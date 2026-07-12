@@ -10,8 +10,8 @@ pub mod endpoint;
 pub mod runtime;
 
 /// Callback invoked after every event so the host UI can wake its render loop
-/// (egui repaint on desktop; unused on iOS, where Swift polls on a timer, and
-/// in headless tests).
+/// (wakes the Slint event loop's event drain on desktop; unused on iOS, where
+/// Swift polls on a timer, and in headless tests).
 pub type WakeFn = std::sync::Arc<dyn Fn() + Send + Sync>;
 
 /// The standing configure-mode identity: the shared secret plus this device's
