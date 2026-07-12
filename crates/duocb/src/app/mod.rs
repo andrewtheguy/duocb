@@ -1,31 +1,34 @@
-//! The eframe application: drains runtime events, routes screens, and holds
-//! all UI state (including the in-memory inbox — clipboard content never
-//! touches disk).
+//! The application state and logic: drains runtime events, routes screens,
+//! and holds all UI state (including the in-memory inbox — clipboard content
+//! never touches disk). Rendering lives in the `ui/*.slint` files; this state
+//! is projected into them by [`sync`](App::sync) and mutated by the `Actions`
+//! callbacks (`callbacks.rs`) and global shortcuts (`keys.rs`).
+
+pub(crate) mod callbacks;
+pub(crate) mod item;
+pub(crate) mod keys;
+mod sync;
 
 use std::time::{Duration, Instant};
 
-use eframe::egui;
-
 use crate::clipboard::SystemClipboard;
+use crate::{ConfigureStep, PairMode, Screen};
 use duocb_core::net::endpoint::ConnPath;
-use duocb_core::net::{
-    ConnStatus, NetEvent, NetHandle, TokenIdentity, UiCommand, spawn_net_runtime,
-};
+use duocb_core::net::{ConnStatus, NetEvent, NetHandle, TokenIdentity, UiCommand};
 use duocb_core::nostr::PeerInfo;
-use crate::ui::{ClipItem, ConfigureStep, PairMode, Screen, screens, session};
+use item::ClipItem;
 
-/// How long the "sent ✓" flash stays visible.
+/// How long the "sent ✓" / "✔ Copied" flashes stay visible.
 const SENT_FLASH: Duration = Duration::from_secs(2);
 
 /// Retention cap for the in-memory inbox: newest-first, only the last few
 /// received items are kept and older ones are dropped.
 const MAX_INBOX_ITEMS: usize = 5;
 
-/// How often the configure hub auto-refreshes the peer device list while
-/// visible.
+/// How often the device picker auto-refreshes the peer list while visible.
 const PEER_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
-pub struct DuocbApp {
+pub(crate) struct App {
     pub(crate) config_lock: crate::config::ConfigLock,
     pub(crate) net: NetHandle,
     pub(crate) clipboard: SystemClipboard,
@@ -75,7 +78,9 @@ pub struct DuocbApp {
     // Client-side session flag (a dial session exists, connected or retrying).
     pub(crate) client_active: bool,
 
-    // Form inputs.
+    // Form inputs (mirrors of the UI's two-way field properties, updated on
+    // every edit; authoritative — sync writes them back, which is how resets
+    // reach the fields).
     pub(crate) in_my_name: String,
     pub(crate) in_import_token: String,
     pub(crate) in_pin: String,
@@ -102,12 +107,8 @@ pub struct DuocbApp {
     pub(crate) copied_flash: Option<Instant>,
 }
 
-impl DuocbApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, mut config_lock: crate::config::ConfigLock) -> Self {
-        let net = spawn_net_runtime(Some(std::sync::Arc::new({
-            let ctx = cc.egui_ctx.clone();
-            move || ctx.request_repaint()
-        })));
+impl App {
+    pub(crate) fn new(mut config_lock: crate::config::ConfigLock, net: NetHandle) -> Self {
         let mut config = config_lock.load();
 
         // The permanent device suffix is minted on the first launch with this
@@ -191,7 +192,21 @@ impl DuocbApp {
         app
     }
 
-    fn apply_event(&mut self, event: NetEvent) {
+    /// Drain every event the runtime has queued. Returns whether any arrived
+    /// (i.e. whether the UI projection needs a refresh).
+    pub(crate) fn drain_events(&mut self) -> bool {
+        let events: Vec<NetEvent> = {
+            let rx = &self.net.events;
+            std::iter::from_fn(|| rx.try_recv().ok()).collect()
+        };
+        let any = !events.is_empty();
+        for event in events {
+            self.apply_event(event);
+        }
+        any
+    }
+
+    pub(crate) fn apply_event(&mut self, event: NetEvent) {
         match event {
             NetEvent::ServerReady {
                 node_id,
@@ -304,6 +319,29 @@ impl DuocbApp {
         }
     }
 
+    /// Periodic work, driven by the UI's heartbeat timer: peek auto-hide and
+    /// the device picker's list refresh. Flash/countdown expiry needs no state
+    /// change — `sync` derives those from timestamps.
+    pub(crate) fn tick(&mut self) {
+        for item in self.inbox.iter_mut().chain(self.outbox.iter_mut()) {
+            item.tick_peek();
+        }
+        // While the device picker is visible, keep the peer list fresh (the
+        // runtime ignores a refresh while one is already in flight). The hub
+        // itself shows no list, so nothing is polled there.
+        if self.screen == Screen::Home
+            && self.mode == PairMode::NostrToken
+            && self.configure_step == ConfigureStep::Join
+        {
+            let due = self
+                .peers_requested_at
+                .is_none_or(|at| at.elapsed() >= PEER_REFRESH_INTERVAL);
+            if due {
+                self.refresh_peers();
+            }
+        }
+    }
+
     /// Read the system clipboard and push it to the peer.
     pub(crate) fn send_clipboard(&mut self) {
         match self.clipboard.read_text() {
@@ -321,7 +359,7 @@ impl DuocbApp {
     }
 
     /// Send arbitrary text (the compose field, or a just-read clipboard) to
-    /// the peer. One in-flight send at a time, like the desktop outbox slot.
+    /// the peer. One in-flight send at a time, like the outbox slot.
     pub(crate) fn send_text(&mut self, text: String) {
         if text.is_empty() || self.pending_outbox.is_some() {
             return;
@@ -329,6 +367,16 @@ impl DuocbApp {
         // Stash it; it becomes the outbox item once ItemSent confirms.
         self.pending_outbox = Some(text.clone());
         self.net.send(UiCommand::SendClipboard { text });
+    }
+
+    /// Send the compose field's draft and clear it (one in-flight send; the
+    /// draft is kept if a previous send is still unconfirmed).
+    pub(crate) fn compose_send(&mut self) {
+        if self.in_compose.is_empty() || self.pending_outbox.is_some() {
+            return;
+        }
+        let text = std::mem::take(&mut self.in_compose);
+        self.send_text(text);
     }
 
     /// Copy arbitrary text (an inbox item, the node id, the token) to the
@@ -374,7 +422,7 @@ impl DuocbApp {
             token: self.secret.clone()?,
             name: self.saved_name.clone()?,
             suffix: self.device_suffix.clone(),
-            relays: crate::ui::screens::default_relays(),
+            relays: default_relays(),
         })
     }
 
@@ -428,6 +476,31 @@ impl DuocbApp {
         self.configure_step = ConfigureStep::SetupGenerate;
     }
 
+    /// Commit the generated secret from its one-time reveal.
+    pub(crate) fn commit_generated_secret(&mut self) {
+        if let Some(token) = self.wizard_token.take() {
+            self.set_secret(token);
+        } else {
+            self.configure_step = ConfigureStep::SetupChoice;
+        }
+    }
+
+    /// Commit the pasted secret from the import step, if it validates.
+    pub(crate) fn use_imported_secret(&mut self) {
+        let token = self.in_import_token.trim().to_string();
+        if duocb_core::auth::validate_token(&token).is_ok() {
+            self.in_import_token.clear();
+            self.set_secret(token);
+        }
+    }
+
+    /// Cancel the generate/import step back to the choice.
+    pub(crate) fn cancel_setup(&mut self) {
+        self.wizard_token = None;
+        self.in_import_token.clear();
+        self.configure_step = ConfigureStep::SetupChoice;
+    }
+
     /// Commit a generated or imported secret and move on to naming the device.
     pub(crate) fn set_secret(&mut self, token: String) {
         self.secret = Some(token);
@@ -453,6 +526,14 @@ impl DuocbApp {
             self.configure_step = ConfigureStep::Ready;
             self.sync_presence();
             self.refresh_peers();
+        }
+    }
+
+    /// Leave the name step without saving (only when an identity exists).
+    pub(crate) fn cancel_name(&mut self) {
+        if self.has_saved_identity() {
+            self.reset_name_field();
+            self.configure_step = ConfigureStep::Ready;
         }
     }
 
@@ -498,7 +579,16 @@ impl DuocbApp {
         }
     }
 
-    /// Join the selected hosting peer from the device picker.
+    /// Toggle the picker selection for a peer row (by stable suffix).
+    pub(crate) fn toggle_peer(&mut self, suffix: &str) {
+        self.selected_peer = if self.selected_peer.as_deref() == Some(suffix) {
+            None
+        } else {
+            Some(suffix.to_string())
+        };
+    }
+
+    /// Join the selected peer from the device picker.
     pub(crate) fn join_selected_peer(&mut self) {
         if self.client_dial_spec().is_some() {
             self.screen = Screen::Client;
@@ -506,7 +596,7 @@ impl DuocbApp {
         }
     }
 
-    /// Move the hub's peer selection up/down (keyboard navigation).
+    /// Move the picker's peer selection up/down (keyboard navigation).
     pub(crate) fn move_peer_selection(&mut self, delta: i32) {
         if self.peers.is_empty() {
             return;
@@ -549,7 +639,7 @@ impl DuocbApp {
         }
     }
 
-    /// Stop whatever session is running (used by the back buttons).
+    /// Stop whatever session is running (used by the back actions).
     pub(crate) fn stop_session(&mut self) {
         if self.server_running {
             self.net.send(UiCommand::StopServer);
@@ -597,7 +687,7 @@ impl DuocbApp {
                 .token_identity()
                 .map(|identity| ServerMode::NostrToken { identity }),
             PairMode::NostrPin => Some(ServerMode::NostrPin {
-                relays: crate::ui::screens::default_relays(),
+                relays: default_relays(),
             }),
             PairMode::Manual => Some(ServerMode::Manual),
         }
@@ -615,7 +705,7 @@ impl DuocbApp {
             PairMode::NostrPin => {
                 duocb_core::pin::normalize_pin(&self.in_pin).map(|canonical_pin| DialSpec::Pin {
                     canonical_pin,
-                    relays: crate::ui::screens::default_relays(),
+                    relays: default_relays(),
                 })
             }
             PairMode::Manual => {
@@ -631,8 +721,8 @@ impl DuocbApp {
         }
     }
 
-    /// Go to the start screen and launch. Every mode starts immediately now:
-    /// the configure mode's identity lives on the home hub, and the quick modes
+    /// Go to the start screen and launch. Every mode starts immediately: the
+    /// configure mode's identity lives on the home hub, and the quick modes
     /// never had a pre-start form.
     pub(crate) fn begin_server(&mut self) {
         if self.server_mode_spec().is_none() {
@@ -660,311 +750,217 @@ impl DuocbApp {
             self.net.send(UiCommand::Connect { spec });
         }
     }
+}
 
-    /// Global keyboard shortcuts. Plain letter keys are only bound on the home
-    /// screen (which has no text fields); everywhere else shortcuts require
-    /// the platform command modifier (Ctrl on Windows/Linux, Command on macOS)
-    /// so typing into fields is never hijacked. Escape is ignored while a text
-    /// field has focus (egui uses it to release focus).
-    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        use egui::{Key, Modifiers};
+pub(crate) fn default_relays() -> Vec<String> {
+    duocb_core::nostr::DEFAULT_NOSTR_RELAYS
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
 
-        let focus_free = ctx.memory(|m| m.focused().is_none());
-        if focus_free
-            && self.screen != Screen::Home
-            && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
-        {
-            self.go_back();
-            return;
-        }
-
-        match self.screen {
-            Screen::Home => {
-                // Plain letters only while no text field has focus — the
-                // configure wizard and hub put editable fields on this screen.
-                if focus_free {
-                    if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Q)) {
-                        self.open_quick();
-                    }
-                    self.handle_configure_shortcuts(ctx);
-                }
-            }
-            Screen::Quick => {
-                if focus_free {
-                    if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::P)) {
-                        self.mode = PairMode::NostrPin;
-                    }
-                    if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::M)) {
-                        self.mode = PairMode::Manual;
-                    }
-                    if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::S)) {
-                        self.begin_server();
-                    }
-                    if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::C)) {
-                        self.screen = Screen::Client;
-                    }
-                }
-            }
-            Screen::Server => {
-                // Copy displayed initiator credentials without the mouse.
-                if let Some(node_id) = self.node_id.clone()
-                    && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::I))
-                {
-                    self.copy_to_clipboard(&node_id);
-                }
-                if let Some(token) = self.manual_token.clone()
-                    && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::T))
-                {
-                    self.copy_to_clipboard(&token);
-                }
-            }
-            Screen::Client => {
-                if !self.client_active
-                    && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Enter))
-                {
-                    self.connect_client();
-                }
-            }
-        }
-
-        self.handle_session_shortcuts(ctx, focus_free);
-    }
-
-    /// Configure-mode home shortcuts, per wizard/hub step. Only called with no
-    /// text field focused.
-    fn handle_configure_shortcuts(&mut self, ctx: &egui::Context) {
-        use egui::{Key, Modifiers};
-        match self.configure_step {
-            ConfigureStep::SetupChoice => {
-                if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::G)) {
-                    self.begin_generate_secret();
-                }
-                if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::I)) {
-                    self.configure_step = ConfigureStep::SetupImport;
-                }
-            }
-            ConfigureStep::SetupGenerate | ConfigureStep::SetupImport => {
-                if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
-                    self.wizard_token = None;
-                    self.in_import_token.clear();
-                    self.configure_step = ConfigureStep::SetupChoice;
-                }
-            }
-            ConfigureStep::SetupName => {
-                if self.has_saved_identity()
-                    && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
-                {
-                    self.reset_name_field();
-                    self.configure_step = ConfigureStep::Ready;
-                }
-            }
-            ConfigureStep::Ready => {
-                if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::S)) {
-                    self.begin_server();
-                }
-                if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::C)) {
-                    self.enter_join_picker();
-                }
-                if let Some(secret) = self.secret.clone()
-                    && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::T))
-                {
-                    self.copy_secret_to_clipboard(&secret);
-                }
-            }
-            ConfigureStep::Join => {
-                if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::C))
-                    || ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter))
-                {
-                    self.join_selected_peer();
-                }
-                if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::R)) {
-                    self.refresh_peers();
-                }
-                if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowDown)) {
-                    self.move_peer_selection(1);
-                }
-                if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowUp)) {
-                    self.move_peer_selection(-1);
-                }
-                if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
-                    self.configure_step = ConfigureStep::Ready;
-                }
-            }
-        }
-    }
-
-    /// Shortcuts for a live paired session (any screen).
-    fn handle_session_shortcuts(&mut self, ctx: &egui::Context, focus_free: bool) {
-        use egui::{Key, Modifiers};
-        // Session shortcuts are also gated on no text field having focus, so
-        // TextEdit editing shortcuts (e.g. Ctrl/Command+Y redo) and destructive actions
-        // like clearing the inbox can't fire while typing or selecting text.
-        if self.status == ConnStatus::Connected && focus_free {
-            if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::S)) {
-                self.send_clipboard();
-            }
-            if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::P))
-                && let Some(item) = self.inbox.first_mut()
-            {
-                item.toggle_peek();
-            }
-            // Ctrl/Command+Y ("yank"): the platform Copy shortcuts are intercepted
-            // by egui's winit layer and never reach key handling.
-            if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Y))
-                && let Some(text) = self.inbox.first().map(|i| i.text.clone())
-            {
-                self.copy_to_clipboard(&text);
-            }
-            if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::L)) {
-                self.inbox.clear();
-            }
-        }
-    }
-
-    /// The on-demand connection-path modal: a point-in-time snapshot of how the
-    /// session is currently routed (direct vs. relay, with RTT). Dismissed by
-    /// the Close button or a click on the backdrop.
-    fn conn_path_modal(&mut self, ctx: &egui::Context) {
-        let Some(paths) = self.conn_path.clone() else {
-            return;
-        };
-        let mut close = false;
-        let response = egui::Modal::new(egui::Id::new("conn_path_modal")).show(ctx, |ui| {
-            ui.set_max_width(460.0);
-            ui.heading("Connection path");
-            ui.add_space(4.0);
-            if paths.is_empty() {
-                ui.label("No active connection.");
-            } else {
-                for path in &paths {
-                    let color = match path.kind {
-                        duocb_core::net::endpoint::ConnPathKind::Direct => {
-                            egui::Color32::from_rgb(0x2e, 0xa0, 0x43)
-                        }
-                        duocb_core::net::endpoint::ConnPathKind::Relay => {
-                            egui::Color32::from_rgb(0xd2, 0x92, 0x22)
-                        }
-                        duocb_core::net::endpoint::ConnPathKind::Other => ui.visuals().weak_text_color(),
-                    };
-                    ui.horizontal(|ui| {
-                        let marker = if path.selected { "●" } else { "○" };
-                        ui.colored_label(color, marker);
-                        ui.label(egui::RichText::new(&path.display).monospace());
-                    });
-                }
-                ui.add_space(4.0);
-                ui.label(
-                    egui::RichText::new("● selected route · ○ other known path")
-                        .weak()
-                        .small(),
-                );
-            }
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui.button("Close").clicked() {
-                    close = true;
-                }
-                if ui.button("Refresh").clicked() {
-                    self.query_conn_path();
-                }
-            });
-        });
-        if close || response.backdrop_response.clicked() {
-            self.conn_path = None;
-        }
-    }
-
-    fn error_banner(&mut self, ui: &mut egui::Ui) {
-        let Some(error) = self.error.clone() else {
-            return;
-        };
-        let mut dismissed = false;
-        egui::Frame::group(ui.style())
-            .fill(ui.visuals().error_fg_color.gamma_multiply(0.15))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.colored_label(ui.visuals().error_fg_color, &error);
-                    if ui.small_button("✕").clicked() {
-                        dismissed = true;
-                    }
-                });
-            });
-        if dismissed {
-            self.error = None;
-        }
-        ui.add_space(6.0);
+/// Shorten a node id for display.
+pub(crate) fn short_id(id: &str) -> String {
+    if id.len() <= 16 {
+        id.to_string()
+    } else {
+        format!("{}…{}", &id[..8], &id[id.len() - 8..])
     }
 }
 
-impl eframe::App for DuocbApp {
-    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Drain runtime events first so the frame renders the latest state.
-        let events: Vec<NetEvent> = {
-            let rx = &self.net.events;
-            std::iter::from_fn(|| rx.try_recv().ok()).collect()
-        };
-        for event in events {
-            self.apply_event(event);
-        }
+/// Mask a secret for display: asterisks plus its last four characters — never
+/// the whole value, but enough of a hint to spot-check that a paste into a
+/// place without fingerprint support (a password manager, a note) took the
+/// right one.
+pub(crate) fn masked_secret_hint(secret: &str) -> String {
+    let tail_start = secret
+        .char_indices()
+        .rev()
+        .nth(3)
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    format!("********{}", &secret[tail_start..])
+}
 
-        self.handle_shortcuts(ctx);
+/// Seconds since the Unix epoch (for peer last-seen ages).
+pub(crate) fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
-        // While the device picker is visible, keep the peer list fresh (the
-        // runtime ignores a refresh while one is already in flight) and its
-        // last-seen labels ticking. The hub itself shows no list, so nothing
-        // is polled there.
-        if self.screen == Screen::Home
-            && self.mode == PairMode::NostrToken
-            && self.configure_step == ConfigureStep::Join
-        {
-            let due = self
-                .peers_requested_at
-                .is_none_or(|at| at.elapsed() >= PEER_REFRESH_INTERVAL);
-            if due {
-                self.refresh_peers();
-            }
-            ctx.request_repaint_after(Duration::from_secs(1));
-        }
-
-        // Auto-hide peeked items after PEEK_TIMEOUT (see ClipItem::tick_peek).
-        let mut any_peeked = false;
-        for item in self.inbox.iter_mut().chain(self.outbox.iter_mut()) {
-            any_peeked |= item.tick_peek();
-        }
-
-        // Keep the PIN countdown, "sent" flash, and peek auto-hide ticking
-        // without user input.
-        if self.pin_display.is_some()
-            || self.sent_flash_active()
-            || self.copied_flash_active()
-            || any_peeked
-        {
-            ctx.request_repaint_after(Duration::from_millis(500));
-        }
-    }
-
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        egui::Frame::central_panel(ui.style()).show(ui, |ui| {
-            self.error_banner(ui);
-            match self.screen {
-                Screen::Home => screens::show_home(self, ui),
-                Screen::Quick => screens::show_quick(self, ui),
-                Screen::Server => screens::show_server(self, ui),
-                Screen::Client => screens::show_client(self, ui),
-            }
-        });
-        self.conn_path_modal(ui.ctx());
-    }
-
-    fn on_exit(&mut self) {
-        self.net.shutdown();
+/// Humanize an age in seconds: "just now", "3m ago", "2h ago", "5d ago".
+pub(crate) fn ago(secs: u64) -> String {
+    if secs < 60 {
+        "just now".to_string()
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86_400)
     }
 }
 
-/// Render the shared "paired" session panel (send button + outbox + inbox),
-/// used by both connection roles, when connected.
-pub(crate) fn session_panel_if_connected(app: &mut DuocbApp, ui: &mut egui::Ui) {
-    if app.status == ConnStatus::Connected {
-        session::show_session(app, ui);
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use duocb_core::net::spawn_net_runtime;
+
+    /// A throwaway App on a fresh temp config with a headless runtime.
+    pub(crate) fn test_app() -> App {
+        let dir = std::env::temp_dir().join(format!(
+            "duocb-app-test-{}-{}",
+            std::process::id(),
+            rand_suffix()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = crate::config::acquire_lock(&dir.join("config.json")).unwrap();
+        App::new(lock, spawn_net_runtime(None))
+    }
+
+    fn rand_suffix() -> String {
+        duocb_core::identity::generate_suffix()
+    }
+
+    pub(crate) fn peer(name: &str, suffix: &str, hosting: bool) -> PeerInfo {
+        PeerInfo {
+            name: name.to_string(),
+            suffix: suffix.to_string(),
+            node_id: hosting.then(|| "node".to_string()),
+            last_seen_unix: now_unix(),
+        }
+    }
+
+    #[test]
+    fn status_idle_resets_session_state_but_keeps_inbox() {
+        let mut app = test_app();
+        app.server_running = true;
+        app.node_id = Some("n".into());
+        app.pending_outbox = Some("draft".into());
+        app.inbox.push(ClipItem::new("kept".into(), jiff::Zoned::now()));
+
+        app.apply_event(NetEvent::Status(ConnStatus::Idle));
+
+        assert!(!app.server_running);
+        assert!(app.node_id.is_none());
+        assert!(app.pending_outbox.is_none());
+        assert_eq!(app.inbox.len(), 1);
+    }
+
+    #[test]
+    fn pulled_item_dedupes_and_inbox_is_capped() {
+        let mut app = test_app();
+        app.apply_event(NetEvent::ItemReceived {
+            text: "dup".into(),
+            pulled: false,
+        });
+        app.apply_event(NetEvent::ItemReceived {
+            text: "dup".into(),
+            pulled: true,
+        });
+        assert_eq!(app.inbox.len(), 1);
+
+        for i in 0..10 {
+            app.apply_event(NetEvent::ItemReceived {
+                text: format!("item {i}"),
+                pulled: false,
+            });
+        }
+        assert_eq!(app.inbox.len(), MAX_INBOX_ITEMS);
+        assert_eq!(app.inbox[0].text, "item 9");
+    }
+
+    #[test]
+    fn item_sent_promotes_pending_and_error_drops_it() {
+        let mut app = test_app();
+        app.pending_outbox = Some("sent text".into());
+        app.apply_event(NetEvent::ItemSent);
+        assert_eq!(app.outbox.as_ref().unwrap().text, "sent text");
+        assert!(app.pending_outbox.is_none());
+
+        app.pending_outbox = Some("rejected".into());
+        app.apply_event(NetEvent::Error("too big".into()));
+        assert!(app.pending_outbox.is_none());
+        assert_eq!(app.outbox.as_ref().unwrap().text, "sent text");
+        assert_eq!(app.error.as_deref(), Some("too big"));
+    }
+
+    #[test]
+    fn peer_list_drops_vanished_selection() {
+        let mut app = test_app();
+        app.selected_peer = Some("gone".into());
+        app.apply_event(NetEvent::PeerList {
+            peers: vec![peer("mac", "here", false)],
+        });
+        assert!(app.selected_peer.is_none());
+
+        app.selected_peer = Some("here".into());
+        app.apply_event(NetEvent::PeerList {
+            peers: vec![peer("mac", "here", true)],
+        });
+        assert_eq!(app.selected_peer.as_deref(), Some("here"));
+    }
+
+    #[test]
+    fn go_back_routes_by_mode_and_stops_picker() {
+        let mut app = test_app();
+        app.screen = Screen::Server;
+        app.mode = PairMode::NostrPin;
+        app.go_back();
+        assert_eq!(app.screen, Screen::Quick);
+        assert_eq!(app.mode, PairMode::NostrPin);
+
+        app.screen = Screen::Client;
+        app.mode = PairMode::NostrToken;
+        app.configure_step = ConfigureStep::Join;
+        app.go_back();
+        assert_eq!(app.screen, Screen::Home);
+        assert_eq!(app.configure_step, ConfigureStep::Ready);
+
+        app.screen = Screen::Quick;
+        app.mode = PairMode::Manual;
+        app.go_back();
+        assert_eq!(app.screen, Screen::Home);
+        assert_eq!(app.mode, PairMode::NostrToken);
+    }
+
+    #[test]
+    fn move_peer_selection_wraps() {
+        let mut app = test_app();
+        app.peers = vec![peer("a", "s1", false), peer("b", "s2", false)];
+
+        app.move_peer_selection(1);
+        assert_eq!(app.selected_peer.as_deref(), Some("s1"));
+        app.move_peer_selection(1);
+        assert_eq!(app.selected_peer.as_deref(), Some("s2"));
+        app.move_peer_selection(1);
+        assert_eq!(app.selected_peer.as_deref(), Some("s1"));
+        app.move_peer_selection(-1);
+        assert_eq!(app.selected_peer.as_deref(), Some("s2"));
+    }
+
+    #[test]
+    fn toggle_peer_selects_and_deselects() {
+        let mut app = test_app();
+        app.toggle_peer("s1");
+        assert_eq!(app.selected_peer.as_deref(), Some("s1"));
+        app.toggle_peer("s1");
+        assert!(app.selected_peer.is_none());
+    }
+
+    #[test]
+    fn masked_secret_hint_shows_last_four() {
+        assert_eq!(masked_secret_hint("abcdefgh"), "********efgh");
+        assert_eq!(masked_secret_hint("abc"), "********abc");
+    }
+
+    #[test]
+    fn ago_humanizes() {
+        assert_eq!(ago(5), "just now");
+        assert_eq!(ago(180), "3m ago");
+        assert_eq!(ago(7200), "2h ago");
+        assert_eq!(ago(200_000), "2d ago");
     }
 }

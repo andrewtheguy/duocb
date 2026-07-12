@@ -1,0 +1,282 @@
+// The home screen: the configure mode's setup wizard, the configured hub, and
+// the device picker behind the Join action. All six steps are always
+// instantiated (visibility-toggled) so the two steps with text fields can
+// expose their focus state; the container height follows the visible step.
+
+import { UiState, Actions } from "globals.slint";
+import { ConfigureStep } from "types.slint";
+import { Theme } from "theme.slint";
+import { Card, CardTitle, Body, Weak, Small, Mono, BigButton, WideButton, LabeledValue, SelectableRow } from "widgets.slint";
+import { Button, LineEdit } from "std-widgets.slint";
+
+component ChoiceStep inherits VerticalLayout {
+    alignment: start;
+    spacing: Theme.pad-m;
+    Card {
+        CardTitle { text: "Set up the shared secret"; }
+        Weak {
+            text: "All of your devices share one secret. Create it on the first device, then import the same secret on every other one.";
+        }
+        Rectangle { height: Theme.pad-s; }
+        BigButton {
+            text: "🔑 Create a new secret";
+            hint: "G";
+            clicked => { Actions.begin-generate(); }
+        }
+        WideButton {
+            text: "📥 Use an existing secret";
+            hint: "I";
+            clicked => { Actions.open-import(); }
+        }
+    }
+}
+
+component GenerateStep inherits VerticalLayout {
+    alignment: start;
+    spacing: Theme.pad-m;
+    Card {
+        CardTitle { text: "Your new secret"; }
+        Weak {
+            text: "Copy it somewhere safe now — you will paste it into your other device. The last four characters are shown so you can spot-check a paste where no fingerprint is available.";
+        }
+        Rectangle { height: Theme.pad-xs; }
+        LabeledValue { label: "Secret:"; value: UiState.wizard-secret-hint; }
+        LabeledValue { label: "Fingerprint:"; value: UiState.wizard-fingerprint; }
+        Rectangle { height: Theme.pad-xs; }
+        HorizontalLayout {
+            spacing: Theme.pad-s;
+            alignment: start;
+            Button {
+                text: UiState.copied-flash ? "✔ Copied" : "Copy secret";
+                clicked => { Actions.copy-secret(); }
+            }
+            Button {
+                text: "✔ I saved it — continue";
+                primary: true;
+                clicked => { Actions.commit-generated(); }
+            }
+            Button {
+                text: "Cancel (Esc)";
+                clicked => { Actions.cancel-setup(); }
+            }
+        }
+    }
+}
+
+component ImportStep inherits VerticalLayout {
+    out property <bool> field-focused: entry.has-focus;
+    alignment: start;
+    spacing: Theme.pad-m;
+    Card {
+        CardTitle { text: "Import the shared secret"; }
+        Body { text: "Paste the secret copied from your other device:"; }
+        entry := LineEdit {
+            input-type: InputType.password;
+            placeholder-text: "…";
+            text <=> UiState.in-import-token;
+            edited => { Actions.fields-edited(); }
+            accepted => { Actions.use-imported(); }
+        }
+        if UiState.import-fingerprint != "": VerticalLayout {
+            spacing: Theme.pad-xs;
+            LabeledValue { label: "Token fingerprint:"; value: UiState.import-fingerprint; }
+            Small { text: "Confirm this matches on the other device."; }
+        }
+        if UiState.import-invalid: Text {
+            text: "That is not a valid token";
+            color: Theme.warn;
+            font-size: Theme.font-body;
+        }
+        Rectangle { height: Theme.pad-xs; }
+        HorizontalLayout {
+            spacing: Theme.pad-s;
+            alignment: start;
+            Button {
+                text: "✔ Use this secret";
+                primary: true;
+                enabled: UiState.import-valid;
+                clicked => { Actions.use-imported(); }
+            }
+            Button {
+                text: "Cancel (Esc)";
+                clicked => { Actions.cancel-setup(); }
+            }
+        }
+    }
+}
+
+component NameStep inherits VerticalLayout {
+    out property <bool> field-focused: entry.has-focus;
+    alignment: start;
+    spacing: Theme.pad-m;
+    Card {
+        CardTitle { text: "Name this device"; }
+        Weak { text: UiState.name-rules; }
+        entry := LineEdit {
+            placeholder-text: "e.g. mac-book";
+            text <=> UiState.in-my-name;
+            edited => { Actions.fields-edited(); }
+            accepted => { Actions.save-name(); }
+        }
+        if UiState.name-preview != "": LabeledValue {
+            label: "Broadcast as:";
+            value: UiState.name-preview;
+        }
+        if UiState.name-error != "": Text {
+            text: UiState.name-error;
+            color: Theme.warn;
+            font-size: Theme.font-body;
+        }
+        Rectangle { height: Theme.pad-xs; }
+        HorizontalLayout {
+            spacing: Theme.pad-s;
+            alignment: start;
+            Button {
+                text: "✔ Save name";
+                primary: true;
+                enabled: UiState.name-valid;
+                clicked => { Actions.save-name(); }
+            }
+            if UiState.can-cancel-name: Button {
+                text: "Cancel (Esc)";
+                clicked => { Actions.cancel-name(); }
+            }
+        }
+    }
+}
+
+component HubStep inherits VerticalLayout {
+    alignment: start;
+    spacing: Theme.pad-m;
+    Card {
+        HorizontalLayout {
+            spacing: Theme.pad-s;
+            alignment: start;
+            Text { text: "This device:"; font-size: Theme.font-body; vertical-alignment: center; }
+            Mono { text: UiState.display-identity; font-weight: 700; vertical-alignment: center; }
+            Button { text: "Rename"; clicked => { Actions.rename(); } }
+        }
+        if UiState.has-secret: HorizontalLayout {
+            spacing: Theme.pad-s;
+            alignment: start;
+            Text { text: "Secret:"; font-size: Theme.font-body; vertical-alignment: center; }
+            Mono { text: UiState.secret-hint; vertical-alignment: center; }
+            Button {
+                text: UiState.copied-flash ? "✔ Copied" : "Copy secret";
+                clicked => { Actions.copy-secret(); }
+            }
+            Button { text: "Clear secret…"; clicked => { Actions.request-clear-secret(); } }
+        }
+        if UiState.has-secret: HorizontalLayout {
+            spacing: Theme.pad-s;
+            alignment: start;
+            Text { text: "Fingerprint:"; font-size: Theme.font-body; vertical-alignment: center; }
+            Mono { text: UiState.secret-fingerprint; vertical-alignment: center; }
+            Small { text: "(must match on every device)"; vertical-alignment: center; }
+        }
+        Small { text: "Config: " + UiState.config-path; }
+        if UiState.presence-conflict != "": Text {
+            text: UiState.presence-conflict;
+            color: Theme.warn;
+            font-size: Theme.font-body;
+            wrap: word-wrap;
+        }
+    }
+    BigButton {
+        text: "🚀 Start a connection";
+        hint: "S";
+        clicked => { Actions.begin-server(); }
+    }
+    WideButton {
+        text: "🔗 Join another device";
+        hint: "C";
+        clicked => { Actions.enter-join-picker(); }
+    }
+    Small {
+        text: "Start makes this device host the connection — the other device joins it. Join shows your other devices and connects to the one that started.";
+        horizontal-alignment: center;
+    }
+}
+
+component JoinStep inherits VerticalLayout {
+    alignment: start;
+    spacing: Theme.pad-m;
+    Card {
+        HorizontalLayout {
+            spacing: Theme.pad-s;
+            alignment: start;
+            CardTitle { text: "Your devices"; vertical-alignment: center; }
+            Button { text: "⟳ Refresh (R)"; clicked => { Actions.refresh-peers(); } }
+            Small { text: UiState.peers-updated; vertical-alignment: center; }
+        }
+        Rectangle { height: Theme.pad-xs; }
+        if UiState.peers-empty-text != "": Weak { text: UiState.peers-empty-text; }
+        for row in UiState.peers: SelectableRow {
+            selected: row.selected;
+            clicked => { Actions.toggle-peer(row.suffix); }
+            Mono { text: row.line; vertical-alignment: center; }
+        }
+    }
+    BigButton {
+        text: "🔗 Join the selected device";
+        hint: "C / Enter";
+        enabled: UiState.join-ready;
+        clicked => { Actions.join-selected(); }
+    }
+    Small {
+        text: UiState.join-ready
+            ? "If it isn't hosting yet, press Start there — the join keeps retrying until it is."
+            : "Select the device to join.";
+        horizontal-alignment: center;
+    }
+    HorizontalLayout {
+        alignment: center;
+        Button { text: "Back (Esc)"; clicked => { Actions.leave-join-picker(); } }
+    }
+}
+
+export component HomeScreen inherits Rectangle {
+    /// Whether any text field on this screen has keyboard focus (gates the
+    /// plain-letter shortcuts). Only the visible step's field counts.
+    out property <bool> field-focused:
+        (UiState.configure-step == ConfigureStep.setup-import && import-step.field-focused)
+        || (UiState.configure-step == ConfigureStep.setup-name && name-step.field-focused);
+
+    VerticalLayout {
+        alignment: start;
+        spacing: Theme.pad-s;
+
+        Text { text: "duocb"; font-size: Theme.font-title; font-weight: 800; }
+        Body { text: "Peer-to-peer clipboard sharing between two devices."; }
+        Weak {
+            text: "Both devices can send and receive. One device starts a connection; the other joins it.";
+        }
+        Rectangle { height: Theme.pad-s; }
+
+        steps := Rectangle {
+            // The steps overlap (all instantiated so field focus stays
+            // referencable); size the container to the visible one.
+            height: UiState.configure-step == ConfigureStep.setup-choice ? choice-step.preferred-height
+                : UiState.configure-step == ConfigureStep.setup-generate ? generate-step.preferred-height
+                : UiState.configure-step == ConfigureStep.setup-import ? import-step.preferred-height
+                : UiState.configure-step == ConfigureStep.setup-name ? name-step.preferred-height
+                : UiState.configure-step == ConfigureStep.ready ? hub-step.preferred-height
+                : join-step.preferred-height;
+
+            choice-step := ChoiceStep { visible: UiState.configure-step == ConfigureStep.setup-choice; }
+            generate-step := GenerateStep { visible: UiState.configure-step == ConfigureStep.setup-generate; }
+            import-step := ImportStep { visible: UiState.configure-step == ConfigureStep.setup-import; }
+            name-step := NameStep { visible: UiState.configure-step == ConfigureStep.setup-name; }
+            hub-step := HubStep { visible: UiState.configure-step == ConfigureStep.ready; }
+            join-step := JoinStep { visible: UiState.configure-step == ConfigureStep.join; }
+        }
+
+        Rectangle { vertical-stretch: 1; }
+
+        WideButton {
+            text: "⚡ Quick options — pair on the spot, nothing saved";
+            hint: "Q";
+            clicked => { Actions.open-quick(); }
+        }
+    }
+}

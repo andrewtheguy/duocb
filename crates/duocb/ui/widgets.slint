@@ -1,0 +1,204 @@
+// Shared building blocks: cards, CTA buttons, weak text — the visual
+// vocabulary every screen composes from.
+
+import { Theme } from "theme.slint";
+import { UiState, Actions } from "globals.slint";
+import { Palette, Button } from "std-widgets.slint";
+
+/// A section card: subtle fill + border, rounded, padded content.
+export component Card inherits Rectangle {
+    background: Theme.card-fill;
+    border-color: Theme.card-border;
+    border-width: 1px;
+    border-radius: Theme.radius;
+    VerticalLayout {
+        padding: Theme.pad-m;
+        spacing: Theme.pad-xs;
+        @children
+    }
+}
+
+/// Body text.
+export component Body inherits Text {
+    font-size: Theme.font-body;
+    wrap: word-wrap;
+}
+
+/// De-emphasized helper text.
+export component Weak inherits Text {
+    font-size: Theme.font-body;
+    opacity: Theme.weak-opacity;
+    wrap: word-wrap;
+}
+
+/// De-emphasized small print.
+export component Small inherits Text {
+    font-size: Theme.font-small;
+    opacity: Theme.weak-opacity;
+    wrap: word-wrap;
+}
+
+/// Section heading inside a card.
+export component CardTitle inherits Text {
+    font-size: Theme.font-body;
+    font-weight: 700;
+}
+
+/// Monospace value text (identities, fingerprints, hashes).
+export component Mono inherits Text {
+    font-size: Theme.font-body;
+    font-family: UiState.mono-font;
+}
+
+/// A "Label: value" row with a monospace value.
+export component LabeledValue inherits HorizontalLayout {
+    in property <string> label;
+    in property <string> value;
+    spacing: Theme.pad-s;
+    alignment: start;
+    Text { text: root.label; font-size: Theme.font-body; vertical-alignment: center; }
+    Mono { text: root.value; vertical-alignment: center; }
+}
+
+/// Screen header: a back button plus the screen title.
+export component BackHeader inherits HorizontalLayout {
+    in property <string> title;
+    spacing: Theme.pad-m;
+    alignment: start;
+    Button {
+        text: "← Back (Esc)";
+        clicked => { Actions.go-back(); }
+    }
+    Text {
+        text: root.title;
+        font-size: Theme.font-heading;
+        font-weight: 700;
+        vertical-alignment: center;
+    }
+}
+
+/// The standing configure-mode identity, kept visible while a session runs,
+/// without showing or exposing the secret itself.
+export component TokenPairingSummary inherits Card {
+    CardTitle { text: "Configured pairing"; }
+    LabeledValue { label: "This device:"; value: UiState.display-identity; }
+    if UiState.joined-peer != "": LabeledValue { label: "Joining:"; value: UiState.joined-peer; }
+    if UiState.node-id-short != "": LabeledValue { label: "This node:"; value: UiState.node-id-short; }
+    if UiState.peer-node-id-short != "": LabeledValue { label: "Paired with:"; value: UiState.peer-node-id-short; }
+    if UiState.session-fingerprint != "": HorizontalLayout {
+        spacing: Theme.pad-s;
+        alignment: start;
+        Text { text: "Secret fingerprint:"; font-size: Theme.font-body; vertical-alignment: center; }
+        Mono { text: UiState.session-fingerprint; vertical-alignment: center; }
+        Small { text: "(must match on both devices)"; vertical-alignment: center; }
+    }
+}
+
+/// The shared scaffolding of the full-width action buttons: accessibility,
+/// keyboard activation (Enter/Space via a FocusScope), touch handling, and
+/// the label + optional shortcut-hint layout. Variants style the background
+/// and border off the exposed `pressed`/`hovered`/`focused` states.
+component CtaButtonBase inherits Rectangle {
+    in property <string> text;
+    in property <string> hint;
+    in property <bool> enabled: true;
+    in property <color> label-color: Palette.foreground;
+    in property <float> hint-opacity: 0.6;
+    out property <bool> pressed: touch.pressed;
+    out property <bool> hovered: touch.has-hover;
+    out property <bool> focused: fs.has-focus;
+    callback clicked();
+
+    height: Theme.cta-height;
+    border-radius: Theme.radius;
+    opacity: root.enabled ? 1.0 : 0.4;
+
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { root.clicked(); }
+
+    fs := FocusScope {
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if (event.text == " " || event.text == Key.Return) {
+                root.clicked();
+                return accept;
+            }
+            reject
+        }
+
+        touch := TouchArea {
+            enabled: root.enabled;
+            clicked => { root.clicked(); }
+            mouse-cursor: root.enabled ? MouseCursor.pointer : MouseCursor.default;
+        }
+        HorizontalLayout {
+            padding-left: Theme.pad-l;
+            padding-right: Theme.pad-l;
+            spacing: Theme.pad-s;
+            alignment: center;
+            Text {
+                text: root.text;
+                color: root.label-color;
+                font-size: Theme.font-body;
+                font-weight: 600;
+                vertical-alignment: center;
+            }
+            if root.hint != "": Text {
+                text: root.hint;
+                color: root.label-color;
+                opacity: root.hint-opacity;
+                font-size: Theme.font-small;
+                vertical-alignment: center;
+            }
+        }
+    }
+}
+
+/// A full-width call-to-action button with an optional trailing shortcut hint.
+export component BigButton inherits CtaButtonBase {
+    label-color: white;
+    hint-opacity: 0.7;
+    background: root.pressed && root.enabled
+        ? Theme.accent.darker(20%)
+        : root.hovered && root.enabled ? Theme.accent.brighter(10%) : Theme.accent;
+    // Focus ring for keyboard activation.
+    border-width: root.focused ? 2px : 0px;
+    border-color: Theme.accent.darker(50%);
+}
+
+/// A secondary full-width action button (quieter than the accent CTA).
+export component WideButton inherits CtaButtonBase {
+    background: root.pressed && root.enabled
+        ? Palette.control-background.darker(10%)
+        : root.hovered && root.enabled ? Palette.control-background.brighter(5%)
+        : Palette.control-background;
+    // Doubles as the focus ring for keyboard activation.
+    border-width: root.focused ? 2px : 1px;
+    border-color: root.focused ? Theme.accent : Theme.card-border;
+}
+
+/// A selectable list row (device picker, mode picker): hover/selected
+/// background and click handling around caller-supplied content.
+export component SelectableRow inherits Rectangle {
+    in property <bool> selected;
+    callback clicked();
+
+    height: 34px;
+    border-radius: Theme.radius - 2px;
+    background: root.selected ? Theme.accent.with-alpha(0.25)
+        : touch.has-hover ? Theme.card-fill : transparent;
+
+    touch := TouchArea {
+        clicked => { root.clicked(); }
+        mouse-cursor: MouseCursor.pointer;
+    }
+    HorizontalLayout {
+        padding-left: Theme.pad-s;
+        padding-right: Theme.pad-s;
+        spacing: Theme.pad-s;
+        alignment: start;
+        @children
+    }
+}

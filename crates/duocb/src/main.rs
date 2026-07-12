@@ -1,9 +1,13 @@
+mod app;
 mod clipboard;
 mod config;
-mod ui;
 
-use eframe::egui;
+slint::include_modules!();
+
+use std::cell::RefCell;
 use std::path::PathBuf;
+use std::rc::Rc;
+use std::sync::Arc;
 
 fn config_override() -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
     let mut explicit = None;
@@ -22,6 +26,29 @@ fn config_override() -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
     Ok(explicit.or_else(|| std::env::var_os("DUOCB_CONFIG").map(PathBuf::from)))
 }
 
+/// Pick the platform's native UI and monospace font families. Slint's
+/// `font-family` takes a single name (no fallback lists), so the per-OS
+/// choice lives here; an empty UI font leaves the renderer's default.
+/// `DUOCB_UI_FONT` overrides the UI family (useful on Linux, where the
+/// default is whatever fontconfig considers sans).
+fn set_platform_fonts(ui: &MainWindow) {
+    use slint::ComponentHandle;
+    let (ui_font, mono_font) = if cfg!(target_os = "macos") {
+        // ".SF NS" is the hidden family name of the San Francisco system
+        // font; the friendlier aliases (".AppleSystemUIFont", "SF Pro") do
+        // not resolve through Skia's CoreText matching.
+        (".SF NS", "Menlo")
+    } else if cfg!(target_os = "windows") {
+        ("Segoe UI", "Consolas")
+    } else {
+        ("", "monospace")
+    };
+    let state = ui.global::<UiState>();
+    let ui_font = std::env::var("DUOCB_UI_FONT").unwrap_or_else(|_| ui_font.to_string());
+    state.set_ui_font(ui_font.into());
+    state.set_mono_font(mono_font.into());
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("duocb=info,duocb_core=info"),
@@ -34,25 +61,63 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // same-machine E2E tests isolated state.
     let config_lock = config::acquire_lock(&config_path)?;
 
-    let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([520.0, 680.0])
-        .with_min_inner_size([420.0, 480.0])
-        .with_title("duocb");
+    let ui = MainWindow::new()?;
+    set_platform_fonts(&ui);
 
-    // Window/Dock icon, baked from icons/icon.png at build time.
-    match eframe::icon_data::from_png_bytes(include_bytes!("../icons/icon.png")) {
-        Ok(icon) => viewport = viewport.with_icon(icon),
-        Err(err) => log::warn!("failed to load app icon: {err}"),
-    }
+    // The runtime's wake signal: Send+Sync and captures no UI state — the
+    // event-drain task below owns the (non-Send) app and window instead.
+    // Notify holds a permit, so a wake racing a finishing drain re-runs the
+    // loop and no event is ever missed.
+    let notify = Arc::new(tokio::sync::Notify::new());
+    let net = duocb_core::net::spawn_net_runtime(Some(Arc::new({
+        let notify = Arc::clone(&notify);
+        move || notify.notify_one()
+    })));
 
-    let options = eframe::NativeOptions {
-        viewport,
-        ..Default::default()
-    };
-    eframe::run_native(
-        "duocb",
-        options,
-        Box::new(move |cc| Ok(Box::new(ui::app::DuocbApp::new(cc, config_lock)))),
-    )?;
+    let app = Rc::new(RefCell::new(app::App::new(config_lock, net)));
+    app::callbacks::wire(&app, &ui);
+    app.borrow().sync(&ui);
+
+    // Drain runtime events on the Slint event loop whenever the runtime
+    // signals; events queued before the loop starts are drained on the first
+    // pass thanks to the stored permit.
+    slint::spawn_local({
+        let app = Rc::clone(&app);
+        let weak = ui.as_weak();
+        async move {
+            loop {
+                notify.notified().await;
+                let Some(ui) = weak.upgrade() else { break };
+                if app.borrow_mut().drain_events() {
+                    app.borrow().sync(&ui);
+                }
+            }
+        }
+    })?;
+
+    // One heartbeat covers all periodic UI work: peek expiry, the flash and
+    // PIN countdowns, "seen Xm ago" labels, and the device picker's 30 s
+    // auto-refresh (all state-derived inside tick + sync).
+    let heartbeat = slint::Timer::default();
+    heartbeat.start(
+        slint::TimerMode::Repeated,
+        std::time::Duration::from_millis(500),
+        {
+            let app = Rc::clone(&app);
+            let weak = ui.as_weak();
+            move || {
+                if let Some(ui) = weak.upgrade() {
+                    app.borrow_mut().tick();
+                    app.borrow().sync(&ui);
+                }
+            }
+        },
+    );
+
+    let result = ui.run();
+    // Window closed: stop sessions and join the runtime thread before the
+    // config lock drops.
+    app.borrow_mut().net.shutdown();
+    result?;
     Ok(())
 }

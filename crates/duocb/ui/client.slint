@@ -1,0 +1,123 @@
+// The join-a-connection screen: per-mode credential forms, then the paired
+// summary plus the session panel. The form block stays instantiated
+// (visibility-toggled) so its fields can report focus for shortcut gating.
+
+import { UiState, Actions } from "globals.slint";
+import { PairMode } from "types.slint";
+import { Theme } from "theme.slint";
+import { Card, Body, Weak, Small, Mono, BackHeader, TokenPairingSummary, LabeledValue } from "widgets.slint";
+import { SessionPanel } from "session.slint";
+import { Button, LineEdit } from "std-widgets.slint";
+
+component PreConnect inherits VerticalLayout {
+    out property <bool> field-focused:
+        pin-entry.has-focus || node-entry.has-focus || token-entry.has-focus;
+    alignment: start;
+    spacing: Theme.pad-m;
+
+    forms := Rectangle {
+        height: UiState.mode == PairMode.nostr-pin ? pin-form.preferred-height
+            : UiState.mode == PairMode.manual ? manual-form.preferred-height
+            : token-hint.preferred-height;
+
+        token-hint := Weak {
+            visible: UiState.mode == PairMode.nostr-token;
+            // A configure-mode join launches from the home hub with the
+            // selected peer; this state is a brief transient.
+            text: "Pick a device to join from the home screen.";
+        }
+
+        pin-form := VerticalLayout {
+            visible: UiState.mode == PairMode.nostr-pin;
+            alignment: start;
+            spacing: Theme.pad-xs;
+            Body { text: "PIN shown on the other device:"; }
+            pin-entry := LineEdit {
+                placeholder-text: "XXXX-XXXX";
+                text <=> UiState.in-pin;
+                edited => { Actions.fields-edited(); }
+                accepted => { Actions.connect-client(); }
+            }
+            if UiState.pin-invalid: Text {
+                text: "Not a valid PIN (check for typos)";
+                color: Theme.warn;
+                font-size: Theme.font-body;
+            }
+        }
+
+        manual-form := VerticalLayout {
+            visible: UiState.mode == PairMode.manual;
+            alignment: start;
+            spacing: Theme.pad-xs;
+            Body { text: "Node id shown on the other device:"; }
+            node-entry := LineEdit {
+                text <=> UiState.in-node-id;
+                edited => { Actions.fields-edited(); }
+            }
+            Body { text: "Token copied from the other device:"; }
+            token-entry := LineEdit {
+                input-type: InputType.password;
+                placeholder-text: "…";
+                text <=> UiState.in-manual-token;
+                edited => { Actions.fields-edited(); }
+                accepted => { Actions.connect-client(); }
+            }
+            Small {
+                text: "Paste the token itself (from “Copy token”) — not the fingerprint shown on the other device.";
+            }
+            if UiState.manual-entry-fingerprint != "": VerticalLayout {
+                spacing: Theme.pad-xs;
+                LabeledValue { label: "Token fingerprint:"; value: UiState.manual-entry-fingerprint; }
+                Small { text: "Confirm this matches on the other device."; }
+            }
+            if UiState.manual-entry-invalid: Text {
+                text: "That is not a valid token";
+                color: Theme.warn;
+                font-size: Theme.font-body;
+            }
+        }
+    }
+
+    if UiState.mode != PairMode.nostr-token: HorizontalLayout {
+        alignment: start;
+        Button {
+            text: "▶ Connect (Ctrl/⌘+Enter)";
+            primary: true;
+            enabled: UiState.dial-ready;
+            clicked => { Actions.connect-client(); }
+        }
+    }
+}
+
+export component ClientScreen inherits Rectangle {
+    out property <bool> field-focused: pre.field-focused || session.field-focused;
+
+    VerticalLayout {
+        alignment: start;
+        spacing: Theme.pad-m;
+
+        BackHeader { title: "Join a connection"; }
+        Body { text: "Status: " + UiState.status-text; }
+
+        Rectangle {
+            height: UiState.client-active ? 0px : pre.preferred-height;
+            pre := PreConnect { visible: !UiState.client-active; }
+        }
+
+        if UiState.client-active && UiState.mode == PairMode.nostr-token: TokenPairingSummary { }
+        if UiState.client-active && UiState.mode != PairMode.nostr-token
+            && UiState.peer-node-id-short != "": LabeledValue {
+            label: "Paired with:";
+            value: UiState.peer-node-id-short;
+        }
+        if UiState.client-active: HorizontalLayout {
+            alignment: start;
+            Button {
+                text: "✕ Disconnect";
+                clicked => { Actions.disconnect(); }
+            }
+        }
+
+        session := SessionPanel { }
+    }
+}

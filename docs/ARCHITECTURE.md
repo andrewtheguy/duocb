@@ -1,8 +1,8 @@
 # duocb Architecture
 
-duocb is a two-device P2P clipboard-sharing desktop app: an **egui** front end over a **tokio** networking runtime that pairs two iroh endpoints (QUIC/TLS 1.3), authenticates in-band, and then pumps clipboard items over one long-lived bidirectional stream. Signaling (how the client learns the server's ephemeral node id) is either **nostr** (token-derived or PIN-derived rendezvous records) or **manual** (a typed node id, resolved via mDNS on a LAN — no internet needed).
+duocb is a two-device P2P clipboard-sharing desktop app: a **Slint** front end over a **tokio** networking runtime that pairs two iroh endpoints (QUIC/TLS 1.3), authenticates in-band, and then pumps clipboard items over one long-lived bidirectional stream. Signaling (how the client learns the server's ephemeral node id) is either **nostr** (token-derived or PIN-derived rendezvous records) or **manual** (a typed node id, resolved via mDNS on a LAN — no internet needed).
 
-The transport/signaling/auth stack is a port of [duopipe](../../duopipe)'s peer runtime with the SOCKS payload replaced by a clipboard message stream and the ratatui TUI replaced by egui. Domain separation is complete: ALPN `duocb/1` and `duocb:*` KDF salts/tags, so duocb and duopipe peers can never interoperate or collide on relays.
+The transport/signaling/auth stack is a port of [duopipe](../../duopipe)'s peer runtime with the SOCKS payload replaced by a clipboard message stream and the ratatui TUI replaced by a Slint GUI. Domain separation is complete: ALPN `duocb/1` and `duocb:*` KDF salts/tags, so duocb and duopipe peers can never interoperate or collide on relays.
 
 ## Contents
 
@@ -23,7 +23,7 @@ The transport/signaling/auth stack is a port of [duopipe](../../duopipe)'s peer 
 
 ```
 src/
-  main.rs          eframe bootstrap (window, run_native)
+  main.rs          Slint bootstrap: window, net-runtime wake bridge, heartbeat timer
   protocol.rs      length-prefixed JSON framing; auth/PIN control messages; ClipMsg
   auth.rs          47-char token: generate / validate (CRC16) / fingerprint (SHA-256/16-hex)
   identity.rs      device identity: unambiguous 8-char suffix, short-name rules, "<name>_<suffix>"
@@ -36,22 +36,34 @@ src/
     mod.rs         TokenIdentity; UiCommand / NetEvent / ConnStatus enums; EventSender; runtime spawn
     endpoint.rs    iroh endpoint builders, connect, ConnPath snapshot + debug path logger (ALPN duocb/1)
     runtime.rs     command loop, presence publisher, server/client sessions, PairClaim, auth, clip pump
-  ui/
-    mod.rs         Screen / PairMode / ConfigureStep / ClipItem (CRC-32, peek + auto-hide)
-    app.rs         eframe::App: event drain, state, keyboard shortcuts, connection-path modal
-    configure.rs   configure mode: secret setup wizard + hub (identity, peer list, start/join)
-    screens.rs     home / start / join screens
-    session.rs     paired panel: send + connection-path buttons, outbox, inbox with peek/copy/clear
+  app/
+    mod.rs         App state: event drain/apply, configure/session transitions, tick
+    item.rs        ClipItem (CRC-32, peek + auto-hide)
+    sync.rs        the single push-style App -> UiState projection
+    callbacks.rs   Actions-callback wiring (mutate, sync, focus handling)
+    keys.rs        global keyboard shortcuts (per screen / configure step)
+ui/                (crates/duocb/ui — .slint markup, compiled by build.rs; fluent style, Skia renderer)
+  main.slint       window, screen routing, shortcut focus scope, error banner, modal overlays
+  globals.slint    UiState (Rust-pushed properties + field bindings) and Actions (callbacks)
+  types.slint      Screen / ConfigureStep / PairMode enums; PeerRow / ClipRow / PathRow structs
+  theme.slint      colors, spacing, type scale (the shared design system)
+  widgets.slint    cards, CTA buttons, labeled values, back header, pairing summary
+  configure.slint  home: secret setup wizard, hub, device picker
+  quick.slint      quick options: PIN/manual mode pick + start/join
+  server.slint     hosting credentials per mode
+  client.slint     join forms per mode + paired summary
+  session.slint    paired panel: send/compose, outbox, inbox with peek/copy/clear
+  modals.slint     clear-secret confirm, connection-path viewer
 ```
 
 ## Threading model: UI ↔ runtime
 
-eframe owns the main thread; a dedicated thread runs a tokio multi-thread runtime. The two sides share **no mutable state** — channels only:
+Slint's event loop owns the main thread; a dedicated thread runs a tokio multi-thread runtime. The two sides share **no mutable state** — channels only:
 
 ```mermaid
 graph LR
-    subgraph "UI thread (eframe)"
-        A[DuocbApp<br/>screens, inbox/outbox, inputs]
+    subgraph "UI thread (Slint event loop)"
+        A[App<br/>screens, inbox/outbox, inputs]
         CB[SystemClipboard<br/>arboard, UI thread only]
     end
     subgraph "net thread (tokio)"
@@ -69,7 +81,8 @@ graph LR
 ```
 
 - **UI → runtime:** `tokio::sync::mpsc::unbounded_channel<UiCommand>` — `StartServer{mode}`, `StopServer`, `Connect{spec}`, `Disconnect`, `SendClipboard{text}`, `QueryConnPath`, `SetPresence{identity?}`, `RefreshPeers`, `Shutdown`. Unbounded senders are synchronous, so the UI thread never blocks.
-- **Runtime → UI:** `std::sync::mpsc::channel<NetEvent>`; every send is followed by `egui::Context::request_repaint()` so the GUI wakes even when idle. `DuocbApp` drains the receiver at the top of each frame.
+- **Runtime → UI:** `std::sync::mpsc::channel<NetEvent>`; every send is followed by the wake callback, which notifies a `tokio::sync::Notify`. A `slint::spawn_local` task on the event loop awaits that signal, drains the receiver, applies the events to `App`, and pushes the result into the UI through one idempotent `App::sync` projection (all rendering state lives in the `UiState` Slint global; the non-Send app state never leaves the main thread). A 500 ms heartbeat timer drives time-derived state: peek expiry, flashes, the PIN countdown, last-seen labels, and the device picker's 30 s auto-refresh.
+- **Rendering:** the winit backend with Slint's **Skia** renderer (not the default femtovg), chosen for native-quality text: font lookup goes through CoreText / DirectWrite / fontconfig. `main.rs` pushes per-platform font families into the UI once at startup — `".SF NS"` (the San Francisco system font's hidden family name; the friendly aliases don't resolve) + Menlo on macOS, Segoe UI + Consolas on Windows, fontconfig defaults on Linux — and `DUOCB_UI_FONT` overrides the UI family. List properties (peers, inbox, connection paths) are diffed into their `VecModel`s row-by-row rather than replaced, so the heartbeat re-sync never re-instantiates unchanged rows.
 - **Events:** `ServerReady{node_id, manual_token?, token_fingerprint?}`, `ClientReady{node_id, token_fingerprint?}`, `PinRotated{pin_display, seconds_left}` / `PinCleared`, `Status(ConnStatus)`, `PeerPaired` / `PeerDisconnected`, `ConnPath(paths)`, `ItemReceived{text}` / `ItemSent`, `PeerList{peers}`, `PresenceConflict{message}`, `Error(message)`.
 - **Presence publisher:** owned by `net_main`, independent of sessions. `SetPresence(Some(identity))` (issued by the UI once secret + name are configured) starts it; it broadcasts this device's presence record and keeps it fresh until `SetPresence(None)` (secret cleared) or shutdown. A configure-mode server session feeds its node id through a `tokio::sync::watch` channel; the publisher republishes immediately on change, so hosting state propagates without coupling the session to the publisher's lifetime. `RefreshPeers` spawns a one-shot fetch (at most one in flight) answered with `PeerList`.
 - **Shutdown:** window close → `UiCommand::Shutdown` → the runtime cancels its session (connection closed with code 0, endpoints closed) and returns; the UI joins the thread.

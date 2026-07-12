@@ -6,7 +6,7 @@
 ## Workspace layout
 
 - `crates/duocb-core` — portable core (token auth, wire protocol, nostr signaling, headless tokio net runtime). No GUI/clipboard/config-file deps.
-- `crates/duocb` — desktop egui app (binary `duocb`); owns config.rs, clipboard.rs, ui/.
+- `crates/duocb` — desktop Slint app (binary `duocb`); owns config.rs, clipboard.rs, src/app/ (state + logic), and ui/*.slint (markup, compiled by build.rs; fluent style, Skia renderer, per-platform fonts set in main.rs).
 - `crates/duocb-ffi` — iOS staticlib (`libduocb.a`, config/token mode only), hand-written `extern "C"`; the C header is hand-maintained at `ios/duocb.h` and must stay in sync.
 - Version bumps: edit the single `[workspace.package] version` in the root Cargo.toml.
 

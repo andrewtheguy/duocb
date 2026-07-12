@@ -1,0 +1,104 @@
+// The application window: screen routing, the global-shortcut focus scope,
+// the error banner, and the modal overlays. All state comes from the Rust
+// side through the `UiState` global; all intents go back through `Actions`.
+
+import { UiState, Actions } from "globals.slint";
+import { Screen, ConfigureStep, PairMode, PeerRow, ClipRow, PathRow } from "types.slint";
+import { Theme } from "theme.slint";
+import { HomeScreen } from "configure.slint";
+import { QuickScreen } from "quick.slint";
+import { ServerScreen } from "server.slint";
+import { ClientScreen } from "client.slint";
+import { ClearSecretModal, ConnPathModal } from "modals.slint";
+
+// Everything the Rust side needs by name.
+export { UiState, Actions, Screen, ConfigureStep, PairMode, PeerRow, ClipRow, PathRow }
+
+export component MainWindow inherits Window {
+    title: "duocb";
+    icon: @image-url("../icons/icon.png");
+    preferred-width: 520px;
+    preferred-height: 680px;
+    min-width: 420px;
+    min-height: 480px;
+    default-font-family: UiState.ui-font;
+
+    /// Whether any text field has keyboard focus — plain-letter shortcuts are
+    /// disabled then, so typing is never hijacked. Only the visible screen's
+    /// fields count.
+    out property <bool> any-field-focused:
+        (UiState.screen == Screen.home && home.field-focused)
+        || (UiState.screen == Screen.server && server.field-focused)
+        || (UiState.screen == Screen.client && client.field-focused);
+
+    /// Pull keyboard focus back to the shortcut scope (called from Rust after
+    /// actions that leave a form, mirroring how the previous UI released
+    /// field focus on step changes).
+    public function reset-focus() {
+        keys.focus();
+    }
+
+    forward-focus: keys;
+    keys := FocusScope {
+        key-pressed(event) => {
+            // Esc while a field has focus only releases the focus (parity
+            // with the previous toolkit); the next Esc navigates.
+            if (event.text == Key.Escape && root.any-field-focused) {
+                self.focus();
+                return accept;
+            }
+            return Actions.global-key(
+                event.text,
+                !event.modifiers.control && !event.modifiers.shift
+                    && !event.modifiers.alt && !event.modifiers.meta,
+                event.modifiers.control && !event.modifiers.shift
+                    && !event.modifiers.alt && !event.modifiers.meta,
+                root.any-field-focused) ? accept : reject;
+        }
+
+        VerticalLayout {
+            padding: Theme.pad-l;
+            spacing: Theme.pad-s;
+
+            if UiState.error != "": Rectangle {
+                background: Theme.err.with-alpha(0.15);
+                border-radius: Theme.radius;
+                HorizontalLayout {
+                    padding: Theme.pad-m;
+                    spacing: Theme.pad-s;
+                    Text {
+                        text: UiState.error;
+                        color: Theme.err;
+                        font-size: Theme.font-body;
+                        wrap: word-wrap;
+                        horizontal-stretch: 1;
+                        vertical-alignment: center;
+                    }
+                    dismiss := TouchArea {
+                        width: 24px;
+                        clicked => { Actions.dismiss-error(); }
+                        Text {
+                            text: "✕";
+                            color: Theme.err;
+                            font-size: Theme.font-body;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+
+            Rectangle {
+                // Screens are all instantiated (visibility-toggled) so their
+                // `field-focused` out-properties stay referencable above.
+                home := HomeScreen { visible: UiState.screen == Screen.home; }
+                quick := QuickScreen { visible: UiState.screen == Screen.quick; }
+                server := ServerScreen { visible: UiState.screen == Screen.server; }
+                client := ClientScreen { visible: UiState.screen == Screen.client; }
+            }
+        }
+    }
+
+    if UiState.show-clear-secret: ClearSecretModal { }
+    if UiState.show-conn-path: ConnPathModal { }
+}

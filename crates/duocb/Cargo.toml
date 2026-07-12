@@ -7,8 +7,12 @@ description.workspace = true
 [dependencies]
 duocb-core.workspace = true
 
-eframe.workspace = true
+slint.workspace = true
 arboard.workspace = true
+# Only for tokio::sync::Notify (the runtime -> UI wake signal); the runtime
+# itself lives in duocb-core. Declared directly with just the "sync" feature:
+# workspace inheritance can only add to the workspace's ["full"] set.
+tokio = { version = "1", default-features = false, features = ["sync"] }
 
 crc32fast.workspace = true
 serde.workspace = true
@@ -18,6 +22,9 @@ log.workspace = true
 env_logger.workspace = true
 dirs.workspace = true
 jiff.workspace = true
+
+[build-dependencies]
+slint-build.workspace = true
 
 # Installer packaging (`cargo packager`): .dmg on macOS, .msi (WiX) on Windows.
 # Icons live in icons/ (icon.png is also baked into the binary as the window/Dock
