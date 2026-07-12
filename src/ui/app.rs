@@ -387,8 +387,9 @@ impl DuocbApp {
 
     /// Global keyboard shortcuts. Plain letter keys are only bound on the home
     /// screen (which has no text fields); everywhere else shortcuts require
-    /// Ctrl so typing into fields is never hijacked. Escape is ignored while a
-    /// text field has focus (egui uses it to release focus).
+    /// the platform command modifier (Ctrl on Windows/Linux, Command on macOS)
+    /// so typing into fields is never hijacked. Escape is ignored while a text
+    /// field has focus (egui uses it to release focus).
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         use egui::{Key, Modifiers};
 
@@ -454,7 +455,7 @@ impl DuocbApp {
         }
 
         // Session shortcuts are also gated on no text field having focus, so
-        // TextEdit editing shortcuts (e.g. Ctrl+Y redo) and destructive actions
+        // TextEdit editing shortcuts (e.g. Ctrl/Command+Y redo) and destructive actions
         // like clearing the inbox can't fire while typing or selecting text.
         if self.status == ConnStatus::Connected && focus_free {
             if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::S)) {
@@ -465,8 +466,8 @@ impl DuocbApp {
             {
                 item.toggle_peek();
             }
-            // Ctrl+Y ("yank"): Ctrl+C / Ctrl+Shift+C are intercepted by egui's
-            // winit layer as the built-in Copy event and never reach key handling.
+            // Ctrl/Command+Y ("yank"): the platform Copy shortcuts are intercepted
+            // by egui's winit layer and never reach key handling.
             if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Y))
                 && let Some(text) = self.inbox.first().map(|i| i.text.clone())
             {

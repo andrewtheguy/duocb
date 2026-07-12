@@ -65,7 +65,7 @@ graph LR
 
 - **UI → runtime:** `tokio::sync::mpsc::unbounded_channel<UiCommand>` — `StartServer{mode}`, `StopServer`, `Connect{spec}`, `Disconnect`, `SendClipboard{text}`, `QueryConnPath`, `Shutdown`. Unbounded senders are synchronous, so the UI thread never blocks.
 - **Runtime → UI:** `std::sync::mpsc::channel<NetEvent>`; every send is followed by `egui::Context::request_repaint()` so the GUI wakes even when idle. `DuocbApp` drains the receiver at the top of each frame.
-- **Events:** `ServerReady{node_id, manual_token?, token_fingerprint?}`, `PinRotated{pin_display, seconds_left}` / `PinCleared`, `Status(ConnStatus)`, `PeerPaired` / `PeerDisconnected`, `ConnPath(paths)`, `ItemReceived{text}` / `ItemSent`, `Error(message)`.
+- **Events:** `ServerReady{node_id, manual_token?, token_fingerprint?}`, `ClientReady{node_id, token_fingerprint?}`, `PinRotated{pin_display, seconds_left}` / `PinCleared`, `Status(ConnStatus)`, `PeerPaired` / `PeerDisconnected`, `ConnPath(paths)`, `ItemReceived{text}` / `ItemSent`, `Error(message)`.
 - **Shutdown:** window close → `UiCommand::Shutdown` → the runtime cancels its session (connection closed with code 0, endpoints closed) and returns; the UI joins the thread.
 
 The `EventSender`'s repaint context is optional, so the whole runtime runs headless in integration tests (`net/runtime.rs` tests pair two real endpoints in-process).
@@ -153,7 +153,7 @@ S→C: PinConfirm       { accepted, proof_s }  proof_s = seal(k, "listener" | no
 | PIN auth key | Argon2id 64 MiB/t3 | PIN, salt `"duocb:pin-auth:v1"` | bucket-independent, distinct domain |
 | token fingerprint | SHA-256 (first 8 bytes) | token string | 16 lowercase hex digits, grouped `xxxx-xxxx-xxxx-xxxx`, display only |
 
-Argon2id makes the ~35-bit PIN expensive to brute-force offline from a captured relay record, and the 60 s rotation + 180 s record TTL bound the window; even a cracked record yields only a node id, never a credential.
+A PIN rendezvous event is an offline guessing target: its author key and ciphertext let an attacker check a candidate `(PIN, bucket)` pair. Argon2id (64 MiB, t=3) makes each guess expensive, while 60 s rotation and the server retaining only the three most recent PIN keys limit an unpaired PIN's useful authentication window to roughly three minutes. NIP-40's 180 s expiry asks relays to remove stale records but cannot prevent an observer from archiving them. A successful guess reveals the PIN itself, which derives both the rendezvous key and the in-band authentication key; the event's encrypted payload contains only the ephemeral node id and no separate standing token.
 
 ## Endpoint and discovery
 
@@ -171,8 +171,8 @@ Connection-path status is **pulled on demand**, not watched: `connection_paths(c
 
 - One **long-lived, lazily created** `arboard::Clipboard` lives on the UI thread for the whole process. On X11, clipboard ownership belongs to the providing connection — a per-operation instance would lose the copied text the moment it dropped.
 - Reads/writes happen directly on the UI thread on button press (text selections are sub-millisecond IPC); failures (e.g. a huge INCR transfer) surface as a dismissible error banner and never affect the connection.
-- **Receive side:** items go into a `Vec<ClipItem>` in app memory, newest first, capped at the **last 5** (older ones drop). Each item shows metadata only until peeked — size hint, a CRC-32 fingerprint (computed once on arrival), and the received time — so the two devices can compare an item without revealing it. *Peek* renders the text read-only, truncated past 4096 chars and auto-hidden after 15 s; *Copy* is the **only** code path that writes the system clipboard (and always yields the full, untruncated text). There is no auto-copy and no persistence.
-- **Send side:** explicit action only (`Ctrl+S`/button reads the clipboard and sends). There is no clipboard watcher. The **last item sent** is kept in a one-slot outbox (same `ClipItem`, promoted from a pending buffer once `ItemSent` confirms it left the wire) and shown above the inbox with its size/CRC, so the receiver can confirm a match.
+- **Receive side:** items go into a `Vec<ClipItem>` in app memory, newest first, capped at the **last 5** (older ones drop). Each item shows metadata only until peeked — size hint, a CRC-32 fingerprint (computed once on arrival), and the received time — so the two devices can compare an item without revealing it. *Peek* renders the text read-only, truncated past 4096 chars and auto-hidden after 15 s; within the received-item flow, *Copy* is the **only** action that writes the system clipboard (and always yields the full, untruncated text). There is no auto-copy and no persistence.
+- **Send side:** explicit action only (`Ctrl+S` on Windows/Linux, `⌘S` on macOS, or the button reads the clipboard and sends). There is no clipboard watcher. The **last item sent** is kept in a one-slot outbox (same `ClipItem`, promoted from a pending buffer once `ItemSent` confirms it left the wire) and shown above the inbox with its size/CRC, so the receiver can confirm a match.
 
 ## Persistence
 
@@ -184,7 +184,7 @@ Once a token-mode form is submitted, both role screens retain a shared identity 
 
 - **Trust boundary:** the two devices. The pairing secret (token or PIN) is assumed to be transferred between your own devices over a channel you already trust.
 - **Transport:** QUIC/TLS 1.3, authenticated by the peer's node id (its public key). The client always connects to exactly the id it typed or resolved.
-- **Relays and signaling servers** (nostr relays, n0 infrastructure) see only ciphertext under secret-derived keys and standard QUIC metadata; they can't read node-id records without the token/PIN and can't pass auth even with them (auth is in-band, per-connection, replay-protected).
+- **Relays and signaling servers** (nostr relays, n0 infrastructure) see ciphertext under secret-derived keys and standard QUIC metadata; without the token/PIN they cannot decrypt the node-id records or pass in-band authentication. A party that obtains the token or successfully guesses a current PIN has the corresponding authentication credential, which is why token secrecy and the PIN KDF/rotation window matter. Authentication is still per connection and bound to the QUIC peer identity.
 - **Debug hygiene:** the token is wrapped in a type whose `Debug` prints `AuthToken(***)`, so it can't leak through logs.
 
 ## Limitations

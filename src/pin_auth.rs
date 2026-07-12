@@ -22,9 +22,11 @@
 //!
 //! Because the listener mints a fresh PIN every rotation bucket, it verifies `proof_d` against the
 //! last few buckets' keys (its recent-PIN cache) — mirroring the dialer's adjacent-bucket look-back
-//! when it fetched the node id. Nothing offline-crackable ever crosses the wire: the proofs are
-//! AEAD over random nonces on a channel iroh already encrypts (QUIC/TLS) and binds to the peer's
-//! node id (the node id *is* its public key), so a formal PAKE is unnecessary here.
+//! when it fetched the node id. QUIC/TLS hides these proofs from passive network and relay observers
+//! and binds the connection to the peer's node id (its public key). This construction is not a PAKE:
+//! a party that can observe a decrypted proof transcript can test PIN guesses offline, as can anyone
+//! archiving the public PIN-derived rendezvous event. Argon2id and the short recent-PIN acceptance
+//! window mitigate that risk; they do not eliminate the offline verifier.
 
 use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};

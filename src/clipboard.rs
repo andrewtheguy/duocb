@@ -29,8 +29,8 @@ impl SystemClipboard {
         self.get()?.get_text().context("reading the clipboard")
     }
 
-    /// Write `text` to the system clipboard. The only place duocb ever writes
-    /// the clipboard is the per-item Copy button — never automatically.
+    /// Write `text` to the system clipboard. Inbox/outbox item and pairing-
+    /// credential copy actions use this helper; duocb never writes automatically.
     pub fn write_text(&mut self, text: &str) -> Result<()> {
         self.get()?
             .set_text(text.to_string())
