@@ -1,0 +1,14 @@
+// The paired session panel, embedded by both role screens while connected.
+
+import { UiState, Actions } from "globals.slint";
+import { Theme } from "theme.slint";
+import { Body } from "widgets.slint";
+
+export component SessionPanel inherits VerticalLayout {
+    /// Whether a compose field inside the panel has focus.
+    out property <bool> field-focused: false;
+    alignment: start;
+    spacing: Theme.pad-s;
+
+    if UiState.connected: Body { text: "session panel (todo)"; }
+}

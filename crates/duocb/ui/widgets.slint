@@ -2,7 +2,8 @@
 // vocabulary every screen composes from.
 
 import { Theme } from "theme.slint";
-import { Palette } from "std-widgets.slint";
+import { UiState, Actions } from "globals.slint";
+import { Palette, Button } from "std-widgets.slint";
 
 /// A section card: subtle fill + border, rounded, padded content.
 export component Card inherits Rectangle {
@@ -47,6 +48,50 @@ export component CardTitle inherits Text {
 export component Mono inherits Text {
     font-size: Theme.font-body;
     font-family: "monospace";
+}
+
+/// A "Label: value" row with a monospace value.
+export component LabeledValue inherits HorizontalLayout {
+    in property <string> label;
+    in property <string> value;
+    spacing: Theme.pad-s;
+    alignment: start;
+    Text { text: root.label; font-size: Theme.font-body; vertical-alignment: center; }
+    Mono { text: root.value; vertical-alignment: center; }
+}
+
+/// Screen header: a back button plus the screen title.
+export component BackHeader inherits HorizontalLayout {
+    in property <string> title;
+    spacing: Theme.pad-m;
+    alignment: start;
+    Button {
+        text: "← Back (Esc)";
+        clicked => { Actions.go-back(); }
+    }
+    Text {
+        text: root.title;
+        font-size: Theme.font-heading;
+        font-weight: 700;
+        vertical-alignment: center;
+    }
+}
+
+/// The standing configure-mode identity, kept visible while a session runs,
+/// without showing or exposing the secret itself.
+export component TokenPairingSummary inherits Card {
+    CardTitle { text: "Configured pairing"; }
+    LabeledValue { label: "This device:"; value: UiState.display-identity; }
+    if UiState.joined-peer != "": LabeledValue { label: "Joining:"; value: UiState.joined-peer; }
+    if UiState.node-id-short != "": LabeledValue { label: "This node:"; value: UiState.node-id-short; }
+    if UiState.peer-node-id-short != "": LabeledValue { label: "Paired with:"; value: UiState.peer-node-id-short; }
+    if UiState.session-fingerprint != "": HorizontalLayout {
+        spacing: Theme.pad-s;
+        alignment: start;
+        Text { text: "Secret fingerprint:"; font-size: Theme.font-body; vertical-alignment: center; }
+        Mono { text: UiState.session-fingerprint; vertical-alignment: center; }
+        Small { text: "(must match on both devices)"; vertical-alignment: center; }
+    }
 }
 
 /// A full-width call-to-action button with an optional trailing shortcut hint.

@@ -6,17 +6,8 @@
 import { UiState, Actions } from "globals.slint";
 import { ConfigureStep } from "types.slint";
 import { Theme } from "theme.slint";
-import { Card, CardTitle, Body, Weak, Small, Mono, BigButton, WideButton } from "widgets.slint";
+import { Card, CardTitle, Body, Weak, Small, Mono, BigButton, WideButton, LabeledValue } from "widgets.slint";
 import { Button, LineEdit } from "std-widgets.slint";
-
-component LabeledValue inherits HorizontalLayout {
-    in property <string> label;
-    in property <string> value;
-    spacing: Theme.pad-s;
-    alignment: start;
-    Text { text: root.label; font-size: Theme.font-body; vertical-alignment: center; }
-    Mono { text: root.value; vertical-alignment: center; }
-}
 
 component ChoiceStep inherits VerticalLayout {
     alignment: start;

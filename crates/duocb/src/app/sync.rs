@@ -142,6 +142,7 @@ impl App {
                 .unwrap_or_default()
                 .into(),
         );
+        s.set_node_id_full(self.node_id.clone().unwrap_or_default().into());
         s.set_peer_node_id_short(
             self.peer_node_id
                 .as_deref()
@@ -169,9 +170,13 @@ impl App {
                 .into(),
         );
         s.set_pin_display(str_or_empty(&self.pin_display));
-        s.set_pin_remaining(self.pin_deadline.map_or(0, |d| {
-            d.saturating_duration_since(Instant::now()).as_secs() as i32
-        }));
+        s.set_pin_countdown(match (&self.pin_display, self.pin_deadline) {
+            (Some(_), Some(deadline)) => {
+                let left = deadline.saturating_duration_since(Instant::now()).as_secs();
+                format!("refreshes in {left}s").into()
+            }
+            _ => SharedString::default(),
+        });
         s.set_pin_paired(self.pin_paired);
 
         // Client join forms.

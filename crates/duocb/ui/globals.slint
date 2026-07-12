@@ -54,6 +54,8 @@ export global UiState {
     // Server / running-session identity.
     in property <string> joined-peer;
     in property <string> node-id-short;
+    /// The full node id, shown in manual mode where the other device types it.
+    in property <string> node-id-full;
     in property <string> peer-node-id-short;
     /// The fingerprint shown in the pairing summary (session token, or the
     /// standing secret's).
@@ -61,7 +63,8 @@ export global UiState {
     in property <bool> manual-token-present;
     in property <string> manual-token-fingerprint;
     in property <string> pin-display;
-    in property <int> pin-remaining;
+    /// "refreshes in 42s", composed in Rust; "" while no PIN shows.
+    in property <string> pin-countdown;
     in property <bool> pin-paired;
 
     // Client join forms.

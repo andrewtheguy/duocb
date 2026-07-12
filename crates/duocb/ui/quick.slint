@@ -1,10 +1,73 @@
-// The quick-options screen: ad-hoc PIN/manual pairing, nothing saved.
+// The quick-options screen: pick an ad-hoc mode, then start or join. Nothing
+// here is persisted; the credentials last one session.
 
 import { UiState, Actions } from "globals.slint";
-import { Body } from "widgets.slint";
+import { PairMode } from "types.slint";
+import { Theme } from "theme.slint";
+import { Card, CardTitle, Weak, Body, BigButton, WideButton, BackHeader } from "widgets.slint";
+
+component ModeRow inherits Rectangle {
+    in property <string> text;
+    in property <bool> selected;
+    callback clicked();
+
+    height: 34px;
+    border-radius: Theme.radius - 2px;
+    background: root.selected ? Theme.accent.with-alpha(0.25)
+        : touch.has-hover ? Theme.card-fill : transparent;
+    touch := TouchArea {
+        clicked => { root.clicked(); }
+        mouse-cursor: MouseCursor.pointer;
+    }
+    HorizontalLayout {
+        padding-left: Theme.pad-s;
+        padding-right: Theme.pad-s;
+        spacing: Theme.pad-s;
+        alignment: start;
+        Text {
+            text: root.selected ? "●" : "○";
+            font-size: Theme.font-body;
+            vertical-alignment: center;
+        }
+        Body { text: root.text; vertical-alignment: center; }
+    }
+}
 
 export component QuickScreen inherits Rectangle {
     out property <bool> field-focused: false;
 
-    Body { text: "quick options (todo)"; }
+    VerticalLayout {
+        alignment: start;
+        spacing: Theme.pad-m;
+
+        BackHeader { title: "Quick options"; }
+        Weak {
+            text: "Pair on the spot — nothing is saved, and the credentials last one session.";
+        }
+
+        Card {
+            CardTitle { text: "Mode"; }
+            ModeRow {
+                text: "P  PIN quick pair — type a short rotating code (internet)";
+                selected: UiState.mode == PairMode.nostr-pin;
+                clicked => { Actions.set-mode(PairMode.nostr-pin); }
+            }
+            ModeRow {
+                text: "M  Manual — node id + token (works offline on the same LAN)";
+                selected: UiState.mode == PairMode.manual;
+                clicked => { Actions.set-mode(PairMode.manual); }
+            }
+        }
+
+        BigButton {
+            text: "🚀 Start a connection";
+            hint: "S";
+            clicked => { Actions.begin-server(); }
+        }
+        WideButton {
+            text: "🔗 Join a connection";
+            hint: "C";
+            clicked => { Actions.open-client(); }
+        }
+    }
 }
