@@ -27,7 +27,7 @@ Received content never touches the receiving machine's clipboard (or disk) by it
 
 ## Pairing modes
 
-Chosen on the home screen. **Configure** is the primary mode; the quick options remain for ad-hoc pairing.
+**Configure** is the primary mode and the home screen itself; the quick options live behind the home's **Quick options** button (`Q`) for ad-hoc pairing.
 
 | Mode | Signaling | What you transfer by hand | Auth | Internet |
 |---|---|---|---|---|
@@ -63,7 +63,7 @@ Run `duocb` on both devices.
 2. **Other device:** press `I`, paste the same secret (confirm the fingerprint matches), and name it.
 3. **Pair:** press `S` (Start) on one device; on the other press `C` (Join) to open the device picker, select it (`R` refreshes the list; a *hosting* badge shows who already started), and press `Enter`. Joining first and starting after also works — the join retries until the host appears.
 
-**Quick modes:** pick `2` (PIN) or `3` (manual) on both devices, press `S` on the starting device and `C` on the joining one, and type the displayed credentials.
+**Quick options:** press `Q` on both devices, pick `P` (PIN) or `M` (manual), press `S` on the starting device and `C` on the joining one, and type the displayed credentials.
 
 **Paired:** both sides now show the same session panel — `Ctrl/⌘+S` (or the button) reads your clipboard and sends it, and a compose field sends typed text directly (Enter) without touching the clipboard; received items appear in the inbox where you can **Peek** (view without copying) and **Copy** (the only action that writes that received item to your clipboard). Either device can send at any time; the outbox above the inbox shows the last item you sent (size + CRC) so the other side can confirm it matches what arrived.
 
@@ -75,14 +75,15 @@ The joining device reconnects automatically with backoff if the connection drops
 
 | Key | Where | Action |
 |---|---|---|
-| `1` / `2` / `3` | home | select configure / PIN quick pair / manual mode |
 | `G` / `I` | home (configure setup) | generate a new secret / import an existing one |
-| `S` | home | start (host) a connection |
+| `S` | home / quick options | start (host) a connection |
 | `C` | home (configure hub) | open the device picker |
 | `C` / `Enter` | device picker | join the selected device |
 | `R` / `↑` `↓` | device picker | refresh the device list / move the selection |
 | `Esc` | device picker | back to the hub |
-| `C` | home (quick modes) | go to the join form |
+| `Q` | home | open the quick options |
+| `P` / `M` | quick options | pick PIN quick pair / manual mode |
+| `C` | quick options | go to the join form |
 | `Ctrl/⌘+Enter` | quick-mode join forms | connect |
 | `Esc` | any screen (no field focused) | back to home, stopping the session |
 | `Ctrl/⌘+I` / `Ctrl/⌘+T` | when available | copy the node id / the token or secret |

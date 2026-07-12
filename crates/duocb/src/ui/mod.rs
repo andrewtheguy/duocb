@@ -12,7 +12,11 @@ pub mod session;
 /// sets the connection up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
+    /// The configure mode's wizard/hub — the primary flow (iOS parity).
     Home,
+    /// The quick-options wizard: ad-hoc PIN/manual pairing, nothing saved.
+    /// Opened from the home CTA so the quick modes never crowd the home.
+    Quick,
     /// Start a connection: this device shows the PIN/auth code and listens
     /// (the transport server).
     Server,

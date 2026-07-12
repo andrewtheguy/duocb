@@ -558,10 +558,31 @@ impl DuocbApp {
         }
     }
 
-    /// Navigate back to the home screen, stopping any running session.
+    /// Open the quick-options screen (ad-hoc PIN/manual pairing).
+    pub(crate) fn open_quick(&mut self) {
+        self.screen = Screen::Quick;
+        // Home implies configure mode; entering the quick screen picks its
+        // default so the Start/Join actions there never run configure mode.
+        if self.mode == PairMode::NostrToken {
+            self.mode = PairMode::NostrPin;
+        }
+    }
+
+    /// Navigate back one screen, stopping any running session. Role screens
+    /// return to where they launched from (the quick-options screen for the
+    /// quick modes, the home hub for configure mode); leaving the quick
+    /// screen restores the home invariant (mode = configure).
     pub(crate) fn go_back(&mut self) {
         self.stop_session();
-        self.screen = Screen::Home;
+        self.screen = match (self.screen, self.mode) {
+            (Screen::Server | Screen::Client, PairMode::NostrPin | PairMode::Manual) => {
+                Screen::Quick
+            }
+            _ => {
+                self.mode = PairMode::NostrToken;
+                Screen::Home
+            }
+        };
         // Home is the hub, not the device picker a join may have started from.
         if self.configure_step == ConfigureStep::Join {
             self.configure_step = ConfigureStep::Ready;
@@ -659,28 +680,28 @@ impl DuocbApp {
 
         match self.screen {
             Screen::Home => {
-                // Plain letters/digits only while no text field has focus — the
+                // Plain letters only while no text field has focus — the
                 // configure wizard and hub put editable fields on this screen.
                 if focus_free {
-                    // 1 = configure (primary), 2 = PIN quick pair, 3 = manual.
-                    if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Num1)) {
-                        self.mode = PairMode::NostrToken;
+                    if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Q)) {
+                        self.open_quick();
                     }
-                    if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Num2)) {
+                    self.handle_configure_shortcuts(ctx);
+                }
+            }
+            Screen::Quick => {
+                if focus_free {
+                    if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::P)) {
                         self.mode = PairMode::NostrPin;
                     }
-                    if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Num3)) {
+                    if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::M)) {
                         self.mode = PairMode::Manual;
                     }
-                    if self.mode == PairMode::NostrToken {
-                        self.handle_configure_shortcuts(ctx);
-                    } else {
-                        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::S)) {
-                            self.begin_server();
-                        }
-                        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::C)) {
-                            self.screen = Screen::Client;
-                        }
+                    if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::S)) {
+                        self.begin_server();
+                    }
+                    if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::C)) {
+                        self.screen = Screen::Client;
                     }
                 }
             }
@@ -927,6 +948,7 @@ impl eframe::App for DuocbApp {
             self.error_banner(ui);
             match self.screen {
                 Screen::Home => screens::show_home(self, ui),
+                Screen::Quick => screens::show_quick(self, ui),
                 Screen::Server => screens::show_server(self, ui),
                 Screen::Client => screens::show_client(self, ui),
             }

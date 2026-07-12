@@ -4,12 +4,12 @@
 //! devices can send and receive. One device *starts* a connection (hosts); the
 //! other *joins* it (dials).
 //!
-//! Keyboard shortcuts (also listed in the UI): home picks the mode with 1
-//! (configure — the primary mode), 2 (PIN quick pair), or 3 (manual). In the
-//! configure wizard G generates a secret and I imports one; on the configured
+//! Keyboard shortcuts (also listed in the UI): home is the configure flow —
+//! in the wizard G generates a secret and I imports one; on the configured
 //! hub S starts hosting and C opens the device picker, where C/Enter joins
 //! the selected device, R refreshes the list, the arrow keys move the
-//! selection, and Esc returns to the hub. Quick modes start/join with S / C.
+//! selection, and Esc returns to the hub. Q opens the quick-options screen,
+//! where P/M pick PIN quick pair or manual and S / C start/join.
 //! Ctrl/Command+Enter connects on join forms; Esc goes back;
 //! Ctrl/Command+I copies the node id, Ctrl/Command+T the token/secret,
 //! whenever they are available.
@@ -113,37 +113,55 @@ pub fn show_home(app: &mut DuocbApp, ui: &mut Ui) {
     );
     ui.add_space(16.0);
 
-    ui.group(|ui| {
-        ui.label(RichText::new("Pairing mode").strong());
-        // Configure mode is the primary choice; the quick modes stay as
-        // demoted, nothing-saved alternatives.
-        ui.radio_value(
-            &mut app.mode,
-            PairMode::NostrToken,
-            "1  Configure — your devices, discovered by a shared secret (internet)",
-        );
-        ui.indent("quick_modes", |ui| {
-            ui.label(RichText::new("Quick options — pair on the spot, nothing saved").weak());
-            ui.radio_value(
-                &mut app.mode,
-                PairMode::NostrPin,
-                "2  PIN quick pair — type a short rotating code (internet)",
-            );
-            ui.radio_value(
-                &mut app.mode,
-                PairMode::Manual,
-                "3  Manual — node id + token (works offline on the same LAN)",
-            );
-        });
+    // Home is the configure mode — the primary flow, like the iOS app: the
+    // setup wizard, then the hub. The nothing-saved quick options live on
+    // their own screen behind the CTA below instead of crowding the home.
+    crate::ui::configure::show_configure(app, ui);
+
+    ui.add_space(16.0);
+    ui.separator();
+    ui.add_space(4.0);
+    ui.vertical_centered_justified(|ui| {
+        if ui
+            .button("⚡ Quick options — pair on the spot, nothing saved  —  Q")
+            .clicked()
+        {
+            app.open_quick();
+        }
     });
+}
+
+/// The quick-options wizard: pick an ad-hoc mode, then start or join. Nothing
+/// here is persisted; the credentials last one session.
+pub fn show_quick(app: &mut DuocbApp, ui: &mut Ui) {
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        back_button(app, ui);
+        ui.heading("Quick options");
+    });
+    ui.label(
+        RichText::new(
+            "Pair on the spot — nothing is saved, and the credentials last \
+             one session.",
+        )
+        .weak(),
+    );
     ui.add_space(12.0);
 
-    if app.mode == PairMode::NostrToken {
-        // The configure mode's whole flow (setup wizard, then the hub with the
-        // device list and start/join actions) lives on the home screen.
-        crate::ui::configure::show_configure(app, ui);
-        return;
-    }
+    ui.group(|ui| {
+        ui.label(RichText::new("Mode").strong());
+        ui.radio_value(
+            &mut app.mode,
+            PairMode::NostrPin,
+            "P  PIN quick pair — type a short rotating code (internet)",
+        );
+        ui.radio_value(
+            &mut app.mode,
+            PairMode::Manual,
+            "M  Manual — node id + token (works offline on the same LAN)",
+        );
+    });
+    ui.add_space(12.0);
 
     ui.vertical_centered_justified(|ui| {
         if ui
@@ -281,10 +299,10 @@ pub fn show_server(app: &mut DuocbApp, ui: &mut Ui) {
 
     ui.add_space(8.0);
     if ui.button("⏹ Stop").clicked() {
-        app.net.send(duocb_core::net::UiCommand::StopServer);
-        // Nothing configurable remains on this screen, so stopping goes home
-        // (the configure hub, or the quick-mode chooser).
-        app.screen = Screen::Home;
+        // Nothing configurable remains on this screen, so stopping goes back
+        // to where the session was launched from (the configure hub, or the
+        // quick-options screen).
+        app.go_back();
     }
 
     session_panel_if_connected(app, ui);
