@@ -25,7 +25,7 @@ The transport/signaling/auth stack is a port of [duopipe](../../duopipe)'s peer 
 src/
   main.rs          eframe bootstrap (window, run_native)
   protocol.rs      length-prefixed JSON framing; auth/PIN control messages; ClipMsg
-  auth.rs          47-char token: generate / validate (CRC16) / fingerprint (SHA-256/8-hex)
+  auth.rs          47-char token: generate / validate (CRC16) / fingerprint (SHA-256/16-hex)
   pin.rs           Crockford-base32 PIN, check digit, 60s buckets, Argon2id KDFs
   pin_auth.rs      in-band mutual PIN challenge-response (NIP-44 sealed proofs)
   nostr.rs         kind-30078 token/name discovery; kind-9421 PIN rendezvous
@@ -76,7 +76,7 @@ The `EventSender`'s repaint context is optional, so the whole runtime runs headl
 
 **Server session** (`run_server_session`):
 
-1. Create the listening endpoint (fresh ephemeral identity) → emit `ServerReady` (manual mode generates its one-time token here) → `Listening`.
+1. Create the listening endpoint (fresh ephemeral identity) → emit `ServerReady` (manual mode generates its token here) → `Listening`.
 2. Spawn the mode's signaling publisher (see below); manual mode has none.
 3. Accept loop, **one connection served at a time**: accept → accept the single session stream and `auth_as_listener` on it → `PeerPaired` → pump clipboard on that same stream until the connection dies → `PeerDisconnected`, keep listening.
 4. A `PairClaim` (below) restricts the whole session to one peer identity.
@@ -122,13 +122,13 @@ Both nostr schemes publish only the server's **ephemeral node id**, NIP-44 (v2) 
 
 ### Manual / offline
 
-No signaling. The server displays its node id + a generated one-time token; the client types both. Resolution of the bare node id falls to the endpoint's discovery services — on a LAN, **mDNS**, which is why this mode works with zero internet. This fixes the corresponding duopipe gap where the manual path had no interactive way to share the listener's token: in duocb the server *generates and displays* the token and the client form has a field for it.
+No signaling. The server displays its node id + a generated token (as a fingerprint, with the raw token copied to the clipboard rather than shown); the client enters both. The token stays valid for the whole server session so the paired peer can reconnect after a drop. Resolution of the bare node id falls to the endpoint's discovery services — on a LAN, **mDNS**, which is why this mode works with zero internet. This fixes the corresponding duopipe gap where the manual path had no interactive way to share the listener's token: in duocb the server *generates and displays* the token and the client form has a field for it.
 
 ## Authentication
 
 Knowing a node id never suffices; every connection authenticates on the session stream before any clipboard frame flows.
 
-**Token method** (token + manual modes): the client sends `AuthRequest::Token{auth_token}`; the server checks membership in its accepted set and replies `AuthResponse{accepted, reason}`. Tokens are 47 chars: `d` + base64url(32 random bytes + CRC16-CCITT-FALSE), with an 8-hex-digit SHA-256 fingerprint shown in the UI so both devices can confirm they hold the same token without re-revealing it.
+**Token method** (token + manual modes): the client sends `AuthRequest::Token{auth_token}`; the server checks membership in its accepted set and replies `AuthResponse{accepted, reason}`. Tokens are 47 chars: `d` + base64url(32 random bytes + CRC16-CCITT-FALSE), with a 16-hex-digit SHA-256 fingerprint (grouped `xxxx-xxxx-xxxx-xxxx`) shown in the UI so both devices can confirm they hold the same token without ever revealing it. The token is never displayed in plain text: entry fields are masked, and the fingerprint appears as soon as the input passes length and checksum validation.
 
 **PIN method**: a 4-message mutual challenge-response on the session stream —
 
@@ -151,7 +151,7 @@ S→C: PinConfirm       { accepted, proof_s }  proof_s = seal(k, "listener" | no
 | record `d` tag (token mode) | SHA-256 | `"duocb:peer-id:v1"` ‖ token ‖ name | token-salted name hash |
 | PIN rendezvous key | Argon2id 64 MiB/t3 | PIN, salt `"duocb:pin-rendezvous:v1"` ‖ bucket | per-bucket nostr keypair |
 | PIN auth key | Argon2id 64 MiB/t3 | PIN, salt `"duocb:pin-auth:v1"` | bucket-independent, distinct domain |
-| token fingerprint | SHA-256 (first 4 bytes) | token string | 8 lowercase hex digits, display only |
+| token fingerprint | SHA-256 (first 8 bytes) | token string | 16 lowercase hex digits, grouped `xxxx-xxxx-xxxx-xxxx`, display only |
 
 Argon2id makes the ~35-bit PIN expensive to brute-force offline from a captured relay record, and the 60 s rotation + 180 s record TTL bound the window; even a cracked record yields only a node id, never a credential.
 
@@ -176,7 +176,7 @@ Connection-path status is **pulled on demand**, not watched: `connection_paths(c
 
 ## Persistence
 
-The default optional file is `~/.config/duocb/config.toml` (`auth_token`, `my_name`) and is used to prefill the token-mode forms. The initiator persists validated settings before a token-mode server session starts; a save failure blocks startup and is surfaced in the UI. The connector persists validated settings only when `PeerPaired` confirms successful authentication, so failed attempts do not overwrite its prior pairing. `--config`/`-c` or `DUOCB_CONFIG` selects an alternative file; the CLI wins over the environment. The process holds an exclusive `<config-path>.lock` sidecar for its lifetime, so one resolved config cannot back two simultaneous local instances while two E2E instances with distinct config paths run independently. A malformed config is ignored with a warning. Nothing else is stored: no identity keys, no peer list, no clipboard content, no inbox or outbox.
+The default optional file is `duocb/config.json` under the platform's per-user config directory (`~/.config` on Linux, `~/Library/Application Support` on macOS, `%APPDATA%` on Windows) with `auth_token` and `my_name`, and is used to prefill the token-mode forms. It is machine-managed JSON, not intended for hand editing. The initiator persists validated settings before a token-mode server session starts; a save failure blocks startup and is surfaced in the UI. The connector persists validated settings only when `PeerPaired` confirms successful authentication, so failed attempts do not overwrite its prior pairing. `--config`/`-c` or `DUOCB_CONFIG` selects an alternative file; the CLI wins over the environment. The process holds an exclusive OS lock on the config file itself for its lifetime, so one resolved config cannot back two simultaneous local instances (and the file is guarded against accidental external edits while duocb runs) while two E2E instances with distinct config paths run independently. Because the lock lives on the file, saves overwrite it in place through the held handle rather than via an atomic temp-and-rename; to keep crash safety each save first writes the complete new content to a flushed sibling `<config>.bak` and only then overwrites the config, so a crash mid-overwrite leaves the config torn but the backup whole, and load recovers from the backup (a config that is malformed with no usable backup is ignored with a warning and falls back to defaults). Nothing else is stored: no identity keys, no peer list, no clipboard content, no inbox or outbox.
 
 Once a token-mode form is submitted, both role screens retain a shared identity summary: this device's name, the token fingerprint, both local and paired node ids once available, and the active saved-config path. The runtime emits endpoint-ready information for both server and client roles. This mirrors duopipe's persistent config-mode header while deliberately omitting the raw auth token.
 

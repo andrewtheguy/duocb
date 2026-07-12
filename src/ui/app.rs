@@ -2,7 +2,6 @@
 //! all UI state (including the in-memory inbox — clipboard content never
 //! touches disk).
 
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -20,7 +19,7 @@ const SENT_FLASH: Duration = Duration::from_secs(2);
 const MAX_INBOX_ITEMS: usize = 5;
 
 pub struct DuocbApp {
-    pub(crate) config_path: PathBuf,
+    pub(crate) config_lock: crate::config::ConfigLock,
     pub(crate) net: NetHandle,
     pub(crate) clipboard: SystemClipboard,
 
@@ -37,7 +36,7 @@ pub struct DuocbApp {
     pub(crate) node_id: Option<String>,
     pub(crate) manual_token: Option<String>,
     pub(crate) token_fingerprint: Option<String>,
-    /// Whether the active token-mode identity has been persisted to `config_path`.
+    /// Whether the active token-mode identity has been persisted to the config.
     pub(crate) token_settings_saved: bool,
     pub(crate) pin_display: Option<String>,
     pub(crate) pin_deadline: Option<Instant>,
@@ -71,11 +70,11 @@ pub struct DuocbApp {
 }
 
 impl DuocbApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, config_path: PathBuf) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, mut config_lock: crate::config::ConfigLock) -> Self {
         let net = spawn_net_runtime(cc.egui_ctx.clone());
-        let config = crate::config::Config::load(&config_path);
+        let config = config_lock.load();
         Self {
-            config_path,
+            config_lock,
             net,
             clipboard: SystemClipboard::new(),
             screen: Screen::Home,
@@ -169,10 +168,10 @@ impl DuocbApp {
                 {
                     self.token_settings_saved = self.persist_token_settings();
                 }
-                // The manual-mode one-time token is consumed by pairing: stop
-                // displaying/copying it on the server and drop the client's
-                // typed copy. (A new server session mints a fresh one anyway.)
-                self.manual_token = None;
+                // The manual-mode token stays valid for the whole server session
+                // — the paired peer can reconnect with it — so keep it copyable on
+                // the initiator (it is cleared only when the session ends, in the
+                // Idle branch above). Drop the joiner's typed copy now it's paired.
                 self.in_manual_token.clear();
             }
             NetEvent::PeerDisconnected => {
@@ -250,7 +249,7 @@ impl DuocbApp {
             auth_token: Some(self.in_token.trim().to_string()).filter(|s| !s.is_empty()),
             my_name: Some(self.in_my_name.trim().to_string()).filter(|s| !s.is_empty()),
         };
-        match cfg.save(&self.config_path) {
+        match self.config_lock.save(&cfg) {
             Ok(()) => true,
             Err(e) => {
                 self.error = Some(format!("Could not save the settings: {e:#}"));
@@ -351,6 +350,16 @@ impl DuocbApp {
         }
     }
 
+    /// Go to the start screen. Quick modes (PIN, manual) have nothing to
+    /// configure, so they launch immediately and skip straight to their
+    /// credentials; token mode stops at its pre-start form.
+    pub(crate) fn begin_server(&mut self) {
+        self.screen = Screen::Server;
+        if self.mode != PairMode::NostrToken {
+            self.start_server();
+        }
+    }
+
     /// Start the server session if the inputs validate.
     pub(crate) fn start_server(&mut self) {
         if let Some(mode) = self.server_mode_spec() {
@@ -394,17 +403,24 @@ impl DuocbApp {
 
         match self.screen {
             Screen::Home => {
-                if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Num1)) {
+                // 1 = quick mode (keep the current sub-choice, else default to
+                // PIN), 2 = use config; P/M jump straight to a quick sub-mode.
+                if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Num1))
+                    && !matches!(self.mode, PairMode::NostrPin | PairMode::Manual)
+                {
                     self.mode = PairMode::NostrPin;
                 }
                 if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Num2)) {
                     self.mode = PairMode::NostrToken;
                 }
-                if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Num3)) {
+                if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::P)) {
+                    self.mode = PairMode::NostrPin;
+                }
+                if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::M)) {
                     self.mode = PairMode::Manual;
                 }
                 if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::S)) {
-                    self.screen = Screen::Server;
+                    self.begin_server();
                 }
                 if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::C)) {
                     self.screen = Screen::Client;

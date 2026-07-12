@@ -5,8 +5,9 @@
 //! PIN/code (the transport server/listener); the other *joins* by entering it
 //! (the client/dialer).
 //!
-//! Keyboard shortcuts (also listed in the UI): home selects mode with 1/2/3
-//! and role with S (start) / C (join); Ctrl+Enter starts/joins; Esc goes back;
+//! Keyboard shortcuts (also listed in the UI): home picks quick mode with 1
+//! (then P for PIN / M for manual) or config with 2, and role with S (start) /
+//! C (join); Ctrl+Enter starts/joins; Esc goes back;
 //! the manual start screen copies its credentials with Ctrl+I (node id) /
 //! Ctrl+T (token).
 
@@ -26,6 +27,30 @@ fn short_id(id: &str) -> String {
         id.to_string()
     } else {
         format!("{}…{}", &id[..8], &id[id.len() - 8..])
+    }
+}
+
+/// Feedback shown beneath a masked token entry field. The token itself is never
+/// rendered: once the input is a complete, checksum-valid token its fingerprint
+/// appears (so both devices can confirm they share it); a non-empty but invalid
+/// input shows a warning instead. Nothing is shown for an empty field.
+fn token_entry_feedback(ui: &mut Ui, token: &str) {
+    let token = token.trim();
+    if token.is_empty() {
+        return;
+    }
+    if crate::auth::validate_token(token).is_ok() {
+        ui.horizontal(|ui| {
+            ui.label("Token fingerprint:");
+            ui.monospace(crate::auth::token_fingerprint(token));
+        });
+        ui.label(
+            RichText::new("Confirm this matches on the other device.")
+                .weak()
+                .small(),
+        );
+    } else {
+        ui.colored_label(ui.visuals().warn_fg_color, "That is not a valid token");
     }
 }
 
@@ -69,7 +94,7 @@ fn show_token_pairing_summary(app: &DuocbApp, ui: &mut Ui) {
         if app.token_settings_saved {
             ui.horizontal_wrapped(|ui| {
                 ui.label("Saved settings:");
-                ui.monospace(app.config_path.display().to_string());
+                ui.monospace(app.config_lock.path().display().to_string());
             });
         } else if app.status == crate::net::ConnStatus::Connected {
             ui.label(
@@ -102,21 +127,42 @@ pub fn show_home(app: &mut DuocbApp, ui: &mut Ui) {
 
     ui.group(|ui| {
         ui.label(RichText::new("Pairing mode").strong());
-        ui.radio_value(
-            &mut app.mode,
-            PairMode::NostrPin,
-            "1  PIN quick pair — type a short rotating code (internet)",
-        );
-        ui.radio_value(
-            &mut app.mode,
-            PairMode::NostrToken,
-            "2  Token + names — standing pairing with a shared token (internet)",
-        );
-        ui.radio_value(
-            &mut app.mode,
-            PairMode::Manual,
-            "3  Manual — type the node id + token (works offline on the same LAN)",
-        );
+
+        // Two-step choice (mirrors duopipe): pick quick vs. config first, then —
+        // for quick — the signaling. Both quick sub-modes map to a `PairMode`
+        // that never touches the saved config; "use config" is the token pairing.
+        let quick_selected = matches!(app.mode, PairMode::NostrPin | PairMode::Manual);
+        if ui
+            .radio(quick_selected, "1  Quick mode — pair on the spot, nothing saved")
+            .clicked()
+            && !quick_selected
+        {
+            // Entering quick mode leads with the headline rotating-PIN flow.
+            app.mode = PairMode::NostrPin;
+        }
+        if quick_selected {
+            ui.indent("quick_submode", |ui| {
+                ui.radio_value(
+                    &mut app.mode,
+                    PairMode::NostrPin,
+                    "P  PIN quick pair — type a short rotating code (internet)",
+                );
+                ui.radio_value(
+                    &mut app.mode,
+                    PairMode::Manual,
+                    "M  Manual — node id + token (works offline on the same LAN)",
+                );
+            });
+        }
+        if ui
+            .radio(
+                app.mode == PairMode::NostrToken,
+                "2  Use config — standing pairing with a shared token (internet)",
+            )
+            .clicked()
+        {
+            app.mode = PairMode::NostrToken;
+        }
     });
     ui.add_space(16.0);
 
@@ -128,7 +174,7 @@ pub fn show_home(app: &mut DuocbApp, ui: &mut Ui) {
             )
             .clicked()
         {
-            app.screen = Screen::Server;
+            app.begin_server();
         }
         ui.add_space(6.0);
         if ui
@@ -174,52 +220,41 @@ pub fn show_server(app: &mut DuocbApp, ui: &mut Ui) {
     ui.add_space(8.0);
 
     if !app.server_running {
-        match app.mode {
-            PairMode::NostrToken => {
-                ui.label("Shared auth token (same on both devices):");
-                ui.horizontal(|ui| {
-                    ui.add(
-                        TextEdit::singleline(&mut app.in_token)
-                            .font(egui::TextStyle::Monospace)
-                            .desired_width(360.0)
-                            .hint_text("d…"),
-                    );
-                    if ui.button("Generate").clicked() {
-                        app.in_token = crate::auth::generate_token();
-                    }
-                });
-                ui.label("This device's unique name:");
-                ui.add(TextEdit::singleline(&mut app.in_my_name).hint_text("e.g. desktop"));
-                ui.label(
-                    RichText::new("Token and name are saved automatically when you start.")
-                        .weak()
-                        .small(),
+        // Only token mode has anything to configure before starting. Quick modes
+        // (PIN, manual) launch straight from the home screen, so this pre-start
+        // form is token-only.
+        if app.mode == PairMode::NostrToken {
+            ui.label("Shared auth token (same on both devices):");
+            ui.horizontal(|ui| {
+                ui.add(
+                    TextEdit::singleline(&mut app.in_token)
+                        .font(egui::TextStyle::Monospace)
+                        .password(true)
+                        .desired_width(360.0)
+                        .hint_text("d…"),
                 );
-                if !app.in_token.trim().is_empty()
-                    && crate::auth::validate_token(app.in_token.trim()).is_err()
-                {
-                    ui.colored_label(ui.visuals().warn_fg_color, "That is not a valid token");
+                if ui.button("Generate").clicked() {
+                    app.in_token = crate::auth::generate_token();
                 }
+            });
+            token_entry_feedback(ui, &app.in_token);
+            ui.label("This device's unique name:");
+            ui.add(TextEdit::singleline(&mut app.in_my_name).hint_text("e.g. desktop"));
+            ui.label(
+                RichText::new("Token and name are saved automatically when you start.")
+                    .weak()
+                    .small(),
+            );
+            ui.add_space(8.0);
+            if ui
+                .add_enabled(
+                    app.server_mode_spec().is_some(),
+                    egui::Button::new("▶ Start (Ctrl+Enter)"),
+                )
+                .clicked()
+            {
+                app.start_server();
             }
-            PairMode::NostrPin => {
-                ui.label("A short PIN will be shown; type it on the other device.");
-            }
-            PairMode::Manual => {
-                ui.label(
-                    "A node id and a one-time token will be shown; enter both on the other \
-                     device. Works with no internet on the same LAN (mDNS).",
-                );
-            }
-        }
-        ui.add_space(8.0);
-        if ui
-            .add_enabled(
-                app.server_mode_spec().is_some(),
-                egui::Button::new("▶ Start (Ctrl+Enter)"),
-            )
-            .clicked()
-        {
-            app.start_server();
         }
         return;
     }
@@ -268,8 +303,23 @@ pub fn show_server(app: &mut DuocbApp, ui: &mut Ui) {
             if let Some(node_id) = app.node_id.clone() {
                 copyable_value(app, ui, "Node id:", "Copy (Ctrl+I)", &node_id);
             }
+            // The token is never shown in plain text — a mask stands in for it,
+            // with a copy CTA — and its fingerprint is shown so the other device
+            // can confirm the match. It stays valid (and copyable) for the whole
+            // session so the paired peer can be re-sent it and reconnect after a
+            // drop.
             if let Some(token) = app.manual_token.clone() {
-                copyable_value(app, ui, "One-time token:", "Copy (Ctrl+T)", &token);
+                ui.horizontal(|ui| {
+                    ui.label("Token:");
+                    ui.monospace("*".repeat(12));
+                    if ui.small_button("Copy token (Ctrl+T)").clicked() {
+                        app.copy_to_clipboard(&token);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Token fingerprint:");
+                    ui.monospace(crate::auth::token_fingerprint(&token));
+                });
             }
             ui.label("Enter both on the other device. No internet needed on the same LAN.");
         }
@@ -278,6 +328,11 @@ pub fn show_server(app: &mut DuocbApp, ui: &mut Ui) {
     ui.add_space(8.0);
     if ui.button("⏹ Stop").clicked() {
         app.net.send(crate::net::UiCommand::StopServer);
+        // Quick modes have no pre-start form to return to, so stopping goes all
+        // the way home rather than showing a bare restart button.
+        if app.mode != PairMode::NostrToken {
+            app.screen = Screen::Home;
+        }
     }
 
     session_panel_if_connected(app, ui);
@@ -298,9 +353,11 @@ pub fn show_client(app: &mut DuocbApp, ui: &mut Ui) {
                 ui.add(
                     TextEdit::singleline(&mut app.in_token)
                         .font(egui::TextStyle::Monospace)
+                        .password(true)
                         .desired_width(f32::INFINITY)
                         .hint_text("d…"),
                 );
+                token_entry_feedback(ui, &app.in_token);
                 ui.label("This device's unique name:");
                 ui.add(TextEdit::singleline(&mut app.in_my_name).hint_text("e.g. laptop"));
                 ui.label(
@@ -308,11 +365,6 @@ pub fn show_client(app: &mut DuocbApp, ui: &mut Ui) {
                         .weak()
                         .small(),
                 );
-                if !app.in_token.trim().is_empty()
-                    && crate::auth::validate_token(app.in_token.trim()).is_err()
-                {
-                    ui.colored_label(ui.visuals().warn_fg_color, "That is not a valid token");
-                }
             }
             PairMode::NostrPin => {
                 ui.label("PIN shown on the other device:");
@@ -336,18 +388,23 @@ pub fn show_client(app: &mut DuocbApp, ui: &mut Ui) {
                         .font(egui::TextStyle::Monospace)
                         .desired_width(f32::INFINITY),
                 );
-                ui.label("One-time token shown on the other device:");
+                ui.label("Token copied from the other device:");
                 ui.add(
                     TextEdit::singleline(&mut app.in_manual_token)
                         .font(egui::TextStyle::Monospace)
+                        .password(true)
                         .desired_width(f32::INFINITY)
-                        .hint_text("d…"),
+                        .hint_text("…"),
                 );
-                if !app.in_manual_token.trim().is_empty()
-                    && crate::auth::validate_token(app.in_manual_token.trim()).is_err()
-                {
-                    ui.colored_label(ui.visuals().warn_fg_color, "That is not a valid token");
-                }
+                ui.label(
+                    RichText::new(
+                        "Paste the token itself (from “Copy token”) — not the fingerprint \
+                         shown on the other device.",
+                    )
+                    .weak()
+                    .small(),
+                );
+                token_entry_feedback(ui, &app.in_manual_token);
             }
         }
 
