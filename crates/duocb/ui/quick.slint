@@ -4,33 +4,16 @@
 import { UiState, Actions } from "globals.slint";
 import { PairMode } from "types.slint";
 import { Theme } from "theme.slint";
-import { Card, CardTitle, Weak, Body, BigButton, WideButton, BackHeader } from "widgets.slint";
+import { Card, CardTitle, Weak, Body, BigButton, WideButton, BackHeader, SelectableRow } from "widgets.slint";
 
-component ModeRow inherits Rectangle {
+component ModeRow inherits SelectableRow {
     in property <string> text;
-    in property <bool> selected;
-    callback clicked();
-
-    height: 34px;
-    border-radius: Theme.radius - 2px;
-    background: root.selected ? Theme.accent.with-alpha(0.25)
-        : touch.has-hover ? Theme.card-fill : transparent;
-    touch := TouchArea {
-        clicked => { root.clicked(); }
-        mouse-cursor: MouseCursor.pointer;
+    Text {
+        text: root.selected ? "●" : "○";
+        font-size: Theme.font-body;
+        vertical-alignment: center;
     }
-    HorizontalLayout {
-        padding-left: Theme.pad-s;
-        padding-right: Theme.pad-s;
-        spacing: Theme.pad-s;
-        alignment: start;
-        Text {
-            text: root.selected ? "●" : "○";
-            font-size: Theme.font-body;
-            vertical-alignment: center;
-        }
-        Body { text: root.text; vertical-alignment: center; }
-    }
+    Body { text: root.text; vertical-alignment: center; }
 }
 
 export component QuickScreen inherits Rectangle {

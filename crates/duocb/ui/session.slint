@@ -44,7 +44,7 @@ component ClipItemRow inherits Card {
     if root.item.expanded: TextEdit {
         read-only: true;
         text: root.item.peek-text;
-        height: max(root.item.peek-lines, 2) * 20px + 16px;
+        height: max(root.item.peek-lines, 2) * Theme.peek-line-height + 2 * Theme.pad-s;
     }
     if root.item.expanded && root.item.truncated-note != "": Small {
         text: root.item.truncated-note;

@@ -6,7 +6,7 @@
 import { UiState, Actions } from "globals.slint";
 import { ConfigureStep } from "types.slint";
 import { Theme } from "theme.slint";
-import { Card, CardTitle, Body, Weak, Small, Mono, BigButton, WideButton, LabeledValue } from "widgets.slint";
+import { Card, CardTitle, Body, Weak, Small, Mono, BigButton, WideButton, LabeledValue, SelectableRow } from "widgets.slint";
 import { Button, LineEdit } from "std-widgets.slint";
 
 component ChoiceStep inherits VerticalLayout {
@@ -211,21 +211,10 @@ component JoinStep inherits VerticalLayout {
         }
         Rectangle { height: Theme.pad-xs; }
         if UiState.peers-empty-text != "": Weak { text: UiState.peers-empty-text; }
-        for row in UiState.peers: Rectangle {
-            height: 34px;
-            border-radius: Theme.radius - 2px;
-            background: row.selected ? Theme.accent.with-alpha(0.25)
-                : touch.has-hover ? Theme.card-fill : transparent;
-            touch := TouchArea {
-                clicked => { Actions.toggle-peer(row.suffix); }
-                mouse-cursor: MouseCursor.pointer;
-            }
-            HorizontalLayout {
-                padding-left: Theme.pad-s;
-                padding-right: Theme.pad-s;
-                alignment: start;
-                Mono { text: row.line; vertical-alignment: center; }
-            }
+        for row in UiState.peers: SelectableRow {
+            selected: row.selected;
+            clicked => { Actions.toggle-peer(row.suffix); }
+            Mono { text: row.line; vertical-alignment: center; }
         }
     }
     BigButton {

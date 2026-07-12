@@ -10,8 +10,9 @@ duocb-core.workspace = true
 slint.workspace = true
 arboard.workspace = true
 # Only for tokio::sync::Notify (the runtime -> UI wake signal); the runtime
-# itself lives in duocb-core.
-tokio.workspace = true
+# itself lives in duocb-core. Declared directly with just the "sync" feature:
+# workspace inheritance can only add to the workspace's ["full"] set.
+tokio = { version = "1", default-features = false, features = ["sync"] }
 
 crc32fast.workspace = true
 serde.workspace = true
