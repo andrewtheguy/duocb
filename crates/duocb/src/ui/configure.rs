@@ -61,18 +61,17 @@ fn setup_generate(app: &mut DuocbApp, ui: &mut Ui) {
         ui.label(RichText::new("Your new secret").strong());
         ui.label(
             RichText::new(
-                "Shown once. Copy it somewhere safe now — you will paste it \
-                 into your other device.",
+                "Copy it somewhere safe now — you will paste it into your \
+                 other device. The last four characters are shown so you can \
+                 spot-check a paste where no fingerprint is available.",
             )
             .weak(),
         );
         ui.add_space(4.0);
-        let mut shown = token.as_str();
-        ui.add(
-            TextEdit::singleline(&mut shown)
-                .font(egui::TextStyle::Monospace)
-                .desired_width(f32::INFINITY),
-        );
+        ui.horizontal(|ui| {
+            ui.label("Secret:");
+            ui.monospace(masked_secret_hint(&token));
+        });
         ui.horizontal(|ui| {
             ui.label("Fingerprint:");
             ui.monospace(duocb_core::auth::token_fingerprint(&token));
@@ -225,7 +224,7 @@ fn identity_group(app: &mut DuocbApp, ui: &mut Ui) {
         if let Some(secret) = app.secret.clone() {
             ui.horizontal(|ui| {
                 ui.label("Secret:");
-                ui.monospace("*".repeat(12));
+                ui.monospace(masked_secret_hint(&secret));
                 if ui.small_button("Copy secret").clicked() {
                     app.copy_to_clipboard(&secret);
                 }
@@ -343,6 +342,20 @@ fn clear_secret_modal(app: &mut DuocbApp, ctx: &egui::Context) {
     if close || response.backdrop_response.clicked() {
         app.confirm_clear_secret = false;
     }
+}
+
+/// Mask a secret for display: asterisks plus its last four characters — never
+/// the whole value, but enough of a hint to spot-check that a paste into a
+/// place without fingerprint support (a password manager, a note) took the
+/// right one.
+fn masked_secret_hint(secret: &str) -> String {
+    let tail_start = secret
+        .char_indices()
+        .rev()
+        .nth(3)
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    format!("********{}", &secret[tail_start..])
 }
 
 /// Seconds since the Unix epoch (for peer last-seen ages).
