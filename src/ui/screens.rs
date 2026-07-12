@@ -55,8 +55,9 @@ fn token_entry_feedback(ui: &mut Ui, token: &str) {
 }
 
 /// Keep the standing-pairing identity visible after the editable form is gone.
-/// Mirrors duopipe's persistent config-mode header without ever showing the token.
-fn show_token_pairing_summary(app: &mut DuocbApp, ui: &mut Ui, token_copyable: bool) {
+/// Mirrors duopipe's persistent config-mode header without showing or exposing
+/// the token while a session is running.
+fn show_token_pairing_summary(app: &DuocbApp, ui: &mut Ui) {
     let token = app.in_token.trim().to_string();
     let fingerprint = app.token_fingerprint.clone().or_else(|| {
         crate::auth::validate_token(&token)
@@ -83,9 +84,6 @@ fn show_token_pairing_summary(app: &mut DuocbApp, ui: &mut Ui, token_copyable: b
                 ui.label("Paired with:");
                 ui.monospace(short_id(peer));
             });
-        }
-        if token_copyable && crate::auth::validate_token(&token).is_ok() {
-            token_copy_action(app, ui, &token);
         }
         if let Some(fingerprint) = fingerprint {
             ui.horizontal(|ui| {
@@ -286,7 +284,7 @@ pub fn show_server(app: &mut DuocbApp, ui: &mut Ui) {
     // Server running: mode-specific credentials display.
     match app.mode {
         PairMode::NostrToken => {
-            show_token_pairing_summary(app, ui, true);
+            show_token_pairing_summary(app, ui);
             ui.label(
                 RichText::new("The other device must use a different name.")
                     .weak()
@@ -448,7 +446,7 @@ pub fn show_client(app: &mut DuocbApp, ui: &mut Ui) {
     }
 
     if app.mode == PairMode::NostrToken {
-        show_token_pairing_summary(app, ui, false);
+        show_token_pairing_summary(app, ui);
     } else if let Some(peer) = app.peer_node_id.clone() {
         ui.horizontal(|ui| {
             ui.label("Paired with:");
