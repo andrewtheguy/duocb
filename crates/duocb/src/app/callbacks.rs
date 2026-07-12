@@ -207,12 +207,13 @@ pub(crate) fn wire(app: &Rc<RefCell<App>>, ui: &MainWindow) {
     actions.on_global_key({
         let app = Rc::clone(app);
         let weak = ui.as_weak();
-        move |text, control, field_focused| {
+        move |text, plain, command, field_focused| {
             let ui = weak.unwrap();
             let handled = super::keys::handle_global_key(
                 &mut app.borrow_mut(),
                 &text,
-                control,
+                plain,
+                command,
                 field_focused,
             );
             app.borrow().sync(&ui);

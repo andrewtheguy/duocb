@@ -8,7 +8,7 @@ import { UiState, Actions } from "globals.slint";
 import { ClipRow } from "types.slint";
 import { Theme } from "theme.slint";
 import { Card, CardTitle, Body, Weak, Small, Mono } from "widgets.slint";
-import { Button, LineEdit, TextEdit } from "std-widgets.slint";
+import { Button, LineEdit, TextEdit, ScrollView } from "std-widgets.slint";
 
 component ClipItemRow inherits Card {
     in property <ClipRow> item;
@@ -126,10 +126,19 @@ export component SessionPanel inherits Rectangle {
             }
         }
         if UiState.inbox.length == 0: Weak { text: "Nothing received yet."; }
-        for row[index] in UiState.inbox: ClipItemRow {
-            item: row;
-            copy-clicked => { Actions.inbox-copy(index); }
-            peek-clicked => { Actions.inbox-peek(index); }
+        // Only the inbox list scrolls (capped height); the send/compose
+        // controls and the outbox stay pinned above it.
+        ScrollView {
+            height: min(inbox-list.preferred-height, 300px);
+            inbox-list := VerticalLayout {
+                alignment: start;
+                spacing: Theme.pad-s;
+                for row[index] in UiState.inbox: ClipItemRow {
+                    item: row;
+                    copy-clicked => { Actions.inbox-copy(index); }
+                    peek-clicked => { Actions.inbox-peek(index); }
+                }
+            }
         }
     }
 }

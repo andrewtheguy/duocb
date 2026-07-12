@@ -7,104 +7,102 @@ import { PairMode } from "types.slint";
 import { Theme } from "theme.slint";
 import { Card, Body, Weak, Small, Mono, BackHeader, TokenPairingSummary, LabeledValue } from "widgets.slint";
 import { SessionPanel } from "session.slint";
-import { Button, LineEdit, ScrollView } from "std-widgets.slint";
+import { Button, LineEdit } from "std-widgets.slint";
 
 export component ServerScreen inherits Rectangle {
     out property <bool> field-focused: session.field-focused;
 
-    ScrollView {
-        VerticalLayout {
+    VerticalLayout {
+        alignment: start;
+        spacing: Theme.pad-m;
+
+        BackHeader { title: "Start a connection"; }
+        Body { text: "Status: " + UiState.status-text; }
+
+        if UiState.server-running && UiState.mode == PairMode.nostr-token: VerticalLayout {
+            spacing: Theme.pad-s;
+            TokenPairingSummary { }
+            Small {
+                text: "Your other devices see this one as hosting — pick it in their list to join.";
+            }
+        }
+
+        if UiState.server-running && UiState.mode == PairMode.nostr-pin
+            && UiState.pin-display != "": VerticalLayout {
+            spacing: Theme.pad-xs;
             alignment: start;
-            spacing: Theme.pad-m;
-
-            BackHeader { title: "Start a connection"; }
-            Body { text: "Status: " + UiState.status-text; }
-
-            if UiState.server-running && UiState.mode == PairMode.nostr-token: VerticalLayout {
-                spacing: Theme.pad-s;
-                TokenPairingSummary { }
-                Small {
-                    text: "Your other devices see this one as hosting — pick it in their list to join.";
-                }
+            Body {
+                text: "Type this PIN on the other device:";
+                horizontal-alignment: center;
             }
+            Text {
+                text: UiState.pin-display;
+                font-family: "monospace";
+                font-size: Theme.font-pin;
+                font-weight: 700;
+                horizontal-alignment: center;
+            }
+            Body {
+                text: UiState.pin-countdown;
+                horizontal-alignment: center;
+            }
+        }
+        if UiState.server-running && UiState.mode == PairMode.nostr-pin
+            && UiState.pin-display == "" && UiState.pin-paired
+            && UiState.node-id-short != "": VerticalLayout {
+            spacing: Theme.pad-xs;
+            // Paired: the PIN is spent. Show this device's node id — the
+            // same value the other device displays as "Paired with:" — so
+            // the user can eyeball that the two match.
+            LabeledValue { label: "This device's id:"; value: UiState.node-id-short; }
+            Small { text: "Confirm this matches “Paired with” on the other device."; }
+        }
 
-            if UiState.server-running && UiState.mode == PairMode.nostr-pin
-                && UiState.pin-display != "": VerticalLayout {
+        if UiState.server-running && UiState.mode == PairMode.manual: VerticalLayout {
+            spacing: Theme.pad-s;
+            if UiState.node-id-full != "": VerticalLayout {
                 spacing: Theme.pad-xs;
-                alignment: start;
-                Body {
-                    text: "Type this PIN on the other device:";
-                    horizontal-alignment: center;
-                }
-                Text {
-                    text: UiState.pin-display;
-                    font-family: "monospace";
-                    font-size: Theme.font-pin;
-                    font-weight: 700;
-                    horizontal-alignment: center;
-                }
-                Body {
-                    text: UiState.pin-countdown;
-                    horizontal-alignment: center;
-                }
-            }
-            if UiState.server-running && UiState.mode == PairMode.nostr-pin
-                && UiState.pin-display == "" && UiState.pin-paired
-                && UiState.node-id-short != "": VerticalLayout {
-                spacing: Theme.pad-xs;
-                // Paired: the PIN is spent. Show this device's node id — the
-                // same value the other device displays as "Paired with:" — so
-                // the user can eyeball that the two match.
-                LabeledValue { label: "This device's id:"; value: UiState.node-id-short; }
-                Small { text: "Confirm this matches “Paired with” on the other device."; }
-            }
-
-            if UiState.server-running && UiState.mode == PairMode.manual: VerticalLayout {
-                spacing: Theme.pad-s;
-                if UiState.node-id-full != "": VerticalLayout {
-                    spacing: Theme.pad-xs;
-                    HorizontalLayout {
-                        spacing: Theme.pad-s;
-                        alignment: start;
-                        Body { text: "Node id:"; vertical-alignment: center; }
-                        Button {
-                            text: "Copy (Ctrl/⌘+I)";
-                            clicked => { Actions.copy-node-id(); }
-                        }
-                    }
-                    Mono { text: UiState.node-id-full; wrap: char-wrap; }
-                }
-                // The token is never shown in plain text — a mask stands in
-                // for it, with a copy CTA — and its fingerprint is shown so
-                // the other device can confirm the match. It stays valid (and
-                // copyable) for the whole session so the paired peer can be
-                // re-sent it and reconnect after a drop.
-                if UiState.manual-token-present: HorizontalLayout {
+                HorizontalLayout {
                     spacing: Theme.pad-s;
                     alignment: start;
-                    Body { text: "Token:"; vertical-alignment: center; }
-                    Mono { text: "************"; vertical-alignment: center; }
+                    Body { text: "Node id:"; vertical-alignment: center; }
                     Button {
-                        text: "Copy token (Ctrl/⌘+T)";
-                        clicked => { Actions.copy-manual-token(); }
+                        text: "Copy (Ctrl/⌘+I)";
+                        clicked => { Actions.copy-node-id(); }
                     }
                 }
-                if UiState.manual-token-present: LabeledValue {
-                    label: "Token fingerprint:";
-                    value: UiState.manual-token-fingerprint;
-                }
-                Body { text: "Enter both on the other device. No internet needed on the same LAN."; }
+                Mono { text: UiState.node-id-full; wrap: char-wrap; }
             }
-
-            if UiState.server-running: HorizontalLayout {
+            // The token is never shown in plain text — a mask stands in
+            // for it, with a copy CTA — and its fingerprint is shown so
+            // the other device can confirm the match. It stays valid (and
+            // copyable) for the whole session so the paired peer can be
+            // re-sent it and reconnect after a drop.
+            if UiState.manual-token-present: HorizontalLayout {
+                spacing: Theme.pad-s;
                 alignment: start;
+                Body { text: "Token:"; vertical-alignment: center; }
+                Mono { text: "************"; vertical-alignment: center; }
                 Button {
-                    text: "⏹ Stop";
-                    clicked => { Actions.go-back(); }
+                    text: "Copy token (Ctrl/⌘+T)";
+                    clicked => { Actions.copy-manual-token(); }
                 }
             }
-
-            session := SessionPanel { }
+            if UiState.manual-token-present: LabeledValue {
+                label: "Token fingerprint:";
+                value: UiState.manual-token-fingerprint;
+            }
+            Body { text: "Enter both on the other device. No internet needed on the same LAN."; }
         }
+
+        if UiState.server-running: HorizontalLayout {
+            alignment: start;
+            Button {
+                text: "⏹ Stop";
+                clicked => { Actions.go-back(); }
+            }
+        }
+
+        session := SessionPanel { }
     }
 }

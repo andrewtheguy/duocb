@@ -7,7 +7,7 @@ import { PairMode } from "types.slint";
 import { Theme } from "theme.slint";
 import { Card, Body, Weak, Small, Mono, BackHeader, TokenPairingSummary, LabeledValue } from "widgets.slint";
 import { SessionPanel } from "session.slint";
-import { Button, LineEdit, ScrollView } from "std-widgets.slint";
+import { Button, LineEdit } from "std-widgets.slint";
 
 component PreConnect inherits VerticalLayout {
     out property <bool> field-focused:
@@ -92,34 +92,32 @@ component PreConnect inherits VerticalLayout {
 export component ClientScreen inherits Rectangle {
     out property <bool> field-focused: pre.field-focused || session.field-focused;
 
-    ScrollView {
-        VerticalLayout {
-            alignment: start;
-            spacing: Theme.pad-m;
+    VerticalLayout {
+        alignment: start;
+        spacing: Theme.pad-m;
 
-            BackHeader { title: "Join a connection"; }
-            Body { text: "Status: " + UiState.status-text; }
+        BackHeader { title: "Join a connection"; }
+        Body { text: "Status: " + UiState.status-text; }
 
-            Rectangle {
-                height: UiState.client-active ? 0px : pre.preferred-height;
-                pre := PreConnect { visible: !UiState.client-active; }
-            }
-
-            if UiState.client-active && UiState.mode == PairMode.nostr-token: TokenPairingSummary { }
-            if UiState.client-active && UiState.mode != PairMode.nostr-token
-                && UiState.peer-node-id-short != "": LabeledValue {
-                label: "Paired with:";
-                value: UiState.peer-node-id-short;
-            }
-            if UiState.client-active: HorizontalLayout {
-                alignment: start;
-                Button {
-                    text: "✕ Disconnect";
-                    clicked => { Actions.disconnect(); }
-                }
-            }
-
-            session := SessionPanel { }
+        Rectangle {
+            height: UiState.client-active ? 0px : pre.preferred-height;
+            pre := PreConnect { visible: !UiState.client-active; }
         }
+
+        if UiState.client-active && UiState.mode == PairMode.nostr-token: TokenPairingSummary { }
+        if UiState.client-active && UiState.mode != PairMode.nostr-token
+            && UiState.peer-node-id-short != "": LabeledValue {
+            label: "Paired with:";
+            value: UiState.peer-node-id-short;
+        }
+        if UiState.client-active: HorizontalLayout {
+            alignment: start;
+            Button {
+                text: "✕ Disconnect";
+                clicked => { Actions.disconnect(); }
+            }
+        }
+
+        session := SessionPanel { }
     }
 }

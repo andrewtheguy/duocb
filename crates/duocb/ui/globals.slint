@@ -152,6 +152,9 @@ export global Actions {
     // and derived validation stay current.
     callback fields-edited();
 
-    // Global shortcuts; returns true when the key was consumed.
-    callback global-key(text: string, control: bool, field-focused: bool) -> bool;
+    // Global shortcuts; returns true when the key was consumed. `plain` means
+    // no modifier is held at all; `command` means exactly the platform command
+    // modifier (Slint's `control`: ⌘ on macOS, Ctrl elsewhere) — shortcuts
+    // never fire with extra modifiers, matching the previous toolkit.
+    callback global-key(text: string, plain: bool, command: bool, field-focused: bool) -> bool;
 }

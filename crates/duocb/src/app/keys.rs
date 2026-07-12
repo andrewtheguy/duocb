@@ -13,26 +13,32 @@ use super::App;
 use crate::{ConfigureStep, PairMode, Screen};
 use duocb_core::net::ConnStatus;
 
-/// Handle one key event. Returns whether the key was consumed (so the caller
-/// can accept it and nothing double-fires).
+/// Handle one key event. `plain` = no modifier held at all; `command` =
+/// exactly the platform command modifier — extra modifiers disqualify a
+/// shortcut in both cases (parity with the previous toolkit's exact-modifier
+/// matching, so e.g. Shift+S or Ctrl+Enter never fire the plain shortcuts).
+/// Returns whether the key was consumed (so the caller can accept it and
+/// nothing double-fires).
 pub(crate) fn handle_global_key(
     app: &mut App,
     text: &str,
-    control: bool,
+    plain: bool,
+    command: bool,
     field_focused: bool,
 ) -> bool {
     let focus_free = !field_focused;
     let key = text.chars().next();
-    let esc = key == Some(char::from(Key::Escape));
-    let enter = key == Some(char::from(Key::Return));
-    let up = key == Some(char::from(Key::UpArrow));
-    let down = key == Some(char::from(Key::DownArrow));
+    let esc = plain && key == Some(char::from(Key::Escape));
+    let enter = plain && key == Some(char::from(Key::Return));
+    let up = plain && key == Some(char::from(Key::UpArrow));
+    let down = plain && key == Some(char::from(Key::DownArrow));
+    let command_enter = command && key == Some(char::from(Key::Return));
     // A plain (unmodified) letter shortcut.
-    let letter = |c: char| !control && key.is_some_and(|k| k.eq_ignore_ascii_case(&c));
+    let letter = |c: char| plain && key.is_some_and(|k| k.eq_ignore_ascii_case(&c));
     // A command-modified letter shortcut.
-    let command = |c: char| control && key.is_some_and(|k| k.eq_ignore_ascii_case(&c));
+    let command = |c: char| command && key.is_some_and(|k| k.eq_ignore_ascii_case(&c));
 
-    if focus_free && app.screen != Screen::Home && esc && !control {
+    if focus_free && app.screen != Screen::Home && esc {
         app.go_back();
         return true;
     }
@@ -68,7 +74,7 @@ pub(crate) fn handle_global_key(
             }
         }
         Screen::Client => {
-            if !app.client_active && control && enter {
+            if !app.client_active && command_enter {
                 app.connect_client();
                 true
             } else {
@@ -192,15 +198,25 @@ mod tests {
 
     const ESC: &str = "\u{1b}";
 
+    /// A key with no modifiers held.
+    fn plain(app: &mut App, text: &str, field_focused: bool) -> bool {
+        handle_global_key(app, text, true, false, field_focused)
+    }
+
+    /// A key with exactly the command modifier held.
+    fn command(app: &mut App, text: &str, field_focused: bool) -> bool {
+        handle_global_key(app, text, false, true, field_focused)
+    }
+
     #[test]
     fn quick_screen_letters_route() {
         let mut app = test_app();
         app.open_quick();
-        assert!(handle_global_key(&mut app, "m", false, false));
+        assert!(plain(&mut app, "m", false));
         assert_eq!(app.mode, PairMode::Manual);
-        assert!(handle_global_key(&mut app, "c", false, false));
+        assert!(plain(&mut app, "c", false));
         assert_eq!(app.screen, Screen::Client);
-        assert!(handle_global_key(&mut app, ESC, false, false));
+        assert!(plain(&mut app, ESC, false));
         assert_eq!(app.screen, Screen::Quick);
     }
 
@@ -208,7 +224,7 @@ mod tests {
     fn letters_ignored_while_field_focused() {
         let mut app = test_app();
         app.open_quick();
-        assert!(!handle_global_key(&mut app, "m", false, true));
+        assert!(!plain(&mut app, "m", true));
         assert_eq!(app.mode, PairMode::NostrPin);
     }
 
@@ -216,20 +232,34 @@ mod tests {
     fn wizard_keys_route() {
         let mut app = test_app();
         assert_eq!(app.configure_step, ConfigureStep::SetupChoice);
-        assert!(handle_global_key(&mut app, "g", false, false));
+        assert!(plain(&mut app, "g", false));
         assert_eq!(app.configure_step, ConfigureStep::SetupGenerate);
-        assert!(handle_global_key(&mut app, ESC, false, false));
+        assert!(plain(&mut app, ESC, false));
         assert_eq!(app.configure_step, ConfigureStep::SetupChoice);
-        assert!(handle_global_key(&mut app, "i", false, false));
+        assert!(plain(&mut app, "i", false));
         assert_eq!(app.configure_step, ConfigureStep::SetupImport);
     }
 
     #[test]
-    fn command_letters_do_not_trigger_plain_shortcuts() {
+    fn modified_keys_do_not_trigger_plain_shortcuts() {
         let mut app = test_app();
-        // ⌘G on the setup choice must not start generating.
-        assert!(!handle_global_key(&mut app, "g", true, false));
+        // ⌘G on the setup choice must not start generating…
+        assert!(!command(&mut app, "g", false));
         assert_eq!(app.configure_step, ConfigureStep::SetupChoice);
+        // …and neither may a letter with any other modifier (plain=false,
+        // command=false — e.g. Shift or Alt held).
+        assert!(!handle_global_key(&mut app, "G", false, false, false));
+        assert_eq!(app.configure_step, ConfigureStep::SetupChoice);
+        // Modified Esc must not navigate either.
+        app.open_quick();
+        assert!(!handle_global_key(&mut app, ESC, false, false, false));
+        assert_eq!(app.screen, Screen::Quick);
+        // And ⌘Enter in the join picker must not join.
+        app.screen = Screen::Home;
+        app.mode = PairMode::NostrToken;
+        app.configure_step = ConfigureStep::Join;
+        let enter = char::from(Key::Return).to_string();
+        assert!(!command(&mut app, &enter, false));
     }
 
     #[test]
@@ -238,9 +268,9 @@ mod tests {
         app.configure_step = ConfigureStep::Join;
         app.peers = vec![crate::app::tests::peer("a", "s1", false)];
         let down = char::from(Key::DownArrow).to_string();
-        assert!(handle_global_key(&mut app, &down, false, false));
+        assert!(plain(&mut app, &down, false));
         assert_eq!(app.selected_peer.as_deref(), Some("s1"));
-        assert!(handle_global_key(&mut app, ESC, false, false));
+        assert!(plain(&mut app, ESC, false));
         assert_eq!(app.configure_step, ConfigureStep::Ready);
     }
 }

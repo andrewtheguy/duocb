@@ -46,8 +46,13 @@ export component MainWindow inherits Window {
                 self.focus();
                 return accept;
             }
-            return Actions.global-key(event.text, event.modifiers.control, root.any-field-focused)
-                ? accept : reject;
+            return Actions.global-key(
+                event.text,
+                !event.modifiers.control && !event.modifiers.shift
+                    && !event.modifiers.alt && !event.modifiers.meta,
+                event.modifiers.control && !event.modifiers.shift
+                    && !event.modifiers.alt && !event.modifiers.meta,
+                root.any-field-focused) ? accept : reject;
         }
 
         VerticalLayout {
