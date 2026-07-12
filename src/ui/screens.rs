@@ -7,9 +7,9 @@
 //!
 //! Keyboard shortcuts (also listed in the UI): home picks quick mode with 1
 //! (then P for PIN / M for manual) or config with 2, and role with S (start) /
-//! C (join); Ctrl+Enter starts/joins; Esc goes back;
-//! the manual start screen copies its credentials with Ctrl+I (node id) /
-//! Ctrl+T (token).
+//! C (join); Ctrl/Command+Enter starts/joins; Esc goes back;
+//! the manual start screen copies its credentials with Ctrl/Command+I (node id) /
+//! Ctrl/Command+T (token).
 
 use eframe::egui::{self, RichText, TextEdit, Ui};
 
@@ -249,7 +249,7 @@ pub fn show_server(app: &mut DuocbApp, ui: &mut Ui) {
             if ui
                 .add_enabled(
                     app.server_mode_spec().is_some(),
-                    egui::Button::new("▶ Start (Ctrl+Enter)"),
+                    egui::Button::new("▶ Start (Ctrl/⌘+Enter)"),
                 )
                 .clicked()
             {
@@ -301,7 +301,7 @@ pub fn show_server(app: &mut DuocbApp, ui: &mut Ui) {
         }
         PairMode::Manual => {
             if let Some(node_id) = app.node_id.clone() {
-                copyable_value(app, ui, "Node id:", "Copy (Ctrl+I)", &node_id);
+                copyable_value(app, ui, "Node id:", "Copy (Ctrl/⌘+I)", &node_id);
             }
             // The token is never shown in plain text — a mask stands in for it,
             // with a copy CTA — and its fingerprint is shown so the other device
@@ -312,7 +312,7 @@ pub fn show_server(app: &mut DuocbApp, ui: &mut Ui) {
                 ui.horizontal(|ui| {
                     ui.label("Token:");
                     ui.monospace("*".repeat(12));
-                    if ui.small_button("Copy token (Ctrl+T)").clicked() {
+                    if ui.small_button("Copy token (Ctrl/⌘+T)").clicked() {
                         app.copy_to_clipboard(&token);
                     }
                 });
@@ -412,7 +412,7 @@ pub fn show_client(app: &mut DuocbApp, ui: &mut Ui) {
         if ui
             .add_enabled(
                 app.client_dial_spec().is_some(),
-                egui::Button::new("▶ Connect (Ctrl+Enter)"),
+                egui::Button::new("▶ Connect (Ctrl/⌘+Enter)"),
             )
             .clicked()
         {

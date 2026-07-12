@@ -12,7 +12,7 @@ pub fn show_session(app: &mut DuocbApp, ui: &mut Ui) {
     ui.separator();
 
     ui.horizontal(|ui| {
-        if ui.button("📤 Send clipboard (Ctrl+S)").clicked() {
+        if ui.button("📤 Send clipboard (Ctrl/⌘+S)").clicked() {
             app.send_clipboard();
         }
         if ui
@@ -48,11 +48,11 @@ pub fn show_session(app: &mut DuocbApp, ui: &mut Ui) {
     ui.add_space(6.0);
     ui.horizontal(|ui| {
         ui.label(RichText::new(format!("Inbox ({})", app.inbox.len())).strong());
-        if !app.inbox.is_empty() && ui.small_button("Clear inbox (Ctrl+L)").clicked() {
+        if !app.inbox.is_empty() && ui.small_button("Clear inbox (Ctrl/⌘+L)").clicked() {
             app.inbox.clear();
         }
         ui.label(
-            RichText::new("newest: peek Ctrl+P · copy Ctrl+Y")
+            RichText::new("newest: peek Ctrl/⌘+P · copy Ctrl/⌘+Y")
                 .weak()
                 .small(),
         );
