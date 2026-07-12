@@ -3,22 +3,28 @@
 //! The app links `libduocb.xcframework` (containing `libduocb.a` slices) and
 //! drives the clipboard-pairing runtime with these calls:
 //!
-//! 1. [`duocb_start`] — parse the JSON config (`role` "start" or "join",
-//!    shared `token`, this device's short `name` and permanent 8-char
+//! 1. [`duocb_start`] — parse the JSON config (`role` "hub", "start", or
+//!    "join", shared `token`, this device's short `name` and permanent 8-char
 //!    `suffix`, the `peer` display identity to dial for the join role,
 //!    optional `relays`), spawn the networking runtime
 //!    ([`duocb_core::net::runtime::net_main`]) on an embedded tokio runtime,
-//!    start the presence broadcast, and issue the initial
-//!    `StartServer`/`Connect` command. Returns an opaque handle. At most
-//!    **one** instance may run at a time (a process-global guard rejects a
-//!    second).
+//!    and start the presence broadcast. The "start"/"join" roles then issue
+//!    the initial `StartServer`/`Connect` command; the "hub" role runs
+//!    presence + peer discovery only (an initial peer fetch is issued, its
+//!    result arriving as a `peer_list` event) so the app can show the device
+//!    list before the user commits to a role. Returns an opaque handle. At
+//!    most **one** instance may run at a time (a process-global guard rejects
+//!    a second).
 //! 2. [`duocb_next_event`] — drain one pending [`NetEvent`] as a JSON string.
 //!    The runtime is event-driven; Swift polls this on a timer until it
 //!    returns 0. PIN/quick-mode events never occur in configure mode and are
 //!    skipped defensively.
-//! 3. [`duocb_send_clipboard`] / [`duocb_query_conn_path`] — fire-and-forget
+//! 3. [`duocb_refresh_peers`] — re-fetch the presence records on demand; the
+//!    result arrives as a `peer_list` event (valid in every role, though the
+//!    hub is the natural place to poll it).
+//! 4. [`duocb_send_clipboard`] / [`duocb_query_conn_path`] — fire-and-forget
 //!    commands; outcomes arrive as `item_sent`/`error` and `conn_path` events.
-//! 4. [`duocb_stop`] — shut the runtime down and free the handle.
+//! 5. [`duocb_stop`] — shut the runtime down and free the handle.
 //!
 //! Configure-mode only: this surface constructs `ServerMode::NostrToken` and
 //! `DialSpec::NostrToken` exclusively. Quick mode (PIN / manual) is
@@ -26,11 +32,10 @@
 //! on iOS); mint the suffix once with [`duocb_generate_suffix`] and reuse it
 //! forever.
 //!
-//! **Interim surface**: this is a reduced adaptation to the presence/peer-list
-//! redesign. The join role requires the caller to supply the target device's
-//! full display identity (`peer`, e.g. `"mac-book_a7B2c3D4"`); a peer-list
-//! browsing call (surfacing `peer_list` events on demand) is a planned
-//! follow-up for the iOS app.
+//! The intended app flow mirrors the desktop hub: run a "hub" instance while
+//! the device list is on screen, and when the user picks an action stop it
+//! and start a fresh instance with role "start" (host) or "join" plus the
+//! selected peer's display identity from the last `peer_list` event.
 //!
 //! The workspace builds with `panic = "abort"` in release, so a Rust panic
 //! terminates the process rather than unwinding across the C boundary.
@@ -84,6 +89,9 @@ struct FfiConfig {
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Role {
+    /// Presence + peer discovery only; no session until restarted as
+    /// `Start`/`Join`.
+    Hub,
     Start,
     Join,
 }
@@ -248,6 +256,10 @@ fn start_inner(json: &str) -> Result<DuocbHandle, String> {
     let task = runtime.spawn(duocb_core::net::runtime::net_main(cmd_rx, events));
 
     let cmd = match cfg.role {
+        // The hub browses: presence is already running (below), so just kick
+        // off the initial peer fetch — its result arrives as a `peer_list`
+        // event. duocb_refresh_peers re-runs it on demand.
+        Role::Hub => UiCommand::RefreshPeers,
         Role::Start => UiCommand::StartServer {
             mode: ServerMode::NostrToken {
                 identity: identity.clone(),
@@ -348,6 +360,22 @@ pub unsafe extern "C" fn duocb_send_clipboard(
     let _ = handle.cmd_tx.send(UiCommand::SendClipboard {
         text: text.to_string(),
     });
+    0
+}
+
+/// Re-fetch the presence records of the other devices sharing the secret; the
+/// result arrives as a `peer_list` event. At most one fetch runs at a time
+/// (extra requests while one is in flight are dropped by the runtime).
+/// Returns 0 = requested, -1 = NULL handle.
+/// # Safety
+/// `handle` must be NULL or a live handle from [`duocb_start`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn duocb_refresh_peers(handle: *const DuocbHandle) -> c_int {
+    if handle.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*handle };
+    let _ = handle.cmd_tx.send(UiCommand::RefreshPeers);
     0
 }
 
@@ -540,6 +568,14 @@ mod tests {
         assert!(matches!(cfg.role, Role::Join));
         assert_eq!(cfg.peer.as_deref(), Some("mac_a7B2c3D4"));
         assert_eq!(cfg.relays, ["wss://r.example"]);
+
+        // The hub role browses the peer list before a role is chosen — no peer.
+        let cfg: FfiConfig = serde_json::from_str(
+            r#"{"role":"hub","token":"t","name":"phone","suffix":"x9Y8z7W6"}"#,
+        )
+        .unwrap();
+        assert!(matches!(cfg.role, Role::Hub));
+        assert!(cfg.peer.is_none());
     }
 
     #[test]

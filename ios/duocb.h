@@ -5,14 +5,13 @@
  *
  * Configure mode only: every device shares one standing secret (the token) and
  * broadcasts a presence record under its unique display identity
- * "<name>_<suffix>" (e.g. "mac-book_a7B2c3D4"). Role "start" hosts (its record
- * carries the node id); role "join" dials exactly the device named by "peer".
+ * "<name>_<suffix>" (e.g. "mac-book_a7B2c3D4"). Role "hub" broadcasts presence
+ * and browses the peer list without a session (the screen where the user picks
+ * what to do); role "start" hosts (its record carries the node id); role
+ * "join" dials exactly the device named by "peer". To move from browsing to a
+ * session, stop the hub instance and start a fresh one with the chosen role
+ * (and, for join, the peer display picked from the last "peer_list" event).
  * Quick mode (PIN / manual) is desktop-only and not exposed here.
- *
- * INTERIM SURFACE after the presence/peer-list redesign: the join role
- * requires the caller to pass the target's full display identity ("peer");
- * an on-demand peer-list browsing call is a planned follow-up. "peer_list"
- * events are already delivered when the runtime produces them.
  *
  * Lifecycle:
  *   1. duocb_init_logging()                                   (once, optional)
@@ -21,12 +20,16 @@
  *   3. duocb_next_event(handle, buf, len) in a loop on a timer:
  *        1 = one JSON event written, call again; 0 = none pending;
  *        -1 = NULL handle; -2 = buf too small (event retained, retry larger).
+ *   -  duocb_refresh_peers(handle)             (re-fetch the device list; the
+ *                                               result arrives as a "peer_list"
+ *                                               event. The hub role fetches once
+ *                                               on start by itself.)
  *   -  duocb_send_clipboard(handle, utf8Text)  (outcome arrives as an event)
  *   -  duocb_query_conn_path(handle)           (answer arrives as a "conn_path" event)
  *   4. duocb_stop(handle)                      (frees the handle)
  *
  * Config JSON:
- *   {"role":"start"|"join","token":"d…47 chars","name":"mac1",
+ *   {"role":"hub"|"start"|"join","token":"d…47 chars","name":"mac1",
  *    "suffix":"a7B2c3D4",                      permanent 8-char device id; mint
  *                                              once with duocb_generate_suffix
  *                                              and persist forever (Keychain)
@@ -98,6 +101,12 @@ DuocbHandle *duocb_start(const char *config_json, char *err_buf, size_t err_len)
 
 /* Drain one pending event as JSON (see header comment for return codes). */
 int duocb_next_event(const DuocbHandle *handle, char *out_buf, size_t out_len);
+
+/* Re-fetch the presence records of the other devices sharing the secret; the
+ * result arrives as a {"type":"peer_list"} event. At most one fetch runs at a
+ * time (extra requests while one is in flight are dropped).
+ * 0 = requested, -1 = NULL handle. */
+int duocb_refresh_peers(const DuocbHandle *handle);
 
 /* Queue a clipboard text for the peer. 0 = queued (outcome arrives as an
  * "item_sent" or "error" event), -1 = NULL/invalid argument. */

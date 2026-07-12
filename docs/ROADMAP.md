@@ -33,15 +33,6 @@ was not implemented.
 
 ## Follow-ups
 
-### iOS surface for the configure-mode redesign
-
-`duocb-ffi` currently exposes a reduced interim surface: the join role requires
-the Swift caller to pass the target device's full display identity (`peer`),
-and suffix persistence is the caller's job (`duocb_generate_suffix` + Keychain).
-The follow-up is a proper peer-list flow for the iOS app: an on-demand
-refresh call surfacing `peer_list` events, plus setup-wizard UX mirroring the
-desktop (one-time secret reveal, fingerprint confirm on import, clear-secret).
-
 ### Presence via relay subscriptions
 
 The peer list is polled (fetch on hub entry, manual refresh, 30 s auto-refresh
