@@ -10,8 +10,7 @@ import { SessionPanel } from "session.slint";
 import { Button, LineEdit } from "std-widgets.slint";
 
 component PreConnect inherits VerticalLayout {
-    out property <bool> field-focused:
-        pin-entry.has-focus || node-entry.has-focus || token-entry.has-focus;
+    out property <bool> field-focused: pin-entry.has-focus || code-entry.has-focus;
     alignment: start;
     spacing: Theme.pad-m;
 
@@ -49,29 +48,15 @@ component PreConnect inherits VerticalLayout {
             visible: UiState.mode == PairMode.manual;
             alignment: start;
             spacing: Theme.pad-xs;
-            Body { text: "Node id shown on the other device:"; }
-            node-entry := LineEdit {
-                text <=> UiState.in-node-id;
-                edited => { Actions.fields-edited(); }
-            }
-            Body { text: "Token copied from the other device:"; }
-            token-entry := LineEdit {
-                input-type: InputType.password;
+            Body { text: "Pairing code copied from the other device:"; }
+            code-entry := LineEdit {
                 placeholder-text: "…";
-                text <=> UiState.in-manual-token;
+                text <=> UiState.in-manual-code;
                 edited => { Actions.fields-edited(); }
                 accepted => { Actions.connect-client(); }
             }
-            Small {
-                text: "Paste the token itself (from “Copy token”) — not the fingerprint shown on the other device.";
-            }
-            if UiState.manual-entry-fingerprint != "": VerticalLayout {
-                spacing: Theme.pad-xs;
-                LabeledValue { label: "Token fingerprint:"; value: UiState.manual-entry-fingerprint; }
-                Small { text: "Confirm this matches on the other device."; }
-            }
-            if UiState.manual-entry-invalid: Text {
-                text: "That is not a valid token";
+            if UiState.manual-code-invalid: Text {
+                text: "Not a complete pairing code (check for missing characters)";
                 color: Theme.warn;
                 font-size: Theme.font-body;
             }

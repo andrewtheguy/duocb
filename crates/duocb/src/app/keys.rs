@@ -69,14 +69,10 @@ pub(crate) fn handle_global_key(
             true
         }
         Screen::Server => {
-            // Copy displayed initiator credentials without the mouse.
-            if command('i') && app.node_id.is_some() {
-                let node_id = app.node_id.clone().unwrap();
-                app.copy_to_clipboard(&node_id);
-                true
-            } else if command('t') && app.manual_token.is_some() {
-                let token = app.manual_token.clone().unwrap();
-                app.copy_to_clipboard(&token);
+            // Copy the displayed pairing code without the mouse (manual mode).
+            if command('t') && app.pairing_code.is_some() {
+                let code = app.pairing_code.clone().unwrap();
+                app.copy_to_clipboard(&code);
                 true
             } else {
                 false

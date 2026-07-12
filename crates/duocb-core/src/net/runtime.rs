@@ -453,33 +453,58 @@ async fn run_server_session(
     };
     let node_id = endpoint.id();
 
-    // Tokens accepted from clients. Manual mode mints a fresh ephemeral token
-    // here and surfaces it in the UI for the user to hand to the client; the
-    // PIN modes accept no tokens (only PIN proofs).
-    let (tokens, manual_token): (HashSet<String>, Option<String>) = match &mode {
-        ServerMode::Manual => {
-            let token = crate::auth::generate_token();
-            (HashSet::from([token.clone()]), Some(token))
-        }
-        ServerMode::NostrToken { identity } => (HashSet::from([identity.token.clone()]), None),
-        ServerMode::Pin { .. } => (HashSet::new(), None),
-    };
-    let token_fingerprint = tokens
-        .iter()
-        .next()
-        .map(|t| crate::auth::token_fingerprint(t));
-    events.send(NetEvent::ServerReady {
-        node_id: node_id.to_string(),
-        manual_token,
-        token_fingerprint,
-    });
-    events.status(ConnStatus::Listening);
-
     // One pairing per server session (all modes). The claim is empty until the
     // first client authenticates and lives until the server is stopped.
     let claim = PairClaim::default();
     let recent_pins = RecentPins::default();
-    let pin_cache = matches!(mode, ServerMode::Pin { .. }).then(|| recent_pins.clone());
+
+    // Tokens accepted from clients — configure mode only. The quick modes both
+    // authenticate with the in-band PIN challenge-response: manual mode mints
+    // a fresh session secret here, records its auth key like a (non-rotating)
+    // PIN, and bundles it with the node id into the pairing code the user
+    // carries to the other device out of band.
+    let (tokens, token_fingerprint): (HashSet<String>, Option<String>) = match &mode {
+        ServerMode::NostrToken { identity } => {
+            let fingerprint = crate::auth::token_fingerprint(&identity.token);
+            (HashSet::from([identity.token.clone()]), Some(fingerprint))
+        }
+        ServerMode::Pin { .. } | ServerMode::Manual => (HashSet::new(), None),
+    };
+    let pairing_code = if matches!(mode, ServerMode::Manual) {
+        let secret = crate::pin::generate_pin();
+        // Argon2id — off the async executor. The key must be in place before
+        // the code is surfaced, or a fast joiner could beat it to the auth.
+        let derived = tokio::task::spawn_blocking({
+            let secret = secret.clone();
+            move || crate::pin_auth::derive_auth_keys(&secret)
+        })
+        .await;
+        match derived {
+            Ok(Ok(keys)) => recent_pins.push(keys),
+            Ok(Err(e)) => {
+                events.error(format!("Failed to start: {e:#}"));
+                events.status(ConnStatus::Idle);
+                return;
+            }
+            Err(e) => {
+                events.error(format!("Failed to start: {e}"));
+                events.status(ConnStatus::Idle);
+                return;
+            }
+        }
+        Some(crate::manual_code::encode(&node_id, &secret))
+    } else {
+        None
+    };
+    events.send(NetEvent::ServerReady {
+        node_id: node_id.to_string(),
+        token_fingerprint,
+        pairing_code,
+    });
+    events.status(ConnStatus::Listening);
+
+    let pin_cache = matches!(mode, ServerMode::Pin { .. } | ServerMode::Manual)
+        .then(|| recent_pins.clone());
 
     // Configure mode: mark this device as hosting for the session's lifetime.
     // The standing presence publisher (owned by the command loop) picks the
@@ -583,13 +608,13 @@ async fn run_client_session(
 ) {
     events.status(ConnStatus::Starting);
 
-    // A manually typed node id is parsed once up front: if it's malformed it
+    // The pairing code's node id is parsed once up front: if it's malformed it
     // will never work, so fail the session immediately.
     let manual_id: Option<EndpointId> = match &spec {
         DialSpec::Manual { node_id, .. } => match node_id.trim().parse() {
             Ok(id) => Some(id),
             Err(e) => {
-                events.error(format!("Invalid node id: {e}"));
+                events.error(format!("Invalid pairing code: {e}"));
                 events.status(ConnStatus::Idle);
                 return;
             }
@@ -707,13 +732,15 @@ async fn run_client_session(
                 // Auth runs on the single session stream; on success the same
                 // stream stays open for clipboard frames.
                 let auth_result = match &spec {
-                    DialSpec::Manual { token, .. } => auth_as_dialer(&conn, token).await,
                     DialSpec::NostrToken { identity, .. } => {
                         auth_as_dialer(&conn, &identity.token).await
                     }
+                    // Both quick modes prove a PIN-shaped secret in-band —
+                    // manual's just arrived via the pasted pairing code.
                     DialSpec::Pin { canonical_pin, .. } => {
                         auth_as_dialer_pin(&conn, canonical_pin).await
                     }
+                    DialSpec::Manual { secret, .. } => auth_as_dialer_pin(&conn, secret).await,
                 };
                 match auth_result {
                     Ok((send, recv)) => {
@@ -1437,24 +1464,25 @@ mod tests {
         let srv_events = EventSender::new(srv_tx, None);
         let srv_session = start_session(SessionKind::Server(ServerMode::Manual), srv_events, None);
 
-        let (node_id, token) = wait_for_event(&srv_rx, Duration::from_secs(30), |ev| {
+        let code = wait_for_event(&srv_rx, Duration::from_secs(30), |ev| {
             if let NetEvent::ServerReady {
-                node_id,
-                manual_token: Some(token),
+                pairing_code: Some(code),
                 ..
             } = ev
             {
-                Some((node_id.clone(), token.clone()))
+                Some(code.clone())
             } else {
                 None
             }
         });
+        let (node_id, secret) =
+            crate::manual_code::decode(&code).expect("displayed pairing code is valid");
 
         // Client side.
         let (cli_tx, cli_rx) = std::sync::mpsc::channel();
         let cli_events = EventSender::new(cli_tx, None);
         let cli_session = start_session(
-            SessionKind::Client(DialSpec::Manual { node_id, token }),
+            SessionKind::Client(DialSpec::Manual { node_id, secret }),
             cli_events,
             None,
         );
@@ -1596,22 +1624,23 @@ mod tests {
             EventSender::new(srv_tx, None),
             None,
         );
-        let (node_id, token) = wait_for_event(&srv_rx, Duration::from_secs(30), |ev| {
+        let code = wait_for_event(&srv_rx, Duration::from_secs(30), |ev| {
             if let NetEvent::ServerReady {
-                node_id,
-                manual_token: Some(token),
+                pairing_code: Some(code),
                 ..
             } = ev
             {
-                Some((node_id.clone(), token.clone()))
+                Some(code.clone())
             } else {
                 None
             }
         });
+        let (node_id, secret) =
+            crate::manual_code::decode(&code).expect("displayed pairing code is valid");
 
         let (cli_tx, cli_rx) = std::sync::mpsc::channel();
         let cli_session = start_session(
-            SessionKind::Client(DialSpec::Manual { node_id, token }),
+            SessionKind::Client(DialSpec::Manual { node_id, secret }),
             EventSender::new(cli_tx, None),
             None,
         );
@@ -1658,9 +1687,10 @@ mod tests {
         stop_session(&mut srv).await;
     }
 
-    /// A client presenting the wrong token is rejected with a fatal auth error.
+    /// A client presenting the wrong session secret is rejected with a fatal
+    /// auth error.
     #[tokio::test(flavor = "multi_thread")]
-    async fn manual_mode_rejects_wrong_token() {
+    async fn manual_mode_rejects_wrong_secret() {
         let _ = env_logger::builder().is_test(true).try_init();
 
         let (srv_tx, srv_rx) = std::sync::mpsc::channel();
@@ -1681,7 +1711,7 @@ mod tests {
         let cli_session = start_session(
             SessionKind::Client(DialSpec::Manual {
                 node_id,
-                token: crate::auth::generate_token(), // not the server's token
+                secret: crate::pin::generate_pin(), // not the server's secret
             }),
             EventSender::new(cli_tx, None),
             None,

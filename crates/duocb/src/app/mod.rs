@@ -71,7 +71,9 @@ pub(crate) struct App {
     // Server presentation state.
     pub(crate) server_running: bool,
     pub(crate) node_id: Option<String>,
-    pub(crate) manual_token: Option<String>,
+    /// Manual mode's out-of-band credential (node id + session secret in one
+    /// copyable string); stays valid for the whole server session.
+    pub(crate) pairing_code: Option<String>,
     pub(crate) token_fingerprint: Option<String>,
     pub(crate) pin_display: Option<String>,
     pub(crate) pin_deadline: Option<Instant>,
@@ -87,8 +89,7 @@ pub(crate) struct App {
     pub(crate) in_my_name: String,
     pub(crate) in_import_token: String,
     pub(crate) in_pin: String,
-    pub(crate) in_node_id: String,
-    pub(crate) in_manual_token: String,
+    pub(crate) in_manual_code: String,
     /// Draft of the session panel's compose field (send typed text).
     pub(crate) in_compose: String,
 
@@ -166,7 +167,7 @@ impl App {
             confirm_clear_secret: false,
             server_running: false,
             node_id: None,
-            manual_token: None,
+            pairing_code: None,
             token_fingerprint: None,
             pin_display: None,
             pin_deadline: None,
@@ -175,8 +176,7 @@ impl App {
             in_my_name: saved_name.unwrap_or_default(),
             in_import_token: String::new(),
             in_pin: String::new(),
-            in_node_id: String::new(),
-            in_manual_token: String::new(),
+            in_manual_code: String::new(),
             in_compose: String::new(),
             peer_node_id: None,
             conn_path: None,
@@ -214,12 +214,12 @@ impl App {
         match event {
             NetEvent::ServerReady {
                 node_id,
-                manual_token,
                 token_fingerprint,
+                pairing_code,
             } => {
                 self.node_id = Some(node_id);
-                self.manual_token = manual_token;
                 self.token_fingerprint = token_fingerprint;
+                self.pairing_code = pairing_code;
             }
             NetEvent::ClientReady {
                 node_id,
@@ -251,7 +251,7 @@ impl App {
                     self.server_running = false;
                     self.client_active = false;
                     self.node_id = None;
-                    self.manual_token = None;
+                    self.pairing_code = None;
                     self.token_fingerprint = None;
                     self.joined_peer = None;
                     self.pin_display = None;
@@ -265,11 +265,11 @@ impl App {
             }
             NetEvent::PeerPaired { peer_node_id } => {
                 self.peer_node_id = Some(peer_node_id);
-                // The manual-mode token stays valid for the whole server session
-                // — the paired peer can reconnect with it — so keep it copyable on
+                // The pairing code stays valid for the whole server session —
+                // the paired peer can reconnect with it — so keep it copyable on
                 // the initiator (it is cleared only when the session ends, in the
-                // Idle branch above). Drop the joiner's typed copy now it's paired.
-                self.in_manual_token.clear();
+                // Idle branch above). Drop the joiner's pasted copy now it's paired.
+                self.in_manual_code.clear();
             }
             NetEvent::PeerDisconnected => {
                 self.peer_node_id = None;
@@ -724,16 +724,8 @@ impl App {
                     channel: self.core_pin_channel(),
                 })
             }
-            PairMode::Manual => {
-                let node_id = self.in_node_id.trim();
-                let token = self.in_manual_token.trim();
-                (!node_id.is_empty() && duocb_core::auth::validate_token(token).is_ok()).then(|| {
-                    DialSpec::Manual {
-                        node_id: node_id.to_string(),
-                        token: token.to_string(),
-                    }
-                })
-            }
+            PairMode::Manual => duocb_core::manual_code::decode(&self.in_manual_code)
+                .map(|(node_id, secret)| DialSpec::Manual { node_id, secret }),
         }
     }
 

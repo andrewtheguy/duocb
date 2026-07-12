@@ -135,14 +135,9 @@ pub(crate) fn wire(app: &Rc<RefCell<App>>, ui: &MainWindow) {
     });
 
     // Server credentials.
-    act!(on_copy_node_id, |app| {
-        if let Some(node_id) = app.node_id.clone() {
-            app.copy_to_clipboard(&node_id);
-        }
-    });
-    act!(on_copy_manual_token, |app| {
-        if let Some(token) = app.manual_token.clone() {
-            app.copy_to_clipboard(&token);
+    act!(on_copy_pairing_code, |app| {
+        if let Some(code) = app.pairing_code.clone() {
+            app.copy_to_clipboard(&code);
         }
     });
 
@@ -204,8 +199,7 @@ pub(crate) fn wire(app: &Rc<RefCell<App>>, ui: &MainWindow) {
                 app.in_my_name = s.get_in_my_name().into();
                 app.in_import_token = s.get_in_import_token().into();
                 app.in_pin = s.get_in_pin().into();
-                app.in_node_id = s.get_in_node_id().into();
-                app.in_manual_token = s.get_in_manual_token().into();
+                app.in_manual_code = s.get_in_manual_code().into();
                 app.in_compose = s.get_in_compose().into();
             }
             app.borrow().sync(&ui);

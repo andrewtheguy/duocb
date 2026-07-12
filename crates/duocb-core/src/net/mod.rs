@@ -72,10 +72,12 @@ pub enum ServerMode {
         relays: Vec<String>,
         channel: PinChannel,
     },
-    /// Manual/offline mode: no signaling. The server displays its node id and a
-    /// freshly generated auth token (reported via [`NetEvent::ServerReady`]);
-    /// the client types both. Discovery falls back to mDNS on the LAN, so this
-    /// works with zero internet.
+    /// Manual/offline mode: no signaling at all. The server displays a single
+    /// pairing code — its node id plus a fresh session secret (see
+    /// `crate::manual_code`, reported via [`NetEvent::ServerReady`]) — which
+    /// the user carries to the other device out of band. Auth is the same
+    /// in-band PIN challenge-response as the PIN mode. Discovery falls back to
+    /// mDNS on the LAN, so this works with zero internet.
     Manual,
 }
 
@@ -97,8 +99,9 @@ pub enum DialSpec {
         relays: Vec<String>,
         channel: PinChannel,
     },
-    /// Dial a manually typed node id and present the server's token.
-    Manual { node_id: String, token: String },
+    /// Dial the node id carried by a pasted pairing code and prove its session
+    /// secret in-band (the same PIN challenge-response as the PIN mode).
+    Manual { node_id: String, secret: String },
 }
 
 /// Commands from the UI thread to the networking runtime.
@@ -147,12 +150,13 @@ pub enum ConnStatus {
 /// Events from the networking runtime to the UI thread.
 #[derive(Debug)]
 pub enum NetEvent {
-    /// Server endpoint is up. `manual_token` is set in manual mode (the token the
-    /// client must type); `token_fingerprint` is set whenever a token is in play.
+    /// Server endpoint is up. `pairing_code` is set in manual mode (the code
+    /// the user carries to the other device); `token_fingerprint` is set in
+    /// configure mode (the standing secret's).
     ServerReady {
         node_id: String,
-        manual_token: Option<String>,
         token_fingerprint: Option<String>,
+        pairing_code: Option<String>,
     },
     /// Client endpoint is online. Token mode includes the fingerprint so the
     /// connector retains the same identity details as the initiator screen.

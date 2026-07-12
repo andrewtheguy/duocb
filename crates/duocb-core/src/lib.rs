@@ -10,6 +10,7 @@ pub use iroh;
 pub mod auth;
 pub mod identity;
 pub mod lan;
+pub mod manual_code;
 pub mod net;
 pub mod nostr;
 pub mod pin;

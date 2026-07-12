@@ -627,8 +627,8 @@ mod tests {
     fn event_json_maps_token_mode_events_and_drops_pin_events() {
         let json = event_json(&NetEvent::ServerReady {
             node_id: "abc".into(),
-            manual_token: None,
             token_fingerprint: Some("aaaa-bbbb-cccc-dddd".into()),
+            pairing_code: None,
         })
         .unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();

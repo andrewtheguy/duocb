@@ -40,12 +40,12 @@ export component QuickScreen inherits Rectangle {
             }
             ModeRow {
                 demoted: true;
-                text: "M  Manual (testing) — node id + token, no nostr";
+                text: "M  Manual (testing) — carry a pairing code yourself";
                 selected: UiState.mode == PairMode.manual;
                 clicked => { Actions.set-mode(PairMode.manual); }
             }
             Small {
-                text: "Manual is for testing connectivity without nostr — offline on the same LAN (mDNS) or across the internet. Everyday pairing is the PIN.";
+                text: "Manual is for testing connectivity with no discovery at all: copy one pairing code between the devices out of band — offline on the same LAN (mDNS) or across the internet. Everyday pairing is the PIN.";
             }
         }
 
