@@ -26,7 +26,10 @@
 //! and binds the connection to the peer's node id (its public key). This construction is not a PAKE:
 //! a party that can observe a decrypted proof transcript can test PIN guesses offline, as can anyone
 //! archiving the public PIN-derived rendezvous event. Argon2id and the short recent-PIN acceptance
-//! window mitigate that risk; they do not eliminate the offline verifier.
+//! window mitigate that risk; they do not eliminate the offline verifier. Once the first peer has
+//! claimed the server, however, the PIN-derived proof is insufficient on its own: a reconnect must
+//! also present the claimed endpoint identity through QUIC/TLS. The PIN does not derive or reveal
+//! QUIC's independently negotiated traffic-encryption keys.
 
 use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
