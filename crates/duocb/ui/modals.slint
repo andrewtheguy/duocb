@@ -5,7 +5,7 @@
 import { UiState, Actions } from "globals.slint";
 import { Theme } from "theme.slint";
 import { Card, Body } from "widgets.slint";
-import { Button, Palette } from "std-widgets.slint";
+import { Button, Palette, ScrollView } from "std-widgets.slint";
 
 component ModalBackdrop inherits Rectangle {
     callback dismissed();
@@ -59,15 +59,24 @@ export component ConnPathModal inherits Rectangle {
             spacing: Theme.pad-s;
             Text { text: "Connection path"; font-size: Theme.font-heading; font-weight: 700; }
             if UiState.conn-paths.length == 0: Body { text: "No active connection."; }
-            for path in UiState.conn-paths: HorizontalLayout {
-                spacing: Theme.pad-s;
-                Text { text: path.marker; color: path.color; font-size: Theme.font-body; }
-                Text {
-                    text: path.display;
-                    font-family: UiState.mono-font;
-                    font-size: Theme.font-body;
-                    wrap: word-wrap;
-                    horizontal-stretch: 1;
+            // Capped like the session inbox list, so many candidate paths
+            // scroll instead of growing the dialog past the window.
+            ScrollView {
+                height: min(paths-list.preferred-height, 280px);
+                paths-list := VerticalLayout {
+                    alignment: start;
+                    spacing: Theme.pad-s;
+                    for path in UiState.conn-paths: HorizontalLayout {
+                        spacing: Theme.pad-s;
+                        Text { text: path.marker; color: path.color; font-size: Theme.font-body; }
+                        Text {
+                            text: path.display;
+                            font-family: UiState.mono-font;
+                            font-size: Theme.font-body;
+                            wrap: word-wrap;
+                            horizontal-stretch: 1;
+                        }
+                    }
                 }
             }
             if UiState.conn-paths.length > 0: Text {
