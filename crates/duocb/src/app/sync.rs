@@ -79,7 +79,13 @@ impl App {
             }
         }
         s.set_can_cancel_name(self.has_saved_identity());
-        s.set_name_max_len(duocb_core::identity::NAME_MAX_LEN as i32);
+        s.set_name_rules(
+            format!(
+                "A short name plus this device's permanent id — other devices will see it in their list. Letters, digits, and '-' only (max {} characters).",
+                duocb_core::identity::NAME_MAX_LEN
+            )
+            .into(),
+        );
         let import = self.in_import_token.trim();
         let import_valid = duocb_core::auth::validate_token(import).is_ok();
         s.set_import_valid(import_valid);

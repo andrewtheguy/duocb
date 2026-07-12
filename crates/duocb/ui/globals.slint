@@ -39,7 +39,9 @@ export global UiState {
     in property <string> import-fingerprint;
     /// True when the import entry is non-empty but not a valid token.
     in property <bool> import-invalid;
-    in property <int> name-max-len;
+    /// The name rules line under the name field (composed in Rust so the max
+    /// length constant lives in one place).
+    in property <string> name-rules;
 
     // Device picker.
     in property <[PeerRow]> peers;
