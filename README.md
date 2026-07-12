@@ -33,12 +33,12 @@ Chosen on the home screen; the **starting** device displays credentials, the **j
 |---|---|---|---|---|
 | **PIN quick pair** | nostr relays | an 8-character PIN that rotates every 60 s | Argon2id PIN challenge-response (mutual, in-band) | required |
 | **Token + names** | nostr relays | a shared 47-char token + each device's own unique name (once; can be remembered) | pre-shared token | required |
-| **Manual / offline** | none | the starting device's node id + a generated one-time token | one-time token | **not required** on the same LAN (mDNS) |
+| **Manual / offline** | none | the starting device's node id + a generated token | shared token | **not required** on the same LAN (mDNS) |
 
 - **PIN quick pair** is the fastest ad-hoc pairing: the starting device shows a short code, you type it on the joining device. The PIN both locates the starting device (an encrypted rendezvous record on public nostr relays) and authenticates the connection in-band — no token ever exists, and nothing offline-crackable crosses the wire. Because it carries no shared standing state — just a fresh ephemeral identity and a rotating PIN — this mode is **conflict-free**: it works just as well for pairing two devices owned by two *different* people as for your own two. That's a supported side effect, not the project's primary focus (which remains linking your own devices).
 - **Token + names** is for a standing pairing: both devices share one auth token (generate it in the app), and each enters its own distinct name. The joining device queries the shared token-derived nostr identity and automatically selects the newest record belonging to a different name; you never enter the other device's name. A restarted starting device is re-resolved automatically. The initiator always saves its valid token and name before starting; the connector saves them automatically only after a connection authenticates successfully.
 - If two devices accidentally use the same name, the current join flow cannot distinguish that live collision from a stale self record. The planned actionable detection and resolution flow is documented in [docs/ROADMAP.md](docs/ROADMAP.md).
-- **Manual / offline** needs no signaling at all: the starting device displays its node id and a freshly generated one-time token; enter both on the joining device. On the same LAN the node id resolves via mDNS, so it works with the internet down.
+- **Manual / offline** needs no signaling at all: the starting device displays its node id and a freshly generated token (shown as a fingerprint, copied to the clipboard); enter both on the joining device. The token stays valid for the whole session, so the paired peer can reconnect after a drop. On the same LAN the node id resolves via mDNS, so it works with the internet down.
 
 The iroh identity is **ephemeral** — a fresh node id (and manual-mode token, and PIN sequence) is minted every time a connection is started. Stopping and restarting invalidates the previous credentials.
 
@@ -73,7 +73,7 @@ The joining device reconnects automatically with backoff if the connection drops
 | `S` / `C` | home | start a connection / join a connection |
 | `Ctrl+Enter` | start / join form | start the connection / connect |
 | `Esc` | any screen (no field focused) | back to home, stopping the session |
-| `Ctrl+I` / `Ctrl+T` | manual start screen | copy the node id / the one-time token |
+| `Ctrl+I` / `Ctrl+T` | manual start screen | copy the node id / the token |
 | `Ctrl+S` | connected | send the current clipboard |
 | `Ctrl+P` | connected | peek/hide the newest inbox item |
 | `Ctrl+Y` | connected | copy the newest inbox item to the clipboard |

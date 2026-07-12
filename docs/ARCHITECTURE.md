@@ -76,7 +76,7 @@ The `EventSender`'s repaint context is optional, so the whole runtime runs headl
 
 **Server session** (`run_server_session`):
 
-1. Create the listening endpoint (fresh ephemeral identity) → emit `ServerReady` (manual mode generates its one-time token here) → `Listening`.
+1. Create the listening endpoint (fresh ephemeral identity) → emit `ServerReady` (manual mode generates its token here) → `Listening`.
 2. Spawn the mode's signaling publisher (see below); manual mode has none.
 3. Accept loop, **one connection served at a time**: accept → accept the single session stream and `auth_as_listener` on it → `PeerPaired` → pump clipboard on that same stream until the connection dies → `PeerDisconnected`, keep listening.
 4. A `PairClaim` (below) restricts the whole session to one peer identity.
@@ -122,7 +122,7 @@ Both nostr schemes publish only the server's **ephemeral node id**, NIP-44 (v2) 
 
 ### Manual / offline
 
-No signaling. The server displays its node id + a generated one-time token; the client types both. Resolution of the bare node id falls to the endpoint's discovery services — on a LAN, **mDNS**, which is why this mode works with zero internet. This fixes the corresponding duopipe gap where the manual path had no interactive way to share the listener's token: in duocb the server *generates and displays* the token and the client form has a field for it.
+No signaling. The server displays its node id + a generated token (as a fingerprint, with the raw token copied to the clipboard rather than shown); the client enters both. The token stays valid for the whole server session so the paired peer can reconnect after a drop. Resolution of the bare node id falls to the endpoint's discovery services — on a LAN, **mDNS**, which is why this mode works with zero internet. This fixes the corresponding duopipe gap where the manual path had no interactive way to share the listener's token: in duocb the server *generates and displays* the token and the client form has a field for it.
 
 ## Authentication
 

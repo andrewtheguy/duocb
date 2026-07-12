@@ -169,10 +169,10 @@ impl DuocbApp {
                 {
                     self.token_settings_saved = self.persist_token_settings();
                 }
-                // The manual-mode one-time token is consumed by pairing: stop
-                // displaying/copying it on the server and drop the client's
-                // typed copy. (A new server session mints a fresh one anyway.)
-                self.manual_token = None;
+                // The manual-mode token stays valid for the whole server session
+                // — the paired peer can reconnect with it — so keep it copyable on
+                // the initiator (it is cleared only when the session ends, in the
+                // Idle branch above). Drop the joiner's typed copy now it's paired.
                 self.in_manual_token.clear();
             }
             NetEvent::PeerDisconnected => {

@@ -303,17 +303,22 @@ pub fn show_server(app: &mut DuocbApp, ui: &mut Ui) {
             if let Some(node_id) = app.node_id.clone() {
                 copyable_value(app, ui, "Node id:", "Copy (Ctrl+I)", &node_id);
             }
-            // The one-time token is never shown in plain text. Until a peer pairs
-            // (which consumes it and clears `manual_token`) show its fingerprint
-            // with a copy CTA so the initiator can hand the secret over the
-            // clipboard without it ever appearing on screen.
+            // The token is never shown in plain text — a mask stands in for it,
+            // with a copy CTA — and its fingerprint is shown so the other device
+            // can confirm the match. It stays valid (and copyable) for the whole
+            // session so the paired peer can be re-sent it and reconnect after a
+            // drop.
             if let Some(token) = app.manual_token.clone() {
                 ui.horizontal(|ui| {
-                    ui.label("One-time token:");
-                    ui.monospace(crate::auth::token_fingerprint(&token));
+                    ui.label("Token:");
+                    ui.monospace("*".repeat(12));
                     if ui.small_button("Copy token (Ctrl+T)").clicked() {
                         app.copy_to_clipboard(&token);
                     }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Token fingerprint:");
+                    ui.monospace(crate::auth::token_fingerprint(&token));
                 });
             }
             ui.label("Enter both on the other device. No internet needed on the same LAN.");
@@ -383,13 +388,21 @@ pub fn show_client(app: &mut DuocbApp, ui: &mut Ui) {
                         .font(egui::TextStyle::Monospace)
                         .desired_width(f32::INFINITY),
                 );
-                ui.label("One-time token shown on the other device:");
+                ui.label("Token copied from the other device:");
                 ui.add(
                     TextEdit::singleline(&mut app.in_manual_token)
                         .font(egui::TextStyle::Monospace)
                         .password(true)
                         .desired_width(f32::INFINITY)
-                        .hint_text("d…"),
+                        .hint_text("…"),
+                );
+                ui.label(
+                    RichText::new(
+                        "Paste the token itself (from “Copy token”) — not the fingerprint \
+                         shown on the other device.",
+                    )
+                    .weak()
+                    .small(),
                 );
                 token_entry_feedback(ui, &app.in_manual_token);
             }
