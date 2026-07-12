@@ -33,9 +33,9 @@ jobs:
         run: |
           # Tag and name are always derived from the Cargo.toml version so the flow is
           # uniform across releases and prereleases. Whether it's a prerelease is decided
-          # purely by the branch this workflow runs against (anything other than master).
+          # purely by the branch this workflow runs against (anything other than main).
           echo "release_tag=v$VERSION" >> "$GITHUB_OUTPUT"
-          if [ "${{ github.ref }}" != "refs/heads/master" ]; then
+          if [ "${{ github.ref }}" != "refs/heads/main" ]; then
             echo "release_title=Prerelease v$VERSION" >> "$GITHUB_OUTPUT"
             echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
           else
