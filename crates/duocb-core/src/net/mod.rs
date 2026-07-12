@@ -35,6 +35,29 @@ impl TokenIdentity {
     }
 }
 
+/// Which transport(s) carry the rotating-PIN rendezvous record (the same
+/// encrypted record either way — see `crate::pin_record`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinChannel {
+    /// Publish/look up on nostr relays **and** the local network (mDNS); the
+    /// lookup races both. The default: works across the internet, and still
+    /// pairs on the same network with no internet.
+    NostrAndLan,
+    /// Nostr relays only (internet required).
+    NostrOnly,
+    /// Local network only (mDNS): zero internet, both devices on one network.
+    LanOnly,
+}
+
+impl PinChannel {
+    pub fn nostr(self) -> bool {
+        matches!(self, Self::NostrAndLan | Self::NostrOnly)
+    }
+    pub fn lan(self) -> bool {
+        matches!(self, Self::NostrAndLan | Self::LanOnly)
+    }
+}
+
 /// How the server signals its ephemeral node id to the client.
 #[derive(Debug, Clone)]
 pub enum ServerMode {
@@ -42,9 +65,13 @@ pub enum ServerMode {
     /// (kept running by the runtime) carries the node id to peers; in-band
     /// token auth gates the connection.
     NostrToken { identity: TokenIdentity },
-    /// Nostr rotating-PIN quick mode: publish under per-bucket PIN-derived keys;
-    /// in-band PIN challenge-response auth.
-    NostrPin { relays: Vec<String> },
+    /// Rotating-PIN quick mode: publish the rendezvous record under per-bucket
+    /// PIN-derived keys on the selected channel(s); in-band PIN
+    /// challenge-response auth.
+    Pin {
+        relays: Vec<String>,
+        channel: PinChannel,
+    },
     /// Manual/offline mode: no signaling. The server displays its node id and a
     /// freshly generated auth token (reported via [`NetEvent::ServerReady`]);
     /// the client types both. Discovery falls back to mDNS on the LAN, so this
@@ -63,10 +90,12 @@ pub enum DialSpec {
         /// The selected peer's full display identity, e.g. `mac-book_a7B2c3D4`.
         peer_display: String,
     },
-    /// Resolve via the rotating-PIN rendezvous, then prove PIN possession in-band.
+    /// Resolve via the rotating-PIN rendezvous on the selected channel(s) —
+    /// racing them when both are enabled — then prove PIN possession in-band.
     Pin {
         canonical_pin: String,
         relays: Vec<String>,
+        channel: PinChannel,
     },
     /// Dial a manually typed node id and present the server's token.
     Manual { node_id: String, token: String },

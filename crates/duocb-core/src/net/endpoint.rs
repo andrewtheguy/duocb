@@ -7,7 +7,7 @@
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use iroh::{
-    Endpoint, EndpointAddr, EndpointId, RelayMode, TransportAddr,
+    Endpoint, EndpointAddr, EndpointId, RelayMode, TransportAddr, Watcher,
     address_lookup::{DnsAddressLookup, PkarrPublisher},
     endpoint::{Builder as EndpointBuilder, PathList, QuicTransportConfig, presets},
 };
@@ -71,14 +71,59 @@ fn create_endpoint_builder() -> Result<EndpointBuilder> {
     Ok(builder)
 }
 
-/// Wait for an endpoint to come online, with a timeout.
-async fn wait_for_endpoint_online(endpoint: &Endpoint) -> Result<()> {
+/// What a freshly bound endpoint waits for before the session proceeds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EndpointReadiness {
+    /// Wait for the home relay (`Endpoint::online`) and fail without it. The
+    /// gate for internet-dependent modes — but `online()` **only** resolves
+    /// once a relay connects, so it times out entirely offline.
+    RelayOnline,
+    /// Prefer the home relay but tolerate its absence: on timeout, log and
+    /// continue with whatever direct addresses exist. The gate for modes that
+    /// work both online and offline (the default nostr+LAN PIN channel).
+    RelayPreferred,
+    /// Wait only for a first direct (IP) address. The gate for LAN-only modes,
+    /// which must come up promptly with zero internet and no relay.
+    LanDirect,
+}
+
+/// Wait until the endpoint has discovered at least one direct (IP) address.
+/// Resolves early if the endpoint is dropped (nothing to wait for then).
+async fn wait_for_direct_address(endpoint: &Endpoint) {
+    let mut watcher = endpoint.watch_addr();
+    loop {
+        if watcher.get().ip_addrs().next().is_some() {
+            break;
+        }
+        if watcher.updated().await.is_err() {
+            break;
+        }
+    }
+}
+
+/// Wait for an endpoint to be ready per `readiness`, with a timeout.
+async fn wait_for_endpoint_ready(endpoint: &Endpoint, readiness: EndpointReadiness) -> Result<()> {
     info!(
-        "Waiting for endpoint to come online (timeout: {}s)...",
+        "Waiting for endpoint to be ready ({readiness:?}, timeout: {}s)...",
         CONNECT_TIMEOUT.as_secs()
     );
-    match tokio::time::timeout(CONNECT_TIMEOUT, endpoint.online()).await {
+    let ready = async {
+        match readiness {
+            EndpointReadiness::RelayOnline | EndpointReadiness::RelayPreferred => {
+                endpoint.online().await
+            }
+            EndpointReadiness::LanDirect => wait_for_direct_address(endpoint).await,
+        }
+    };
+    match tokio::time::timeout(CONNECT_TIMEOUT, ready).await {
         Ok(()) => Ok(()),
+        Err(_) if readiness == EndpointReadiness::RelayPreferred => {
+            info!(
+                "No relay came online after {}s — continuing offline (LAN pairing still works)",
+                CONNECT_TIMEOUT.as_secs()
+            );
+            Ok(())
+        }
         Err(_) => anyhow::bail!(
             "Endpoint failed to come online after {}s - check network connectivity",
             CONNECT_TIMEOUT.as_secs()
@@ -88,24 +133,24 @@ async fn wait_for_endpoint_online(endpoint: &Endpoint) -> Result<()> {
 
 /// Create a listening endpoint. The endpoint identity is ephemeral, so the node
 /// id changes every run.
-pub async fn create_server_endpoint() -> Result<Endpoint> {
+pub async fn create_server_endpoint(readiness: EndpointReadiness) -> Result<Endpoint> {
     let builder = create_endpoint_builder()?.alpns(vec![ALPN.to_vec()]);
     let endpoint = builder
         .bind()
         .await
         .context("Failed to create iroh endpoint")?;
-    wait_for_endpoint_online(&endpoint).await?;
+    wait_for_endpoint_ready(&endpoint, readiness).await?;
     Ok(endpoint)
 }
 
 /// Create a dialing endpoint. The endpoint identity is ephemeral.
-pub async fn create_client_endpoint() -> Result<Endpoint> {
+pub async fn create_client_endpoint(readiness: EndpointReadiness) -> Result<Endpoint> {
     let builder = create_endpoint_builder()?;
     let endpoint = builder
         .bind()
         .await
         .context("Failed to create iroh endpoint")?;
-    wait_for_endpoint_online(&endpoint).await?;
+    wait_for_endpoint_ready(&endpoint, readiness).await?;
     Ok(endpoint)
 }
 

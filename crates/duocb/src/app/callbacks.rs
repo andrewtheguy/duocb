@@ -117,6 +117,15 @@ pub(crate) fn wire(app: &Rc<RefCell<App>>, ui: &MainWindow) {
             app.borrow().sync(&ui);
         }
     });
+    actions.on_set_pin_channel({
+        let app = Rc::clone(app);
+        let weak = ui.as_weak();
+        move |channel| {
+            let ui = weak.unwrap();
+            app.borrow_mut().pin_channel = channel;
+            app.borrow().sync(&ui);
+        }
+    });
     nav!(on_open_client, |app| {
         app.screen = crate::Screen::Client;
     });

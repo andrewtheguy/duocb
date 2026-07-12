@@ -2,7 +2,7 @@
 // here is persisted; the credentials last one session.
 
 import { UiState, Actions } from "globals.slint";
-import { PairMode } from "types.slint";
+import { PairMode, PinChannel } from "types.slint";
 import { Theme } from "theme.slint";
 import { Card, CardTitle, Weak, Small, Body, BigButton, WideButton, BackHeader, SelectableRow } from "widgets.slint";
 
@@ -46,6 +46,28 @@ export component QuickScreen inherits Rectangle {
             }
             Small {
                 text: "Manual is for testing connectivity without nostr — offline on the same LAN (mDNS) or across the internet. Everyday pairing is the PIN.";
+            }
+        }
+
+        if UiState.mode == PairMode.nostr-pin: Card {
+            CardTitle { text: "PIN discovery"; }
+            ModeRow {
+                text: "1  Internet + local network — works everywhere";
+                selected: UiState.pin-channel == PinChannel.both;
+                clicked => { Actions.set-pin-channel(PinChannel.both); }
+            }
+            ModeRow {
+                text: "2  Internet only (nostr relays)";
+                selected: UiState.pin-channel == PinChannel.nostr-only;
+                clicked => { Actions.set-pin-channel(PinChannel.nostr-only); }
+            }
+            ModeRow {
+                text: "3  Local network only — no internet needed";
+                selected: UiState.pin-channel == PinChannel.lan-only;
+                clicked => { Actions.set-pin-channel(PinChannel.lan-only); }
+            }
+            Small {
+                text: "Pick the same discovery on both devices (the default matches everything).";
             }
         }
 

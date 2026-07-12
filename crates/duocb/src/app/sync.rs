@@ -19,6 +19,7 @@ impl App {
         s.set_screen(self.screen);
         s.set_configure_step(self.configure_step);
         s.set_mode(self.mode);
+        s.set_pin_channel(self.pin_channel);
         s.set_status_text(self.status_text().into());
         s.set_connected(self.status == ConnStatus::Connected);
         s.set_server_running(self.server_running);

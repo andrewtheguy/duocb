@@ -29,6 +29,9 @@ arboard = "3.6.1"
 # P2P transport
 iroh = "1.0.2"
 iroh-mdns-address-lookup = "0.4.0"
+# Also the engine under iroh-mdns-address-lookup; kept on the same version so
+# the two mDNS responders share one stack.
+swarm-discovery = "0.6.3"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 futures = "0.3"
 

@@ -10,7 +10,7 @@
 use slint::platform::Key;
 
 use super::App;
-use crate::{ConfigureStep, PairMode, Screen};
+use crate::{ConfigureStep, PairMode, PinChannel, Screen};
 use duocb_core::net::ConnStatus;
 
 /// Handle one key event. `plain` = no modifier held at all; `command` =
@@ -46,10 +46,19 @@ pub(crate) fn handle_global_key(
     let handled = match app.screen {
         Screen::Home if focus_free => handle_configure_key(app, esc, enter, up, down, &letter, &command),
         Screen::Quick if focus_free => {
+            // Digits pick the PIN discovery channel (only meaningful — and
+            // only visible — while the PIN mode is selected).
+            let pin_mode = app.mode == PairMode::NostrPin;
             if letter('p') {
                 app.mode = PairMode::NostrPin;
             } else if letter('m') {
                 app.mode = PairMode::Manual;
+            } else if pin_mode && letter('1') {
+                app.pin_channel = PinChannel::Both;
+            } else if pin_mode && letter('2') {
+                app.pin_channel = PinChannel::NostrOnly;
+            } else if pin_mode && letter('3') {
+                app.pin_channel = PinChannel::LanOnly;
             } else if letter('s') {
                 app.begin_server();
             } else if letter('c') {
@@ -212,8 +221,17 @@ mod tests {
     fn quick_screen_letters_route() {
         let mut app = test_app();
         app.open_quick();
+        assert_eq!(app.mode, PairMode::NostrPin);
+        // Digits pick the PIN discovery channel while the PIN mode is selected…
+        assert!(plain(&mut app, "3", false));
+        assert_eq!(app.pin_channel, PinChannel::LanOnly);
+        assert!(plain(&mut app, "1", false));
+        assert_eq!(app.pin_channel, PinChannel::Both);
         assert!(plain(&mut app, "m", false));
         assert_eq!(app.mode, PairMode::Manual);
+        // …but not while another mode is.
+        assert!(!plain(&mut app, "2", false));
+        assert_eq!(app.pin_channel, PinChannel::Both);
         assert!(plain(&mut app, "c", false));
         assert_eq!(app.screen, Screen::Client);
         assert!(plain(&mut app, ESC, false));

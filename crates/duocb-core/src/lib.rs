@@ -9,8 +9,10 @@ pub use iroh;
 
 pub mod auth;
 pub mod identity;
+pub mod lan;
 pub mod net;
 pub mod nostr;
 pub mod pin;
 pub mod pin_auth;
+mod pin_record;
 pub mod protocol;

@@ -3,7 +3,7 @@
 // carries every user intent back into Rust, which mutates the `App` state and
 // re-syncs. No UI-side state beyond what lives here.
 
-import { Screen, ConfigureStep, PairMode, PeerRow, ClipRow, PathRow } from "types.slint";
+import { Screen, ConfigureStep, PairMode, PinChannel, PeerRow, ClipRow, PathRow } from "types.slint";
 
 export global UiState {
     // Per-platform font families, set once at startup from Rust ("" = the
@@ -16,6 +16,7 @@ export global UiState {
     in property <Screen> screen;
     in property <ConfigureStep> configure-step;
     in property <PairMode> mode;
+    in property <PinChannel> pin-channel;
     in property <string> status-text;
     in property <bool> connected;
     in property <bool> server-running;
@@ -135,6 +136,7 @@ export global Actions {
 
     // Quick options / client.
     callback set-mode(mode: PairMode);
+    callback set-pin-channel(channel: PinChannel);
     callback open-client();
     callback connect-client();
     callback disconnect();

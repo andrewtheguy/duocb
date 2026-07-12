@@ -12,7 +12,7 @@ mod sync;
 use std::time::{Duration, Instant};
 
 use crate::clipboard::SystemClipboard;
-use crate::{ConfigureStep, PairMode, Screen};
+use crate::{ConfigureStep, PairMode, PinChannel, Screen};
 use duocb_core::net::endpoint::ConnPath;
 use duocb_core::net::{ConnStatus, NetEvent, NetHandle, TokenIdentity, UiCommand};
 use duocb_core::nostr::PeerInfo;
@@ -36,6 +36,9 @@ pub(crate) struct App {
     // Navigation.
     pub(crate) screen: Screen,
     pub(crate) mode: PairMode,
+    /// Which rendezvous transport(s) the PIN quick mode uses (both sides must
+    /// have overlapping channels; the default covers everything).
+    pub(crate) pin_channel: PinChannel,
 
     // Shared status.
     pub(crate) status: ConnStatus,
@@ -146,6 +149,7 @@ impl App {
             clipboard: SystemClipboard::new(),
             screen: Screen::Home,
             mode: PairMode::NostrToken,
+            pin_channel: PinChannel::Both,
             status: ConnStatus::Idle,
             error: startup_error,
             secret,
@@ -679,6 +683,16 @@ impl App {
         }
     }
 
+    /// The selected PIN channel as the core's enum.
+    fn core_pin_channel(&self) -> duocb_core::net::PinChannel {
+        use duocb_core::net::PinChannel as Core;
+        match self.pin_channel {
+            PinChannel::Both => Core::NostrAndLan,
+            PinChannel::NostrOnly => Core::NostrOnly,
+            PinChannel::LanOnly => Core::LanOnly,
+        }
+    }
+
     /// Build the server mode from the current state, if it validates.
     pub(crate) fn server_mode_spec(&self) -> Option<duocb_core::net::ServerMode> {
         use duocb_core::net::ServerMode;
@@ -686,8 +700,9 @@ impl App {
             PairMode::NostrToken => self
                 .token_identity()
                 .map(|identity| ServerMode::NostrToken { identity }),
-            PairMode::NostrPin => Some(ServerMode::NostrPin {
+            PairMode::NostrPin => Some(ServerMode::Pin {
                 relays: default_relays(),
+                channel: self.core_pin_channel(),
             }),
             PairMode::Manual => Some(ServerMode::Manual),
         }
@@ -706,6 +721,7 @@ impl App {
                 duocb_core::pin::normalize_pin(&self.in_pin).map(|canonical_pin| DialSpec::Pin {
                     canonical_pin,
                     relays: default_relays(),
+                    channel: self.core_pin_channel(),
                 })
             }
             PairMode::Manual => {
@@ -924,6 +940,32 @@ pub(crate) mod tests {
         app.go_back();
         assert_eq!(app.screen, Screen::Home);
         assert_eq!(app.mode, PairMode::NostrToken);
+    }
+
+    #[test]
+    fn pin_specs_carry_the_selected_channel() {
+        let mut app = test_app();
+        app.mode = PairMode::NostrPin;
+        app.pin_channel = PinChannel::LanOnly;
+        let canonical = duocb_core::pin::generate_pin();
+        app.in_pin = duocb_core::pin::format_pin(&canonical);
+        match app.server_mode_spec() {
+            Some(duocb_core::net::ServerMode::Pin { channel, .. }) => {
+                assert_eq!(channel, duocb_core::net::PinChannel::LanOnly);
+            }
+            other => panic!("unexpected server mode: {other:?}"),
+        }
+        match app.client_dial_spec() {
+            Some(duocb_core::net::DialSpec::Pin {
+                channel,
+                canonical_pin,
+                ..
+            }) => {
+                assert_eq!(channel, duocb_core::net::PinChannel::LanOnly);
+                assert_eq!(canonical_pin, canonical);
+            }
+            other => panic!("unexpected dial spec: {other:?}"),
+        }
     }
 
     #[test]
