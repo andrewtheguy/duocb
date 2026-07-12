@@ -10,6 +10,7 @@ duocb-core.workspace = true
 eframe.workspace = true
 arboard.workspace = true
 
+crc32fast.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true

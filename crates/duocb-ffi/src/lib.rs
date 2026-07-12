@@ -427,14 +427,19 @@ unsafe fn cstr_arg<'a>(ptr: *const c_char) -> Option<&'a str> {
 }
 
 /// Copy `s` into `buf` as a NUL-terminated C string, truncating if needed.
-/// Returns true if the whole string (plus NUL) fit.
+/// Truncation lands on a UTF-8 character boundary so the written content is
+/// always valid UTF-8. Returns true if the whole string (plus NUL) fit.
 fn write_cstr(buf: *mut c_char, len: usize, s: &str) -> bool {
     if buf.is_null() || len == 0 {
         return false;
     }
     let bytes = s.as_bytes();
-    // Reserve one byte for the trailing NUL.
-    let copy = bytes.len().min(len - 1);
+    // Reserve one byte for the trailing NUL, then back off to the nearest
+    // char boundary so a multibyte character is never sliced in half.
+    let mut copy = bytes.len().min(len - 1);
+    while copy > 0 && !s.is_char_boundary(copy) {
+        copy -= 1;
+    }
     unsafe {
         ptr::copy_nonoverlapping(bytes.as_ptr(), buf as *mut u8, copy);
         *buf.add(copy) = 0;
@@ -519,5 +524,20 @@ mod tests {
         assert!(!write_cstr(buf.as_mut_ptr(), buf.len(), "abcd"));
         // Truncated output is still NUL-terminated.
         assert_eq!(buf[3], 0);
+    }
+
+    #[test]
+    fn write_cstr_truncates_on_utf8_boundaries() {
+        // "é" is 2 bytes; a 4-byte buffer (3 usable) must not slice it in half.
+        let mut buf = [0 as c_char; 4];
+        assert!(!write_cstr(buf.as_mut_ptr(), buf.len(), "aéb"));
+        let written = unsafe { CStr::from_ptr(buf.as_ptr()) };
+        assert_eq!(written.to_str().expect("valid UTF-8"), "aé");
+
+        // Boundary right at the cut: only "a" fits (the é would straddle it).
+        let mut buf = [0 as c_char; 3];
+        assert!(!write_cstr(buf.as_mut_ptr(), buf.len(), "aé"));
+        let written = unsafe { CStr::from_ptr(buf.as_ptr()) };
+        assert_eq!(written.to_str().expect("valid UTF-8"), "a");
     }
 }
