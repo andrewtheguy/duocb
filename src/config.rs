@@ -229,14 +229,16 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// A directory unique to each caller. Tests run in parallel and each cleans
+    /// up its own directory, so a process-wide atomic counter (not a timestamp,
+    /// which can collide within the same nanosecond) keeps them isolated.
     fn temp_dir() -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         std::env::temp_dir().join(format!(
             "duocb-config-test-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            COUNTER.fetch_add(1, Ordering::Relaxed)
         ))
     }
 
