@@ -6,7 +6,6 @@ The transport/signaling/auth stack is a port of [duopipe](../../duopipe)'s peer 
 
 ## Contents
 
-- [Module map](#module-map)
 - [Threading model: UI ↔ runtime](#threading-model-ui--runtime)
 - [Sessions and connection lifecycle](#sessions-and-connection-lifecycle)
 - [Wire protocol](#wire-protocol)
@@ -18,43 +17,6 @@ The transport/signaling/auth stack is a port of [duopipe](../../duopipe)'s peer 
 - [Persistence](#persistence)
 - [Security model](#security-model)
 - [Limitations](#limitations)
-
-## Module map
-
-```
-crates/duocb-core/src/       portable core (no GUI, clipboard, or config-file deps)
-  auth.rs                    47-char token: generate / validate / fingerprint
-  identity.rs                short-name rules + permanent random device suffix
-  lan.rs                     local-network PIN rendezvous over mDNS
-  manual_code.rs             one-string node-id + session-secret pairing code
-  nostr.rs                   configure presence + internet PIN rendezvous
-  pin.rs / pin_auth.rs       PIN format/KDFs + mutual challenge-response
-  pin_record.rs              shared encrypted PIN-record codec (private module)
-  protocol.rs                v2 length-prefixed JSON auth and clipboard frames
-  net/
-    mod.rs                   commands/events/status types + runtime spawn
-    endpoint.rs              iroh builders, dialing, path snapshots/logging
-    runtime.rs               presence, sessions, PairClaim, auth, clipboard pump
-
-crates/duocb/src/            desktop Slint application
-  main.rs                    window, net-runtime wake bridge, heartbeat timer
-  clipboard.rs               long-lived, lazily initialized arboard wrapper
-  config.rs                  config persistence + process-lifetime file lock
-  app/
-    mod.rs                   app state, event handling, transitions, heartbeat
-    item.rs                  ClipItem (CRC-32, peek + auto-hide)
-    sync.rs                  App -> UiState projection
-    callbacks.rs             Actions callback wiring
-    keys.rs                  global keyboard shortcuts
-  ui/                        .slint markup, compiled by build.rs
-    main.slint / globals.slint / types.slint
-    theme.slint / widgets.slint
-    configure.slint / quick.slint / server.slint / client.slint
-    session.slint / modals.slint
-
-crates/duocb-ffi/src/lib.rs  configure-mode-only C FFI used by the iOS app
-ios/duocb.h                  hand-maintained public C header
-```
 
 ## Threading model: UI ↔ runtime
 
