@@ -67,7 +67,7 @@ export component QuickScreen inherits Rectangle {
                 clicked => { Actions.set-pin-channel(PinChannel.lan-only); }
             }
             Small {
-                text: "Pick the same discovery on both devices (the default matches everything).";
+                text: "Pairing works as long as both devices share at least one transport — the default (internet + local network) overlaps with any choice.";
             }
         }
 

@@ -87,14 +87,23 @@ pub async fn lookup_pin_record(candidates: &[Keys]) -> Result<Option<EndpointId>
 
     // Browse-only discoverer (no addrs registered → nothing announced). The
     // label only needs to be a valid DNS label distinct from the advertisers'.
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(String, String)>();
+    // The callback prefilters to our candidate instance labels so unrelated
+    // `_duocb-pin._udp.local.` advertisers on the LAN never enter the channel,
+    // which stays bounded (try_send drops on a full queue — one decryptable hit
+    // is all the loop below needs).
+    let accepted: std::collections::HashSet<String> = by_instance.keys().cloned().collect();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, String)>(16);
     let _guard = Discoverer::new_interactive(
         PIN_SERVICE_NAME.to_string(),
         format!("lookup-{:08x}", rand::random::<u32>()),
     )
     .with_callback(move |peer_id, peer| {
+        let peer_id = peer_id.to_string();
+        if !accepted.contains(&peer_id) {
+            return;
+        }
         if let Some(Some(content)) = peer.txt_attribute(TXT_KEY) {
-            let _ = tx.send((peer_id.to_string(), content.to_string()));
+            let _ = tx.try_send((peer_id, content.to_string()));
         }
     })
     .spawn(&tokio::runtime::Handle::current())
