@@ -8,8 +8,8 @@
 Only one duocb process may use a config path at a time (it holds an exclusive `<config-path>.lock` sidecar for its lifetime). To run both peers of a config/token pairing on the same machine, give each process its own config location — otherwise the second fails to acquire the lock. Keep the shared `auth_token` equal and the `my_name` values different:
 
 ```sh
-duocb --config /tmp/duocb-peer1.toml   # or DUOCB_CONFIG=/tmp/duocb-peer1.toml
-duocb --config /tmp/duocb-peer2.toml   # or DUOCB_CONFIG=/tmp/duocb-peer2.toml
+cargo run -- --config /tmp/duocb-peer1.toml   # or DUOCB_CONFIG=/tmp/duocb-peer1.toml
+cargo run -- --config /tmp/duocb-peer2.toml   # or DUOCB_CONFIG=/tmp/duocb-peer2.toml
 ```
 
 `-c` is an alias for `--config`; the CLI flag wins over `DUOCB_CONFIG`. Without an override, both processes resolve to the same default location (see README) and collide.
