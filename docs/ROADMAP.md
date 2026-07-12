@@ -8,17 +8,19 @@ documented in [README.md](../README.md) and [ARCHITECTURE.md](./ARCHITECTURE.md)
 ## Duplicate device names in token mode — SUPERSEDED
 
 The duplicate-name problem this entry used to design around no longer exists.
-The configure-mode redesign replaced free-form device names with unique-by-
-construction display identities:
+The configure-mode redesign replaced free-form device names with collision-
+resistant display identities:
 
 - Every device carries a **permanent random 8-character suffix** (unambiguous
   mixed-case alphabet), minted on the first launch with its config file and
   never regenerated. The broadcast identity is `<name>_<suffix>`
-  (e.g. `mac-book_a7B2c3D4`), so two devices choosing the same short name can
-  never collide on the presence-record `d` tag.
+  (e.g. `mac-book_a7B2c3D4`), so devices choosing the same short name receive
+  independently randomized presence-record `d` tags. A suffix collision is
+  possible in principle but negligible at the intended device count.
 - The joiner no longer auto-picks "the newest record that isn't mine": it
   fetches the decrypted device list and the user selects the specific hosting
-  device to dial. The ambiguous same-name lookup failure cannot occur.
+  device to dial. Normal operation no longer depends on an ambiguous short-name
+  lookup.
 - Configs are **per-machine** — copying a config file to another device is not
   a supported use case, so a cloned suffix is out of scope. The residual
   safety net is the per-publisher-run `run_id` in each presence record: a

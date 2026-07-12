@@ -6,8 +6,9 @@
 //! secret". Each running device publishes one kind-30078 parameterized-
 //! replaceable **presence record** under a `d` tag of
 //! `duocb:presence:<sha256(auth||identity)>`, where `identity` is the device's
-//! unique display identity `<name>_<suffix>` (see `crate::identity`). The hash
-//! is salted with the token so identities cannot be enumerated on relays.
+//! collision-resistant display identity `<name>_<suffix>` (see
+//! `crate::identity`). The hash is salted with the token so identities cannot
+//! be enumerated on relays.
 //!
 //! The record content is NIP-44 **self-encrypted** under the token-derived
 //! keypair and carries a JSON [`PresenceRecord`]: the plaintext display name

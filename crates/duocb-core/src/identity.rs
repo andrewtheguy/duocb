@@ -4,9 +4,9 @@
 //!
 //! The suffix is minted once, on the first launch with a given config file, and
 //! never changes afterwards — it survives clearing or regenerating the secret.
-//! Because every device carries its own random suffix, the full display identity
-//! is unique by construction, which is what makes the per-device nostr record
-//! tags collision-free (two devices may freely pick the same short name).
+//! Because every device carries its own high-entropy random suffix, the full
+//! display identity is collision-resistant, which lets devices freely share the
+//! same short name without practical per-device nostr record-tag collisions.
 //!
 //! The suffix alphabet is mixed-case letters and digits minus the ambiguous
 //! `0 O o 1 l I`, so an identity read aloud or eyeballed across two screens

@@ -1,8 +1,8 @@
 //! iroh endpoint helpers: builders, connect, and the connection path watcher.
 //!
 //! The iroh identity is always ephemeral (a fresh node id every run); node-id
-//! discovery is handled out-of-band (nostr or a manually typed node id), so no
-//! secret key is ever persisted or wired in here.
+//! discovery is handled out-of-band (nostr or a node id embedded in a manual
+//! pairing code), so no secret key is ever persisted or wired in here.
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
@@ -43,8 +43,8 @@ pub const QUIC_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Create a base endpoint builder with common configuration: default relays,
 /// keep-alive/idle transport tuning, and discovery via n0 DNS/pkarr **plus mDNS**.
-/// mDNS is what lets the manual/offline mode resolve a typed node id on the local
-/// network with zero internet connectivity.
+/// mDNS is what lets the manual/offline mode resolve the node id carried by its
+/// pairing code on the local network with zero internet connectivity.
 fn create_endpoint_builder() -> Result<EndpointBuilder> {
     let mut transport_config = QuicTransportConfig::builder();
     let idle_timeout = QUIC_IDLE_TIMEOUT

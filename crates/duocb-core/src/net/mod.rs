@@ -15,8 +15,9 @@ pub mod runtime;
 pub type WakeFn = std::sync::Arc<dyn Fn() + Send + Sync>;
 
 /// The standing configure-mode identity: the shared secret plus this device's
-/// unique display identity (`<name>_<suffix>`, see `crate::identity`). Everything
-/// the presence publisher, a hosting session, and a joining session need.
+/// collision-resistant display identity (`<name>_<suffix>`, see
+/// `crate::identity`). Everything the presence publisher, a hosting session,
+/// and a joining session need.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TokenIdentity {
     /// The shared auth token (the standing secret).

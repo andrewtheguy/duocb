@@ -34,7 +34,7 @@ export component QuickScreen inherits Rectangle {
         Card {
             CardTitle { text: "Mode"; }
             ModeRow {
-                text: "P  PIN quick pair — type a short rotating code (internet)";
+                text: "P  PIN quick pair — type a short rotating code";
                 selected: UiState.mode == PairMode.nostr-pin;
                 clicked => { Actions.set-mode(PairMode.nostr-pin); }
             }
