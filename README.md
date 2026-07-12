@@ -51,7 +51,9 @@ From source:
 cargo build --release        # binary at target/release/duocb
 ```
 
-On Linux CI/minimal systems, the Slint UI needs: `libxkbcommon-dev libwayland-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libfontconfig1-dev` plus OpenGL (mesa).
+On Linux CI/minimal systems, the Slint UI needs: `libxkbcommon-dev libwayland-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libfontconfig1-dev` plus OpenGL (mesa). The first build downloads the prebuilt Skia binaries for the text renderer, so expect it to take a while.
+
+The UI renders in the platform's native fonts (San Francisco/Menlo on macOS, Segoe UI/Consolas on Windows, the fontconfig defaults on Linux); set `DUOCB_UI_FONT` to override the UI font family.
 
 ## Usage
 
