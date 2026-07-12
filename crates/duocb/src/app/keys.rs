@@ -280,7 +280,7 @@ mod tests {
     fn join_picker_arrows_and_escape() {
         let mut app = test_app();
         app.configure_step = ConfigureStep::Join;
-        app.peers = vec![crate::app::tests::peer("a", "s1", false)];
+        app.peers = vec![crate::app::tests::peer("a", "s1")];
         let down = char::from(Key::DownArrow).to_string();
         assert!(plain(&mut app, &down, false));
         assert_eq!(app.selected_peer.as_deref(), Some("s1"));

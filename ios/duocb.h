@@ -53,14 +53,13 @@
  *                                               latest item — skip it if the
  *                                               inbox already holds that text)
  *   item_sent         {}
- *   peer_list         {peers: [{display, name, suffix, hosting,
- *                               last_seen_unix}]}   (no online/offline flag:
- *                                               relay freshness is unreliable.
- *                                               Any listed peer is joinable —
- *                                               "hosting" is informational; a
- *                                               join re-resolves and retries,
- *                                               and the iroh dial is the real
- *                                               liveness check)
+ *   peer_list         {peers: [{display, name, suffix,
+ *                               last_seen_unix}]}   (no online/offline or
+ *                                               hosting flag: relay freshness is
+ *                                               unreliable. Any listed peer is
+ *                                               joinable — a join re-resolves and
+ *                                               retries, and the iroh dial is the
+ *                                               real liveness check)
  *   presence_conflict {message}                (another live process publishes
  *                                               as this device; broadcasting
  *                                               stopped)
