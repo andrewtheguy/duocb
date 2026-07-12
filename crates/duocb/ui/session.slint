@@ -30,12 +30,12 @@ component ClipItemRow inherits Card {
         }
         Rectangle { horizontal-stretch: 1; }
         Button {
-            text: "Copy";
-            clicked => { root.copy-clicked(); }
-        }
-        Button {
             text: root.item.expanded ? "Hide" : "Peek";
             clicked => { root.peek-clicked(); }
+        }
+        Button {
+            text: "Copy";
+            clicked => { root.copy-clicked(); }
         }
     }
     // Read-only, selectable, never touches the system clipboard unless the
