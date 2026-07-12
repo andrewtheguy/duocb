@@ -1,65 +1,10 @@
-//! egui user interface: screen routing and shared UI types.
+//! In-memory clipboard items (inbox/outbox rows) and their peek behavior.
+//! Lives only in memory, never written to disk.
 
 use std::time::{Duration, Instant};
 
-pub mod app;
-pub mod configure;
-pub mod screens;
-pub mod session;
-
-/// Which screen is showing. The two non-home screens are the two connection
-/// roles; both peers send and receive once paired — the role only decides who
-/// sets the connection up.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Screen {
-    /// The configure mode's wizard/hub — the primary flow (iOS parity).
-    Home,
-    /// The quick-options wizard: ad-hoc PIN/manual pairing, nothing saved.
-    /// Opened from the home CTA so the quick modes never crowd the home.
-    Quick,
-    /// Start a connection: this device shows the PIN/auth code and listens
-    /// (the transport server).
-    Server,
-    /// Join a connection: this device enters the PIN/auth code and dials
-    /// (the transport client).
-    Client,
-}
-
-/// The pairing mode selected on the home screen.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PairMode {
-    /// The primary mode: a standing secret + per-device identities, device
-    /// discovery and rendezvous via nostr (internet).
-    NostrToken,
-    /// Rotating PIN quick pair via nostr (internet).
-    NostrPin,
-    /// Manually typed node id + token; works offline on the same LAN (mDNS).
-    Manual,
-}
-
-/// Where the configure mode's home-screen flow currently is. The setup steps
-/// gate everything on the standing secret: without one, only the wizard is
-/// reachable; once secret + name are saved the hub ([`ConfigureStep::Ready`])
-/// is home until the user explicitly clears the secret.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConfigureStep {
-    /// No secret: choose between generating a new one and importing one.
-    SetupChoice,
-    /// One-time reveal of a freshly generated secret.
-    SetupGenerate,
-    /// Paste an existing secret (masked, fingerprint-confirmed).
-    SetupImport,
-    /// Enter/confirm this device's short name.
-    SetupName,
-    /// Fully configured: the hub — device identity + start/join actions.
-    Ready,
-    /// The device picker, shown only after choosing Join on the hub: the
-    /// peer list is fetched and refreshed only while this step is visible.
-    Join,
-}
-
 /// Max characters shown in the peek view. Larger payloads are truncated to
-/// this many chars so the read-only editor stays responsive — laying out a
+/// this many chars so the read-only view stays responsive — laying out a
 /// multi-MB string is expensive, and a peek is a glance, not a full viewer.
 pub const PEEK_LIMIT: usize = 4096;
 
@@ -68,8 +13,7 @@ pub const PEEK_LIMIT: usize = 4096;
 pub const PEEK_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// A clipboard item that passed through the session — a received item in the
-/// inbox, or the last item sent in the outbox. Lives only in memory, never
-/// written to disk.
+/// inbox, or the last item sent in the outbox.
 pub struct ClipItem {
     pub text: String,
     /// When it was received (inbox) or sent (outbox).
@@ -104,7 +48,7 @@ impl ClipItem {
 
     /// Collapse the peek if it has been open longer than [`PEEK_TIMEOUT`].
     /// Returns whether it is still expanded afterward, so the caller can keep
-    /// requesting repaints while any peek is counting down.
+    /// ticking while any peek is counting down.
     pub fn tick_peek(&mut self) -> bool {
         if self.peeked_at.is_some_and(|t| t.elapsed() >= PEEK_TIMEOUT) {
             self.peeked_at = None;

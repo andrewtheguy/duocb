@@ -14,7 +14,8 @@ description = "P2P clipboard sharing between two devices over iroh"
 duocb-core = { path = "crates/duocb-core" }
 
 # GUI
-eframe = "0.35"
+slint = "1.17"
+slint-build = "1.17"
 arboard = "3.6.1"
 
 # P2P transport

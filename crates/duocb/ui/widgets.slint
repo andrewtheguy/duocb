@@ -1,0 +1,133 @@
+// Shared building blocks: cards, CTA buttons, weak text — the visual
+// vocabulary every screen composes from.
+
+import { Theme } from "theme.slint";
+import { Palette } from "std-widgets.slint";
+
+/// A section card: subtle fill + border, rounded, padded content.
+export component Card inherits Rectangle {
+    background: Theme.card-fill;
+    border-color: Theme.card-border;
+    border-width: 1px;
+    border-radius: Theme.radius;
+    VerticalLayout {
+        padding: Theme.pad-m;
+        spacing: Theme.pad-xs;
+        @children
+    }
+}
+
+/// Body text.
+export component Body inherits Text {
+    font-size: Theme.font-body;
+    wrap: word-wrap;
+}
+
+/// De-emphasized helper text.
+export component Weak inherits Text {
+    font-size: Theme.font-body;
+    opacity: Theme.weak-opacity;
+    wrap: word-wrap;
+}
+
+/// De-emphasized small print.
+export component Small inherits Text {
+    font-size: Theme.font-small;
+    opacity: Theme.weak-opacity;
+    wrap: word-wrap;
+}
+
+/// Section heading inside a card.
+export component CardTitle inherits Text {
+    font-size: Theme.font-body;
+    font-weight: 700;
+}
+
+/// Monospace value text (identities, fingerprints, hashes).
+export component Mono inherits Text {
+    font-size: Theme.font-body;
+    font-family: "monospace";
+}
+
+/// A full-width call-to-action button with an optional trailing shortcut hint.
+export component BigButton inherits Rectangle {
+    in property <string> text;
+    in property <string> hint;
+    in property <bool> enabled: true;
+    callback clicked();
+
+    height: Theme.cta-height;
+    border-radius: Theme.radius;
+    background: touch.pressed && root.enabled
+        ? Theme.accent.darker(20%)
+        : touch.has-hover && root.enabled ? Theme.accent.brighter(10%) : Theme.accent;
+    opacity: root.enabled ? 1.0 : 0.4;
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+        mouse-cursor: root.enabled ? MouseCursor.pointer : MouseCursor.default;
+    }
+    HorizontalLayout {
+        padding-left: Theme.pad-l;
+        padding-right: Theme.pad-l;
+        spacing: Theme.pad-s;
+        alignment: center;
+        Text {
+            text: root.text;
+            color: white;
+            font-size: Theme.font-body;
+            font-weight: 600;
+            vertical-alignment: center;
+        }
+        if root.hint != "": Text {
+            text: root.hint;
+            color: white;
+            opacity: 0.7;
+            font-size: Theme.font-small;
+            vertical-alignment: center;
+        }
+    }
+}
+
+/// A secondary full-width action button (quieter than the accent CTA).
+export component WideButton inherits Rectangle {
+    in property <string> text;
+    in property <string> hint;
+    in property <bool> enabled: true;
+    callback clicked();
+
+    height: Theme.cta-height;
+    border-radius: Theme.radius;
+    border-width: 1px;
+    border-color: Theme.card-border;
+    background: touch.pressed && root.enabled
+        ? Palette.control-background.darker(10%)
+        : touch.has-hover && root.enabled ? Palette.control-background.brighter(5%)
+        : Palette.control-background;
+    opacity: root.enabled ? 1.0 : 0.4;
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+        mouse-cursor: root.enabled ? MouseCursor.pointer : MouseCursor.default;
+    }
+    HorizontalLayout {
+        padding-left: Theme.pad-l;
+        padding-right: Theme.pad-l;
+        spacing: Theme.pad-s;
+        alignment: center;
+        Text {
+            text: root.text;
+            font-size: Theme.font-body;
+            font-weight: 600;
+            vertical-alignment: center;
+        }
+        if root.hint != "": Text {
+            text: root.hint;
+            opacity: 0.6;
+            font-size: Theme.font-small;
+            vertical-alignment: center;
+        }
+    }
+}

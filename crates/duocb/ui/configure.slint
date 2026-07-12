@@ -1,0 +1,12 @@
+// The home screen: the configure mode's wizard / hub / device picker.
+
+import { UiState, Actions } from "globals.slint";
+import { Body } from "widgets.slint";
+
+export component HomeScreen inherits Rectangle {
+    /// Whether any text field on this screen has keyboard focus (gates the
+    /// plain-letter shortcuts).
+    out property <bool> field-focused: false;
+
+    Body { text: "home (todo)"; }
+}

@@ -1,0 +1,39 @@
+// The redesign-lite design system: one place for colors, spacing, and type
+// sizes so every screen reads consistently. Palette colors adapt to the
+// platform light/dark scheme where they need to.
+
+export global Theme {
+    // Status colors (match the previous UI's direct/relay/ok markers).
+    out property <color> ok: #2ea043;
+    out property <color> warn: #d29222;
+    out property <color> err: #c94f4f;
+    out property <color> accent: #3574f0;
+
+    // Text emphasis. `weak`/`faint` derive from the default text color at
+    // render time via opacity, so they work in both light and dark.
+    out property <float> weak-opacity: 0.65;
+    out property <float> faint-opacity: 0.45;
+
+    // Spacing scale.
+    out property <length> pad-xs: 4px;
+    out property <length> pad-s: 8px;
+    out property <length> pad-m: 12px;
+    out property <length> pad-l: 16px;
+    out property <length> pad-xl: 24px;
+
+    // Cards / groups.
+    out property <length> radius: 8px;
+    out property <color> card-border: #80808040;
+    out property <color> card-fill: #80808012;
+
+    // Type scale.
+    out property <length> font-title: 22px;
+    out property <length> font-heading: 17px;
+    out property <length> font-body: 13px;
+    out property <length> font-small: 11px;
+    out property <length> font-pin: 36px;
+
+    // Control sizes.
+    out property <length> cta-height: 40px;
+    out property <length> button-height: 32px;
+}

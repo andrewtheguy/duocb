@@ -1,0 +1,82 @@
+// Overlay modals: clear-secret confirmation and the connection-path viewer.
+// Conditional full-window overlays with a dimmed, click-to-dismiss backdrop —
+// the same semantics as the previous UI's modals.
+
+import { UiState, Actions } from "globals.slint";
+import { Theme } from "theme.slint";
+import { Card, Body } from "widgets.slint";
+import { Button, Palette } from "std-widgets.slint";
+
+component ModalBackdrop inherits Rectangle {
+    callback dismissed();
+    background: #00000080;
+    TouchArea { clicked => { root.dismissed(); } }
+}
+
+export component ClearSecretModal inherits Rectangle {
+    ModalBackdrop { dismissed => { Actions.cancel-clear-secret(); } }
+    Rectangle {
+        width: min(root.width - 2 * Theme.pad-xl, 420px);
+        height: content.preferred-height;
+        background: Palette.background;
+        border-radius: Theme.radius;
+        border-width: 1px;
+        border-color: Theme.card-border;
+        TouchArea { }
+        content := VerticalLayout {
+            padding: Theme.pad-l;
+            spacing: Theme.pad-s;
+            Text { text: "Clear the shared secret?"; font-size: Theme.font-heading; font-weight: 700; }
+            Body {
+                text: "This device will stop broadcasting and can no longer pair with your other devices until a secret is set up again. The device's permanent id is kept.";
+            }
+            HorizontalLayout {
+                spacing: Theme.pad-s;
+                alignment: end;
+                Button { text: "Clear secret"; clicked => { Actions.confirm-clear-secret(); } }
+                Button { text: "Cancel"; clicked => { Actions.cancel-clear-secret(); } }
+            }
+        }
+    }
+}
+
+export component ConnPathModal inherits Rectangle {
+    ModalBackdrop { dismissed => { Actions.close-conn-path(); } }
+    Rectangle {
+        width: min(root.width - 2 * Theme.pad-xl, 460px);
+        height: content.preferred-height;
+        background: Palette.background;
+        border-radius: Theme.radius;
+        border-width: 1px;
+        border-color: Theme.card-border;
+        TouchArea { }
+        content := VerticalLayout {
+            padding: Theme.pad-l;
+            spacing: Theme.pad-s;
+            Text { text: "Connection path"; font-size: Theme.font-heading; font-weight: 700; }
+            if UiState.conn-paths.length == 0: Body { text: "No active connection."; }
+            for path in UiState.conn-paths: HorizontalLayout {
+                spacing: Theme.pad-s;
+                Text { text: path.marker; color: path.color; font-size: Theme.font-body; }
+                Text {
+                    text: path.display;
+                    font-family: "monospace";
+                    font-size: Theme.font-body;
+                    wrap: word-wrap;
+                    horizontal-stretch: 1;
+                }
+            }
+            if UiState.conn-paths.length > 0: Text {
+                text: "● selected route · ○ other known path";
+                font-size: Theme.font-small;
+                opacity: Theme.weak-opacity;
+            }
+            HorizontalLayout {
+                spacing: Theme.pad-s;
+                alignment: end;
+                Button { text: "Close"; clicked => { Actions.close-conn-path(); } }
+                Button { text: "Refresh"; clicked => { Actions.query-conn-path(); } }
+            }
+        }
+    }
+}

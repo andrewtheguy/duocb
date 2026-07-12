@@ -1,0 +1,151 @@
+// The UI <-> Rust surface. `UiState` is written by the Rust side's single
+// push-style `App::sync` projection (plus two-way field bindings); `Actions`
+// carries every user intent back into Rust, which mutates the `App` state and
+// re-syncs. No UI-side state beyond what lives here.
+
+import { Screen, ConfigureStep, PairMode, PeerRow, ClipRow, PathRow } from "types.slint";
+
+export global UiState {
+    // Navigation / shared status.
+    in property <Screen> screen;
+    in property <ConfigureStep> configure-step;
+    in property <PairMode> mode;
+    in property <string> status-text;
+    in property <bool> connected;
+    in property <bool> server-running;
+    in property <bool> client-active;
+    /// Error banner text; "" hides the banner.
+    in property <string> error;
+
+    // Configure identity / wizard. Secrets are never pushed here in full —
+    // only masked hints and fingerprints.
+    in property <string> display-identity;
+    in property <bool> has-secret;
+    in property <string> secret-hint;
+    in property <string> secret-fingerprint;
+    in property <string> config-path;
+    in property <string> presence-conflict;
+    in property <bool> copied-flash;
+    in property <string> wizard-secret-hint;
+    in property <string> wizard-fingerprint;
+    in property <bool> name-valid;
+    /// "Broadcast as" preview when the name is valid, "" otherwise.
+    in property <string> name-preview;
+    /// Validation message for a non-empty invalid name, "" otherwise.
+    in property <string> name-error;
+    in property <bool> can-cancel-name;
+    in property <bool> import-valid;
+    /// Fingerprint of a checksum-valid import entry, "" otherwise.
+    in property <string> import-fingerprint;
+    /// True when the import entry is non-empty but not a valid token.
+    in property <bool> import-invalid;
+    in property <int> name-max-len;
+
+    // Device picker.
+    in property <[PeerRow]> peers;
+    /// "updated 2m ago", or "" before the first fetch.
+    in property <string> peers-updated;
+    /// Empty-list placeholder, "" while the list has rows.
+    in property <string> peers-empty-text;
+    in property <bool> join-ready;
+
+    // Server / running-session identity.
+    in property <string> joined-peer;
+    in property <string> node-id-short;
+    in property <string> peer-node-id-short;
+    /// The fingerprint shown in the pairing summary (session token, or the
+    /// standing secret's).
+    in property <string> session-fingerprint;
+    in property <bool> manual-token-present;
+    in property <string> manual-token-fingerprint;
+    in property <string> pin-display;
+    in property <int> pin-remaining;
+    in property <bool> pin-paired;
+
+    // Client join forms.
+    /// True when the PIN entry is non-empty but not a valid PIN.
+    in property <bool> pin-invalid;
+    /// Fingerprint of a checksum-valid manual-token entry, "" otherwise.
+    in property <string> manual-entry-fingerprint;
+    /// True when the manual-token entry is non-empty but invalid.
+    in property <bool> manual-entry-invalid;
+    in property <bool> dial-ready;
+
+    // Session panel.
+    in property <bool> sent-flash;
+    in property <bool> outbox-present;
+    in property <ClipRow> outbox;
+    in property <[ClipRow]> inbox;
+    in property <int> inbox-count;
+
+    // Modals.
+    in property <bool> show-clear-secret;
+    in property <bool> show-conn-path;
+    in property <[PathRow]> conn-paths;
+
+    // Form inputs, two-way bound to their fields. The Rust side mirrors them
+    // on every edit and writes them back on sync (authoritative after resets).
+    in-out property <string> in-my-name;
+    in-out property <string> in-import-token;
+    in-out property <string> in-pin;
+    in-out property <string> in-node-id;
+    in-out property <string> in-manual-token;
+    in-out property <string> in-compose;
+}
+
+export global Actions {
+    // Navigation.
+    callback go-back();
+    callback open-quick();
+    callback dismiss-error();
+
+    // Configure wizard.
+    callback begin-generate();
+    callback open-import();
+    callback cancel-setup();
+    callback commit-generated();
+    callback use-imported();
+    callback save-name();
+    callback cancel-name();
+    callback rename();
+    callback copy-secret();
+    callback request-clear-secret();
+    callback confirm-clear-secret();
+    callback cancel-clear-secret();
+
+    // Hub / device picker.
+    callback begin-server();
+    callback enter-join-picker();
+    callback leave-join-picker();
+    callback refresh-peers();
+    callback toggle-peer(suffix: string);
+    callback join-selected();
+
+    // Quick options / client.
+    callback set-mode(mode: PairMode);
+    callback open-client();
+    callback connect-client();
+    callback disconnect();
+
+    // Server credentials.
+    callback copy-node-id();
+    callback copy-manual-token();
+
+    // Session panel.
+    callback send-clipboard();
+    callback compose-send();
+    callback clear-inbox();
+    callback inbox-copy(index: int);
+    callback inbox-peek(index: int);
+    callback outbox-copy();
+    callback outbox-peek();
+    callback query-conn-path();
+    callback close-conn-path();
+
+    // Input mirroring: fired by every field's `edited` so the Rust mirrors
+    // and derived validation stay current.
+    callback fields-edited();
+
+    // Global shortcuts; returns true when the key was consumed.
+    callback global-key(text: string, control: bool, field-focused: bool) -> bool;
+}

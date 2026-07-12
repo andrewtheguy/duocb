@@ -1,0 +1,68 @@
+// Shared enums and row structs. The exported enums are the routing types on
+// both sides: the Rust `App` stores the generated equivalents directly.
+
+/// Which screen is showing. The two non-home screens are the two connection
+/// roles; both peers send and receive once paired — the role only decides who
+/// sets the connection up.
+export enum Screen {
+    /// The configure mode's wizard/hub — the primary flow (iOS parity).
+    home,
+    /// The quick-options wizard: ad-hoc PIN/manual pairing, nothing saved.
+    quick,
+    /// Start a connection: this device hosts and shows credentials.
+    server,
+    /// Join a connection: this device enters credentials and dials.
+    client,
+}
+
+/// Where the configure mode's home-screen flow currently is.
+export enum ConfigureStep {
+    /// No secret: choose between generating a new one and importing one.
+    setup-choice,
+    /// One-time reveal of a freshly generated secret.
+    setup-generate,
+    /// Paste an existing secret (masked, fingerprint-confirmed).
+    setup-import,
+    /// Enter/confirm this device's short name.
+    setup-name,
+    /// Fully configured: the hub — device identity + start/join actions.
+    ready,
+    /// The device picker, shown only after choosing Join on the hub.
+    join,
+}
+
+/// The pairing mode. `nostr-token` is the configure mode (home); the other two
+/// are the quick options.
+export enum PairMode {
+    nostr-token,
+    nostr-pin,
+    manual,
+}
+
+/// One row of the device picker. `line` is fully composed in Rust
+/// ("name_sfx  — hosting  · seen 3m ago"); `suffix` is the stable selection key.
+export struct PeerRow {
+    suffix: string,
+    line: string,
+    selected: bool,
+}
+
+/// One inbox/outbox item projection. `peek-text` is only populated while the
+/// item is expanded so collapsed items never ship their content to the UI.
+export struct ClipRow {
+    time: string,
+    size: string,
+    crc: string,
+    expanded: bool,
+    peek-text: string,
+    peek-lines: int,
+    truncated-note: string,
+}
+
+/// One connection-path row for the on-demand modal; the marker/color encode
+/// selected/kind (green direct, amber relay), composed in Rust.
+export struct PathRow {
+    marker: string,
+    color: color,
+    display: string,
+}
