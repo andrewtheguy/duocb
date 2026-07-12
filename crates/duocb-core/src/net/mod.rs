@@ -14,16 +14,34 @@ pub mod runtime;
 /// in headless tests).
 pub type WakeFn = std::sync::Arc<dyn Fn() + Send + Sync>;
 
+/// The standing configure-mode identity: the shared secret plus this device's
+/// unique display identity (`<name>_<suffix>`, see `crate::identity`). Everything
+/// the presence publisher, a hosting session, and a joining session need.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenIdentity {
+    /// The shared auth token (the standing secret).
+    pub token: String,
+    /// This device's user-chosen short name.
+    pub name: String,
+    /// This device's permanent random suffix.
+    pub suffix: String,
+    pub relays: Vec<String>,
+}
+
+impl TokenIdentity {
+    /// The full display identity `<name>_<suffix>` broadcast to peers.
+    pub fn display(&self) -> String {
+        crate::identity::display_identity(&self.name, &self.suffix)
+    }
+}
+
 /// How the server signals its ephemeral node id to the client.
 #[derive(Debug, Clone)]
 pub enum ServerMode {
-    /// Nostr token/name mode: publish the node id under keys derived from the
-    /// shared auth token, tagged with this device's name. In-band token auth.
-    NostrToken {
-        token: String,
-        name: String,
-        relays: Vec<String>,
-    },
+    /// Configure mode: host under the standing secret. The presence publisher
+    /// (kept running by the runtime) carries the node id to peers; in-band
+    /// token auth gates the connection.
+    NostrToken { identity: TokenIdentity },
     /// Nostr rotating-PIN quick mode: publish under per-bucket PIN-derived keys;
     /// in-band PIN challenge-response auth.
     NostrPin { relays: Vec<String> },
@@ -37,12 +55,13 @@ pub enum ServerMode {
 /// What the client dials.
 #[derive(Debug, Clone)]
 pub enum DialSpec {
-    /// Resolve the other device under the shared token-derived nostr author,
-    /// excluding this device's own named record, then authenticate with the token.
+    /// Dial exactly the chosen peer: resolve `peer_display`'s presence record
+    /// under the shared token-derived nostr author (re-resolved on every attempt,
+    /// so a restarted host self-heals), then authenticate with the token.
     NostrToken {
-        token: String,
-        own_name: String,
-        relays: Vec<String>,
+        identity: TokenIdentity,
+        /// The selected peer's full display identity, e.g. `mac-book_a7B2c3D4`.
+        peer_display: String,
     },
     /// Resolve via the rotating-PIN rendezvous, then prove PIN possession in-band.
     Pin {
@@ -64,6 +83,14 @@ pub enum UiCommand {
     /// Request a point-in-time snapshot of the live connection's paths, answered
     /// with [`NetEvent::ConnPath`]. Empty if no connection is up.
     QueryConnPath,
+    /// `Some`: start (or replace) the standing presence publisher for this
+    /// identity. `None`: stop it (the secret was cleared). Independent of any
+    /// session; [`UiCommand::StartServer`] in configure mode ensures it runs.
+    SetPresence { identity: Option<TokenIdentity> },
+    /// One-shot fetch of the peer device list under the configured presence
+    /// identity, answered with [`NetEvent::PeerList`]. Ignored while a previous
+    /// fetch is still in flight; an error event if no identity is configured.
+    RefreshPeers,
     Shutdown,
 }
 
@@ -122,6 +149,13 @@ pub enum NetEvent {
     /// back — which the UI should drop if it already holds that content.
     ItemReceived { text: String, pulled: bool },
     ItemSent,
+    /// Answer to [`UiCommand::RefreshPeers`]: the decoded peer device list
+    /// (this device's own record already excluded).
+    PeerList { peers: Vec<crate::nostr::PeerInfo> },
+    /// The presence publisher found a record under this device's own identity
+    /// written by another live publisher and stopped. Another process is using
+    /// this device's identity (e.g. a second instance on a cloned config).
+    PresenceConflict { message: String },
     Error(String),
 }
 

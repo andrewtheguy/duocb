@@ -27,20 +27,19 @@ Received content never touches the receiving machine's clipboard (or disk) by it
 
 ## Pairing modes
 
-Chosen on the home screen; the **starting** device displays credentials, the **joining** device types them.
+Chosen on the home screen. **Configure** is the primary mode; the quick options remain for ad-hoc pairing.
 
 | Mode | Signaling | What you transfer by hand | Auth | Internet |
 |---|---|---|---|---|
+| **Configure** (primary) | nostr relays | a shared 47-char secret (once per device, at setup) | pre-shared secret | required |
 | **PIN quick pair** | nostr relays | an 8-character PIN that rotates every 60 s | Argon2id PIN challenge-response (mutual, in-band) | required |
-| **Token + names** | nostr relays | a shared 47-char token + each device's own unique name (once; can be remembered) | pre-shared token | required |
 | **Manual / offline** | none | the starting device's node id + a generated token | shared token | **not required** on the same LAN (mDNS) |
 
-- **PIN quick pair** is the fastest ad-hoc pairing: the starting device shows a short code, you type it on the joining device. The PIN both locates the starting device (an encrypted rendezvous record on public nostr relays) and authenticates the connection in-band — no token ever exists. A captured relay record is an offline PIN-guessing target; Argon2id makes each guess expensive, and a guessed PIN is useful to an attacker only before the first peer claims the server. Once paired, the server stops publishing PINs and binds the session to that peer's QUIC-authenticated node id: a later PIN recovery alone cannot join, reconnect as a different identity, or decrypt the established QUIC session. Because this mode carries no shared standing state — just a fresh ephemeral identity and a rotating PIN — it is free of token-mode name conflicts and works just as well for pairing two devices owned by two *different* people as for your own two. That's a supported side effect, not the project's primary focus (which remains linking your own devices).
-- **Token + names** is for a standing pairing: both devices share one auth token (generate and copy it on the starting device), and each enters its own distinct name. The joining device pastes the copied token, queries the shared token-derived nostr identity, and automatically selects the newest record belonging to a different name; you never enter the other device's name. A restarted starting device is re-resolved automatically. The initiator always saves its valid token and name before starting; the connector saves them automatically only after a connection authenticates successfully.
-- If two devices accidentally use the same name, the current join flow cannot distinguish that live collision from a stale self record. The planned actionable detection and resolution flow is documented in [docs/ROADMAP.md](docs/ROADMAP.md).
+- **Configure** links all of your devices under one **standing secret**. A setup wizard generates the secret on the first device (revealed once, with a fingerprint) or imports it on the next (masked paste, fingerprint confirmation); it stays in the config until you explicitly **Clear secret**. Each device gets a unique identity `<name>_<suffix>` — a short name you choose plus a permanent random 8-character suffix minted on first launch — and broadcasts an encrypted presence record on public nostr relays under a keypair derived from the secret (authorship *is* the proof of secret possession). The home screen then shows your device list: who is online, who is hosting, and when each was last seen. To pair, press **Start** on one device and pick it from the list on the other — you never type the other device's name, and identical short names can't collide (the suffix guarantees uniqueness). A restarted host is re-resolved automatically.
+- **PIN quick pair** is the fastest ad-hoc pairing: the starting device shows a short code, you type it on the joining device. The PIN both locates the starting device (an encrypted rendezvous record on public nostr relays) and authenticates the connection in-band — no token ever exists. A captured relay record is an offline PIN-guessing target; Argon2id makes each guess expensive, and a guessed PIN is useful to an attacker only before the first peer claims the server. Once paired, the server stops publishing PINs and binds the session to that peer's QUIC-authenticated node id: a later PIN recovery alone cannot join, reconnect as a different identity, or decrypt the established QUIC session. Because this mode carries no shared standing state — just a fresh ephemeral identity and a rotating PIN — it works just as well for pairing two devices owned by two *different* people as for your own two. That's a supported side effect, not the project's primary focus (which remains linking your own devices).
 - **Manual / offline** needs no signaling at all: the starting device displays its node id and a freshly generated token (shown as a fingerprint, with a **Copy token** action for transferring the secret); enter both on the joining device. The token stays valid for the whole session, so the paired peer can reconnect after a drop. On the same LAN the node id resolves via mDNS, so it works with the internet down.
 
-The iroh identity is **ephemeral** — a fresh node id (and, depending on the mode, a manual token or PIN sequence) is minted every time a connection is started. Stopping and restarting invalidates those ephemeral credentials. The token+names mode's saved token and device name persist and are reused; its nostr record is updated with the new node id.
+The iroh identity is **ephemeral** — a fresh node id (and, depending on the mode, a manual token or PIN sequence) is minted every time a connection is started. Stopping and restarting invalidates those ephemeral credentials. The configure mode's secret, device name, and suffix persist; its presence record is updated with each run's fresh node id.
 
 ## Install / build
 
@@ -58,10 +57,15 @@ On Linux CI/minimal systems, eframe needs: `libxkbcommon-dev libwayland-dev libx
 
 Run `duocb` on both devices.
 
-1. **Both devices:** pick the same pairing mode on the home screen: `1` selects quick mode, then `P` selects PIN or `M` selects manual; `2` selects token+names mode.
-2. **Starting device:** press `S`. PIN and manual modes start immediately; in token mode, generate or reuse the token, copy it to the joining device, enter this device's name, and press `Ctrl/⌘+Enter`.
-3. **Joining device:** press `C`, type the credentials, then press `Ctrl/⌘+Enter` to connect.
-4. **Paired:** both sides now show the same session panel — `Ctrl/⌘+S` (or the button) reads your clipboard and sends it; received items appear in the inbox where you can **Peek** (view without copying) and **Copy** (the only action that writes that received item to your clipboard). Either device can send at any time; the outbox above the inbox shows the last item you sent (size + CRC) so the other side can confirm it matches what arrived.
+**Configure mode (primary):**
+
+1. **First device:** the setup wizard opens on launch. Press `G` to generate the secret (shown once — copy it somewhere safe), then name the device. The home screen becomes the hub: your identity (e.g. `mac-book_a7B2c3D4`), the secret's fingerprint, and your device list.
+2. **Other device:** press `I`, paste the same secret (confirm the fingerprint matches), and name it. Both devices now see each other in their lists.
+3. **Pair:** press `S` (Start) on one device; on the other, select it in the list (it shows a *hosting* badge — press `R` to refresh) and press `C` (Join).
+
+**Quick modes:** pick `2` (PIN) or `3` (manual) on both devices, press `S` on the starting device and `C` on the joining one, and type the displayed credentials.
+
+**Paired:** both sides now show the same session panel — `Ctrl/⌘+S` (or the button) reads your clipboard and sends it; received items appear in the inbox where you can **Peek** (view without copying) and **Copy** (the only action that writes that received item to your clipboard). Either device can send at any time; the outbox above the inbox shows the last item you sent (size + CRC) so the other side can confirm it matches what arrived.
 
 The joining device reconnects automatically with backoff if the connection drops. The starting device stays listening after its peer disconnects, but only the **same** peer may reconnect — a *restarted* joining device has a new identity and is refused; restart the connection to pair a fresh session.
 
@@ -71,12 +75,15 @@ The joining device reconnects automatically with backoff if the connection drops
 
 | Key | Where | Action |
 |---|---|---|
-| `1` / `2` | home | select quick mode / token+names mode |
-| `P` / `M` | home (quick mode) | select PIN / manual mode |
-| `S` / `C` | home | start a connection / join a connection |
-| `Ctrl/⌘+Enter` | token start form / any join form | start the token connection / connect |
+| `1` / `2` / `3` | home | select configure / PIN quick pair / manual mode |
+| `G` / `I` | home (configure setup) | generate a new secret / import an existing one |
+| `S` | home | start (host) a connection |
+| `C` / `Enter` | home (configure hub) | join the selected device |
+| `R` / `↑` `↓` | home (configure hub) | refresh the device list / move the selection |
+| `C` | home (quick modes) | go to the join form |
+| `Ctrl/⌘+Enter` | quick-mode join forms | connect |
 | `Esc` | any screen (no field focused) | back to home, stopping the session |
-| `Ctrl/⌘+I` / `Ctrl/⌘+T` | start screen (when available) | copy the node id / the token |
+| `Ctrl/⌘+I` / `Ctrl/⌘+T` | when available | copy the node id / the token or secret |
 | `Ctrl/⌘+S` | connected | send the current clipboard |
 | `Ctrl/⌘+P` | connected | peek/hide the newest inbox item |
 | `Ctrl/⌘+Y` | connected | copy the newest inbox item to the clipboard |
@@ -84,21 +91,28 @@ The joining device reconnects automatically with backoff if the connection drops
 
 ## Configuration
 
-On every launch, duocb creates (if needed) and locks `duocb/config.json` under the platform's per-user config directory — `~/.config/duocb/config.json` on Linux, `~/Library/Application Support/duocb/config.json` on macOS, and `%APPDATA%\duocb\config.json` on Windows. The file stores settings only for token+names mode and may remain empty when that mode has never been saved. It is written and read by duocb, not meant for hand editing. Starting a token-mode connection writes the valid initiator settings before launch. Joining writes the connector settings only after successful authentication, so failed attempts never replace the saved pairing:
+On every launch, duocb creates (if needed) and locks `duocb/config.json` under the platform's per-user config directory — `~/.config/duocb/config.json` on Linux, `~/Library/Application Support/duocb/config.json` on macOS, and `%APPDATA%\duocb\config.json` on Windows. The file stores the configure mode's state and is written and read by duocb, not meant for hand editing. The setup wizard saves the secret and device name as soon as they are entered; `device_suffix` is generated on the very first launch and never changes — it survives **Clear secret** (which removes only `auth_token`):
 
 ```json
 {
   "auth_token": "d…",
-  "my_name": "desktop"
+  "my_name": "mac-book",
+  "device_suffix": "a7B2c3D4"
 }
 ```
+
+The config is **per-machine**: the permanent suffix is this device's identity, so
+copying a config file to another machine is not supported — import the secret
+through the wizard there instead. Configs from versions before the suffix
+existed load with a fresh suffix; there is no other migration (pre-1.0, no
+backward compatibility).
 
 Only one duocb process may use a config path at a time. The process holds an
 exclusive OS lock on the config file itself for its lifetime, preventing two local
 instances from accidentally claiming the same device identity and guarding the
 file against accidental external edits while duocb runs. For same-machine
-end-to-end testing, give each process its own config while keeping the token equal
-and the names different:
+end-to-end testing, give each process its own config (each mints its own suffix;
+keep the secret equal):
 
 ```sh
 duocb --config /tmp/duocb-mac1.json
@@ -114,7 +128,7 @@ Clipboard content and the inbox are never persisted anywhere.
 ## Security model
 
 - The transport is iroh QUIC (TLS 1.3); the starting device's node id **is** its public key, so the joining device always talks to the endpoint it typed/resolved, end to end.
-- Signaling records on public nostr relays contain only the starting device's **ephemeral node id**, NIP-44-encrypted under keys derived from the shared secret (token or PIN+time-bucket via Argon2id). Relay operators see ciphertext under rotating keys.
+- Signaling records on public nostr relays are NIP-44-encrypted under keys derived from the shared secret (token or PIN+time-bucket via Argon2id). Configure-mode presence records carry each device's display name and, while hosting, its **ephemeral node id** — both inside the ciphertext; PIN records carry only the node id. Relay operators see ciphertext, author keys, and event timing.
 - The node id is not a credential: every connection must pass in-band auth (token match or mutual PIN proof) before the clipboard channel opens, and the first authenticated peer claims the connection for the whole session.
 - Clipboard payloads are capped at 1 MiB per item, text only.
 

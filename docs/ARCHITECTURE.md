@@ -26,18 +26,20 @@ src/
   main.rs          eframe bootstrap (window, run_native)
   protocol.rs      length-prefixed JSON framing; auth/PIN control messages; ClipMsg
   auth.rs          47-char token: generate / validate (CRC16) / fingerprint (SHA-256/16-hex)
+  identity.rs      device identity: unambiguous 8-char suffix, short-name rules, "<name>_<suffix>"
   pin.rs           Crockford-base32 PIN, check digit, 60s buckets, Argon2id KDFs
   pin_auth.rs      in-band mutual PIN challenge-response (NIP-44 sealed proofs)
-  nostr.rs         kind-30078 token/name discovery; kind-9421 PIN rendezvous
+  nostr.rs         kind-30078 presence records (configure mode); kind-9421 PIN rendezvous
   clipboard.rs     arboard wrapper (one long-lived instance, lazy init)
   config.rs        config resolution/persistence + process-lifetime config lock
   net/
-    mod.rs         UiCommand / NetEvent / ConnStatus enums; EventSender; runtime spawn
+    mod.rs         TokenIdentity; UiCommand / NetEvent / ConnStatus enums; EventSender; runtime spawn
     endpoint.rs    iroh endpoint builders, connect, ConnPath snapshot + debug path logger (ALPN duocb/1)
-    runtime.rs     command loop, server/client sessions, PairClaim, auth, clip pump
+    runtime.rs     command loop, presence publisher, server/client sessions, PairClaim, auth, clip pump
   ui/
-    mod.rs         Screen / PairMode / ClipItem (CRC-32, peek + auto-hide)
+    mod.rs         Screen / PairMode / ConfigureStep / ClipItem (CRC-32, peek + auto-hide)
     app.rs         eframe::App: event drain, state, keyboard shortcuts, connection-path modal
+    configure.rs   configure mode: secret setup wizard + hub (identity, peer list, start/join)
     screens.rs     home / start / join screens
     session.rs     paired panel: send + connection-path buttons, outbox, inbox with peek/copy/clear
 ```
@@ -55,17 +57,21 @@ graph LR
     subgraph "net thread (tokio)"
         M[net_main<br/>command loop]
         S[session task<br/>server or client]
-        P[publisher task<br/>nostr node-id / PIN]
+        PR[presence publisher<br/>standing, configure mode]
+        P[PIN publisher task]
     end
     A -- "UiCommand (tokio mpsc, sync send)" --> M
     M -- "NetEvent (std mpsc) + request_repaint()" --> A
     M --> S
+    M --> PR
     S --> P
+    S -. "hosting node id (watch)" .-> PR
 ```
 
-- **UI → runtime:** `tokio::sync::mpsc::unbounded_channel<UiCommand>` — `StartServer{mode}`, `StopServer`, `Connect{spec}`, `Disconnect`, `SendClipboard{text}`, `QueryConnPath`, `Shutdown`. Unbounded senders are synchronous, so the UI thread never blocks.
+- **UI → runtime:** `tokio::sync::mpsc::unbounded_channel<UiCommand>` — `StartServer{mode}`, `StopServer`, `Connect{spec}`, `Disconnect`, `SendClipboard{text}`, `QueryConnPath`, `SetPresence{identity?}`, `RefreshPeers`, `Shutdown`. Unbounded senders are synchronous, so the UI thread never blocks.
 - **Runtime → UI:** `std::sync::mpsc::channel<NetEvent>`; every send is followed by `egui::Context::request_repaint()` so the GUI wakes even when idle. `DuocbApp` drains the receiver at the top of each frame.
-- **Events:** `ServerReady{node_id, manual_token?, token_fingerprint?}`, `ClientReady{node_id, token_fingerprint?}`, `PinRotated{pin_display, seconds_left}` / `PinCleared`, `Status(ConnStatus)`, `PeerPaired` / `PeerDisconnected`, `ConnPath(paths)`, `ItemReceived{text}` / `ItemSent`, `Error(message)`.
+- **Events:** `ServerReady{node_id, manual_token?, token_fingerprint?}`, `ClientReady{node_id, token_fingerprint?}`, `PinRotated{pin_display, seconds_left}` / `PinCleared`, `Status(ConnStatus)`, `PeerPaired` / `PeerDisconnected`, `ConnPath(paths)`, `ItemReceived{text}` / `ItemSent`, `PeerList{peers}`, `PresenceConflict{message}`, `Error(message)`.
+- **Presence publisher:** owned by `net_main`, independent of sessions. `SetPresence(Some(identity))` (issued by the UI once secret + name are configured) starts it; it broadcasts this device's presence record and keeps it fresh until `SetPresence(None)` (secret cleared) or shutdown. A configure-mode server session feeds its node id through a `tokio::sync::watch` channel; the publisher republishes immediately on change, so hosting state propagates without coupling the session to the publisher's lifetime. `RefreshPeers` spawns a one-shot fetch (at most one in flight) answered with `PeerList`.
 - **Shutdown:** window close → `UiCommand::Shutdown` → the runtime cancels its session (connection closed with code 0, endpoints closed) and returns; the UI joins the thread.
 
 The `EventSender`'s repaint context is optional, so the whole runtime runs headless in integration tests (`net/runtime.rs` tests pair two real endpoints in-process).
@@ -77,13 +83,13 @@ The `EventSender`'s repaint context is optional, so the whole runtime runs headl
 **Server session** (`run_server_session`):
 
 1. Create the listening endpoint (fresh ephemeral identity) → emit `ServerReady` (manual mode generates its token here) → `Listening`.
-2. Spawn the mode's signaling publisher (see below); manual mode has none.
+2. Signaling: configure mode publishes its node id into the hosting watch channel (a drop-guard clears it on every exit path), and the standing presence publisher carries it to the relays; PIN mode spawns its rotating-PIN publisher; manual mode has none.
 3. Accept loop, **one connection served at a time**: accept → accept the single session stream and `auth_as_listener` on it → `PeerPaired` → pump clipboard on that same stream until the connection dies → `PeerDisconnected`, keep listening.
 4. A `PairClaim` (below) restricts the whole session to one peer identity.
 
 **Client session** (`run_client_session`) — resolve/connect/auth loop with reconnect:
 
-1. Resolve the target **each attempt**: manual = the typed node id; token mode = query the shared auth-derived nostr author and select the newest record whose name is not this device's own (so a restarted server with a fresh node id self-heals); PIN mode = nostr rendezvous lookup, with a **pinned node id fast path** after the first pairing (the PIN has rotated off the relays, but the server retains our pairing key, so reconnects dial the remembered id and re-prove the same PIN in-band).
+1. Resolve the target **each attempt**: manual = the typed node id; configure mode = look up the **selected peer's** presence record by its exact identity tag and dial the node id inside (so a restarted host with a fresh node id self-heals; a record without a node id means "online but not hosting" and surfaces as an actionable error); PIN mode = nostr rendezvous lookup, with a **pinned node id fast path** after the first pairing (the PIN has rotated off the relays, but the server retains our pairing key, so reconnects dial the remembered id and re-prove the same PIN in-band).
 2. Self-dial guard, then connect (10 s timeout) → open the single session stream, auth on it → `Connected` → pump on the same stream.
 3. On a drop: reconnect with exponential backoff (1 s → ×2 → 30 s cap), unlimited after the first success, 10 attempts before it. **Auth failures are fatal** — the credential won't get better on its own; the session ends and the error is surfaced.
 
@@ -104,14 +110,15 @@ The pump (`pump_clipboard`) runs the writer (drain `clip_rx` → encode → writ
 
 ## Signaling
 
-Both nostr schemes publish only the server's **ephemeral node id**, NIP-44 (v2) self-encrypted; no token is ever placed on a relay. Default relays: `nos.lol`, `relay.nostr.net`, `relay.primal.net`, `relay.snort.social`.
+Both nostr schemes publish NIP-44 (v2) self-encrypted content; no token is ever placed on a relay. Default relays: `nos.lol`, `relay.nostr.net`, `relay.primal.net`, `relay.snort.social`.
 
-### Token + names (kind 30078, parameterized-replaceable)
+### Configure-mode presence (kind 30078, parameterized-replaceable)
 
-- Both peers derive the **same nostr keypair** from the shared auth token: `SecretKey = SHA-256("duocb:nostr-rendezvous:v1" ‖ token)`.
-- Each device enters its **own** unique name. The `d` tag namespaces its record under the shared author: `duocb:nodeid:<hex SHA-256("duocb:peer-id:v1" ‖ token ‖ own_name)>` — salted with the token so short names can't be enumerated.
-- The server publishes on start, re-checks/republishes quickly for the first ~minute, then every 300 s (replaceable events can be dropped by relays). If a lookup shows a **different live node id** under our name, another device took the name: the publisher stops and surfaces an error (the existing connection is unaffected).
-- The client queries by **author key alone** on every connect attempt, excludes its own name's `d` tag, chooses the newest valid other-device record, and decrypts it with the shared derived key. The client never asks for the other device's name.
+- All devices sharing the secret derive the **same nostr keypair** from it: `SecretKey = SHA-256("duocb:nostr-rendezvous:v1" ‖ token)`. Authorship under that key is the proof of secret possession — every presence record is effectively signed by the secret.
+- Each device has a unique display identity `<name>_<suffix>` (`crate::identity`): a user-chosen short name (`A-Za-z0-9-`, ≤ 24 chars) plus a permanent random 8-char suffix from an unambiguous mixed-case alphabet (no `0 O o 1 l I`), minted on first launch. The suffix makes identities unique by construction, so devices may freely share short names.
+- One **presence record** per device, `d` tag `duocb:presence:<hex SHA-256("duocb:presence-id:v1" ‖ token ‖ identity)>` — salted with the token so identities can't be enumerated. The encrypted payload is JSON: `{version, name, suffix, run_id, node_id?}` — the plaintext display name (readable only by token holders), the stable suffix, a random per-publisher-run id, and, while hosting, the current ephemeral node id. One record serves both presence ("this device exists, last seen at `created_at`") and rendezvous ("dial this node id").
+- The standing publisher runs whenever secret + name are configured: a quick startup burst (6 × 10 s), then a 120 s heartbeat, plus an immediate republish when the hosting state changes. After the first publish it re-reads its own tag; a record carrying a **foreign `run_id`** means another live process is publishing as this device — it emits `PresenceConflict` and stops rather than fight over the record.
+- The peer list is fetched by **author key alone** and decoded client-side: records older than 7 days are dropped, the newest record per **suffix** wins (a renamed device's old-identity record disappears), this device's own suffix is excluded, and records fresher than 300 s (≥ 2 missed heartbeats tolerated) show as online. The joiner picks a specific hosting device from this list; nothing is auto-selected.
 
 ### PIN quick pair (kind 9421, regular events with NIP-40 expiry)
 
@@ -147,8 +154,8 @@ S→C: PinConfirm       { accepted, proof_s }  proof_s = seal(k, "listener" | no
 
 | Purpose | Function | Input | Notes |
 |---|---|---|---|
-| nostr identity (token mode) | SHA-256 | `"duocb:nostr-rendezvous:v1"` ‖ token | same keypair on both peers |
-| record `d` tag (token mode) | SHA-256 | `"duocb:peer-id:v1"` ‖ token ‖ name | token-salted name hash |
+| nostr identity (configure mode) | SHA-256 | `"duocb:nostr-rendezvous:v1"` ‖ token | same keypair on all devices |
+| presence `d` tag (configure mode) | SHA-256 | `"duocb:presence-id:v1"` ‖ token ‖ identity | token-salted identity hash |
 | PIN rendezvous key | Argon2id 64 MiB/t3 | PIN, salt `"duocb:pin-rendezvous:v1"` ‖ bucket | per-bucket nostr keypair |
 | PIN auth key | Argon2id 64 MiB/t3 | PIN, salt `"duocb:pin-auth:v1"` | bucket-independent, distinct domain |
 | token fingerprint | SHA-256 (first 8 bytes) | token string | 16 lowercase hex digits, grouped `xxxx-xxxx-xxxx-xxxx`, display only |
@@ -176,15 +183,15 @@ Connection-path status is **pulled on demand**, not watched: `connection_paths(c
 
 ## Persistence
 
-The default optional file is `duocb/config.json` under the platform's per-user config directory (`~/.config` on Linux, `~/Library/Application Support` on macOS, `%APPDATA%` on Windows) with `auth_token` and `my_name`, and is used to prefill the token-mode forms. It is machine-managed JSON, not intended for hand editing. The initiator persists validated settings before a token-mode server session starts; a save failure blocks startup and is surfaced in the UI. The connector persists validated settings only when `PeerPaired` confirms successful authentication, so failed attempts do not overwrite its prior pairing. `--config`/`-c` or `DUOCB_CONFIG` selects an alternative file; the CLI wins over the environment. The process holds an exclusive OS lock on the config file itself for its lifetime, so one resolved config cannot back two simultaneous local instances (and the file is guarded against accidental external edits while duocb runs) while two E2E instances with distinct config paths run independently. Because the lock lives on the file, saves overwrite it in place through the held handle rather than via an atomic temp-and-rename; to keep crash safety each save first writes the complete new content to a flushed sibling `<config>.bak` and only then overwrites the config, so a crash mid-overwrite leaves the config torn but the backup whole, and load recovers from the backup (a config that is malformed with no usable backup is ignored with a warning and falls back to defaults). Nothing else is stored: no identity keys, no peer list, no clipboard content, no inbox or outbox.
+The default file is `duocb/config.json` under the platform's per-user config directory (`~/.config` on Linux, `~/Library/Application Support` on macOS, `%APPDATA%` on Windows) with the configure mode's three fields: `auth_token` (the standing secret), `my_name` (this device's short name), and `device_suffix` (the permanent 8-char identity suffix, generated on the first launch with this config file and never regenerated — it survives clearing the secret). The config is **per-machine**; copying it to another device is not supported. It is machine-managed JSON, not intended for hand editing. The setup wizard persists the secret as soon as it is generated/imported and the name as soon as it is confirmed; **Clear secret** (an explicit, confirmed action) removes only `auth_token`. `--config`/`-c` or `DUOCB_CONFIG` selects an alternative file; the CLI wins over the environment. The process holds an exclusive OS lock on the config file itself for its lifetime, so one resolved config cannot back two simultaneous local instances (and the file is guarded against accidental external edits while duocb runs) while two E2E instances with distinct config paths run independently — each minting its own suffix. Because the lock lives on the file, saves overwrite it in place through the held handle rather than via an atomic temp-and-rename; to keep crash safety each save first writes the complete new content to a flushed sibling `<config>.bak` and only then overwrites the config, so a crash mid-overwrite leaves the config torn but the backup whole, and load recovers from the backup (a config that is malformed with no usable backup is ignored with a warning and falls back to defaults). Nothing else is stored: no identity keys, no peer list, no clipboard content, no inbox or outbox.
 
-The token-mode initiator renders its token as a mask with an explicit copy action, both before startup and in the running identity summary; the raw secret is never displayed. Once a token-mode form is submitted, both role screens retain a shared identity summary: this device's name, the token fingerprint, both local and paired node ids once available, and the active saved-config path. The runtime emits endpoint-ready information for both server and client roles. The connector's summary omits the token copy action.
+The secret is never displayed after setup: the one-time reveal at generation is the only time it renders, and afterwards the hub shows a mask with an explicit "Copy secret" action (for onboarding the next device) plus the fingerprint. The running role screens retain an identity summary: this device's display identity, the secret fingerprint, both local and paired node ids once available, and — on the joiner — which device it is joining.
 
 ## Security model
 
 - **Trust boundary:** the two devices. The pairing secret (token or PIN) is assumed to be transferred between your own devices over a channel you already trust.
 - **Transport:** QUIC/TLS 1.3, authenticated by the peer's node id (its public key). The client always connects to exactly the id it typed or resolved.
-- **Relays and signaling servers** (nostr relays, n0 infrastructure) see ciphertext under secret-derived keys and standard QUIC metadata; without the token/PIN they cannot decrypt the node-id records or pass in-band authentication. Before a server is claimed, a party that obtains the token or successfully guesses a current PIN has the corresponding in-band authentication credential, which is why token secrecy and the PIN KDF/rotation window matter. After the first pairing, the PIN alone is no longer sufficient: every connection is also bound to the already-claimed QUIC peer identity, and the PIN does not derive the QUIC traffic keys.
+- **Relays and signaling servers** (nostr relays, n0 infrastructure) see ciphertext under secret-derived keys and standard QUIC metadata; without the token/PIN they cannot decrypt the presence records (which carry the plaintext device name **inside** the ciphertext) or pass in-band authentication. A configured device publishes its (encrypted) presence on a ~2-minute heartbeat whenever the app runs, so relay operators observe event timing and author-key activity — a deliberate footprint for the always-current device list. Before a server is claimed, a party that obtains the token or successfully guesses a current PIN has the corresponding in-band authentication credential, which is why token secrecy and the PIN KDF/rotation window matter. After the first pairing, the PIN alone is no longer sufficient: every connection is also bound to the already-claimed QUIC peer identity, and the PIN does not derive the QUIC traffic keys.
 - **Debug hygiene:** the token is wrapped in a type whose `Debug` prints `AuthToken(***)`, so it can't leak through logs.
 
 ## Limitations

@@ -3,6 +3,7 @@
 use std::time::{Duration, Instant};
 
 pub mod app;
+pub mod configure;
 pub mod screens;
 pub mod session;
 
@@ -23,12 +24,31 @@ pub enum Screen {
 /// The pairing mode selected on the home screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PairMode {
-    /// Shared auth token + names, rendezvous via nostr (internet).
+    /// The primary mode: a standing secret + per-device identities, device
+    /// discovery and rendezvous via nostr (internet).
     NostrToken,
     /// Rotating PIN quick pair via nostr (internet).
     NostrPin,
     /// Manually typed node id + token; works offline on the same LAN (mDNS).
     Manual,
+}
+
+/// Where the configure mode's home-screen flow currently is. The setup steps
+/// gate everything on the standing secret: without one, only the wizard is
+/// reachable; once secret + name are saved the hub ([`ConfigureStep::Ready`])
+/// is home until the user explicitly clears the secret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigureStep {
+    /// No secret: choose between generating a new one and importing one.
+    SetupChoice,
+    /// One-time reveal of a freshly generated secret.
+    SetupGenerate,
+    /// Paste an existing secret (masked, fingerprint-confirmed).
+    SetupImport,
+    /// Enter/confirm this device's short name.
+    SetupName,
+    /// Fully configured: device identity + peer list + start/join actions.
+    Ready,
 }
 
 /// Max characters shown in the peek view. Larger payloads are truncated to

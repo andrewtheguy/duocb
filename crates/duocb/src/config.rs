@@ -1,7 +1,10 @@
-//! Minimal config persistence: pre-fills the nostr token-mode forms so a
-//! standing pairing's 47-char token and device name don't have to be retyped every
-//! launch. The initiator saves before starting; the connector saves only after
-//! successful authentication. Clipboard content and the inbox are never persisted.
+//! Minimal config persistence for the configure mode: the standing secret (the
+//! 47-char auth token), this device's short name, and its permanent random
+//! suffix. The setup wizard saves the secret and name as soon as they are
+//! entered; the suffix is generated on the first launch with this config file
+//! and never changes (it survives clearing the secret). The config is
+//! per-machine — copying it to another device is not supported. Clipboard
+//! content and the inbox are never persisted.
 //!
 //! The config is a machine-managed JSON file, not meant for hand editing. duocb
 //! holds an exclusive OS lock on the file itself for the whole session, which
@@ -23,11 +26,14 @@ use std::path::{Path, PathBuf};
 #[derive(Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// Shared auth token for the nostr token/name mode.
+    /// The standing secret shared by all of this user's devices (configure mode).
     pub auth_token: Option<String>,
-    /// This device's unique name in token mode, regardless of whether it starts
-    /// or joins the connection.
+    /// This device's user-chosen short name (without the suffix).
     pub my_name: Option<String>,
+    /// Permanent per-device random suffix (8 unambiguous chars), generated on
+    /// the first launch with this config file and never regenerated — it
+    /// survives clearing the secret, so the device keeps its identity.
+    pub device_suffix: Option<String>,
 }
 
 impl std::fmt::Debug for Config {
@@ -36,6 +42,7 @@ impl std::fmt::Debug for Config {
         f.debug_struct("Config")
             .field("auth_token", &self.auth_token.as_ref().map(|_| "***"))
             .field("my_name", &self.my_name)
+            .field("device_suffix", &self.device_suffix)
             .finish()
     }
 }
@@ -294,6 +301,7 @@ mod tests {
         lock.save(&Config {
             auth_token: Some("token-value".to_string()),
             my_name: Some("desktop".to_string()),
+            device_suffix: Some("a7B2c3D4".to_string()),
         })
         .expect("save");
 
@@ -305,6 +313,7 @@ mod tests {
         lock.save(&Config {
             auth_token: Some("t".to_string()),
             my_name: None,
+            device_suffix: None,
         })
         .expect("save shorter");
         let loaded = lock.load();
@@ -339,6 +348,7 @@ mod tests {
         lock.save(&Config {
             auth_token: Some("stale".to_string()),
             my_name: Some("desktop".to_string()),
+            device_suffix: None,
         })
         .expect("save");
         drop(lock);
@@ -355,6 +365,54 @@ mod tests {
     }
 
     #[test]
+    fn config_without_suffix_field_loads_with_none() {
+        let dir = temp_dir();
+        let path = dir.join("config.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        // A config written before the suffix existed: still parses, suffix None,
+        // so the app treats it as a first launch for the suffix only.
+        std::fs::write(
+            &path,
+            br#"{ "auth_token": "tok", "my_name": "desktop" }"#,
+        )
+        .unwrap();
+
+        let mut lock = acquire_lock(&path).expect("lock");
+        let loaded = lock.load();
+        assert_eq!(loaded.auth_token.as_deref(), Some("tok"));
+        assert_eq!(loaded.my_name.as_deref(), Some("desktop"));
+        assert_eq!(loaded.device_suffix, None);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn clearing_the_secret_keeps_the_suffix() {
+        let dir = temp_dir();
+        let path = dir.join("config.json");
+        let mut lock = acquire_lock(&path).expect("lock");
+
+        lock.save(&Config {
+            auth_token: Some("secret".to_string()),
+            my_name: Some("desktop".to_string()),
+            device_suffix: Some("a7B2c3D4".to_string()),
+        })
+        .expect("save");
+
+        // The clear-secret action drops the token but must keep the permanent
+        // suffix (and may keep the name as a prefill).
+        let mut cleared = lock.load();
+        cleared.auth_token = None;
+        lock.save(&cleared).expect("save cleared");
+
+        let loaded = lock.load();
+        assert_eq!(loaded.auth_token, None);
+        assert_eq!(loaded.device_suffix.as_deref(), Some("a7B2c3D4"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn load_recovers_from_backup_when_config_is_torn() {
         let dir = temp_dir();
         let path = dir.join("config.json");
@@ -363,6 +421,7 @@ mod tests {
         lock.save(&Config {
             auth_token: Some("good".to_string()),
             my_name: Some("desktop".to_string()),
+            device_suffix: None,
         })
         .expect("save");
         drop(lock);

@@ -3,9 +3,16 @@
  * Hand-maintained; keep in sync with crates/duocb-ffi/src/lib.rs.
  * Build with ./build-ios.sh (stages dist/ios/libduocb.xcframework + this header).
  *
- * Config mode only: role "start" publishes this device's node id on nostr and
- * listens; role "join" resolves the peer by the shared token and dials. Quick
- * mode (PIN / manual) is desktop-only and not exposed here.
+ * Configure mode only: every device shares one standing secret (the token) and
+ * broadcasts a presence record under its unique display identity
+ * "<name>_<suffix>" (e.g. "mac-book_a7B2c3D4"). Role "start" hosts (its record
+ * carries the node id); role "join" dials exactly the device named by "peer".
+ * Quick mode (PIN / manual) is desktop-only and not exposed here.
+ *
+ * INTERIM SURFACE after the presence/peer-list redesign: the join role
+ * requires the caller to pass the target's full display identity ("peer");
+ * an on-demand peer-list browsing call is a planned follow-up. "peer_list"
+ * events are already delivered when the runtime produces them.
  *
  * Lifecycle:
  *   1. duocb_init_logging()                                   (once, optional)
@@ -20,6 +27,11 @@
  *
  * Config JSON:
  *   {"role":"start"|"join","token":"d…47 chars","name":"mac1",
+ *    "suffix":"a7B2c3D4",                      permanent 8-char device id; mint
+ *                                              once with duocb_generate_suffix
+ *                                              and persist forever (Keychain)
+ *    "peer":"mac2_x9Y8z7W6",                   join role only: the target
+ *                                              device's display identity
  *    "relays":["wss://…"]}                     relays optional (built-in defaults)
  *
  * Events (one JSON object per duocb_next_event call), by "type":
@@ -38,6 +50,11 @@
  *                                               latest item — skip it if the
  *                                               inbox already holds that text)
  *   item_sent         {}
+ *   peer_list         {peers: [{display, name, suffix, hosting, online,
+ *                               last_seen_unix}]}
+ *   presence_conflict {message}                (another live process publishes
+ *                                               as this device; broadcasting
+ *                                               stopped)
  *   error             {message}
  *
  * All strings are NUL-terminated UTF-8. All functions are NULL-safe and never
@@ -62,6 +79,11 @@ void duocb_init_logging(void);
 
 /* Generate a fresh token. 1 = written, 0 = buffer too small, -1 = NULL buffer. */
 int duocb_generate_token(char *out_buf, size_t out_len);
+
+/* Generate this device's permanent 8-char identity suffix. Call once on first
+ * launch and persist the result forever — it must never change, even when the
+ * secret is replaced. 1 = written, 0 = buffer too small, -1 = NULL buffer. */
+int duocb_generate_suffix(char *out_buf, size_t out_len);
 
 /* 1 = valid, 0 = invalid (reason written to err_buf), -1 = NULL argument. */
 int duocb_validate_token(const char *token, char *err_buf, size_t err_len);

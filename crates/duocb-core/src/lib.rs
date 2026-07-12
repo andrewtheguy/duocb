@@ -8,6 +8,7 @@
 pub use iroh;
 
 pub mod auth;
+pub mod identity;
 pub mod net;
 pub mod nostr;
 pub mod pin;
