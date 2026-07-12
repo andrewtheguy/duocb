@@ -197,7 +197,7 @@ impl App {
         s.set_outbox_present(self.outbox.is_some());
         s.set_outbox(self.outbox.as_ref().map(clip_row).unwrap_or_default());
         let inbox: Vec<ClipRow> = self.inbox.iter().map(clip_row).collect();
-        s.set_inbox_count(inbox.len() as i32);
+        s.set_inbox_title(format!("Inbox ({})", inbox.len()).into());
         s.set_inbox(ModelRc::new(VecModel::from(inbox)));
 
         // Modals.

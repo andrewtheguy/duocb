@@ -81,7 +81,8 @@ export global UiState {
     in property <bool> outbox-present;
     in property <ClipRow> outbox;
     in property <[ClipRow]> inbox;
-    in property <int> inbox-count;
+    /// "Inbox (2)", composed in Rust.
+    in property <string> inbox-title;
 
     // Modals.
     in property <bool> show-clear-secret;

@@ -1,14 +1,135 @@
-// The paired session panel, embedded by both role screens while connected.
+// The paired session panel: send actions (the clipboard, or typed text via
+// the compose field), path info, the last-sent outbox item, and the
+// in-memory inbox. Every item supports peek (view without copying, truncated
+// when large) and per-item Copy. Embedded by both role screens; collapses to
+// nothing while not connected.
 
 import { UiState, Actions } from "globals.slint";
+import { ClipRow } from "types.slint";
 import { Theme } from "theme.slint";
-import { Body } from "widgets.slint";
+import { Card, CardTitle, Body, Weak, Small, Mono } from "widgets.slint";
+import { Button, LineEdit, TextEdit } from "std-widgets.slint";
 
-export component SessionPanel inherits VerticalLayout {
-    /// Whether a compose field inside the panel has focus.
-    out property <bool> field-focused: false;
-    alignment: start;
-    spacing: Theme.pad-s;
+component ClipItemRow inherits Card {
+    in property <ClipRow> item;
+    callback copy-clicked();
+    callback peek-clicked();
 
-    if UiState.connected: Body { text: "session panel (todo)"; }
+    HorizontalLayout {
+        spacing: Theme.pad-s;
+        Mono {
+            text: root.item.time;
+            opacity: Theme.weak-opacity;
+            vertical-alignment: center;
+        }
+        Small { text: root.item.size; vertical-alignment: center; }
+        Small {
+            text: "CRC " + root.item.crc;
+            font-family: "monospace";
+            vertical-alignment: center;
+        }
+        Rectangle { horizontal-stretch: 1; }
+        Button {
+            text: "Copy";
+            clicked => { root.copy-clicked(); }
+        }
+        Button {
+            text: root.item.expanded ? "Hide" : "Peek";
+            clicked => { root.peek-clicked(); }
+        }
+    }
+    // Read-only, selectable, never touches the system clipboard unless the
+    // user selects + copies deliberately. Large payloads are truncated; Copy
+    // still yields the full content.
+    if root.item.expanded: TextEdit {
+        read-only: true;
+        text: root.item.peek-text;
+        height: max(root.item.peek-lines, 2) * 20px + 16px;
+    }
+    if root.item.expanded && root.item.truncated-note != "": Small {
+        text: root.item.truncated-note;
+    }
+}
+
+export component SessionPanel inherits Rectangle {
+    /// Whether the compose field has keyboard focus (gates letter shortcuts).
+    out property <bool> field-focused: compose-entry.has-focus;
+
+    height: UiState.connected ? content.preferred-height : 0px;
+
+    content := VerticalLayout {
+        visible: UiState.connected;
+        alignment: start;
+        spacing: Theme.pad-s;
+
+        Rectangle { height: 1px; background: Theme.card-border; }
+
+        HorizontalLayout {
+            spacing: Theme.pad-s;
+            alignment: start;
+            Button {
+                text: "📤 Send clipboard (Ctrl/⌘+S)";
+                primary: true;
+                clicked => { Actions.send-clipboard(); }
+            }
+            Button {
+                text: "🌐 Connection path";
+                clicked => { Actions.query-conn-path(); }
+            }
+            if UiState.sent-flash: Text {
+                text: "sent ✓";
+                color: Theme.ok;
+                font-size: Theme.font-body;
+                vertical-alignment: center;
+            }
+        }
+
+        // Compose row: send typed text without touching the clipboard. Enter
+        // sends and keeps focus, so consecutive sends need no re-click.
+        HorizontalLayout {
+            spacing: Theme.pad-s;
+            compose-entry := LineEdit {
+                placeholder-text: "Or type text to send… (Enter)";
+                text <=> UiState.in-compose;
+                horizontal-stretch: 1;
+                edited => { Actions.fields-edited(); }
+                accepted => { Actions.compose-send(); }
+            }
+            Button {
+                text: "Send";
+                enabled: UiState.in-compose != "";
+                clicked => { Actions.compose-send(); }
+            }
+        }
+
+        // Outbox: the last item sent, shown so the receiver can compare its
+        // size/CRC against the matching inbox item on the other device.
+        CardTitle { text: "Outbox (last sent)"; }
+        if UiState.outbox-present: ClipItemRow {
+            item: UiState.outbox;
+            copy-clicked => { Actions.outbox-copy(); }
+            peek-clicked => { Actions.outbox-peek(); }
+        }
+        if !UiState.outbox-present: Weak { text: "Nothing sent yet."; }
+
+        HorizontalLayout {
+            spacing: Theme.pad-s;
+            alignment: start;
+            CardTitle { text: UiState.inbox-title; vertical-alignment: center; }
+            if UiState.inbox.length > 0: Button {
+                text: "Clear inbox (Ctrl/⌘+L)";
+                clicked => { Actions.clear-inbox(); }
+            }
+            Small {
+                text: "newest: peek Ctrl/⌘+P · copy Ctrl/⌘+Y";
+                vertical-alignment: center;
+            }
+        }
+        if UiState.inbox.length == 0: Weak { text: "Nothing received yet."; }
+        for row[index] in UiState.inbox: ClipItemRow {
+            item: row;
+            copy-clicked => { Actions.inbox-copy(index); }
+            peek-clicked => { Actions.inbox-peek(index); }
+        }
+    }
 }
