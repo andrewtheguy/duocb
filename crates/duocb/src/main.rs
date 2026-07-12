@@ -1,3 +1,8 @@
+// On Windows, build a GUI-subsystem executable in release so launching the app
+// doesn't spawn an extra console window. Debug builds keep the console so
+// `cargo run` still surfaces stderr/logs. No effect on other platforms.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod app;
 mod clipboard;
 mod config;
