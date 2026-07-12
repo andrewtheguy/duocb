@@ -6,8 +6,9 @@
 //! secret". Each running device publishes one kind-30078 parameterized-
 //! replaceable **presence record** under a `d` tag of
 //! `duocb:presence:<sha256(auth||identity)>`, where `identity` is the device's
-//! unique display identity `<name>_<suffix>` (see `crate::identity`). The hash
-//! is salted with the token so identities cannot be enumerated on relays.
+//! collision-resistant display identity `<name>_<suffix>` (see
+//! `crate::identity`). The hash is salted with the token so identities cannot
+//! be enumerated on relays.
 //!
 //! The record content is NIP-44 **self-encrypted** under the token-derived
 //! keypair and carries a JSON [`PresenceRecord`]: the plaintext display name
@@ -333,21 +334,15 @@ pub fn build_peer_list(
 // Quick-mode PIN rendezvous
 // ============================================================================
 //
-// Quick mode shares only the server's **ephemeral node id** through nostr — never a token. The
-// server shows a short PIN (see `crate::pin`) that rotates every 60s. Unlike the node-id
-// discovery above (keyed off the shared auth token), here the client starts with nothing but
-// the PIN. Both sides derive the same nostr keypair from `(pin, bucket)` via Argon2id, so the
-// server publishes a record under that key and a client holding the PIN derives the same key to
-// find and decrypt it. The lookup is by **author key** (only someone with the PIN can derive
-// it); no extra tag is needed.
+// The nostr transport for the encrypted PIN record (see `crate::pin_record`
+// for the shared codec, and `crate::lan` for the mDNS transport). Unlike the
+// node-id discovery above (keyed off the shared auth token), here the client
+// starts with nothing but the PIN; the lookup is by **author key** — the
+// `(pin, bucket)`-derived public key — so no extra tag is needed.
 //
-// The record is a regular (stored, non-replaceable) event carrying the NIP-44 encrypted
-// `{node_id}` payload, with a NIP-40 expiration so per-bucket records coexist briefly (for
-// boundary look-back) then self-clean.
-//
-// Encrypting the node id is **defense in depth, not the security boundary**: the node id is not
-// a credential (dialing it still requires passing the in-band PIN auth), and the intended client
-// needs the PIN to derive the author key and find the record anyway.
+// The record is a regular (stored, non-replaceable) event carrying the NIP-44
+// encrypted `{node_id}` payload, with a NIP-40 expiration so per-bucket records
+// coexist briefly (for boundary look-back) then self-clean.
 
 /// Regular (stored, non-replaceable) event kind for PIN rendezvous records. Deliberately
 /// *not* the replaceable 30078 used above, so each 60s bucket's record coexists long
@@ -366,57 +361,18 @@ fn pin_kind() -> Kind {
     Kind::from_u16(PIN_KIND_U16)
 }
 
-/// The payload carried (NIP-44 encrypted) in a PIN rendezvous record: the server's ephemeral
-/// node id. No token is here — the PIN authenticates the connection in-band (see
-/// `crate::pin_auth`).
-#[derive(Serialize, Deserialize)]
-struct PinPayload {
-    node_id: String,
-}
-
-/// Derive the nostr keypair for a `(pin, bucket)` pair. Both peers run this on the same
-/// canonical PIN and bucket and get the same keypair, whose public key is the relay lookup
-/// key and whose secret key (self-)encrypts the payload.
-fn pin_keys(canonical_pin: &str, bucket: u64) -> Result<Keys> {
-    let material = pin::derive_key_material(canonical_pin, bucket)?;
-    let secret = SecretKey::from_slice(&material).context("deriving nostr key from PIN")?;
-    Ok(Keys::new(secret))
-}
-
-/// Publish a PIN rendezvous record for the current bucket: the server's ephemeral node id,
-/// NIP-44 self-encrypted under the PIN-derived key, as a stored event that expires after a few
-/// rotation periods.
-pub async fn publish_pin_record(
-    canonical_pin: &str,
-    bucket: u64,
-    node_id: &EndpointId,
-    relays: &[String],
-) -> Result<()> {
-    // The PIN KDF is Argon2id (slow, memory-hard by design); derive off the
-    // async executor.
-    let keys = tokio::task::spawn_blocking({
-        let pin = canonical_pin.to_string();
-        move || pin_keys(&pin, bucket)
-    })
-    .await
-    .context("PIN key-derivation task failed")??;
-    let payload = serde_json::to_string(&PinPayload {
-        node_id: node_id.to_string(),
-    })
-    .context("serializing PIN payload")?;
-    let content = nip44::encrypt(
-        keys.secret_key(),
-        &keys.public_key(),
-        payload,
-        nip44::Version::V2,
-    )
-    .context("encrypting PIN payload")?;
+/// Publish a PIN rendezvous record for one bucket: the server's ephemeral node id,
+/// NIP-44 self-encrypted under `keys` (the `(pin, bucket)`-derived keypair, derived
+/// by the caller — the KDF is Argon2id and must run off the async executor), as a
+/// stored event that expires after a few rotation periods.
+pub async fn publish_pin_record(keys: &Keys, node_id: &EndpointId, relays: &[String]) -> Result<()> {
+    let content = crate::pin_record::encrypt_pin_payload(keys, node_id)?;
 
     let expiration = Timestamp::now() + PIN_EVENT_TTL_SECS;
     let client = connect_client(relays).await?;
     let event = EventBuilder::new(pin_kind(), content)
         .tag(Tag::expiration(expiration))
-        .sign_with_keys(&keys)
+        .sign_with_keys(keys)
         .context("signing PIN record")?;
     let res = client.send_event(&event).await;
     client.disconnect().await;
@@ -424,33 +380,22 @@ pub async fn publish_pin_record(
     Ok(())
 }
 
-/// Look up the PIN rendezvous record for `canonical_pin`, searching the current bucket and
-/// its immediate neighbors (covers the rotation boundary and small clock skew). Returns the
-/// decrypted node id, or `Ok(None)` when no matching record is found (wrong or expired PIN).
-/// All adjacent buckets are queried in a single relay round-trip. The connection is then
+/// Look up the PIN rendezvous record on nostr relays, trying each candidate
+/// keypair (the caller derives one per adjacent bucket — see
+/// `pin_record::candidate_keys`; all are queried in a single relay
+/// round-trip). Returns the decrypted node id, or `Ok(None)` when no matching
+/// record is found (wrong or expired PIN). The connection is then
 /// authenticated in-band with the same PIN (see `crate::pin_auth`).
 pub async fn lookup_pin_record(
-    canonical_pin: &str,
+    candidates: &[Keys],
     relays: &[String],
 ) -> Result<Option<EndpointId>> {
-    let current = pin::current_bucket();
-    // Search order favors the current bucket, then the previous (the common late-read case),
-    // then the next (clock skew where our clock trails the publisher's).
-    let buckets = [current, current.wrapping_sub(1), current + 1];
-
-    // Derive each bucket's keypair once; map public key -> keys so we can decrypt a returned
-    // event with the right bucket's secret. Three Argon2id runs — off the async executor.
-    let all_keys = tokio::task::spawn_blocking({
-        let pin = canonical_pin.to_string();
-        move || -> Result<Vec<Keys>> { buckets.iter().map(|&b| pin_keys(&pin, b)).collect() }
-    })
-    .await
-    .context("PIN key-derivation task failed")??;
-    let mut by_pubkey: std::collections::HashMap<PublicKey, Keys> =
-        std::collections::HashMap::new();
-    for keys in all_keys {
-        by_pubkey.insert(keys.public_key(), keys);
-    }
+    // Map public key -> keys so a returned event decrypts with the right
+    // bucket's secret.
+    let by_pubkey: std::collections::HashMap<PublicKey, &Keys> = candidates
+        .iter()
+        .map(|keys| (keys.public_key(), keys))
+        .collect();
 
     let client = connect_client(relays).await?;
     let filter = Filter::new()
@@ -467,14 +412,7 @@ pub async fn lookup_pin_record(
         let Some(keys) = by_pubkey.get(&event.pubkey) else {
             continue;
         };
-        let Ok(plaintext) = nip44::decrypt(keys.secret_key(), &keys.public_key(), &event.content)
-        else {
-            continue;
-        };
-        let Ok(payload) = serde_json::from_str::<PinPayload>(&plaintext) else {
-            continue;
-        };
-        let Ok(node_id) = payload.node_id.trim().parse::<EndpointId>() else {
+        let Some(node_id) = crate::pin_record::decrypt_pin_payload(keys, &event.content) else {
             continue;
         };
         return Ok(Some(node_id));
@@ -672,49 +610,6 @@ mod tests {
             "decryption must fail under a different auth token"
         );
         assert!(presence_from_events(&attacker, [&event]).is_empty());
-    }
-
-    #[test]
-    fn pin_payload_round_trips_and_wrong_pin_fails() {
-        // Mirror publish/lookup without touching relays: encrypt under one (pin, bucket)
-        // key and confirm the same pin+bucket decrypts while a different pin does not.
-        let pin = "K7P29QXM";
-        let bucket = 12345;
-        let node_id = iroh::SecretKey::generate().public();
-
-        let keys = pin_keys(pin, bucket).unwrap();
-        let payload = serde_json::to_string(&PinPayload {
-            node_id: node_id.to_string(),
-        })
-        .unwrap();
-        let content = nip44::encrypt(
-            keys.secret_key(),
-            &keys.public_key(),
-            payload,
-            nip44::Version::V2,
-        )
-        .unwrap();
-        // The ciphertext must not leak the node id.
-        assert!(!content.contains(&node_id.to_string()));
-
-        // Same pin + bucket recovers the payload.
-        let plaintext = nip44::decrypt(keys.secret_key(), &keys.public_key(), &content).unwrap();
-        let got: PinPayload = serde_json::from_str(&plaintext).unwrap();
-        assert_eq!(got.node_id, node_id.to_string());
-
-        // A different pin derives a different key and cannot decrypt.
-        let wrong = pin_keys("9QXMK7P2", bucket).unwrap();
-        assert!(nip44::decrypt(wrong.secret_key(), &wrong.public_key(), &content).is_err());
-        // The right pin at the wrong bucket also fails.
-        let wrong_bucket = pin_keys(pin, bucket + 1).unwrap();
-        assert!(
-            nip44::decrypt(
-                wrong_bucket.secret_key(),
-                &wrong_bucket.public_key(),
-                &content
-            )
-            .is_err()
-        );
     }
 
     #[tokio::test]

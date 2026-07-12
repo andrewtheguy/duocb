@@ -19,6 +19,7 @@ impl App {
         s.set_screen(self.screen);
         s.set_configure_step(self.configure_step);
         s.set_mode(self.mode);
+        s.set_pin_channel(self.pin_channel);
         s.set_status_text(self.status_text().into());
         s.set_connected(self.status == ConnStatus::Connected);
         s.set_server_running(self.server_running);
@@ -144,7 +145,6 @@ impl App {
                 .unwrap_or_default()
                 .into(),
         );
-        s.set_node_id_full(self.node_id.clone().unwrap_or_default().into());
         s.set_peer_node_id_short(
             self.peer_node_id
                 .as_deref()
@@ -163,14 +163,7 @@ impl App {
                 .unwrap_or_default()
                 .into(),
         );
-        s.set_manual_token_present(self.manual_token.is_some());
-        s.set_manual_token_fingerprint(
-            self.manual_token
-                .as_deref()
-                .map(duocb_core::auth::token_fingerprint)
-                .unwrap_or_default()
-                .into(),
-        );
+        s.set_pairing_code(str_or_empty(&self.pairing_code));
         s.set_pin_display(str_or_empty(&self.pin_display));
         s.set_pin_countdown(match (&self.pin_display, self.pin_deadline) {
             (Some(_), Some(deadline)) => {
@@ -184,14 +177,10 @@ impl App {
         // Client join forms.
         let pin = self.in_pin.trim();
         s.set_pin_invalid(!pin.is_empty() && duocb_core::pin::normalize_pin(pin).is_none());
-        let manual = self.in_manual_token.trim();
-        let manual_valid = duocb_core::auth::validate_token(manual).is_ok();
-        s.set_manual_entry_fingerprint(if manual_valid {
-            duocb_core::auth::token_fingerprint(manual).into()
-        } else {
-            SharedString::default()
-        });
-        s.set_manual_entry_invalid(!manual.is_empty() && !manual_valid);
+        let code = self.in_manual_code.trim();
+        s.set_manual_code_invalid(
+            !code.is_empty() && duocb_core::manual_code::decode(code).is_none(),
+        );
         s.set_dial_ready(self.client_dial_spec().is_some());
 
         // Session panel.
@@ -232,8 +221,7 @@ impl App {
         s.set_in_my_name(self.in_my_name.clone().into());
         s.set_in_import_token(self.in_import_token.clone().into());
         s.set_in_pin(self.in_pin.clone().into());
-        s.set_in_node_id(self.in_node_id.clone().into());
-        s.set_in_manual_token(self.in_manual_token.clone().into());
+        s.set_in_manual_code(self.in_manual_code.clone().into());
         s.set_in_compose(self.in_compose.clone().into());
     }
 }

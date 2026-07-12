@@ -58,41 +58,25 @@ export component ServerScreen inherits Rectangle {
             Small { text: "Confirm this matches “Paired with” on the other device."; }
         }
 
-        if UiState.server-running && UiState.mode == PairMode.manual: VerticalLayout {
-            spacing: Theme.pad-s;
-            if UiState.node-id-full != "": VerticalLayout {
-                spacing: Theme.pad-xs;
-                HorizontalLayout {
-                    spacing: Theme.pad-s;
-                    alignment: start;
-                    Body { text: "Node id:"; vertical-alignment: center; }
-                    Button {
-                        text: "Copy (Ctrl/⌘+I)";
-                        clicked => { Actions.copy-node-id(); }
-                    }
-                }
-                Mono { text: UiState.node-id-full; wrap: char-wrap; }
-            }
-            // The token is never shown in plain text — a mask stands in
-            // for it, with a copy CTA — and its fingerprint is shown so
-            // the other device can confirm the match. It stays valid (and
-            // copyable) for the whole session so the paired peer can be
-            // re-sent it and reconnect after a drop.
-            if UiState.manual-token-present: HorizontalLayout {
+        // The pairing code bundles the node id and the session secret; it is
+        // shown in the clear like a PIN (its holder can pair anyway, and the
+        // session is claimed by the first peer). It stays valid (and copyable)
+        // for the whole session so the paired peer can be re-sent it and
+        // reconnect after a drop.
+        if UiState.server-running && UiState.mode == PairMode.manual
+            && UiState.pairing-code != "": VerticalLayout {
+            spacing: Theme.pad-xs;
+            HorizontalLayout {
                 spacing: Theme.pad-s;
                 alignment: start;
-                Body { text: "Token:"; vertical-alignment: center; }
-                Mono { text: "************"; vertical-alignment: center; }
+                Body { text: "Pairing code:"; vertical-alignment: center; }
                 Button {
-                    text: "Copy token (Ctrl/⌘+T)";
-                    clicked => { Actions.copy-manual-token(); }
+                    text: "Copy (Ctrl/⌘+T)";
+                    clicked => { Actions.copy-pairing-code(); }
                 }
             }
-            if UiState.manual-token-present: LabeledValue {
-                label: "Token fingerprint:";
-                value: UiState.manual-token-fingerprint;
-            }
-            Body { text: "Enter both on the other device. No internet needed on the same LAN."; }
+            Mono { text: UiState.pairing-code; wrap: char-wrap; }
+            Body { text: "Send it to the other device over any channel you trust and paste it there. No internet needed on the same LAN."; }
         }
 
         if UiState.server-running: HorizontalLayout {

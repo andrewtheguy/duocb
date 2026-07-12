@@ -84,10 +84,11 @@ impl std::ops::Deref for AuthToken {
 /// Authentication request sent by the client immediately after the iroh connection,
 /// on the first bidirectional stream it opens. The `method` tag selects the auth path
 /// the server runs:
-/// - `Token` — pre-shared auth token (nostr token mode and manual mode).
-/// - `Pin` — quick-mode PIN challenge-response: `nonce` is the dialer's random nonce
-///   and the exchange continues with [`PinChallenge`] / [`PinResponse`] / [`PinConfirm`]
-///   on the same stream (see `crate::pin_auth`). No token crosses the wire.
+/// - `Token` — pre-shared auth token (configure mode).
+/// - `Pin` — PIN/session-secret challenge-response used by PIN quick pair and
+///   manual mode: `nonce` is the dialer's random nonce and the exchange continues
+///   with [`PinChallenge`] / [`PinResponse`] / [`PinConfirm`] on the same stream
+///   (see `crate::pin_auth`). No token crosses the wire.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method")]
 pub enum AuthRequest {

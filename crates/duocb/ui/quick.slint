@@ -2,12 +2,15 @@
 // here is persisted; the credentials last one session.
 
 import { UiState, Actions } from "globals.slint";
-import { PairMode } from "types.slint";
+import { PairMode, PinChannel } from "types.slint";
 import { Theme } from "theme.slint";
-import { Card, CardTitle, Weak, Body, BigButton, WideButton, BackHeader, SelectableRow } from "widgets.slint";
+import { Card, CardTitle, Weak, Small, Body, BigButton, WideButton, BackHeader, SelectableRow } from "widgets.slint";
 
 component ModeRow inherits SelectableRow {
     in property <string> text;
+    /// Renders the row de-emphasized (the testing-only manual mode).
+    in property <bool> demoted;
+    opacity: root.demoted && !root.selected ? Theme.weak-opacity : 1.0;
     Text {
         text: root.selected ? "●" : "○";
         font-size: Theme.font-body;
@@ -31,14 +34,40 @@ export component QuickScreen inherits Rectangle {
         Card {
             CardTitle { text: "Mode"; }
             ModeRow {
-                text: "P  PIN quick pair — type a short rotating code (internet)";
+                text: "P  PIN quick pair — type a short rotating code";
                 selected: UiState.mode == PairMode.nostr-pin;
                 clicked => { Actions.set-mode(PairMode.nostr-pin); }
             }
             ModeRow {
-                text: "M  Manual — node id + token (works offline on the same LAN)";
+                demoted: true;
+                text: "M  Manual (testing) — carry a pairing code yourself";
                 selected: UiState.mode == PairMode.manual;
                 clicked => { Actions.set-mode(PairMode.manual); }
+            }
+            Small {
+                text: "Manual is for testing connectivity with no discovery at all: copy one pairing code between the devices out of band — offline on the same LAN (mDNS) or across the internet. Everyday pairing is the PIN.";
+            }
+        }
+
+        if UiState.mode == PairMode.nostr-pin: Card {
+            CardTitle { text: "PIN discovery"; }
+            ModeRow {
+                text: "1  Internet + local network — works everywhere";
+                selected: UiState.pin-channel == PinChannel.both;
+                clicked => { Actions.set-pin-channel(PinChannel.both); }
+            }
+            ModeRow {
+                text: "2  Internet only (nostr relays)";
+                selected: UiState.pin-channel == PinChannel.nostr-only;
+                clicked => { Actions.set-pin-channel(PinChannel.nostr-only); }
+            }
+            ModeRow {
+                text: "3  Local network only — no internet needed";
+                selected: UiState.pin-channel == PinChannel.lan-only;
+                clicked => { Actions.set-pin-channel(PinChannel.lan-only); }
+            }
+            Small {
+                text: "Pairing works as long as both devices share at least one transport — the default (internet + local network) overlaps with any choice.";
             }
         }
 

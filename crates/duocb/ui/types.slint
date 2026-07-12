@@ -32,11 +32,21 @@ export enum ConfigureStep {
 }
 
 /// The pairing mode. `nostr-token` is the configure mode (home); the other two
-/// are the quick options.
+/// are the quick options — `nostr-pin` is the everyday pick, `manual` is a
+/// demoted testing-only option (connectivity without nostr).
 export enum PairMode {
     nostr-token,
     nostr-pin,
     manual,
+}
+
+/// Which rendezvous transport(s) carry the PIN quick mode's record. `both`
+/// (the default) publishes/looks up on nostr relays and the local network;
+/// the others restrict to one transport.
+export enum PinChannel {
+    both,
+    nostr-only,
+    lan-only,
 }
 
 /// One row of the device picker. `line` is fully composed in Rust

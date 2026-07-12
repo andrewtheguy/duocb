@@ -15,8 +15,9 @@ pub mod runtime;
 pub type WakeFn = std::sync::Arc<dyn Fn() + Send + Sync>;
 
 /// The standing configure-mode identity: the shared secret plus this device's
-/// unique display identity (`<name>_<suffix>`, see `crate::identity`). Everything
-/// the presence publisher, a hosting session, and a joining session need.
+/// collision-resistant display identity (`<name>_<suffix>`, see
+/// `crate::identity`). Everything the presence publisher, a hosting session,
+/// and a joining session need.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TokenIdentity {
     /// The shared auth token (the standing secret).
@@ -35,6 +36,29 @@ impl TokenIdentity {
     }
 }
 
+/// Which transport(s) carry the rotating-PIN rendezvous record (the same
+/// encrypted record either way — see `crate::pin_record`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinChannel {
+    /// Publish/look up on nostr relays **and** the local network (mDNS); the
+    /// lookup races both. The default: works across the internet, and still
+    /// pairs on the same network with no internet.
+    NostrAndLan,
+    /// Nostr relays only (internet required).
+    NostrOnly,
+    /// Local network only (mDNS): zero internet, both devices on one network.
+    LanOnly,
+}
+
+impl PinChannel {
+    pub fn nostr(self) -> bool {
+        matches!(self, Self::NostrAndLan | Self::NostrOnly)
+    }
+    pub fn lan(self) -> bool {
+        matches!(self, Self::NostrAndLan | Self::LanOnly)
+    }
+}
+
 /// How the server signals its ephemeral node id to the client.
 #[derive(Debug, Clone)]
 pub enum ServerMode {
@@ -42,13 +66,19 @@ pub enum ServerMode {
     /// (kept running by the runtime) carries the node id to peers; in-band
     /// token auth gates the connection.
     NostrToken { identity: TokenIdentity },
-    /// Nostr rotating-PIN quick mode: publish under per-bucket PIN-derived keys;
-    /// in-band PIN challenge-response auth.
-    NostrPin { relays: Vec<String> },
-    /// Manual/offline mode: no signaling. The server displays its node id and a
-    /// freshly generated auth token (reported via [`NetEvent::ServerReady`]);
-    /// the client types both. Discovery falls back to mDNS on the LAN, so this
-    /// works with zero internet.
+    /// Rotating-PIN quick mode: publish the rendezvous record under per-bucket
+    /// PIN-derived keys on the selected channel(s); in-band PIN
+    /// challenge-response auth.
+    Pin {
+        relays: Vec<String>,
+        channel: PinChannel,
+    },
+    /// Manual/offline mode: no signaling at all. The server displays a single
+    /// pairing code — its node id plus a fresh session secret (see
+    /// `crate::manual_code`, reported via [`NetEvent::ServerReady`]) — which
+    /// the user carries to the other device out of band. Auth is the same
+    /// in-band PIN challenge-response as the PIN mode. Discovery falls back to
+    /// mDNS on the LAN, so this works with zero internet.
     Manual,
 }
 
@@ -63,13 +93,16 @@ pub enum DialSpec {
         /// The selected peer's full display identity, e.g. `mac-book_a7B2c3D4`.
         peer_display: String,
     },
-    /// Resolve via the rotating-PIN rendezvous, then prove PIN possession in-band.
+    /// Resolve via the rotating-PIN rendezvous on the selected channel(s) —
+    /// racing them when both are enabled — then prove PIN possession in-band.
     Pin {
         canonical_pin: String,
         relays: Vec<String>,
+        channel: PinChannel,
     },
-    /// Dial a manually typed node id and present the server's token.
-    Manual { node_id: String, token: String },
+    /// Dial the node id carried by a pasted pairing code and prove its session
+    /// secret in-band (the same PIN challenge-response as the PIN mode).
+    Manual { node_id: String, secret: String },
 }
 
 /// Commands from the UI thread to the networking runtime.
@@ -118,12 +151,13 @@ pub enum ConnStatus {
 /// Events from the networking runtime to the UI thread.
 #[derive(Debug)]
 pub enum NetEvent {
-    /// Server endpoint is up. `manual_token` is set in manual mode (the token the
-    /// client must type); `token_fingerprint` is set whenever a token is in play.
+    /// Server endpoint is up. `pairing_code` is set in manual mode (the code
+    /// the user carries to the other device); `token_fingerprint` is set in
+    /// configure mode (the standing secret's).
     ServerReady {
         node_id: String,
-        manual_token: Option<String>,
         token_fingerprint: Option<String>,
+        pairing_code: Option<String>,
     },
     /// Client endpoint is online. Token mode includes the fingerprint so the
     /// connector retains the same identity details as the initiator screen.

@@ -1860,7 +1860,7 @@ checksum = "edf234dd1594d6dd434a8fb8cada51ddbbc593e40e4a01556a0b31c62da2775b"
 
 [[package]]
 name = "duocb"
-version = "0.0.12"
+version = "0.0.13"
 dependencies = [
  "anyhow",
  "arboard",
@@ -1879,7 +1879,7 @@ dependencies = [
 
 [[package]]
 name = "duocb-core"
-version = "0.0.12"
+version = "0.0.13"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1897,13 +1897,14 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "subtle",
+ "swarm-discovery",
  "tokio",
  "tokio-util",
 ]
 
 [[package]]
 name = "duocb-ffi"
-version = "0.0.12"
+version = "0.0.13"
 dependencies = [
  "duocb-core",
  "env_logger",

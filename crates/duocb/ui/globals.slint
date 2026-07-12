@@ -3,7 +3,7 @@
 // carries every user intent back into Rust, which mutates the `App` state and
 // re-syncs. No UI-side state beyond what lives here.
 
-import { Screen, ConfigureStep, PairMode, PeerRow, ClipRow, PathRow } from "types.slint";
+import { Screen, ConfigureStep, PairMode, PinChannel, PeerRow, ClipRow, PathRow } from "types.slint";
 
 export global UiState {
     // Per-platform font families, set once at startup from Rust ("" = the
@@ -16,6 +16,7 @@ export global UiState {
     in property <Screen> screen;
     in property <ConfigureStep> configure-step;
     in property <PairMode> mode;
+    in property <PinChannel> pin-channel;
     in property <string> status-text;
     in property <bool> connected;
     in property <bool> server-running;
@@ -60,14 +61,13 @@ export global UiState {
     // Server / running-session identity.
     in property <string> joined-peer;
     in property <string> node-id-short;
-    /// The full node id, shown in manual mode where the other device types it.
-    in property <string> node-id-full;
     in property <string> peer-node-id-short;
     /// The fingerprint shown in the pairing summary (session token, or the
     /// standing secret's).
     in property <string> session-fingerprint;
-    in property <bool> manual-token-present;
-    in property <string> manual-token-fingerprint;
+    /// Manual mode's out-of-band credential (node id + session secret in one
+    /// copyable string), "" outside manual hosting.
+    in property <string> pairing-code;
     in property <string> pin-display;
     /// "refreshes in 42s", composed in Rust; "" while no PIN shows.
     in property <string> pin-countdown;
@@ -76,10 +76,8 @@ export global UiState {
     // Client join forms.
     /// True when the PIN entry is non-empty but not a valid PIN.
     in property <bool> pin-invalid;
-    /// Fingerprint of a checksum-valid manual-token entry, "" otherwise.
-    in property <string> manual-entry-fingerprint;
-    /// True when the manual-token entry is non-empty but invalid.
-    in property <bool> manual-entry-invalid;
+    /// True when the pairing-code entry is non-empty but not a valid code.
+    in property <bool> manual-code-invalid;
     in property <bool> dial-ready;
 
     // Session panel.
@@ -100,8 +98,7 @@ export global UiState {
     in-out property <string> in-my-name;
     in-out property <string> in-import-token;
     in-out property <string> in-pin;
-    in-out property <string> in-node-id;
-    in-out property <string> in-manual-token;
+    in-out property <string> in-manual-code;
     in-out property <string> in-compose;
 }
 
@@ -135,13 +132,13 @@ export global Actions {
 
     // Quick options / client.
     callback set-mode(mode: PairMode);
+    callback set-pin-channel(channel: PinChannel);
     callback open-client();
     callback connect-client();
     callback disconnect();
 
     // Server credentials.
-    callback copy-node-id();
-    callback copy-manual-token();
+    callback copy-pairing-code();
 
     // Session panel.
     callback send-clipboard();

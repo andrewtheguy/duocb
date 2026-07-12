@@ -3,7 +3,7 @@
 // side through the `UiState` global; all intents go back through `Actions`.
 
 import { UiState, Actions } from "globals.slint";
-import { Screen, ConfigureStep, PairMode, PeerRow, ClipRow, PathRow } from "types.slint";
+import { Screen, ConfigureStep, PairMode, PinChannel, PeerRow, ClipRow, PathRow } from "types.slint";
 import { Theme } from "theme.slint";
 import { HomeScreen } from "configure.slint";
 import { QuickScreen } from "quick.slint";
@@ -12,7 +12,7 @@ import { ClientScreen } from "client.slint";
 import { ClearSecretModal, ConnPathModal } from "modals.slint";
 
 // Everything the Rust side needs by name.
-export { UiState, Actions, Screen, ConfigureStep, PairMode, PeerRow, ClipRow, PathRow }
+export { UiState, Actions, Screen, ConfigureStep, PairMode, PinChannel, PeerRow, ClipRow, PathRow }
 
 export component MainWindow inherits Window {
     title: "duocb";
