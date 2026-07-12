@@ -81,6 +81,8 @@ pub struct DuocbApp {
     pub(crate) in_pin: String,
     pub(crate) in_node_id: String,
     pub(crate) in_manual_token: String,
+    /// Draft of the session panel's compose field (send typed text).
+    pub(crate) in_compose: String,
 
     // Live session state.
     pub(crate) peer_node_id: Option<String>,
@@ -170,6 +172,7 @@ impl DuocbApp {
             in_pin: String::new(),
             in_node_id: String::new(),
             in_manual_token: String::new(),
+            in_compose: String::new(),
             peer_node_id: None,
             conn_path: None,
             inbox: Vec::new(),
@@ -312,13 +315,20 @@ impl DuocbApp {
                 // outbox tracks exactly one in-flight item — otherwise the next
                 // ItemSent could promote the wrong (possibly rejected) text.
             }
-            Ok(text) => {
-                // Stash it; it becomes the outbox item once ItemSent confirms.
-                self.pending_outbox = Some(text.clone());
-                self.net.send(UiCommand::SendClipboard { text });
-            }
+            Ok(text) => self.send_text(text),
             Err(e) => self.error = Some(format!("Could not read the clipboard: {e:#}")),
         }
+    }
+
+    /// Send arbitrary text (the compose field, or a just-read clipboard) to
+    /// the peer. One in-flight send at a time, like the desktop outbox slot.
+    pub(crate) fn send_text(&mut self, text: String) {
+        if text.is_empty() || self.pending_outbox.is_some() {
+            return;
+        }
+        // Stash it; it becomes the outbox item once ItemSent confirms.
+        self.pending_outbox = Some(text.clone());
+        self.net.send(UiCommand::SendClipboard { text });
     }
 
     /// Copy arbitrary text (an inbox item, the node id, the token) to the

@@ -65,7 +65,7 @@ Run `duocb` on both devices.
 
 **Quick modes:** pick `2` (PIN) or `3` (manual) on both devices, press `S` on the starting device and `C` on the joining one, and type the displayed credentials.
 
-**Paired:** both sides now show the same session panel — `Ctrl/⌘+S` (or the button) reads your clipboard and sends it; received items appear in the inbox where you can **Peek** (view without copying) and **Copy** (the only action that writes that received item to your clipboard). Either device can send at any time; the outbox above the inbox shows the last item you sent (size + CRC) so the other side can confirm it matches what arrived.
+**Paired:** both sides now show the same session panel — `Ctrl/⌘+S` (or the button) reads your clipboard and sends it, and a compose field sends typed text directly (Enter) without touching the clipboard; received items appear in the inbox where you can **Peek** (view without copying) and **Copy** (the only action that writes that received item to your clipboard). Either device can send at any time; the outbox above the inbox shows the last item you sent (size + CRC) so the other side can confirm it matches what arrived.
 
 The joining device reconnects automatically with backoff if the connection drops. The starting device stays listening after its peer disconnects, but only the **same** peer may reconnect — a *restarted* joining device has a new identity and is refused; restart the connection to pair a fresh session.
 

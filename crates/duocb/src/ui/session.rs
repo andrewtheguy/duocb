@@ -1,6 +1,7 @@
-//! The paired session panel: send button, path info, the last-sent outbox
-//! item, and the in-memory inbox. Every item supports peek (view without
-//! copying, truncated when large) and per-item Copy.
+//! The paired session panel: send actions (the clipboard, or typed text via
+//! the compose field), path info, the last-sent outbox item, and the
+//! in-memory inbox. Every item supports peek (view without copying, truncated
+//! when large) and per-item Copy.
 
 use eframe::egui::{self, RichText, ScrollArea, TextEdit, Ui};
 
@@ -24,6 +25,29 @@ pub fn show_session(app: &mut DuocbApp, ui: &mut Ui) {
         }
         if app.sent_flash_active() {
             ui.colored_label(egui::Color32::from_rgb(0x2e, 0xa0, 0x43), "sent ✓");
+        }
+    });
+
+    // Compose row: send typed text without touching the clipboard (iOS parity).
+    // Laid out right-to-left so the field takes whatever the button leaves.
+    ui.add_space(4.0);
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        let clicked = ui
+            .add_enabled(!app.in_compose.is_empty(), egui::Button::new("Send"))
+            .clicked();
+        let field = ui.add(
+            TextEdit::singleline(&mut app.in_compose)
+                .hint_text("Or type text to send… (Enter)")
+                .desired_width(ui.available_width()),
+        );
+        let entered = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if (clicked || entered) && !app.in_compose.is_empty() && app.pending_outbox.is_none() {
+            let text = std::mem::take(&mut app.in_compose);
+            app.send_text(text);
+            if entered {
+                // Keep typing: consecutive sends without re-clicking the field.
+                field.request_focus();
+            }
         }
     });
 
