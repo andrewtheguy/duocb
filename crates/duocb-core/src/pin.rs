@@ -49,8 +49,10 @@ const PIN_CHECK_LEN: usize = 1;
 /// Random data characters: the PIN minus its check digit.
 const PIN_DATA_LEN: usize = PIN_LEN - PIN_CHECK_LEN;
 
-/// Rotation period, in seconds. The displayed PIN (and the relay record under it) changes
-/// every bucket; the client searches a small window of adjacent buckets.
+/// Rotation period, in seconds. A fresh PIN is minted (and displayed) this often; its relay
+/// record is keyed under the wall-clock bucket at mint time, and the client searches a small
+/// window of adjacent buckets, so a displayed PIN stays resolvable for its full period even
+/// when the display window straddles a bucket boundary.
 pub const BUCKET_SECS: u64 = 60;
 
 /// Argon2id memory cost, in KiB (64 MiB).
@@ -151,15 +153,6 @@ pub fn current_bucket() -> u64 {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     secs / BUCKET_SECS
-}
-
-/// Seconds remaining until the current bucket rolls over (drives the countdown UI).
-pub fn secs_until_next_bucket() -> u64 {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    BUCKET_SECS - (secs % BUCKET_SECS)
 }
 
 /// Run the shared Argon2id KDF over `canonical_pin` with the given `salt`, producing 32 bytes.

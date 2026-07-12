@@ -959,8 +959,9 @@ async fn run_presence_publisher(
     }
 }
 
-/// PIN quick mode publisher: mint a fresh PIN each rotation period, publish the
-/// node-id record under it, and surface the PIN + rollover countdown to the UI.
+/// PIN quick mode publisher: mint a fresh PIN each rotation period (measured
+/// from when the PIN is shown, not from wall-clock bucket boundaries), publish
+/// the node-id record under it, and surface the PIN + countdown to the UI.
 /// Each bucket's PIN auth key is recorded in `recent` so the listener auth path
 /// can verify a dialer's proof. Stops (and clears the displayed PIN) once a
 /// peer pairs — no more peers are accepted this session.
@@ -982,11 +983,16 @@ async fn run_pin_publisher(
 
         let pin = crate::pin::generate_pin();
         let bucket = crate::pin::current_bucket();
-        let remaining = crate::pin::secs_until_next_bucket();
-        // Show the new code right away (before the network publish).
+        // Show the new code right away (before the network publish) and give it a
+        // full rotation period from *now*, not from the wall-clock bucket boundary:
+        // a PIN minted late in a bucket would otherwise flash for only a few
+        // seconds. The dialer's adjacent-bucket look-back (and the record TTL)
+        // keeps the code resolvable for the whole displayed window even when it
+        // straddles a boundary.
+        let shown_at = tokio::time::Instant::now();
         events.send(NetEvent::PinRotated {
             pin_display: crate::pin::format_pin(&pin),
-            seconds_left: remaining,
+            seconds_left: crate::pin::BUCKET_SECS,
         });
 
         // Record this bucket's PIN auth key so an inbound dialer holding this
@@ -1004,13 +1010,16 @@ async fn run_pin_publisher(
         }
 
         match crate::nostr::publish_pin_record(&pin, bucket, &node_id, &relays).await {
-            Ok(()) => log::info!("Published rotating PIN to nostr (refreshes in {remaining}s)"),
+            Ok(()) => log::info!(
+                "Published rotating PIN to nostr (refreshes in {}s)",
+                crate::pin::BUCKET_SECS
+            ),
             Err(e) => log::warn!("Failed to publish PIN to nostr: {e:#}"),
         }
 
-        // Sleep to the next bucket boundary, then rotate. `max(1)` avoids a busy
-        // spin if we happen to land exactly on the boundary.
-        let sleep_for = Duration::from_secs(crate::pin::secs_until_next_bucket().max(1));
+        // Rotate one full period after the PIN was shown (key derivation and the
+        // publish above ate into that window), matching the countdown the UI runs.
+        let rotate_at = shown_at + Duration::from_secs(crate::pin::BUCKET_SECS);
         tokio::select! {
             _ = cancel.cancelled() => break,
             _ = paired.cancelled() => {
@@ -1018,7 +1027,7 @@ async fn run_pin_publisher(
                 events.send(NetEvent::PinCleared);
                 break;
             }
-            _ = tokio::time::sleep(sleep_for) => {}
+            _ = tokio::time::sleep_until(rotate_at) => {}
         }
     }
 }
