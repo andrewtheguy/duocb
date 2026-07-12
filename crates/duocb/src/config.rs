@@ -59,6 +59,17 @@ pub fn resolve_path(explicit: Option<PathBuf>) -> Result<PathBuf> {
     }
 }
 
+/// What the locked config file held on read (see [`ConfigLock::read_locked`]).
+enum LockedConfig {
+    Valid(Config),
+    /// Empty file: fresh install or deliberate reset — load defaults, do not
+    /// consult the backup.
+    Empty,
+    /// Non-empty malformed or unreadable content (e.g. torn by a crash during
+    /// the in-place overwrite) — the backup may recover it.
+    Damaged,
+}
+
 /// Process-lifetime exclusive lock on the config file, opened once and held open
 /// for the whole session. All config reads and writes go through this handle, so
 /// the lock also serves as the sole gateway to the file. Different explicit
@@ -116,32 +127,44 @@ impl ConfigLock {
     }
 
     /// Read the config, returning defaults when nothing valid is on disk (a
-    /// broken config must never block startup). Reads the locked file first;
-    /// if it is torn — e.g. a crash during an in-place overwrite — falls back to
-    /// the sibling backup that [`save`](Self::save) writes before overwriting.
+    /// broken config must never block startup). Reads the locked file first.
+    /// An **empty** file is a fresh install or a deliberate reset and yields
+    /// defaults immediately — it must never pull stale credentials back from
+    /// the backup. Only **non-empty damaged** content (torn by a crash during
+    /// the in-place overwrite, or unreadable) falls back to the sibling backup
+    /// that [`save`](Self::save) writes before overwriting.
     pub fn load(&mut self) -> Config {
-        if let Some(cfg) = self.read_locked() {
-            return cfg;
-        }
-        let backup = self.backup_path();
-        match std::fs::read_to_string(&backup) {
-            Ok(content) if !content.trim().is_empty() => match serde_json::from_str(&content) {
-                Ok(cfg) => {
-                    log::warn!("Recovered config from backup {}", backup.display());
-                    cfg
+        match self.read_locked() {
+            LockedConfig::Valid(cfg) => cfg,
+            LockedConfig::Empty => Config::default(),
+            LockedConfig::Damaged => {
+                let backup = self.backup_path();
+                match std::fs::read_to_string(&backup) {
+                    Ok(content) if !content.trim().is_empty() => {
+                        match serde_json::from_str(&content) {
+                            Ok(cfg) => {
+                                log::warn!("Recovered config from backup {}", backup.display());
+                                cfg
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "Ignoring malformed config backup {}: {e}",
+                                    backup.display()
+                                );
+                                Config::default()
+                            }
+                        }
+                    }
+                    _ => Config::default(),
                 }
-                Err(e) => {
-                    log::warn!("Ignoring malformed config backup {}: {e}", backup.display());
-                    Config::default()
-                }
-            },
-            _ => Config::default(),
+            }
         }
     }
 
-    /// Parse the locked config file. `None` means "nothing usable here, try the
-    /// backup": the file is empty (a fresh install), unreadable, or malformed.
-    fn read_locked(&mut self) -> Option<Config> {
+    /// Parse the locked config file, distinguishing "nothing here" from "torn":
+    /// an empty file must load as defaults, while non-empty malformed or
+    /// unreadable content is a candidate for backup recovery.
+    fn read_locked(&mut self) -> LockedConfig {
         let mut content = String::new();
         if let Err(e) = self
             .file
@@ -149,16 +172,16 @@ impl ConfigLock {
             .and_then(|_| self.file.read_to_string(&mut content))
         {
             log::warn!("Ignoring unreadable config {}: {e}", self.path.display());
-            return None;
+            return LockedConfig::Damaged;
         }
         if content.trim().is_empty() {
-            return None;
+            return LockedConfig::Empty;
         }
         match serde_json::from_str(&content) {
-            Ok(cfg) => Some(cfg),
+            Ok(cfg) => LockedConfig::Valid(cfg),
             Err(e) => {
                 log::warn!("Ignoring malformed config {}: {e}", self.path.display());
-                None
+                LockedConfig::Damaged
             }
         }
     }
@@ -301,6 +324,31 @@ mod tests {
         let mut lock = acquire_lock(&path).expect("lock");
         let loaded = lock.load();
         assert!(loaded.auth_token.is_none());
+        assert!(loaded.my_name.is_none());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn emptied_config_loads_defaults_and_ignores_stale_backup() {
+        let dir = temp_dir();
+        let path = dir.join("config.json");
+
+        // A save leaves a backup with credentials behind.
+        let mut lock = acquire_lock(&path).expect("lock");
+        lock.save(&Config {
+            auth_token: Some("stale".to_string()),
+            my_name: Some("desktop".to_string()),
+        })
+        .expect("save");
+        drop(lock);
+
+        // The user resets/deletes the config (empty file): the stale backup
+        // must NOT be restored.
+        std::fs::write(&path, b"").unwrap();
+        let mut lock = acquire_lock(&path).expect("relock");
+        let loaded = lock.load();
+        assert!(loaded.auth_token.is_none(), "stale token must not return");
         assert!(loaded.my_name.is_none());
 
         let _ = std::fs::remove_dir_all(dir);

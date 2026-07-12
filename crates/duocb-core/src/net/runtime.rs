@@ -831,10 +831,17 @@ async fn run_pin_publisher(
         });
 
         // Record this bucket's PIN auth key so an inbound dialer holding this
-        // PIN can be authenticated in-band, even after the code rotates.
-        match crate::pin_auth::derive_auth_keys(&pin) {
-            Ok(keys) => recent.push(keys),
-            Err(e) => log::warn!("Failed to derive PIN auth key: {e:#}"),
+        // PIN can be authenticated in-band, even after the code rotates. The
+        // Argon2id derivation runs off the async executor.
+        let derived = tokio::task::spawn_blocking({
+            let pin = pin.clone();
+            move || crate::pin_auth::derive_auth_keys(&pin)
+        })
+        .await;
+        match derived {
+            Ok(Ok(keys)) => recent.push(keys),
+            Ok(Err(e)) => log::warn!("Failed to derive PIN auth key: {e:#}"),
+            Err(e) => log::warn!("PIN key-derivation task failed: {e}"),
         }
 
         match crate::nostr::publish_pin_record(&pin, bucket, &node_id, &relays).await {
@@ -928,24 +935,26 @@ async fn auth_as_dialer(conn: &iroh::endpoint::Connection, auth_token: &str) -> 
 /// [`AuthFailure`] — fatal for this target, exactly like a wrong token. On success the opened
 /// stream is returned (not finished) for the clipboard.
 async fn auth_as_dialer_pin(conn: &iroh::endpoint::Connection, pin: &str) -> Result<Bi> {
-    let (mut send, mut recv) = conn.open_bi().await.context("opening session stream")?;
-    match tokio::time::timeout(
-        AUTH_TIMEOUT,
-        crate::pin_auth::dialer_handshake(&mut send, &mut recv, pin),
-    )
-    .await
-    {
-        Err(_) => return Err(auth_failure("PIN auth timed out")),
+    // One deadline over the whole exchange, including opening the stream — a
+    // stalled open_bi must not delay the point where the timeout starts.
+    let handshake = async {
+        let (mut send, mut recv) = conn.open_bi().await.context("opening session stream")?;
+        crate::pin_auth::dialer_handshake(&mut send, &mut recv, pin).await?;
+        Ok::<Bi, anyhow::Error>((send, recv))
+    };
+    match tokio::time::timeout(AUTH_TIMEOUT, handshake).await {
+        Err(_) => Err(auth_failure("PIN auth timed out")),
         Ok(Err(e)) => {
             if let Some(reason) = auth_close_reason(conn) {
                 return Err(auth_failure(reason));
             }
-            return Err(anyhow::Error::new(AuthFailure(format!("{e:#}"))));
+            Err(anyhow::Error::new(AuthFailure(format!("{e:#}"))))
         }
-        Ok(Ok(())) => {}
+        Ok(Ok(streams)) => {
+            log::info!("Authenticated with peer via PIN");
+            Ok(streams)
+        }
     }
-    log::info!("Authenticated with peer via PIN");
-    Ok((send, recv))
 }
 
 /// Authenticate as the listener. Accepts either a pre-shared token or (PIN mode) a PIN proof;

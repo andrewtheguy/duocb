@@ -121,7 +121,14 @@ where
     W: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
 {
-    let keys = derive_auth_keys(canonical_pin)?;
+    // Argon2id is deliberately slow and memory-hard; run it off the async
+    // executor so it cannot stall other tasks on this worker.
+    let keys = tokio::task::spawn_blocking({
+        let pin = canonical_pin.to_string();
+        move || derive_auth_keys(&pin)
+    })
+    .await
+    .context("PIN key-derivation task failed")??;
     let nonce_d = generate_nonce();
 
     // 1. Open with the PIN method + our nonce.
