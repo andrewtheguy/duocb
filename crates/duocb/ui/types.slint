@@ -32,7 +32,8 @@ export enum ConfigureStep {
 }
 
 /// The pairing mode. `nostr-token` is the configure mode (home); the other two
-/// are the quick options.
+/// are the quick options — `nostr-pin` is the everyday pick, `manual` is a
+/// demoted testing-only option (connectivity without nostr).
 export enum PairMode {
     nostr-token,
     nostr-pin,

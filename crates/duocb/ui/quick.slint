@@ -4,10 +4,13 @@
 import { UiState, Actions } from "globals.slint";
 import { PairMode } from "types.slint";
 import { Theme } from "theme.slint";
-import { Card, CardTitle, Weak, Body, BigButton, WideButton, BackHeader, SelectableRow } from "widgets.slint";
+import { Card, CardTitle, Weak, Small, Body, BigButton, WideButton, BackHeader, SelectableRow } from "widgets.slint";
 
 component ModeRow inherits SelectableRow {
     in property <string> text;
+    /// Renders the row de-emphasized (the testing-only manual mode).
+    in property <bool> demoted;
+    opacity: root.demoted && !root.selected ? Theme.weak-opacity : 1.0;
     Text {
         text: root.selected ? "●" : "○";
         font-size: Theme.font-body;
@@ -36,9 +39,13 @@ export component QuickScreen inherits Rectangle {
                 clicked => { Actions.set-mode(PairMode.nostr-pin); }
             }
             ModeRow {
-                text: "M  Manual — node id + token (works offline on the same LAN)";
+                demoted: true;
+                text: "M  Manual (testing) — node id + token, no nostr";
                 selected: UiState.mode == PairMode.manual;
                 clicked => { Actions.set-mode(PairMode.manual); }
+            }
+            Small {
+                text: "Manual is for testing connectivity without nostr — offline on the same LAN (mDNS) or across the internet. Everyday pairing is the PIN.";
             }
         }
 
