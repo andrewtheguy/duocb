@@ -86,13 +86,7 @@ pub fn acquire_lock(config_path: &Path) -> Result<ConfigLock> {
 
     // The token is a credential: keep the file owner-only. Safe to apply here
     // because the file is still empty (or being reused) before any write.
-    // (Windows: %APPDATA% is already per-user; no extra ACL is set.)
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))
-            .context("restricting config file permissions")?;
-    }
+    restrict_to_owner(&file)?;
 
     match file.try_lock() {
         Ok(()) => Ok(ConfigLock {
@@ -198,22 +192,36 @@ impl ConfigLock {
     }
 }
 
+/// Restrict `file` to owner-only access, since the config holds a credential.
+/// Unix-only; a no-op elsewhere (on Windows, `%APPDATA%` is already per-user, so
+/// no extra ACL is set).
+#[cfg(unix)]
+fn restrict_to_owner(file: &File) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .context("restricting config file permissions")
+}
+
+#[cfg(not(unix))]
+fn restrict_to_owner(_file: &File) -> Result<()> {
+    Ok(())
+}
+
 /// Truncate-write `bytes` to `path` (creating it), owner-only and flushed to
 /// disk. Permissions are set while the file is still empty so the credential it
 /// will hold is never briefly group/world-readable.
-fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut file = OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
-        .open(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    }
-    file.write_all(bytes)?;
-    file.sync_all()?;
+        .open(path)
+        .with_context(|| format!("creating {}", path.display()))?;
+    restrict_to_owner(&file)?;
+    file.write_all(bytes)
+        .with_context(|| format!("writing {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("flushing {}", path.display()))?;
     Ok(())
 }
 
