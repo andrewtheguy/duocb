@@ -351,6 +351,16 @@ impl DuocbApp {
         }
     }
 
+    /// Go to the start screen. Quick modes (PIN, manual) have nothing to
+    /// configure, so they launch immediately and skip straight to their
+    /// credentials; token mode stops at its pre-start form.
+    pub(crate) fn begin_server(&mut self) {
+        self.screen = Screen::Server;
+        if self.mode != PairMode::NostrToken {
+            self.start_server();
+        }
+    }
+
     /// Start the server session if the inputs validate.
     pub(crate) fn start_server(&mut self) {
         if let Some(mode) = self.server_mode_spec() {
@@ -394,17 +404,24 @@ impl DuocbApp {
 
         match self.screen {
             Screen::Home => {
-                if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Num1)) {
+                // 1 = quick mode (keep the current sub-choice, else default to
+                // PIN), 2 = use config; P/M jump straight to a quick sub-mode.
+                if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Num1))
+                    && !matches!(self.mode, PairMode::NostrPin | PairMode::Manual)
+                {
                     self.mode = PairMode::NostrPin;
                 }
                 if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Num2)) {
                     self.mode = PairMode::NostrToken;
                 }
-                if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Num3)) {
+                if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::P)) {
+                    self.mode = PairMode::NostrPin;
+                }
+                if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::M)) {
                     self.mode = PairMode::Manual;
                 }
                 if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::S)) {
-                    self.screen = Screen::Server;
+                    self.begin_server();
                 }
                 if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::C)) {
                     self.screen = Screen::Client;

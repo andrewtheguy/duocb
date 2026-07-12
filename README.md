@@ -81,7 +81,7 @@ The joining device reconnects automatically with backoff if the connection drops
 
 ## Configuration
 
-Optional, only for the token+name mode: `~/.config/duocb/config.toml`. Starting a token-mode connection writes the valid initiator settings before launch. Joining writes the connector settings only after successful authentication, so failed attempts never replace the saved pairing:
+Optional, only for the token+name mode: a `duocb/config.toml` under the platform's per-user config directory — `~/.config/duocb/config.toml` on Linux, `~/Library/Application Support/duocb/config.toml` on macOS, and `%APPDATA%\duocb\config.toml` on Windows. Starting a token-mode connection writes the valid initiator settings before launch. Joining writes the connector settings only after successful authentication, so failed attempts never replace the saved pairing:
 
 ```toml
 auth_token = "d…"       # shared 47-char token

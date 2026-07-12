@@ -5,8 +5,9 @@
 //! PIN/code (the transport server/listener); the other *joins* by entering it
 //! (the client/dialer).
 //!
-//! Keyboard shortcuts (also listed in the UI): home selects mode with 1/2/3
-//! and role with S (start) / C (join); Ctrl+Enter starts/joins; Esc goes back;
+//! Keyboard shortcuts (also listed in the UI): home picks quick mode with 1
+//! (then P for PIN / M for manual) or config with 2, and role with S (start) /
+//! C (join); Ctrl+Enter starts/joins; Esc goes back;
 //! the manual start screen copies its credentials with Ctrl+I (node id) /
 //! Ctrl+T (token).
 
@@ -102,21 +103,42 @@ pub fn show_home(app: &mut DuocbApp, ui: &mut Ui) {
 
     ui.group(|ui| {
         ui.label(RichText::new("Pairing mode").strong());
-        ui.radio_value(
-            &mut app.mode,
-            PairMode::NostrPin,
-            "1  PIN quick pair — type a short rotating code (internet)",
-        );
-        ui.radio_value(
-            &mut app.mode,
-            PairMode::NostrToken,
-            "2  Token + names — standing pairing with a shared token (internet)",
-        );
-        ui.radio_value(
-            &mut app.mode,
-            PairMode::Manual,
-            "3  Manual — type the node id + token (works offline on the same LAN)",
-        );
+
+        // Two-step choice (mirrors duopipe): pick quick vs. config first, then —
+        // for quick — the signaling. Both quick sub-modes map to a `PairMode`
+        // that never touches the saved config; "use config" is the token pairing.
+        let quick_selected = matches!(app.mode, PairMode::NostrPin | PairMode::Manual);
+        if ui
+            .radio(quick_selected, "1  Quick mode — pair on the spot, nothing saved")
+            .clicked()
+            && !quick_selected
+        {
+            // Entering quick mode leads with the headline rotating-PIN flow.
+            app.mode = PairMode::NostrPin;
+        }
+        if quick_selected {
+            ui.indent("quick_submode", |ui| {
+                ui.radio_value(
+                    &mut app.mode,
+                    PairMode::NostrPin,
+                    "P  PIN quick pair — type a short rotating code (internet)",
+                );
+                ui.radio_value(
+                    &mut app.mode,
+                    PairMode::Manual,
+                    "M  Manual — node id + token (works offline on the same LAN)",
+                );
+            });
+        }
+        if ui
+            .radio(
+                app.mode == PairMode::NostrToken,
+                "2  Use config — standing pairing with a shared token (internet)",
+            )
+            .clicked()
+        {
+            app.mode = PairMode::NostrToken;
+        }
     });
     ui.add_space(16.0);
 
@@ -128,7 +150,7 @@ pub fn show_home(app: &mut DuocbApp, ui: &mut Ui) {
             )
             .clicked()
         {
-            app.screen = Screen::Server;
+            app.begin_server();
         }
         ui.add_space(6.0);
         if ui
@@ -174,52 +196,44 @@ pub fn show_server(app: &mut DuocbApp, ui: &mut Ui) {
     ui.add_space(8.0);
 
     if !app.server_running {
-        match app.mode {
-            PairMode::NostrToken => {
-                ui.label("Shared auth token (same on both devices):");
-                ui.horizontal(|ui| {
-                    ui.add(
-                        TextEdit::singleline(&mut app.in_token)
-                            .font(egui::TextStyle::Monospace)
-                            .desired_width(360.0)
-                            .hint_text("d…"),
-                    );
-                    if ui.button("Generate").clicked() {
-                        app.in_token = crate::auth::generate_token();
-                    }
-                });
-                ui.label("This device's unique name:");
-                ui.add(TextEdit::singleline(&mut app.in_my_name).hint_text("e.g. desktop"));
-                ui.label(
-                    RichText::new("Token and name are saved automatically when you start.")
-                        .weak()
-                        .small(),
+        // Only token mode has anything to configure before starting. Quick modes
+        // (PIN, manual) launch straight from the home screen, so this pre-start
+        // form is token-only.
+        if app.mode == PairMode::NostrToken {
+            ui.label("Shared auth token (same on both devices):");
+            ui.horizontal(|ui| {
+                ui.add(
+                    TextEdit::singleline(&mut app.in_token)
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(360.0)
+                        .hint_text("d…"),
                 );
-                if !app.in_token.trim().is_empty()
-                    && crate::auth::validate_token(app.in_token.trim()).is_err()
-                {
-                    ui.colored_label(ui.visuals().warn_fg_color, "That is not a valid token");
+                if ui.button("Generate").clicked() {
+                    app.in_token = crate::auth::generate_token();
                 }
+            });
+            ui.label("This device's unique name:");
+            ui.add(TextEdit::singleline(&mut app.in_my_name).hint_text("e.g. desktop"));
+            ui.label(
+                RichText::new("Token and name are saved automatically when you start.")
+                    .weak()
+                    .small(),
+            );
+            if !app.in_token.trim().is_empty()
+                && crate::auth::validate_token(app.in_token.trim()).is_err()
+            {
+                ui.colored_label(ui.visuals().warn_fg_color, "That is not a valid token");
             }
-            PairMode::NostrPin => {
-                ui.label("A short PIN will be shown; type it on the other device.");
+            ui.add_space(8.0);
+            if ui
+                .add_enabled(
+                    app.server_mode_spec().is_some(),
+                    egui::Button::new("▶ Start (Ctrl+Enter)"),
+                )
+                .clicked()
+            {
+                app.start_server();
             }
-            PairMode::Manual => {
-                ui.label(
-                    "A node id and a one-time token will be shown; enter both on the other \
-                     device. Works with no internet on the same LAN (mDNS).",
-                );
-            }
-        }
-        ui.add_space(8.0);
-        if ui
-            .add_enabled(
-                app.server_mode_spec().is_some(),
-                egui::Button::new("▶ Start (Ctrl+Enter)"),
-            )
-            .clicked()
-        {
-            app.start_server();
         }
         return;
     }
@@ -278,6 +292,11 @@ pub fn show_server(app: &mut DuocbApp, ui: &mut Ui) {
     ui.add_space(8.0);
     if ui.button("⏹ Stop").clicked() {
         app.net.send(crate::net::UiCommand::StopServer);
+        // Quick modes have no pre-start form to return to, so stopping goes all
+        // the way home rather than showing a bare restart button.
+        if app.mode != PairMode::NostrToken {
+            app.screen = Screen::Home;
+        }
     }
 
     session_panel_if_connected(app, ui);
