@@ -443,10 +443,12 @@ impl DuocbApp {
                     self.copy_to_clipboard(&node_id);
                 }
                 let copyable_token = match self.mode {
-                    PairMode::NostrToken => Some(self.in_token.trim().to_string())
-                        .filter(|token| duocb_core::auth::validate_token(token).is_ok()),
+                    PairMode::NostrToken if !self.server_running => {
+                        Some(self.in_token.trim().to_string())
+                            .filter(|token| duocb_core::auth::validate_token(token).is_ok())
+                    }
                     PairMode::Manual => self.manual_token.clone(),
-                    PairMode::NostrPin => None,
+                    PairMode::NostrToken | PairMode::NostrPin => None,
                 };
                 if let Some(token) = copyable_token
                     && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::T))
