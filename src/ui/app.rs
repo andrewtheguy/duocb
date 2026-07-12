@@ -433,13 +433,19 @@ impl DuocbApp {
                 {
                     self.start_server();
                 }
-                // Manual mode: copy the displayed credentials without the mouse.
+                // Copy displayed initiator credentials without the mouse.
                 if let Some(node_id) = self.node_id.clone()
                     && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::I))
                 {
                     self.copy_to_clipboard(&node_id);
                 }
-                if let Some(token) = self.manual_token.clone()
+                let copyable_token = match self.mode {
+                    PairMode::NostrToken => Some(self.in_token.trim().to_string())
+                        .filter(|token| crate::auth::validate_token(token).is_ok()),
+                    PairMode::Manual => self.manual_token.clone(),
+                    PairMode::NostrPin => None,
+                };
+                if let Some(token) = copyable_token
                     && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::T))
                 {
                     self.copy_to_clipboard(&token);

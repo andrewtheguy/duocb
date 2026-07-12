@@ -8,8 +8,8 @@
 //! Keyboard shortcuts (also listed in the UI): home picks quick mode with 1
 //! (then P for PIN / M for manual) or config with 2, and role with S (start) /
 //! C (join); Ctrl/Command+Enter starts/joins; Esc goes back;
-//! the manual start screen copies its credentials with Ctrl/Command+I (node id) /
-//! Ctrl/Command+T (token).
+//! starting-device credentials can be copied with Ctrl/Command+I (node id) /
+//! Ctrl/Command+T (token) whenever they are available.
 
 use eframe::egui::{self, RichText, TextEdit, Ui};
 
@@ -56,12 +56,12 @@ fn token_entry_feedback(ui: &mut Ui, token: &str) {
 
 /// Keep the standing-pairing identity visible after the editable form is gone.
 /// Mirrors duopipe's persistent config-mode header without ever showing the token.
-fn show_token_pairing_summary(app: &DuocbApp, ui: &mut Ui) {
-    let token = app.in_token.trim();
+fn show_token_pairing_summary(app: &mut DuocbApp, ui: &mut Ui, token_copyable: bool) {
+    let token = app.in_token.trim().to_string();
     let fingerprint = app.token_fingerprint.clone().or_else(|| {
-        crate::auth::validate_token(token)
+        crate::auth::validate_token(&token)
             .is_ok()
-            .then(|| crate::auth::token_fingerprint(token))
+            .then(|| crate::auth::token_fingerprint(&token))
     });
 
     ui.group(|ui| {
@@ -83,6 +83,9 @@ fn show_token_pairing_summary(app: &DuocbApp, ui: &mut Ui) {
                 ui.label("Paired with:");
                 ui.monospace(short_id(peer));
             });
+        }
+        if token_copyable && crate::auth::validate_token(&token).is_ok() {
+            token_copy_action(app, ui, &token);
         }
         if let Some(fingerprint) = fingerprint {
             ui.horizontal(|ui| {
@@ -211,6 +214,18 @@ fn copyable_value(app: &mut DuocbApp, ui: &mut Ui, label: &str, copy_label: &str
     );
 }
 
+/// Show a token without rendering the secret itself, while still giving the
+/// starting device an explicit way to transfer it to the joining device.
+fn token_copy_action(app: &mut DuocbApp, ui: &mut Ui, token: &str) {
+    ui.horizontal(|ui| {
+        ui.label("Token:");
+        ui.monospace("*".repeat(12));
+        if ui.small_button("Copy token (Ctrl/⌘+T)").clicked() {
+            app.copy_to_clipboard(token);
+        }
+    });
+}
+
 pub fn show_server(app: &mut DuocbApp, ui: &mut Ui) {
     ui.horizontal(|ui| {
         back_button(app, ui);
@@ -225,19 +240,28 @@ pub fn show_server(app: &mut DuocbApp, ui: &mut Ui) {
         // form is token-only.
         if app.mode == PairMode::NostrToken {
             ui.label("Shared auth token (same on both devices):");
-            ui.horizontal(|ui| {
-                ui.add(
-                    TextEdit::singleline(&mut app.in_token)
-                        .font(egui::TextStyle::Monospace)
-                        .password(true)
-                        .desired_width(360.0)
-                        .hint_text("d…"),
+            let token = app.in_token.trim().to_string();
+            let token_valid = crate::auth::validate_token(&token).is_ok();
+            if token_valid {
+                token_copy_action(app, ui, &token);
+                ui.horizontal(|ui| {
+                    ui.label("Token fingerprint:");
+                    ui.monospace(crate::auth::token_fingerprint(&token));
+                });
+            } else if !token.is_empty() {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    "The saved token is invalid; generate a new one",
                 );
-                if ui.button("Generate").clicked() {
-                    app.in_token = crate::auth::generate_token();
-                }
-            });
-            token_entry_feedback(ui, &app.in_token);
+            }
+            let generate_label = if token_valid {
+                "Generate new token"
+            } else {
+                "Generate token"
+            };
+            if ui.button(generate_label).clicked() {
+                app.in_token = crate::auth::generate_token();
+            }
             ui.label("This device's unique name:");
             ui.add(TextEdit::singleline(&mut app.in_my_name).hint_text("e.g. desktop"));
             ui.label(
@@ -262,7 +286,7 @@ pub fn show_server(app: &mut DuocbApp, ui: &mut Ui) {
     // Server running: mode-specific credentials display.
     match app.mode {
         PairMode::NostrToken => {
-            show_token_pairing_summary(app, ui);
+            show_token_pairing_summary(app, ui, true);
             ui.label(
                 RichText::new("The other device must use a different name.")
                     .weak()
@@ -309,13 +333,7 @@ pub fn show_server(app: &mut DuocbApp, ui: &mut Ui) {
             // session so the paired peer can be re-sent it and reconnect after a
             // drop.
             if let Some(token) = app.manual_token.clone() {
-                ui.horizontal(|ui| {
-                    ui.label("Token:");
-                    ui.monospace("*".repeat(12));
-                    if ui.small_button("Copy token (Ctrl/⌘+T)").clicked() {
-                        app.copy_to_clipboard(&token);
-                    }
-                });
+                token_copy_action(app, ui, &token);
                 ui.horizontal(|ui| {
                     ui.label("Token fingerprint:");
                     ui.monospace(crate::auth::token_fingerprint(&token));
@@ -349,13 +367,21 @@ pub fn show_client(app: &mut DuocbApp, ui: &mut Ui) {
     if !app.client_active {
         match app.mode {
             PairMode::NostrToken => {
-                ui.label("Shared auth token (same on both devices):");
+                ui.label("Token copied from the starting device:");
                 ui.add(
                     TextEdit::singleline(&mut app.in_token)
                         .font(egui::TextStyle::Monospace)
                         .password(true)
                         .desired_width(f32::INFINITY)
-                        .hint_text("d…"),
+                        .hint_text("…"),
+                );
+                ui.label(
+                    RichText::new(
+                        "Paste the token itself (from “Copy token”) — not the fingerprint \
+                         shown on the other device.",
+                    )
+                    .weak()
+                    .small(),
                 );
                 token_entry_feedback(ui, &app.in_token);
                 ui.label("This device's unique name:");
@@ -422,7 +448,7 @@ pub fn show_client(app: &mut DuocbApp, ui: &mut Ui) {
     }
 
     if app.mode == PairMode::NostrToken {
-        show_token_pairing_summary(app, ui);
+        show_token_pairing_summary(app, ui, false);
     } else if let Some(peer) = app.peer_node_id.clone() {
         ui.horizontal(|ui| {
             ui.label("Paired with:");
