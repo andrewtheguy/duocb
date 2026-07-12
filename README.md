@@ -81,25 +81,28 @@ The joining device reconnects automatically with backoff if the connection drops
 
 ## Configuration
 
-Optional, only for the token+name mode: a `duocb/config.toml` under the platform's per-user config directory — `~/.config/duocb/config.toml` on Linux, `~/Library/Application Support/duocb/config.toml` on macOS, and `%APPDATA%\duocb\config.toml` on Windows. Starting a token-mode connection writes the valid initiator settings before launch. Joining writes the connector settings only after successful authentication, so failed attempts never replace the saved pairing:
+Optional, only for the token+name mode: a `duocb/config.json` under the platform's per-user config directory — `~/.config/duocb/config.json` on Linux, `~/Library/Application Support/duocb/config.json` on macOS, and `%APPDATA%\duocb\config.json` on Windows. It is written and read by duocb, not meant for hand editing. Starting a token-mode connection writes the valid initiator settings before launch. Joining writes the connector settings only after successful authentication, so failed attempts never replace the saved pairing:
 
-```toml
-auth_token = "d…"       # shared 47-char token
-my_name = "desktop"     # this device's unique name, whether starting or joining
+```json
+{
+  "auth_token": "d…",
+  "my_name": "desktop"
+}
 ```
 
 Only one duocb process may use a config path at a time. The process holds an
-exclusive `config.toml.lock` sidecar for its lifetime, preventing two local
-instances from accidentally claiming the same device identity. For same-machine
+exclusive OS lock on the config file itself for its lifetime, preventing two local
+instances from accidentally claiming the same device identity and guarding the
+file against accidental external edits while duocb runs. For same-machine
 end-to-end testing, give each process its own config while keeping the token equal
 and the names different:
 
 ```sh
-duocb --config /tmp/duocb-mac1.toml
-duocb --config /tmp/duocb-mac2.toml
+duocb --config /tmp/duocb-mac1.json
+duocb --config /tmp/duocb-mac2.json
 ```
 
-`-c` is an alias for `--config`; `DUOCB_CONFIG=/path/to/config.toml` provides the
+`-c` is an alias for `--config`; `DUOCB_CONFIG=/path/to/config.json` provides the
 same override for test harnesses. A command-line path takes precedence over the
 environment variable.
 

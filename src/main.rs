@@ -33,9 +33,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let config_path = config::resolve_path(config_override()?)?;
-    // Held until the GUI exits. A second process may run only with another
-    // explicit config path, which gives same-machine E2E tests isolated state.
-    let _config_lock = config::acquire_lock(&config_path)?;
+    // The lock is held (and moved into the app) until the GUI exits. A second
+    // process may run only with another explicit config path, which gives
+    // same-machine E2E tests isolated state.
+    let config_lock = config::acquire_lock(&config_path)?;
 
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([520.0, 680.0])
@@ -55,12 +56,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eframe::run_native(
         "duocb",
         options,
-        Box::new(move |cc| {
-            Ok(Box::new(ui::app::DuocbApp::new(
-                cc,
-                config_path.clone(),
-            )))
-        }),
+        Box::new(move |cc| Ok(Box::new(ui::app::DuocbApp::new(cc, config_lock)))),
     )?;
     Ok(())
 }

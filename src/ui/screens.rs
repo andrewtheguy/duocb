@@ -94,7 +94,7 @@ fn show_token_pairing_summary(app: &DuocbApp, ui: &mut Ui) {
         if app.token_settings_saved {
             ui.horizontal_wrapped(|ui| {
                 ui.label("Saved settings:");
-                ui.monospace(app.config_path.display().to_string());
+                ui.monospace(app.config_lock.path().display().to_string());
             });
         } else if app.status == crate::net::ConnStatus::Connected {
             ui.label(
