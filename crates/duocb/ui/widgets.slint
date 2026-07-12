@@ -107,30 +107,49 @@ export component BigButton inherits Rectangle {
         ? Theme.accent.darker(20%)
         : touch.has-hover && root.enabled ? Theme.accent.brighter(10%) : Theme.accent;
     opacity: root.enabled ? 1.0 : 0.4;
+    // Focus ring for keyboard activation.
+    border-width: fs.has-focus ? 2px : 0px;
+    border-color: Theme.accent.darker(50%);
 
-    touch := TouchArea {
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { root.clicked(); }
+
+    fs := FocusScope {
         enabled: root.enabled;
-        clicked => { root.clicked(); }
-        mouse-cursor: root.enabled ? MouseCursor.pointer : MouseCursor.default;
-    }
-    HorizontalLayout {
-        padding-left: Theme.pad-l;
-        padding-right: Theme.pad-l;
-        spacing: Theme.pad-s;
-        alignment: center;
-        Text {
-            text: root.text;
-            color: white;
-            font-size: Theme.font-body;
-            font-weight: 600;
-            vertical-alignment: center;
+        key-pressed(event) => {
+            if (event.text == " " || event.text == Key.Return) {
+                root.clicked();
+                return accept;
+            }
+            reject
         }
-        if root.hint != "": Text {
-            text: root.hint;
-            color: white;
-            opacity: 0.7;
-            font-size: Theme.font-small;
-            vertical-alignment: center;
+
+        touch := TouchArea {
+            enabled: root.enabled;
+            clicked => { root.clicked(); }
+            mouse-cursor: root.enabled ? MouseCursor.pointer : MouseCursor.default;
+        }
+        HorizontalLayout {
+            padding-left: Theme.pad-l;
+            padding-right: Theme.pad-l;
+            spacing: Theme.pad-s;
+            alignment: center;
+            Text {
+                text: root.text;
+                color: white;
+                font-size: Theme.font-body;
+                font-weight: 600;
+                vertical-alignment: center;
+            }
+            if root.hint != "": Text {
+                text: root.hint;
+                color: white;
+                opacity: 0.7;
+                font-size: Theme.font-small;
+                vertical-alignment: center;
+            }
         }
     }
 }
@@ -144,35 +163,52 @@ export component WideButton inherits Rectangle {
 
     height: Theme.cta-height;
     border-radius: Theme.radius;
-    border-width: 1px;
-    border-color: Theme.card-border;
+    // Doubles as the focus ring for keyboard activation.
+    border-width: fs.has-focus ? 2px : 1px;
+    border-color: fs.has-focus ? Theme.accent : Theme.card-border;
     background: touch.pressed && root.enabled
         ? Palette.control-background.darker(10%)
         : touch.has-hover && root.enabled ? Palette.control-background.brighter(5%)
         : Palette.control-background;
     opacity: root.enabled ? 1.0 : 0.4;
 
-    touch := TouchArea {
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { root.clicked(); }
+
+    fs := FocusScope {
         enabled: root.enabled;
-        clicked => { root.clicked(); }
-        mouse-cursor: root.enabled ? MouseCursor.pointer : MouseCursor.default;
-    }
-    HorizontalLayout {
-        padding-left: Theme.pad-l;
-        padding-right: Theme.pad-l;
-        spacing: Theme.pad-s;
-        alignment: center;
-        Text {
-            text: root.text;
-            font-size: Theme.font-body;
-            font-weight: 600;
-            vertical-alignment: center;
+        key-pressed(event) => {
+            if (event.text == " " || event.text == Key.Return) {
+                root.clicked();
+                return accept;
+            }
+            reject
         }
-        if root.hint != "": Text {
-            text: root.hint;
-            opacity: 0.6;
-            font-size: Theme.font-small;
-            vertical-alignment: center;
+
+        touch := TouchArea {
+            enabled: root.enabled;
+            clicked => { root.clicked(); }
+            mouse-cursor: root.enabled ? MouseCursor.pointer : MouseCursor.default;
+        }
+        HorizontalLayout {
+            padding-left: Theme.pad-l;
+            padding-right: Theme.pad-l;
+            spacing: Theme.pad-s;
+            alignment: center;
+            Text {
+                text: root.text;
+                font-size: Theme.font-body;
+                font-weight: 600;
+                vertical-alignment: center;
+            }
+            if root.hint != "": Text {
+                text: root.hint;
+                opacity: 0.6;
+                font-size: Theme.font-small;
+                vertical-alignment: center;
+            }
         }
     }
 }
