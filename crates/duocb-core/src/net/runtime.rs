@@ -434,11 +434,14 @@ async fn run_server_session(
 ) {
     events.status(ConnStatus::Starting);
 
-    // PIN modes that include the LAN channel must come up with zero internet:
-    // don't hard-require the home relay (which never connects offline).
+    // Modes that must come up with zero internet (manual, and PIN with the LAN
+    // channel) can't hard-require the home relay: `online()` never resolves
+    // offline, which would fail the whole session despite mDNS being enough on
+    // a LAN. Only configure mode (nostr-dependent anyway) requires it.
     let readiness = match &mode {
         ServerMode::Pin { channel, .. } => pin_channel_readiness(*channel),
-        _ => EndpointReadiness::RelayOnline,
+        ServerMode::Manual => EndpointReadiness::RelayPreferred,
+        ServerMode::NostrToken { .. } => EndpointReadiness::RelayOnline,
     };
     let endpoint = match create_server_endpoint(readiness).await {
         Ok(ep) => ep,
@@ -594,11 +597,14 @@ async fn run_client_session(
         _ => None,
     };
 
-    // PIN modes that include the LAN channel must come up with zero internet:
-    // don't hard-require the home relay (which never connects offline).
+    // Modes that must come up with zero internet (manual, and PIN with the LAN
+    // channel) can't hard-require the home relay: `online()` never resolves
+    // offline, which would fail the whole session despite mDNS being enough on
+    // a LAN. Only configure mode (nostr-dependent anyway) requires it.
     let readiness = match &spec {
         DialSpec::Pin { channel, .. } => pin_channel_readiness(*channel),
-        _ => EndpointReadiness::RelayOnline,
+        DialSpec::Manual { .. } => EndpointReadiness::RelayPreferred,
+        DialSpec::NostrToken { .. } => EndpointReadiness::RelayOnline,
     };
     let endpoint = match create_client_endpoint(readiness).await {
         Ok(ep) => ep,
