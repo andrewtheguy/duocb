@@ -3,25 +3,39 @@
 //! The app links `libduocb.xcframework` (containing `libduocb.a` slices) and
 //! drives the clipboard-pairing runtime with these calls:
 //!
-//! 1. [`duocb_start`] — parse the JSON config (`role` "start" or "join",
-//!    shared `token`, this device's `name`, optional `relays`), spawn the
-//!    networking runtime ([`duocb_core::net::runtime::net_main`]) on an
-//!    embedded tokio runtime, and issue the initial `StartServer`/`Connect`
-//!    command. Returns an opaque handle. At most **one** instance may run at a
-//!    time (a process-global guard rejects a second).
+//! 1. [`duocb_start`] — parse the JSON config (`role` "hub", "start", or
+//!    "join", shared `token`, this device's short `name` and permanent 8-char
+//!    `suffix`, the `peer` display identity to dial for the join role,
+//!    optional `relays`), spawn the networking runtime
+//!    ([`duocb_core::net::runtime::net_main`]) on an embedded tokio runtime,
+//!    and start the presence broadcast. The "start"/"join" roles then issue
+//!    the initial `StartServer`/`Connect` command; the "hub" role runs
+//!    presence + peer discovery only (an initial peer fetch is issued, its
+//!    result arriving as a `peer_list` event) so the app can show the device
+//!    list before the user commits to a role. Returns an opaque handle. At
+//!    most **one** instance may run at a time (a process-global guard rejects
+//!    a second).
 //! 2. [`duocb_next_event`] — drain one pending [`NetEvent`] as a JSON string.
 //!    The runtime is event-driven; Swift polls this on a timer until it
-//!    returns 0. PIN/quick-mode events never occur in token mode and are
+//!    returns 0. PIN/quick-mode events never occur in configure mode and are
 //!    skipped defensively.
-//! 3. [`duocb_send_clipboard`] / [`duocb_query_conn_path`] — fire-and-forget
+//! 3. [`duocb_refresh_peers`] — re-fetch the presence records on demand; the
+//!    result arrives as a `peer_list` event (valid in every role, though the
+//!    hub is the natural place to poll it).
+//! 4. [`duocb_send_clipboard`] / [`duocb_query_conn_path`] — fire-and-forget
 //!    commands; outcomes arrive as `item_sent`/`error` and `conn_path` events.
-//! 4. [`duocb_stop`] — shut the runtime down and free the handle.
+//! 5. [`duocb_stop`] — shut the runtime down and free the handle.
 //!
-//! Config-mode only: this surface constructs `ServerMode::NostrToken` and
+//! Configure-mode only: this surface constructs `ServerMode::NostrToken` and
 //! `DialSpec::NostrToken` exclusively. Quick mode (PIN / manual) is
-//! desktop-only. Token/name persistence is the caller's job (Keychain on
-//! iOS), mirroring the desktop policy: the start role persists before
-//! starting, the join role persists on the first `peer_paired` event.
+//! desktop-only. Token/name/suffix persistence is the caller's job (Keychain
+//! on iOS); mint the suffix once with [`duocb_generate_suffix`] and reuse it
+//! forever.
+//!
+//! The intended app flow mirrors the desktop hub: run a "hub" instance while
+//! the device list is on screen, and when the user picks an action stop it
+//! and start a fresh instance with role "start" (host) or "join" plus the
+//! selected peer's display identity from the last `peer_list` event.
 //!
 //! The workspace builds with `panic = "abort"` in release, so a Rust panic
 //! terminates the process rather than unwinding across the C boundary.
@@ -35,7 +49,9 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use duocb_core::net::endpoint::ConnPathKind;
-use duocb_core::net::{ConnStatus, DialSpec, EventSender, NetEvent, ServerMode, UiCommand};
+use duocb_core::net::{
+    ConnStatus, DialSpec, EventSender, NetEvent, ServerMode, TokenIdentity, UiCommand,
+};
 
 /// Process-global guard: at most one running session per process.
 static RUNNING: AtomicBool = AtomicBool::new(false);
@@ -54,10 +70,17 @@ pub struct DuocbHandle {
 #[derive(Deserialize)]
 struct FfiConfig {
     role: Role,
-    /// 47-char duocb auth token shared by both devices.
+    /// 47-char duocb auth token (the standing secret) shared by all devices.
     token: String,
-    /// This device's name; must differ from the peer's.
+    /// This device's short name (`A-Za-z0-9-`, ≤ 24 chars).
     name: String,
+    /// This device's permanent 8-char suffix (mint once with
+    /// `duocb_generate_suffix`, persist forever).
+    suffix: String,
+    /// Join role only: the target device's full display identity as shown in
+    /// the peer list, e.g. `"mac-book_a7B2c3D4"`.
+    #[serde(default)]
+    peer: Option<String>,
     /// Empty/omitted means the built-in default relays.
     #[serde(default)]
     relays: Vec<String>,
@@ -66,6 +89,9 @@ struct FfiConfig {
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Role {
+    /// Presence + peer discovery only; no session until restarted as
+    /// `Start`/`Join`.
+    Hub,
     Start,
     Join,
 }
@@ -91,6 +117,24 @@ pub unsafe extern "C" fn duocb_generate_token(out_buf: *mut c_char, out_len: usi
         return -1;
     }
     if write_cstr(out_buf, out_len, &duocb_core::auth::generate_token()) {
+        1
+    } else {
+        0
+    }
+}
+
+/// Generate this device's permanent 8-char identity suffix into `out_buf`.
+/// Call once on first launch and persist the result forever (it must never
+/// change, even when the secret is replaced).
+/// Returns 1 on success, 0 if the buffer is too small, -1 on a NULL buffer.
+/// # Safety
+/// `out_buf` must be NULL or point to at least `out_len` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn duocb_generate_suffix(out_buf: *mut c_char, out_len: usize) -> c_int {
+    if out_buf.is_null() {
+        return -1;
+    }
+    if write_cstr(out_buf, out_len, &duocb_core::identity::generate_suffix()) {
         1
     } else {
         0
@@ -182,8 +226,9 @@ fn start_inner(json: &str) -> Result<DuocbHandle, String> {
         serde_json::from_str(json).map_err(|e| format!("invalid config JSON: {e}"))?;
     duocb_core::auth::validate_token(&cfg.token).map_err(|e| format!("invalid token: {e:#}"))?;
     let name = cfg.name.trim().to_string();
-    if name.is_empty() {
-        return Err("name must not be empty".into());
+    duocb_core::identity::validate_name(&name).map_err(|e| format!("invalid name: {e:#}"))?;
+    if !duocb_core::identity::is_valid_suffix(&cfg.suffix) {
+        return Err("invalid suffix (mint one with duocb_generate_suffix)".into());
     }
     let relays = if cfg.relays.is_empty() {
         duocb_core::nostr::DEFAULT_NOSTR_RELAYS
@@ -192,6 +237,12 @@ fn start_inner(json: &str) -> Result<DuocbHandle, String> {
             .collect()
     } else {
         cfg.relays
+    };
+    let identity = TokenIdentity {
+        token: cfg.token,
+        name,
+        suffix: cfg.suffix,
+        relays,
     };
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -205,21 +256,35 @@ fn start_inner(json: &str) -> Result<DuocbHandle, String> {
     let task = runtime.spawn(duocb_core::net::runtime::net_main(cmd_rx, events));
 
     let cmd = match cfg.role {
+        // The hub browses: presence is already running (below), so just kick
+        // off the initial peer fetch — its result arrives as a `peer_list`
+        // event. duocb_refresh_peers re-runs it on demand.
+        Role::Hub => UiCommand::RefreshPeers,
         Role::Start => UiCommand::StartServer {
             mode: ServerMode::NostrToken {
-                token: cfg.token,
-                name,
-                relays,
+                identity: identity.clone(),
             },
         },
         Role::Join => UiCommand::Connect {
             spec: DialSpec::NostrToken {
-                token: cfg.token,
-                own_name: name,
-                relays,
+                peer_display: cfg
+                    .peer
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                    .ok_or("peer (the target device's display identity) is required for join")?
+                    .to_string(),
+                identity: identity.clone(),
             },
         },
     };
+    // The presence broadcast makes this device visible in the other devices'
+    // lists and, for the start role, carries the hosting node id to the joiner.
+    cmd_tx
+        .send(UiCommand::SetPresence {
+            identity: Some(identity),
+        })
+        .map_err(|_| "runtime unavailable".to_string())?;
     cmd_tx.send(cmd).map_err(|_| "runtime unavailable".to_string())?;
 
     Ok(DuocbHandle {
@@ -295,6 +360,22 @@ pub unsafe extern "C" fn duocb_send_clipboard(
     let _ = handle.cmd_tx.send(UiCommand::SendClipboard {
         text: text.to_string(),
     });
+    0
+}
+
+/// Re-fetch the presence records of the other devices sharing the secret; the
+/// result arrives as a `peer_list` event. At most one fetch runs at a time
+/// (extra requests while one is in flight are dropped by the runtime).
+/// Returns 0 = requested, -1 = NULL handle.
+/// # Safety
+/// `handle` must be NULL or a live handle from [`duocb_start`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn duocb_refresh_peers(handle: *const DuocbHandle) -> c_int {
+    if handle.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*handle };
+    let _ = handle.cmd_tx.send(UiCommand::RefreshPeers);
     0
 }
 
@@ -413,6 +494,24 @@ fn event_json(event: &NetEvent) -> Option<String> {
             json!({ "type": "item_received", "text": text, "pulled": pulled })
         }
         NetEvent::ItemSent => json!({ "type": "item_sent" }),
+        NetEvent::PeerList { peers } => json!({
+            "type": "peer_list",
+            "peers": peers
+                .iter()
+                .map(|p| {
+                    json!({
+                        "display": p.display(),
+                        "name": p.name,
+                        "suffix": p.suffix,
+                        "hosting": p.node_id.is_some(),
+                        "last_seen_unix": p.last_seen_unix,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        }),
+        NetEvent::PresenceConflict { message } => {
+            json!({ "type": "presence_conflict", "message": message })
+        }
         NetEvent::Error(message) => json!({ "type": "error", "message": message }),
     };
     Some(value.to_string())
@@ -453,25 +552,75 @@ mod tests {
 
     #[test]
     fn config_parses_roles_and_defaults_relays() {
-        let cfg: FfiConfig =
-            serde_json::from_str(r#"{"role":"start","token":"t","name":"mac"}"#).unwrap();
+        let cfg: FfiConfig = serde_json::from_str(
+            r#"{"role":"start","token":"t","name":"mac","suffix":"a7B2c3D4"}"#,
+        )
+        .unwrap();
         assert!(matches!(cfg.role, Role::Start));
         assert!(cfg.relays.is_empty());
+        assert!(cfg.peer.is_none());
 
         let cfg: FfiConfig = serde_json::from_str(
-            r#"{"role":"join","token":"t","name":"phone","relays":["wss://r.example"]}"#,
+            r#"{"role":"join","token":"t","name":"phone","suffix":"x9Y8z7W6","peer":"mac_a7B2c3D4","relays":["wss://r.example"]}"#,
         )
         .unwrap();
         assert!(matches!(cfg.role, Role::Join));
+        assert_eq!(cfg.peer.as_deref(), Some("mac_a7B2c3D4"));
         assert_eq!(cfg.relays, ["wss://r.example"]);
+
+        // The hub role browses the peer list before a role is chosen — no peer.
+        let cfg: FfiConfig = serde_json::from_str(
+            r#"{"role":"hub","token":"t","name":"phone","suffix":"x9Y8z7W6"}"#,
+        )
+        .unwrap();
+        assert!(matches!(cfg.role, Role::Hub));
+        assert!(cfg.peer.is_none());
     }
 
     #[test]
     fn config_rejects_unknown_role() {
         assert!(
-            serde_json::from_str::<FfiConfig>(r#"{"role":"quick","token":"t","name":"x"}"#)
-                .is_err()
+            serde_json::from_str::<FfiConfig>(
+                r#"{"role":"quick","token":"t","name":"x","suffix":"a7B2c3D4"}"#
+            )
+            .is_err()
         );
+    }
+
+    #[test]
+    fn join_requires_a_peer_identity() {
+        let token = duocb_core::auth::generate_token();
+        let json = format!(
+            r#"{{"role":"join","token":"{token}","name":"phone","suffix":"x9Y8z7W6"}}"#
+        );
+        let err = start_inner(&json).err().expect("join without peer fails");
+        assert!(err.contains("peer"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn event_json_maps_peer_list_and_presence_conflict() {
+        let json = event_json(&NetEvent::PeerList {
+            peers: vec![duocb_core::nostr::PeerInfo {
+                name: "mac".into(),
+                suffix: "a7B2c3D4".into(),
+                node_id: Some("abc".into()),
+                last_seen_unix: 42,
+            }],
+        })
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "peer_list");
+        assert_eq!(v["peers"][0]["display"], "mac_a7B2c3D4");
+        assert_eq!(v["peers"][0]["hosting"], true);
+        assert_eq!(v["peers"][0]["last_seen_unix"], 42);
+
+        let json = event_json(&NetEvent::PresenceConflict {
+            message: "another process".into(),
+        })
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "presence_conflict");
+        assert_eq!(v["message"], "another process");
     }
 
     #[test]

@@ -16,14 +16,14 @@
 
 ## Config-based E2E tests on the same device
 
-Only one duocb process may use a config path at a time (it holds an exclusive OS lock on the config file itself for its lifetime). To run both peers of a config/token pairing on the same machine, give each process its own config location — otherwise the second fails to acquire the lock. Keep the shared `auth_token` equal and the `my_name` values different:
+Only one duocb process may use a config path at a time (it holds an exclusive OS lock on the config file itself for its lifetime). To run both peers of a configure-mode pairing on the same machine, give each process its own config location — otherwise the second fails to acquire the lock. Each config mints its own permanent `device_suffix` on first launch, so short names don't need to differ; keep the shared `auth_token` equal (import the same secret through the setup wizard):
 
 ```sh
 cargo run -- --config /tmp/duocb-peer1.json   # or DUOCB_CONFIG=/tmp/duocb-peer1.json
 cargo run -- --config /tmp/duocb-peer2.json   # or DUOCB_CONFIG=/tmp/duocb-peer2.json
 ```
 
-`-c` is an alias for `--config`; the CLI flag wins over `DUOCB_CONFIG`. Without an override, both processes resolve to the same default location (see README) and collide.
+`-c` is an alias for `--config`; the CLI flag wins over `DUOCB_CONFIG`. Without an override, both processes resolve to the same default location (see README) and collide. Joining is by choosing Join on the home hub, which opens the device picker, and selecting the peer there (any listed device — the join retries until that device hosts); no peer name is typed. Configs are per-machine, never copied between machines.
 
 ## Running GUI apps for Linux
 

@@ -1,15 +1,18 @@
 //! Home / start / join screens.
 //!
 //! The two roles are only about who sets up the connection — once paired, both
-//! devices can send and receive. One device *starts* a connection and shows a
-//! PIN/code (the transport server/listener); the other *joins* by entering it
-//! (the client/dialer).
+//! devices can send and receive. One device *starts* a connection (hosts); the
+//! other *joins* it (dials).
 //!
-//! Keyboard shortcuts (also listed in the UI): home picks quick mode with 1
-//! (then P for PIN / M for manual) or config with 2, and role with S (start) /
-//! C (join); Ctrl/Command+Enter starts/joins; Esc goes back;
-//! starting-device credentials can be copied with Ctrl/Command+I (node id) /
-//! Ctrl/Command+T (token) whenever they are available.
+//! Keyboard shortcuts (also listed in the UI): home is the configure flow —
+//! in the wizard G generates a secret and I imports one; on the configured
+//! hub S starts hosting and C opens the device picker, where C/Enter joins
+//! the selected device, R refreshes the list, the arrow keys move the
+//! selection, and Esc returns to the hub. Q opens the quick-options screen,
+//! where P/M pick PIN quick pair or manual and S / C start/join.
+//! Ctrl/Command+Enter connects on join forms; Esc goes back;
+//! Ctrl/Command+I copies the node id, Ctrl/Command+T the token/secret,
+//! whenever they are available.
 
 use eframe::egui::{self, RichText, TextEdit, Ui};
 
@@ -34,7 +37,7 @@ fn short_id(id: &str) -> String {
 /// rendered: once the input is a complete, checksum-valid token its fingerprint
 /// appears (so both devices can confirm they share it); a non-empty but invalid
 /// input shows a warning instead. Nothing is shown for an empty field.
-fn token_entry_feedback(ui: &mut Ui, token: &str) {
+pub(crate) fn token_entry_feedback(ui: &mut Ui, token: &str) {
     let token = token.trim();
     if token.is_empty() {
         return;
@@ -54,23 +57,25 @@ fn token_entry_feedback(ui: &mut Ui, token: &str) {
     }
 }
 
-/// Keep the standing-pairing identity visible after the editable form is gone.
-/// Mirrors duopipe's persistent config-mode header without showing or exposing
-/// the token while a session is running.
+/// Keep the standing configure-mode identity visible while a session runs,
+/// without showing or exposing the secret itself.
 fn show_token_pairing_summary(app: &DuocbApp, ui: &mut Ui) {
-    let token = app.in_token.trim().to_string();
     let fingerprint = app.token_fingerprint.clone().or_else(|| {
-        duocb_core::auth::validate_token(&token)
-            .is_ok()
-            .then(|| duocb_core::auth::token_fingerprint(&token))
+        app.secret
+            .as_deref()
+            .map(duocb_core::auth::token_fingerprint)
     });
 
     ui.group(|ui| {
-        ui.label(RichText::new("Token pairing").strong());
-        if let Some(name) = Some(app.in_my_name.trim()).filter(|name| !name.is_empty()) {
+        ui.label(RichText::new("Configured pairing").strong());
+        ui.horizontal(|ui| {
+            ui.label("This device:");
+            ui.label(RichText::new(app.display_identity()).strong().monospace());
+        });
+        if let Some(joined) = &app.joined_peer {
             ui.horizontal(|ui| {
-                ui.label("This device:");
-                ui.label(RichText::new(name).strong());
+                ui.label("Joining:");
+                ui.label(RichText::new(joined).monospace());
             });
         }
         if let Some(node_id) = &app.node_id {
@@ -87,28 +92,10 @@ fn show_token_pairing_summary(app: &DuocbApp, ui: &mut Ui) {
         }
         if let Some(fingerprint) = fingerprint {
             ui.horizontal(|ui| {
-                ui.label("Token fingerprint:");
+                ui.label("Secret fingerprint:");
                 ui.monospace(fingerprint);
                 ui.label("(must match on both devices)");
             });
-        }
-        if app.token_settings_saved {
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Saved settings:");
-                ui.monospace(app.config_lock.path().display().to_string());
-            });
-        } else if app.status == duocb_core::net::ConnStatus::Connected {
-            ui.label(
-                RichText::new("Settings could not be saved; see the error above.")
-                    .weak()
-                    .small(),
-            );
-        } else if app.client_active {
-            ui.label(
-                RichText::new("Settings will be saved after a successful connection.")
-                    .weak()
-                    .small(),
-            );
         }
     });
 }
@@ -119,53 +106,62 @@ pub fn show_home(app: &mut DuocbApp, ui: &mut Ui) {
     ui.label("Peer-to-peer clipboard sharing between two devices.");
     ui.label(
         RichText::new(
-            "Both devices can send and receive. One device starts a connection \
-             and shows a code; the other joins by entering it.",
+            "Both devices can send and receive. One device starts a connection; \
+             the other joins it.",
         )
         .weak(),
     );
     ui.add_space(16.0);
 
-    ui.group(|ui| {
-        ui.label(RichText::new("Pairing mode").strong());
+    // Home is the configure mode — the primary flow, like the iOS app: the
+    // setup wizard, then the hub. The nothing-saved quick options live on
+    // their own screen behind the CTA below instead of crowding the home.
+    crate::ui::configure::show_configure(app, ui);
 
-        // Two-step choice (mirrors duopipe): pick quick vs. config first, then —
-        // for quick — the signaling. Both quick sub-modes map to a `PairMode`
-        // that never touches the saved config; "use config" is the token pairing.
-        let quick_selected = matches!(app.mode, PairMode::NostrPin | PairMode::Manual);
+    ui.add_space(16.0);
+    ui.separator();
+    ui.add_space(4.0);
+    ui.vertical_centered_justified(|ui| {
         if ui
-            .radio(quick_selected, "1  Quick mode — pair on the spot, nothing saved")
-            .clicked()
-            && !quick_selected
-        {
-            // Entering quick mode leads with the headline rotating-PIN flow.
-            app.mode = PairMode::NostrPin;
-        }
-        if quick_selected {
-            ui.indent("quick_submode", |ui| {
-                ui.radio_value(
-                    &mut app.mode,
-                    PairMode::NostrPin,
-                    "P  PIN quick pair — type a short rotating code (internet)",
-                );
-                ui.radio_value(
-                    &mut app.mode,
-                    PairMode::Manual,
-                    "M  Manual — node id + token (works offline on the same LAN)",
-                );
-            });
-        }
-        if ui
-            .radio(
-                app.mode == PairMode::NostrToken,
-                "2  Use config — standing pairing with a shared token (internet)",
-            )
+            .button("⚡ Quick options — pair on the spot, nothing saved  —  Q")
             .clicked()
         {
-            app.mode = PairMode::NostrToken;
+            app.open_quick();
         }
     });
-    ui.add_space(16.0);
+}
+
+/// The quick-options wizard: pick an ad-hoc mode, then start or join. Nothing
+/// here is persisted; the credentials last one session.
+pub fn show_quick(app: &mut DuocbApp, ui: &mut Ui) {
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        back_button(app, ui);
+        ui.heading("Quick options");
+    });
+    ui.label(
+        RichText::new(
+            "Pair on the spot — nothing is saved, and the credentials last \
+             one session.",
+        )
+        .weak(),
+    );
+    ui.add_space(12.0);
+
+    ui.group(|ui| {
+        ui.label(RichText::new("Mode").strong());
+        ui.radio_value(
+            &mut app.mode,
+            PairMode::NostrPin,
+            "P  PIN quick pair — type a short rotating code (internet)",
+        );
+        ui.radio_value(
+            &mut app.mode,
+            PairMode::Manual,
+            "M  Manual — node id + token (works offline on the same LAN)",
+        );
+    });
+    ui.add_space(12.0);
 
     ui.vertical_centered_justified(|ui| {
         if ui
@@ -233,57 +229,8 @@ pub fn show_server(app: &mut DuocbApp, ui: &mut Ui) {
     ui.add_space(8.0);
 
     if !app.server_running {
-        // Only token mode has anything to configure before starting. Quick modes
-        // (PIN, manual) launch straight from the home screen, so this pre-start
-        // form is token-only.
-        if app.mode == PairMode::NostrToken {
-            ui.label("Shared auth token (same on both devices):");
-            ui.add(
-                TextEdit::singleline(&mut app.in_token)
-                    .font(egui::TextStyle::Monospace)
-                    .password(true)
-                    .desired_width(f32::INFINITY)
-                    .hint_text("…"),
-            );
-            ui.label(
-                RichText::new("Paste an existing token, or generate a new one.")
-                    .weak()
-                    .small(),
-            );
-            token_entry_feedback(ui, &app.in_token);
-            let token = app.in_token.trim().to_string();
-            let token_valid = duocb_core::auth::validate_token(&token).is_ok();
-            ui.horizontal(|ui| {
-                let generate_label = if token_valid {
-                    "Generate new token"
-                } else {
-                    "Generate token"
-                };
-                if ui.button(generate_label).clicked() {
-                    app.in_token = duocb_core::auth::generate_token();
-                }
-                if token_valid && ui.button("Copy token (Ctrl/⌘+T)").clicked() {
-                    app.copy_to_clipboard(&token);
-                }
-            });
-            ui.label("This device's unique name:");
-            ui.add(TextEdit::singleline(&mut app.in_my_name).hint_text("e.g. desktop"));
-            ui.label(
-                RichText::new("Token and name are saved automatically when you start.")
-                    .weak()
-                    .small(),
-            );
-            ui.add_space(8.0);
-            if ui
-                .add_enabled(
-                    app.server_mode_spec().is_some(),
-                    egui::Button::new("▶ Start (Ctrl/⌘+Enter)"),
-                )
-                .clicked()
-            {
-                app.start_server();
-            }
-        }
+        // Every mode starts straight from the home screen now; this state is a
+        // brief transient during teardown.
         return;
     }
 
@@ -292,9 +239,12 @@ pub fn show_server(app: &mut DuocbApp, ui: &mut Ui) {
         PairMode::NostrToken => {
             show_token_pairing_summary(app, ui);
             ui.label(
-                RichText::new("The other device must use a different name.")
-                    .weak()
-                    .small(),
+                RichText::new(
+                    "Your other devices see this one as hosting — pick it in \
+                     their list to join.",
+                )
+                .weak()
+                .small(),
             );
         }
         PairMode::NostrPin => {
@@ -349,12 +299,10 @@ pub fn show_server(app: &mut DuocbApp, ui: &mut Ui) {
 
     ui.add_space(8.0);
     if ui.button("⏹ Stop").clicked() {
-        app.net.send(duocb_core::net::UiCommand::StopServer);
-        // Quick modes have no pre-start form to return to, so stopping goes all
-        // the way home rather than showing a bare restart button.
-        if app.mode != PairMode::NostrToken {
-            app.screen = Screen::Home;
-        }
+        // Nothing configurable remains on this screen, so stopping goes back
+        // to where the session was launched from (the configure hub, or the
+        // quick-options screen).
+        app.go_back();
     }
 
     session_panel_if_connected(app, ui);
@@ -371,30 +319,10 @@ pub fn show_client(app: &mut DuocbApp, ui: &mut Ui) {
     if !app.client_active {
         match app.mode {
             PairMode::NostrToken => {
-                ui.label("Token copied from the starting device:");
-                ui.add(
-                    TextEdit::singleline(&mut app.in_token)
-                        .font(egui::TextStyle::Monospace)
-                        .password(true)
-                        .desired_width(f32::INFINITY)
-                        .hint_text("…"),
-                );
-                ui.label(
-                    RichText::new(
-                        "Paste the token itself (from “Copy token”) — not the fingerprint \
-                         shown on the other device.",
-                    )
-                    .weak()
-                    .small(),
-                );
-                token_entry_feedback(ui, &app.in_token);
-                ui.label("This device's unique name:");
-                ui.add(TextEdit::singleline(&mut app.in_my_name).hint_text("e.g. laptop"));
-                ui.label(
-                    RichText::new("Token and name are saved after a successful connection.")
-                        .weak()
-                        .small(),
-                );
+                // A configure-mode join launches from the home hub with the
+                // selected peer; this state is a brief transient.
+                ui.label(RichText::new("Pick a device to join from the home screen.").weak());
+                return;
             }
             PairMode::NostrPin => {
                 ui.label("PIN shown on the other device:");

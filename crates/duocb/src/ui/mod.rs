@@ -3,6 +3,7 @@
 use std::time::{Duration, Instant};
 
 pub mod app;
+pub mod configure;
 pub mod screens;
 pub mod session;
 
@@ -11,7 +12,11 @@ pub mod session;
 /// sets the connection up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
+    /// The configure mode's wizard/hub — the primary flow (iOS parity).
     Home,
+    /// The quick-options wizard: ad-hoc PIN/manual pairing, nothing saved.
+    /// Opened from the home CTA so the quick modes never crowd the home.
+    Quick,
     /// Start a connection: this device shows the PIN/auth code and listens
     /// (the transport server).
     Server,
@@ -23,12 +28,34 @@ pub enum Screen {
 /// The pairing mode selected on the home screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PairMode {
-    /// Shared auth token + names, rendezvous via nostr (internet).
+    /// The primary mode: a standing secret + per-device identities, device
+    /// discovery and rendezvous via nostr (internet).
     NostrToken,
     /// Rotating PIN quick pair via nostr (internet).
     NostrPin,
     /// Manually typed node id + token; works offline on the same LAN (mDNS).
     Manual,
+}
+
+/// Where the configure mode's home-screen flow currently is. The setup steps
+/// gate everything on the standing secret: without one, only the wizard is
+/// reachable; once secret + name are saved the hub ([`ConfigureStep::Ready`])
+/// is home until the user explicitly clears the secret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigureStep {
+    /// No secret: choose between generating a new one and importing one.
+    SetupChoice,
+    /// One-time reveal of a freshly generated secret.
+    SetupGenerate,
+    /// Paste an existing secret (masked, fingerprint-confirmed).
+    SetupImport,
+    /// Enter/confirm this device's short name.
+    SetupName,
+    /// Fully configured: the hub — device identity + start/join actions.
+    Ready,
+    /// The device picker, shown only after choosing Join on the hub: the
+    /// peer list is fetched and refreshed only while this step is visible.
+    Join,
 }
 
 /// Max characters shown in the peek view. Larger payloads are truncated to

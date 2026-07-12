@@ -22,7 +22,9 @@ use crate::net::endpoint::{
     connect_to_server, connection_paths, create_client_endpoint, create_server_endpoint,
     watch_connection_paths,
 };
-use crate::net::{ConnStatus, DialSpec, EventSender, NetEvent, ServerMode, UiCommand};
+use crate::net::{
+    ConnStatus, DialSpec, EventSender, NetEvent, ServerMode, TokenIdentity, UiCommand,
+};
 use crate::protocol::{
     AuthRequest, AuthResponse, ClipBody, ClipMsg, MAX_CLIP_MESSAGE_SIZE,
     MAX_CONTROL_MESSAGE_SIZE, decode_auth_request, decode_auth_response, decode_clip_msg,
@@ -54,19 +56,6 @@ const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
 /// reconnects without limit. This bounds the startup phase so an unreachable
 /// peer fails fast instead of looping forever.
 const MAX_INITIAL_CONNECT_ATTEMPTS: u32 = 10;
-
-/// Steady-state interval between node-id republishes (token mode). Replaceable
-/// nostr events can be dropped by relays at varying times, so we refresh
-/// periodically while listening.
-const NODE_ID_REPUBLISH_INTERVAL: Duration = Duration::from_secs(300);
-
-/// Interval for the initial republish burst: a second device launched against a
-/// live name surfaces quickly instead of waiting a full republish interval.
-const STARTUP_RECHECK_INTERVAL: Duration = Duration::from_secs(10);
-
-/// Number of publish cycles that use [`STARTUP_RECHECK_INTERVAL`] before
-/// settling into [`NODE_ID_REPUBLISH_INTERVAL`].
-const STARTUP_RECHECK_CYCLES: u32 = 6;
 
 /// Marker error for fatal authentication failures (wrong token/PIN, explicit
 /// rejection, auth timeout). The client session ends on these instead of
@@ -195,6 +184,11 @@ type Bi = (iroh::endpoint::SendStream, iroh::endpoint::RecvStream);
 /// Never persisted; a fresh session starts empty.
 type LastSent = Arc<parking_lot::Mutex<Option<(String, u64)>>>;
 
+/// Shared channel carrying the hosting state (the server endpoint's node id
+/// while a configure-mode session is listening, `None` otherwise) from the
+/// session into the standing presence publisher, which republishes on change.
+type HostingTx = Arc<tokio::sync::watch::Sender<Option<EndpointId>>>;
+
 /// A running server or client session: its cancel token, task handle, the
 /// channel that feeds outbound clipboard items into the active connection, and
 /// the shared connection slot for on-demand path queries.
@@ -205,7 +199,7 @@ struct Session {
     conn: ConnSlot,
 }
 
-fn start_session(kind: SessionKind, events: EventSender) -> Session {
+fn start_session(kind: SessionKind, events: EventSender, hosting: Option<HostingTx>) -> Session {
     let cancel = CancellationToken::new();
     let (clip_tx, clip_rx) = mpsc::unbounded_channel();
     let task_cancel = cancel.clone();
@@ -215,7 +209,10 @@ fn start_session(kind: SessionKind, events: EventSender) -> Session {
         let last_sent = LastSent::default();
         match kind {
             SessionKind::Server(mode) => {
-                run_server_session(mode, events, task_cancel, clip_rx, task_conn, last_sent).await
+                run_server_session(
+                    mode, events, task_cancel, clip_rx, task_conn, last_sent, hosting,
+                )
+                .await
             }
             SessionKind::Client(spec) => {
                 run_client_session(spec, events, task_cancel, clip_rx, task_conn, last_sent).await
@@ -233,25 +230,96 @@ fn start_session(kind: SessionKind, events: EventSender) -> Session {
 async fn stop_session(session: &mut Option<Session>) {
     if let Some(s) = session.take() {
         s.cancel.cancel();
-        let _ = s.handle.await;
+        // A graceful teardown (closing the endpoint, notifying the peer)
+        // normally finishes in well under a second. Bound the wait so a
+        // stalled close can never wedge this command loop — every queued UI
+        // command (and the iOS FFI's stop, which blocks on shutdown) sits
+        // behind this await.
+        let mut handle = s.handle;
+        if tokio::time::timeout(Duration::from_secs(3), &mut handle)
+            .await
+            .is_err()
+        {
+            handle.abort();
+        }
+    }
+}
+
+/// The standing presence publisher task and the identity it broadcasts.
+struct Presence {
+    cancel: CancellationToken,
+    handle: JoinHandle<()>,
+    identity: TokenIdentity,
+}
+
+async fn stop_presence(presence: &mut Option<Presence>) {
+    if let Some(p) = presence.take() {
+        p.cancel.cancel();
+        let _ = p.handle.await;
+    }
+}
+
+/// Random per-publisher-run id (16 hex chars) carried in presence records so a
+/// publisher can recognize a record written by another live process under its
+/// own identity.
+fn generate_run_id() -> String {
+    let bytes: [u8; 8] = rand::Rng::random(&mut rand::rng());
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn spawn_presence(identity: TokenIdentity, hosting: &HostingTx, events: EventSender) -> Presence {
+    let cancel = CancellationToken::new();
+    let handle = tokio::spawn(run_presence_publisher(
+        identity.clone(),
+        generate_run_id(),
+        hosting.subscribe(),
+        events,
+        cancel.clone(),
+    ));
+    Presence {
+        cancel,
+        handle,
+        identity,
     }
 }
 
 /// The runtime's main loop: consume UI commands until shutdown. At most one
 /// session (server or client) runs at a time; starting a new one replaces the
-/// current one.
+/// current one. The presence publisher is independent of sessions: it runs from
+/// [`UiCommand::SetPresence`] until stopped, with the hosting watch channel
+/// carrying the current server node id into its records.
 pub async fn net_main(mut cmd_rx: mpsc::UnboundedReceiver<UiCommand>, events: EventSender) {
     let mut session: Option<Session> = None;
+    let mut presence: Option<Presence> = None;
+    // One in-flight peer-list fetch at a time; a completed handle is replaced.
+    let mut peer_fetch: Option<JoinHandle<()>> = None;
+    let hosting: HostingTx = Arc::new(tokio::sync::watch::channel(None).0);
 
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
             UiCommand::StartServer { mode } => {
                 stop_session(&mut session).await;
-                session = Some(start_session(SessionKind::Server(mode), events.clone()));
+                let session_hosting = if let ServerMode::NostrToken { identity } = &mode {
+                    // Hosting requires the presence publisher: its record is how
+                    // peers find this device's node id. Ensure it runs for this
+                    // exact identity (the UI normally has it running already).
+                    if presence.as_ref().is_none_or(|p| p.identity != *identity) {
+                        stop_presence(&mut presence).await;
+                        presence = Some(spawn_presence(identity.clone(), &hosting, events.clone()));
+                    }
+                    Some(hosting.clone())
+                } else {
+                    None
+                };
+                session = Some(start_session(
+                    SessionKind::Server(mode),
+                    events.clone(),
+                    session_hosting,
+                ));
             }
             UiCommand::Connect { spec } => {
                 stop_session(&mut session).await;
-                session = Some(start_session(SessionKind::Client(spec), events.clone()));
+                session = Some(start_session(SessionKind::Client(spec), events.clone(), None));
             }
             UiCommand::StopServer | UiCommand::Disconnect => {
                 stop_session(&mut session).await;
@@ -274,11 +342,53 @@ pub async fn net_main(mut cmd_rx: mpsc::UnboundedReceiver<UiCommand>, events: Ev
                     .unwrap_or_default();
                 events.send(NetEvent::ConnPath(paths));
             }
+            UiCommand::SetPresence { identity } => {
+                stop_presence(&mut presence).await;
+                if let Some(identity) = identity {
+                    presence = Some(spawn_presence(identity, &hosting, events.clone()));
+                }
+            }
+            UiCommand::RefreshPeers => {
+                if peer_fetch.as_ref().is_some_and(|h| !h.is_finished()) {
+                    // A fetch is already running; its answer is on the way.
+                } else if let Some(p) = &presence {
+                    let identity = p.identity.clone();
+                    let events = events.clone();
+                    // Spawned so a slow relay lookup never blocks this loop.
+                    peer_fetch = Some(tokio::spawn(async move {
+                        match crate::nostr::fetch_presence_records(
+                            &identity.token,
+                            &identity.relays,
+                        )
+                        .await
+                        {
+                            Ok(records) => {
+                                let now = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0);
+                                let peers =
+                                    crate::nostr::build_peer_list(records, &identity.suffix, now);
+                                events.send(NetEvent::PeerList { peers });
+                            }
+                            Err(e) => {
+                                events.error(format!("Could not refresh the device list: {e:#}"));
+                            }
+                        }
+                    }));
+                } else {
+                    events.error("Set up the secret and device name first");
+                }
+            }
             UiCommand::Shutdown => break,
         }
     }
 
     stop_session(&mut session).await;
+    stop_presence(&mut presence).await;
+    if let Some(fetch) = peer_fetch.take() {
+        fetch.abort();
+    }
 }
 
 // ============================================================================
@@ -294,6 +404,25 @@ impl Drop for PublisherGuard {
     }
 }
 
+/// Marks this device as hosting for the lifetime of a configure-mode server
+/// session: publishes the node id into the hosting watch channel on creation
+/// and clears it on drop, so every session exit path (stop, error, replacement)
+/// reliably flips the presence record back to non-hosting.
+struct HostingGuard(HostingTx);
+
+impl HostingGuard {
+    fn new(tx: HostingTx, node_id: EndpointId) -> Self {
+        tx.send_replace(Some(node_id));
+        Self(tx)
+    }
+}
+
+impl Drop for HostingGuard {
+    fn drop(&mut self) {
+        self.0.send_replace(None);
+    }
+}
+
 async fn run_server_session(
     mode: ServerMode,
     events: EventSender,
@@ -301,6 +430,7 @@ async fn run_server_session(
     mut clip_rx: mpsc::UnboundedReceiver<String>,
     conn_slot: ConnSlot,
     last_sent: LastSent,
+    hosting: Option<HostingTx>,
 ) {
     events.status(ConnStatus::Starting);
 
@@ -322,7 +452,7 @@ async fn run_server_session(
             let token = crate::auth::generate_token();
             (HashSet::from([token.clone()]), Some(token))
         }
-        ServerMode::NostrToken { token, .. } => (HashSet::from([token.clone()]), None),
+        ServerMode::NostrToken { identity } => (HashSet::from([identity.token.clone()]), None),
         ServerMode::NostrPin { .. } => (HashSet::new(), None),
     };
     let token_fingerprint = tokens
@@ -342,20 +472,15 @@ async fn run_server_session(
     let recent_pins = RecentPins::default();
     let pin_cache = matches!(mode, ServerMode::NostrPin { .. }).then(|| recent_pins.clone());
 
+    // Configure mode: mark this device as hosting for the session's lifetime.
+    // The standing presence publisher (owned by the command loop) picks the
+    // node id up from the watch channel and republishes; the guard's drop
+    // clears it on every exit path.
+    let _hosting_guard = hosting.map(|tx| HostingGuard::new(tx, node_id));
+
     // Mode-specific signaling publisher, aborted on session teardown.
     let _publisher: Option<PublisherGuard> = match &mode {
-        ServerMode::NostrToken {
-            token,
-            name,
-            relays,
-        } => Some(PublisherGuard(tokio::spawn(run_node_id_publisher(
-            token.clone(),
-            name.clone(),
-            node_id,
-            relays.clone(),
-            events.clone(),
-            cancel.clone(),
-        )))),
+        ServerMode::NostrToken { .. } => None,
         ServerMode::NostrPin { relays } => Some(PublisherGuard(tokio::spawn(run_pin_publisher(
             node_id,
             recent_pins,
@@ -470,7 +595,9 @@ async fn run_client_session(
     };
     let own_id = endpoint.id();
     let token_fingerprint = match &spec {
-        DialSpec::NostrToken { token, .. } => Some(crate::auth::token_fingerprint(token)),
+        DialSpec::NostrToken { identity, .. } => {
+            Some(crate::auth::token_fingerprint(&identity.token))
+        }
         DialSpec::Pin { .. } | DialSpec::Manual { .. } => None,
     };
     events.send(NetEvent::ClientReady {
@@ -489,19 +616,32 @@ async fn run_client_session(
     let mut pinned_pin_id: Option<EndpointId> = None;
 
     loop {
-        // Resolve the target each attempt: token mode re-queries the shared nostr
-        // author (excluding our own name), so a restarted server's fresh id is found.
+        // Resolve the target each attempt: configure mode re-queries the chosen
+        // peer's presence record, so a restarted host's fresh node id is found.
         let resolved: Result<EndpointId> = match &spec {
             DialSpec::Manual { .. } => Ok(manual_id.expect("validated above")),
             DialSpec::NostrToken {
-                token,
-                own_name,
-                relays,
+                identity,
+                peer_display,
             } => {
                 events.status(ConnStatus::Resolving);
                 tokio::select! {
                     _ = cancel.cancelled() => return,
-                    r = crate::nostr::lookup_peer_node_id(token, own_name, relays) => r,
+                    r = crate::nostr::lookup_presence(&identity.token, peer_display, &identity.relays) => match r {
+                        Ok(Some((record, _))) => match record.node_id {
+                            Some(id) => id
+                                .trim()
+                                .parse::<EndpointId>()
+                                .context("the peer's presence record holds an invalid node id"),
+                            None => Err(anyhow::anyhow!(
+                                "'{peer_display}' is not hosting a connection — press Start on that device"
+                            )),
+                        },
+                        Ok(None) => Err(anyhow::anyhow!(
+                            "no presence record found for '{peer_display}' — is it running with the same secret?"
+                        )),
+                        Err(e) => Err(e.context("nostr presence lookup failed")),
+                    },
                 }
             }
             DialSpec::Pin { .. } if pinned_pin_id.is_some() => Ok(pinned_pin_id.unwrap()),
@@ -552,7 +692,9 @@ async fn run_client_session(
                 // stream stays open for clipboard frames.
                 let auth_result = match &spec {
                     DialSpec::Manual { token, .. } => auth_as_dialer(&conn, token).await,
-                    DialSpec::NostrToken { token, .. } => auth_as_dialer(&conn, token).await,
+                    DialSpec::NostrToken { identity, .. } => {
+                        auth_as_dialer(&conn, &identity.token).await
+                    }
                     DialSpec::Pin { canonical_pin, .. } => {
                         auth_as_dialer_pin(&conn, canonical_pin).await
                     }
@@ -746,55 +888,72 @@ async fn pump_clipboard(
 }
 
 // ============================================================================
-// Signaling publishers (server side)
+// Signaling publishers
 // ============================================================================
 
-/// Token mode: claim/refresh this device's name on nostr. On a conflict
-/// (another device took the name over), stop publishing and surface an error —
-/// the connection itself is unaffected.
-async fn run_node_id_publisher(
-    token: String,
-    name: String,
-    node_id: EndpointId,
-    relays: Vec<String>,
+/// Configure mode: broadcast this device's presence record and keep it fresh.
+/// Runs from `SetPresence` until stopped, independent of sessions; the hosting
+/// watch channel feeds the current server node id into the record, and a change
+/// there triggers an immediate republish. After the first publish, finding a
+/// record under our own identity written by a different publisher run means
+/// another live process is broadcasting as this device — surface the conflict
+/// and stop rather than fight over the record.
+async fn run_presence_publisher(
+    identity: TokenIdentity,
+    run_id: String,
+    mut hosting_rx: tokio::sync::watch::Receiver<Option<EndpointId>>,
     events: EventSender,
     cancel: CancellationToken,
 ) {
+    let display = identity.display();
     let mut publishes: u32 = 0;
     loop {
-        // After the first publish, check whether a live competitor overwrote our
-        // record with a different node id. Startup deliberately does no lookup:
-        // our own stale record from a previous run (a different ephemeral node
-        // id) must not read as a conflict.
         if publishes > 0 {
-            match crate::nostr::lookup_node_id_opt(&token, &name, &relays).await {
-                Ok(Some(id)) if id != node_id => {
-                    let short: String = id.to_string().chars().take(12).collect();
-                    events.error(format!(
-                        "Name '{name}' is now used by another device ({short}…); stopped publishing"
-                    ));
+            match crate::nostr::lookup_presence(&identity.token, &display, &identity.relays).await
+            {
+                Ok(Some((record, _))) if record.run_id != run_id => {
+                    events.send(NetEvent::PresenceConflict {
+                        message: format!(
+                            "Another process is broadcasting as '{display}' — stopped publishing \
+                             presence. Is a second instance using this device's config?"
+                        ),
+                    });
                     return;
                 }
-                // Our own record, no record, or a network error: can't prove a
-                // conflict, so just (re)publish.
+                // Our own record, no record, or a network error: nothing provable.
                 _ => {}
             }
         }
 
-        match crate::nostr::publish_node_id(&token, &name, &node_id, &relays).await {
-            Ok(()) => log::info!("Published node id to nostr for peer discovery"),
-            Err(e) => log::warn!("Failed to publish node id to nostr: {e:#}"),
+        let record = crate::nostr::PresenceRecord {
+            version: crate::nostr::PRESENCE_VERSION,
+            name: identity.name.clone(),
+            suffix: identity.suffix.clone(),
+            run_id: run_id.clone(),
+            node_id: hosting_rx.borrow_and_update().map(|id| id.to_string()),
+        };
+        match crate::nostr::publish_presence(&identity.token, &record, &identity.relays).await {
+            Ok(()) => log::info!("Published presence to nostr"),
+            Err(e) => log::warn!("Failed to publish presence to nostr: {e:#}"),
         }
         publishes = publishes.saturating_add(1);
 
-        // Re-check quickly for the first few cycles, then settle to the slow cadence.
-        let interval = if publishes <= STARTUP_RECHECK_CYCLES {
-            STARTUP_RECHECK_INTERVAL
+        // Re-publish quickly for the first few cycles, then settle to the slow
+        // heartbeat; a hosting change republishes immediately.
+        let interval = if publishes <= crate::nostr::PRESENCE_STARTUP_CYCLES {
+            crate::nostr::PRESENCE_STARTUP_INTERVAL
         } else {
-            NODE_ID_REPUBLISH_INTERVAL
+            crate::nostr::PRESENCE_REPUBLISH_INTERVAL
         };
         tokio::select! {
             _ = cancel.cancelled() => return,
+            changed = hosting_rx.changed() => {
+                if changed.is_err() {
+                    // The hosting sender is owned by the command loop; it going
+                    // away means the runtime is tearing down.
+                    return;
+                }
+            }
             _ = tokio::time::sleep(interval) => {}
         }
     }
@@ -1114,10 +1273,7 @@ mod tests {
         // Server side.
         let (srv_tx, srv_rx) = std::sync::mpsc::channel();
         let srv_events = EventSender::new(srv_tx, None);
-        let srv_session = start_session(
-            SessionKind::Server(ServerMode::Manual),
-            srv_events,
-        );
+        let srv_session = start_session(SessionKind::Server(ServerMode::Manual), srv_events, None);
 
         let (node_id, token) = wait_for_event(&srv_rx, Duration::from_secs(30), |ev| {
             if let NetEvent::ServerReady {
@@ -1138,6 +1294,7 @@ mod tests {
         let cli_session = start_session(
             SessionKind::Client(DialSpec::Manual { node_id, token }),
             cli_events,
+            None,
         );
 
         // Both sides report Connected.
@@ -1193,6 +1350,7 @@ mod tests {
         let srv_session = start_session(
             SessionKind::Server(ServerMode::Manual),
             EventSender::new(srv_tx, None),
+            None,
         );
         let (node_id, token) = wait_for_event(&srv_rx, Duration::from_secs(30), |ev| {
             if let NetEvent::ServerReady {
@@ -1211,6 +1369,7 @@ mod tests {
         let cli_session = start_session(
             SessionKind::Client(DialSpec::Manual { node_id, token }),
             EventSender::new(cli_tx, None),
+            None,
         );
         wait_for_event(&cli_rx, Duration::from_secs(60), |ev| {
             matches!(ev, NetEvent::Status(ConnStatus::Connected)).then_some(())
@@ -1264,6 +1423,7 @@ mod tests {
         let srv_session = start_session(
             SessionKind::Server(ServerMode::Manual),
             EventSender::new(srv_tx, None),
+            None,
         );
         let node_id = wait_for_event(&srv_rx, Duration::from_secs(30), |ev| {
             if let NetEvent::ServerReady { node_id, .. } = ev {
@@ -1280,6 +1440,7 @@ mod tests {
                 token: crate::auth::generate_token(), // not the server's token
             }),
             EventSender::new(cli_tx, None),
+            None,
         );
 
         let err = wait_for_event(&cli_rx, Duration::from_secs(60), |ev| {
@@ -1298,5 +1459,30 @@ mod tests {
         let mut srv = Some(srv_session);
         stop_session(&mut cli).await;
         stop_session(&mut srv).await;
+    }
+
+    /// A peer-list refresh before any presence identity is configured must
+    /// answer with an actionable error instead of silently doing nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn refresh_peers_without_presence_yields_error() {
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (ev_tx, ev_rx) = std::sync::mpsc::channel();
+        let main = tokio::spawn(net_main(cmd_rx, EventSender::new(ev_tx, None)));
+
+        cmd_tx.send(UiCommand::RefreshPeers).unwrap();
+        let err = wait_for_event(&ev_rx, Duration::from_secs(5), |ev| {
+            if let NetEvent::Error(e) = ev {
+                Some(e.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            err.contains("secret"),
+            "expected a setup hint, got: {err}"
+        );
+
+        cmd_tx.send(UiCommand::Shutdown).unwrap();
+        let _ = main.await;
     }
 }
