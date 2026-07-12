@@ -7,10 +7,12 @@
 //! holds an exclusive OS lock on the file itself for the whole session, which
 //! both stops a second local instance from claiming the same identity and guards
 //! the file against accidental external edits while duocb runs. Because the lock
-//! lives on the file, reads and writes go in place through the held handle rather
-//! than via an atomic temp-and-rename (a rename would swap the inode and drop the
-//! lock). A crash mid-write can therefore leave the file malformed, but [`load`]
-//! tolerates that by falling back to defaults.
+//! lives on the file, writes go in place through the held handle rather than via
+//! an atomic temp-and-rename (a rename would swap the inode and drop the lock).
+//! To keep the crash safety a rename would have given, each save first writes the
+//! complete new content to a sibling `<config>.bak`, flushes it, and only then
+//! overwrites the config in place; a crash mid-overwrite leaves the config torn
+//! but the backup intact, and [`ConfigLock::load`] recovers from it.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -113,9 +115,39 @@ impl ConfigLock {
         &self.path
     }
 
-    /// Read the config from the locked file, returning defaults when the file is
-    /// empty or malformed (a broken config must never block startup).
+    fn backup_path(&self) -> PathBuf {
+        let mut name = self.path.as_os_str().to_os_string();
+        name.push(".bak");
+        PathBuf::from(name)
+    }
+
+    /// Read the config, returning defaults when nothing valid is on disk (a
+    /// broken config must never block startup). Reads the locked file first;
+    /// if it is torn — e.g. a crash during an in-place overwrite — falls back to
+    /// the sibling backup that [`save`](Self::save) writes before overwriting.
     pub fn load(&mut self) -> Config {
+        if let Some(cfg) = self.read_locked() {
+            return cfg;
+        }
+        let backup = self.backup_path();
+        match std::fs::read_to_string(&backup) {
+            Ok(content) if !content.trim().is_empty() => match serde_json::from_str(&content) {
+                Ok(cfg) => {
+                    log::warn!("Recovered config from backup {}", backup.display());
+                    cfg
+                }
+                Err(e) => {
+                    log::warn!("Ignoring malformed config backup {}: {e}", backup.display());
+                    Config::default()
+                }
+            },
+            _ => Config::default(),
+        }
+    }
+
+    /// Parse the locked config file. `None` means "nothing usable here, try the
+    /// backup": the file is empty (a fresh install), unreadable, or malformed.
+    fn read_locked(&mut self) -> Option<Config> {
         let mut content = String::new();
         if let Err(e) = self
             .file
@@ -123,22 +155,32 @@ impl ConfigLock {
             .and_then(|_| self.file.read_to_string(&mut content))
         {
             log::warn!("Ignoring unreadable config {}: {e}", self.path.display());
-            return Config::default();
+            return None;
         }
         if content.trim().is_empty() {
-            return Config::default();
+            return None;
         }
-        serde_json::from_str(&content).unwrap_or_else(|e| {
-            log::warn!("Ignoring malformed config {}: {e}", self.path.display());
-            Config::default()
-        })
+        match serde_json::from_str(&content) {
+            Ok(cfg) => Some(cfg),
+            Err(e) => {
+                log::warn!("Ignoring malformed config {}: {e}", self.path.display());
+                None
+            }
+        }
     }
 
-    /// Overwrite the config file in place through the held handle. This forfeits
-    /// the crash atomicity of a temp-and-rename so the lock can stay on the file;
-    /// [`load`] tolerates a torn write by falling back to defaults.
+    /// Persist the config. The lock stays on the config inode, so this cannot use
+    /// an atomic temp-and-rename; instead it writes the complete new content to a
+    /// flushed sibling backup first, then overwrites the config in place through
+    /// the held handle. A crash before the overwrite finishes leaves the config
+    /// torn but the backup whole, and [`load`](Self::load) recovers from it.
     pub fn save(&mut self, cfg: &Config) -> Result<()> {
         let content = serde_json::to_string_pretty(cfg).context("serializing config")?;
+
+        let backup = self.backup_path();
+        write_private_file(&backup, content.as_bytes())
+            .with_context(|| format!("writing config backup {}", backup.display()))?;
+
         self.file
             .seek(SeekFrom::Start(0))
             .context("rewinding config for write")?;
@@ -154,6 +196,25 @@ impl ConfigLock {
             .with_context(|| format!("flushing config {}", self.path.display()))?;
         Ok(())
     }
+}
+
+/// Truncate-write `bytes` to `path` (creating it), owner-only and flushed to
+/// disk. Permissions are set while the file is still empty so the credential it
+/// will hold is never briefly group/world-readable.
+fn write_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -231,6 +292,31 @@ mod tests {
         let loaded = lock.load();
         assert!(loaded.auth_token.is_none());
         assert!(loaded.my_name.is_none());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_recovers_from_backup_when_config_is_torn() {
+        let dir = temp_dir();
+        let path = dir.join("config.json");
+
+        let mut lock = acquire_lock(&path).expect("lock");
+        lock.save(&Config {
+            auth_token: Some("good".to_string()),
+            my_name: Some("desktop".to_string()),
+        })
+        .expect("save");
+        drop(lock);
+
+        // Simulate a crash during the in-place overwrite: the config is torn but
+        // the backup written beforehand is intact.
+        std::fs::write(&path, b"{ torn").unwrap();
+
+        let mut lock = acquire_lock(&path).expect("relock");
+        let loaded = lock.load();
+        assert_eq!(loaded.auth_token.as_deref(), Some("good"));
+        assert_eq!(loaded.my_name.as_deref(), Some("desktop"));
 
         let _ = std::fs::remove_dir_all(dir);
     }
