@@ -3,7 +3,7 @@
 - run cargo clippy and test after rust code changes
 - no cargo fmt
 
-## Running GUI apps
+## Running GUI apps for Linux
 
 A TigerVNC server (XFCE desktop) runs on display `:1`, served on `127.0.0.1:5901` (localhost-only, 1280x800, 24-bit).
 
