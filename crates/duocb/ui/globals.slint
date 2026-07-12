@@ -6,6 +6,12 @@
 import { Screen, ConfigureStep, PairMode, PeerRow, ClipRow, PathRow } from "types.slint";
 
 export global UiState {
+    // Per-platform font families, set once at startup from Rust ("" = the
+    // renderer's default). Slint takes a single family name, so the platform
+    // pick happens on the Rust side.
+    in property <string> ui-font;
+    in property <string> mono-font: "monospace";
+
     // Navigation / shared status.
     in property <Screen> screen;
     in property <ConfigureStep> configure-step;

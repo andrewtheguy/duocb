@@ -14,7 +14,15 @@ description = "P2P clipboard sharing between two devices over iroh"
 duocb-core = { path = "crates/duocb-core" }
 
 # GUI
-slint = "1.17"
+# Skia renderer instead of the default femtovg: native-quality text
+# rasterization and CoreText/DirectWrite/fontconfig font lookup.
+slint = { version = "1.17", default-features = false, features = [
+    "std",
+    "backend-winit",
+    "renderer-skia",
+    "accessibility",
+    "compat-1-2",
+] }
 slint-build = "1.17"
 arboard = "3.6.1"
 

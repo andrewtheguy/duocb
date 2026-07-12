@@ -26,6 +26,29 @@ fn config_override() -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
     Ok(explicit.or_else(|| std::env::var_os("DUOCB_CONFIG").map(PathBuf::from)))
 }
 
+/// Pick the platform's native UI and monospace font families. Slint's
+/// `font-family` takes a single name (no fallback lists), so the per-OS
+/// choice lives here; an empty UI font leaves the renderer's default.
+/// `DUOCB_UI_FONT` overrides the UI family (useful on Linux, where the
+/// default is whatever fontconfig considers sans).
+fn set_platform_fonts(ui: &MainWindow) {
+    use slint::ComponentHandle;
+    let (ui_font, mono_font) = if cfg!(target_os = "macos") {
+        // ".SF NS" is the hidden family name of the San Francisco system
+        // font; the friendlier aliases (".AppleSystemUIFont", "SF Pro") do
+        // not resolve through Skia's CoreText matching.
+        (".SF NS", "Menlo")
+    } else if cfg!(target_os = "windows") {
+        ("Segoe UI", "Consolas")
+    } else {
+        ("", "monospace")
+    };
+    let state = ui.global::<UiState>();
+    let ui_font = std::env::var("DUOCB_UI_FONT").unwrap_or_else(|_| ui_font.to_string());
+    state.set_ui_font(ui_font.into());
+    state.set_mono_font(mono_font.into());
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("duocb=info,duocb_core=info"),
@@ -39,6 +62,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config_lock = config::acquire_lock(&config_path)?;
 
     let ui = MainWindow::new()?;
+    set_platform_fonts(&ui);
 
     // The runtime's wake signal: Send+Sync and captures no UI state — the
     // event-drain task below owns the (non-Send) app and window instead.
