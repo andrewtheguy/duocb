@@ -14,7 +14,9 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 /// Protocol version carried in every frame and validated on decode.
-pub const DUOCB_PROTO_VERSION: u16 = 1;
+/// v2: [`ClipMsg`] grew a `kind` tag (item / pull_latest / latest) for the
+/// resume-pull exchange; pre-1.0, mixed versions reject each other cleanly.
+pub const DUOCB_PROTO_VERSION: u16 = 2;
 
 /// Cap for control frames (auth/pin). Small request/response messages only.
 pub const MAX_CONTROL_MESSAGE_SIZE: usize = 16 * 1024;
@@ -226,23 +228,53 @@ impl AuthResponse {
     }
 }
 
-/// A shared clipboard payload on the post-auth session stream, flowing in both
-/// directions. Text only.
+/// A frame on the post-auth session stream, flowing in both directions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClipMsg {
     pub version: u16,
-    pub text: String,
-    /// Sender's wall clock at send time, milliseconds since the Unix epoch.
-    /// Informational — receivers display their own received-at time.
-    pub sent_at_ms: u64,
+    #[serde(flatten)]
+    pub body: ClipBody,
+}
+
+/// What a [`ClipMsg`] carries. Text only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ClipBody {
+    /// A pushed clipboard item.
+    Item { text: String, sent_at_ms: u64 },
+    /// Ask the peer for the latest item it sent this session. Each side sends
+    /// this when the clipboard stream (re-)opens, so content sent while the
+    /// connection was interrupted is re-delivered on resume.
+    PullLatest,
+    /// Answer to [`ClipBody::PullLatest`]: a re-delivery of the latest sent
+    /// item (not sent at all when nothing has been sent this session). The
+    /// receiver may already hold it, so it is marked for deduplication.
+    Latest { text: String, sent_at_ms: u64 },
 }
 
 impl ClipMsg {
     pub fn item(text: impl Into<String>, sent_at_ms: u64) -> Self {
-        ClipMsg {
-            version: DUOCB_PROTO_VERSION,
+        Self::of(ClipBody::Item {
             text: text.into(),
             sent_at_ms,
+        })
+    }
+
+    pub fn pull_latest() -> Self {
+        Self::of(ClipBody::PullLatest)
+    }
+
+    pub fn latest(text: impl Into<String>, sent_at_ms: u64) -> Self {
+        Self::of(ClipBody::Latest {
+            text: text.into(),
+            sent_at_ms,
+        })
+    }
+
+    fn of(body: ClipBody) -> Self {
+        ClipMsg {
+            version: DUOCB_PROTO_VERSION,
+            body,
         }
     }
 
@@ -633,8 +665,25 @@ mod tests {
         let msg = ClipMsg::item("hello 🔐 world\nline two", 1_720_000_000_123);
         let decoded = decode_clip_msg(&encode_clip_msg(&msg).unwrap()).unwrap();
         assert_eq!(decoded.version, DUOCB_PROTO_VERSION);
-        assert_eq!(decoded.text, "hello 🔐 world\nline two");
-        assert_eq!(decoded.sent_at_ms, 1_720_000_000_123);
+        let ClipBody::Item { text, sent_at_ms } = decoded.body else {
+            panic!("expected Item, got {:?}", decoded.body);
+        };
+        assert_eq!(text, "hello 🔐 world\nline two");
+        assert_eq!(sent_at_ms, 1_720_000_000_123);
+    }
+
+    #[test]
+    fn test_clip_msg_pull_latest_and_latest_roundtrip() {
+        let decoded = decode_clip_msg(&encode_clip_msg(&ClipMsg::pull_latest()).unwrap()).unwrap();
+        assert!(matches!(decoded.body, ClipBody::PullLatest));
+
+        let decoded =
+            decode_clip_msg(&encode_clip_msg(&ClipMsg::latest("resumed", 42)).unwrap()).unwrap();
+        let ClipBody::Latest { text, sent_at_ms } = decoded.body else {
+            panic!("expected Latest, got {:?}", decoded.body);
+        };
+        assert_eq!(text, "resumed");
+        assert_eq!(sent_at_ms, 42);
     }
 
     #[test]
@@ -664,7 +713,7 @@ mod tests {
 
     #[test]
     fn test_clip_msg_wrong_version_rejected() {
-        let json = br#"{"version":99,"text":"x","sent_at_ms":0}"#;
+        let json = br#"{"version":99,"kind":"item","text":"x","sent_at_ms":0}"#;
         let len = (json.len() as u32).to_be_bytes();
         let mut buf = Vec::from(len);
         buf.extend_from_slice(json);

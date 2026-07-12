@@ -71,8 +71,9 @@ fn main() {
                     net.send(UiCommand::SendClipboard { text });
                 }
             }
-            NetEvent::ItemReceived { text } => {
-                println!("received-text: {text}");
+            NetEvent::ItemReceived { text, pulled } => {
+                let tag = if pulled { "received-latest" } else { "received-text" };
+                println!("{tag}: {text}");
             }
             _ => {}
         }

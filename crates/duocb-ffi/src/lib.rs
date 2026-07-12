@@ -409,7 +409,9 @@ fn event_json(event: &NetEvent) -> Option<String> {
                 })
                 .collect::<Vec<_>>(),
         }),
-        NetEvent::ItemReceived { text } => json!({ "type": "item_received", "text": text }),
+        NetEvent::ItemReceived { text, pulled } => {
+            json!({ "type": "item_received", "text": text, "pulled": pulled })
+        }
         NetEvent::ItemSent => json!({ "type": "item_sent" }),
         NetEvent::Error(message) => json!({ "type": "error", "message": message }),
     };
@@ -490,6 +492,15 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["state"], "connected");
         assert!(v.get("backoff_secs").is_none());
+
+        let json = event_json(&NetEvent::ItemReceived {
+            text: "resumed".into(),
+            pulled: true,
+        })
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "item_received");
+        assert_eq!(v["pulled"], true);
 
         assert!(
             event_json(&NetEvent::PinRotated {

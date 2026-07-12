@@ -188,7 +188,12 @@ impl DuocbApp {
             NetEvent::ConnPath(paths) => {
                 self.conn_path = Some(paths);
             }
-            NetEvent::ItemReceived { text, .. } => {
+            NetEvent::ItemReceived { text, pulled } => {
+                // A resume re-delivery may duplicate content this inbox already
+                // holds (it was received before the connection dropped) — skip it.
+                if pulled && self.inbox.iter().any(|item| item.text == text) {
+                    return;
+                }
                 self.inbox.insert(0, ClipItem::new(text, jiff::Zoned::now()));
                 // Bounded retention (see MAX_INBOX_ITEMS): drop the oldest.
                 self.inbox.truncate(MAX_INBOX_ITEMS);

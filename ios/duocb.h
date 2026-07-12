@@ -31,8 +31,12 @@
  *   peer_paired       {peer_node_id}
  *   peer_disconnected {}
  *   conn_path         {paths: [{kind: direct|relay|other, display, selected}]}
- *   item_received     {text}                   (text can be up to 1 MiB; a
- *                                               2 MiB buffer always fits)
+ *   item_received     {text, pulled}           (text can be up to 1 MiB; a
+ *                                               2 MiB buffer always fits.
+ *                                               pulled=true marks a resume
+ *                                               re-delivery of the peer's
+ *                                               latest item — skip it if the
+ *                                               inbox already holds that text)
  *   item_sent         {}
  *   error             {message}
  *

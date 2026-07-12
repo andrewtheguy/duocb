@@ -117,7 +117,10 @@ pub enum NetEvent {
     /// Answer to [`UiCommand::QueryConnPath`]: a point-in-time snapshot of the
     /// connection's paths (empty if no connection is currently up).
     ConnPath(Vec<endpoint::ConnPath>),
-    ItemReceived { text: String },
+    /// A clipboard item arrived. `pulled` marks a resume re-delivery — the
+    /// peer's latest sent item, fetched when an interrupted connection came
+    /// back — which the UI should drop if it already holds that content.
+    ItemReceived { text: String, pulled: bool },
     ItemSent,
     Error(String),
 }
