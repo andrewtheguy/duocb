@@ -1,10 +1,18 @@
-[package]
-name = "duocb"
-version = "0.0.7"
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+# Bare `cargo build` skips the iOS staticlib (built via build-ios.sh with
+# `-p duocb-ffi`); `--workspace` still covers all crates for clippy/test.
+default-members = ["crates/duocb-core", "crates/duocb"]
+
+[workspace.package]
+version = "0.0.8"
 edition = "2024"
 description = "P2P clipboard sharing between two devices over iroh"
 
-[dependencies]
+[workspace.dependencies]
+duocb-core = { path = "crates/duocb-core" }
+
 # GUI
 eframe = "0.35"
 arboard = "3.6.1"
@@ -41,12 +49,5 @@ jiff = "0.2"
 strip = true
 lto = "thin"
 codegen-units = 1
-
-# Installer packaging (`cargo packager`): .dmg on macOS, .msi (WiX) on Windows.
-# Icons live in icons/ (icon.png is also baked into the binary as the window/Dock
-# icon; see src/main.rs).
-[package.metadata.packager]
-product-name = "duocb"
-identifier = "com.andrewtheguy.duocb"
-category = "Utility"
-icons = ["icons/icon.icns", "icons/icon.ico", "icons/icon.png"]
+# The FFI staticlib must never unwind into Swift; applies workspace-wide.
+panic = "abort"

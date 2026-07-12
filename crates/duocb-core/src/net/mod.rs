@@ -1,14 +1,18 @@
-//! Bridge between the egui UI thread and the tokio networking runtime.
+//! Bridge between a host UI and the tokio networking runtime.
 //!
 //! The UI sends [`UiCommand`]s over an unbounded tokio channel (sync send from
 //! the UI thread); the runtime sends [`NetEvent`]s back over a std mpsc channel
-//! and pokes `egui::Context::request_repaint()` so the GUI wakes even when idle.
-//! Channels only — no shared mutable app state between the two sides.
+//! and invokes an optional wake callback so the host UI can wake its render
+//! loop even when idle. Channels only — no shared mutable app state between
+//! the two sides.
 
 pub mod endpoint;
 pub mod runtime;
 
-use eframe::egui;
+/// Callback invoked after every event so the host UI can wake its render loop
+/// (egui repaint on desktop; unused on iOS, where Swift polls on a timer, and
+/// in headless tests).
+pub type WakeFn = std::sync::Arc<dyn Fn() + Send + Sync>;
 
 /// How the server signals its ephemeral node id to the client.
 #[derive(Debug, Clone)]
@@ -118,24 +122,24 @@ pub enum NetEvent {
     Error(String),
 }
 
-/// Cloneable sender for [`NetEvent`]s that wakes the egui event loop after each
-/// send. The repaint context is optional so the runtime can run in headless
-/// tests.
+/// Cloneable sender for [`NetEvent`]s that wakes the host UI after each send.
+/// The wake callback is optional so the runtime can run in headless tests and
+/// under polling hosts (the iOS FFI).
 #[derive(Clone)]
 pub struct EventSender {
     tx: std::sync::mpsc::Sender<NetEvent>,
-    repaint: Option<egui::Context>,
+    wake: Option<WakeFn>,
 }
 
 impl EventSender {
-    pub fn new(tx: std::sync::mpsc::Sender<NetEvent>, repaint: Option<egui::Context>) -> Self {
-        Self { tx, repaint }
+    pub fn new(tx: std::sync::mpsc::Sender<NetEvent>, wake: Option<WakeFn>) -> Self {
+        Self { tx, wake }
     }
 
     pub fn send(&self, event: NetEvent) {
         let _ = self.tx.send(event);
-        if let Some(ctx) = &self.repaint {
-            ctx.request_repaint();
+        if let Some(wake) = &self.wake {
+            wake();
         }
     }
 
@@ -172,11 +176,12 @@ impl NetHandle {
 }
 
 /// Spawn the networking runtime on a dedicated thread with its own tokio
-/// multi-thread runtime. `ctx` is used to wake the egui loop on every event.
-pub fn spawn_net_runtime(ctx: egui::Context) -> NetHandle {
+/// multi-thread runtime. `wake` is invoked after every event so the host UI
+/// can wake its render loop.
+pub fn spawn_net_runtime(wake: Option<WakeFn>) -> NetHandle {
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
     let (event_tx, event_rx) = std::sync::mpsc::channel();
-    let events = EventSender::new(event_tx, Some(ctx));
+    let events = EventSender::new(event_tx, wake);
     let thread = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()

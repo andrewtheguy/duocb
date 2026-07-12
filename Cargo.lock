@@ -1569,19 +1569,31 @@ checksum = "d8b14ccef22fc6f5a8f4d7d768562a182c04ce9a3b3157b91390b52ddfdf1a76"
 
 [[package]]
 name = "duocb"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = [
  "anyhow",
  "arboard",
+ "dirs",
+ "duocb-core",
+ "eframe",
+ "env_logger",
+ "jiff",
+ "log",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "duocb-core"
+version = "0.0.8"
+dependencies = [
+ "anyhow",
  "argon2",
  "base64",
- "dirs",
- "eframe",
  "env_logger",
  "futures",
  "iroh",
  "iroh-mdns-address-lookup",
- "jiff",
  "log",
  "nostr-sdk",
  "parking_lot",
@@ -1593,6 +1605,18 @@ dependencies = [
  "subtle",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "duocb-ffi"
+version = "0.0.8"
+dependencies = [
+ "duocb-core",
+ "env_logger",
+ "log",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

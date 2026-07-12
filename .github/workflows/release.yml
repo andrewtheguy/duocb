@@ -19,7 +19,7 @@ jobs:
       - name: Extract version from Cargo.toml
         id: version
         run: |
-          VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="duocb") | .version')
           if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
             echo "::error::Could not parse version from Cargo.toml"
             exit 1
@@ -106,18 +106,20 @@ jobs:
 
       - name: Build Release
         run: |
-          cargo build --release --target ${{ matrix.target }}
+          cargo build --release -p duocb --target ${{ matrix.target }}
 
       - uses: cargo-bins/cargo-binstall@main
 
       - name: Package AppImage
         # cargo-packager downloads linuxdeploy + appimagetool itself. Both run
         # under FUSE by default, which the runner lacks; extract-and-run avoids it.
+        # Run from the desktop crate dir so packager reads its [package.metadata.packager];
+        # the shared workspace target/ stays at the repo root.
         env:
           APPIMAGE_EXTRACT_AND_RUN: 1
         run: |
           cargo binstall -y --force cargo-packager@0.11.8
-          cargo packager --release --formats appimage --target ${{ matrix.target }}
+          (cd crates/duocb && cargo packager --release --formats appimage --target ${{ matrix.target }})
           mv target/${{ matrix.target }}/release/*.AppImage target/release/duocb-${{ matrix.suffix }}.AppImage
 
       - uses: actions/upload-artifact@v4
@@ -135,7 +137,7 @@ jobs:
 
       - name: Build Release
         run: |
-          cargo build --release --target aarch64-apple-darwin
+          cargo build --release -p duocb --target aarch64-apple-darwin
 
       - uses: cargo-bins/cargo-binstall@main
 
@@ -143,10 +145,11 @@ jobs:
         # Unsigned: browser downloads get the quarantine attribute; users clear it
         # with `xattr -dr com.apple.quarantine duocb.app`. The dmg format wraps the
         # .app in a drag-to-Applications disk image (cargo-packager builds the .app
-        # bundle first as a prerequisite).
+        # bundle first as a prerequisite). Run from the desktop crate dir so
+        # packager reads its [package.metadata.packager].
         run: |
           cargo binstall -y --force cargo-packager@0.11.8
-          cargo packager --release --formats dmg --target aarch64-apple-darwin
+          (cd crates/duocb && cargo packager --release --formats dmg --target aarch64-apple-darwin)
           mv target/aarch64-apple-darwin/release/*.dmg target/release/duocb-macos-arm64.dmg
 
       - uses: actions/upload-artifact@v4
@@ -165,16 +168,19 @@ jobs:
 
       - name: Build Release
         run: |
-          cargo build --release --target x86_64-pc-windows-msvc
+          cargo build --release -p duocb --target x86_64-pc-windows-msvc
 
       - uses: cargo-bins/cargo-binstall@main
 
       - name: Package desktop installer (.msi, unsigned)
         # cargo-packager downloads the WiX toolset itself. Unsigned: users see
-        # the SmartScreen "unknown publisher" prompt.
+        # the SmartScreen "unknown publisher" prompt. Run from the desktop crate
+        # dir so packager reads its [package.metadata.packager].
         run: |
           cargo binstall -y --force cargo-packager@0.11.8
+          Set-Location crates/duocb
           cargo packager --release --formats wix --target x86_64-pc-windows-msvc
+          Set-Location ../..
           Move-Item target/x86_64-pc-windows-msvc/release/*.msi target/release/duocb-windows-amd64.msi
 
       - uses: actions/upload-artifact@v4
@@ -182,9 +188,30 @@ jobs:
           name: release-windows-amd64
           path: target/release/duocb-windows-amd64.msi
 
+  build-ios:
+    needs: setup
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build iOS xcframework + header
+        run: ./build-ios.sh release
+
+      - name: Package xcframework + header
+        run: |
+          cd dist/ios
+          zip -r libduocb-ios.xcframework.zip libduocb.xcframework duocb.h
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-ios
+          path: dist/ios/libduocb-ios.xcframework.zip
+
   publish-release:
-    needs: [setup, build-linux, build-macos, build-windows]
-    if: always() && needs.setup.result == 'success' && needs.build-linux.result == 'success' && needs.build-macos.result == 'success' && (needs.build-windows.result == 'success' || needs.build-windows.result == 'skipped')
+    needs: [setup, build-linux, build-macos, build-ios, build-windows]
+    if: always() && needs.setup.result == 'success' && needs.build-linux.result == 'success' && needs.build-macos.result == 'success' && needs.build-ios.result == 'success' && (needs.build-windows.result == 'success' || needs.build-windows.result == 'skipped')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4

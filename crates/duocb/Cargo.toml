@@ -1,0 +1,28 @@
+[package]
+name = "duocb"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+
+[dependencies]
+duocb-core.workspace = true
+
+eframe.workspace = true
+arboard.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+dirs.workspace = true
+jiff.workspace = true
+
+# Installer packaging (`cargo packager`): .dmg on macOS, .msi (WiX) on Windows.
+# Icons live in icons/ (icon.png is also baked into the binary as the window/Dock
+# icon; see src/main.rs).
+[package.metadata.packager]
+product-name = "duocb"
+identifier = "com.andrewtheguy.duocb"
+category = "Utility"
+icons = ["icons/icon.icns", "icons/icon.ico", "icons/icon.png"]
