@@ -230,7 +230,18 @@ fn start_session(kind: SessionKind, events: EventSender, hosting: Option<Hosting
 async fn stop_session(session: &mut Option<Session>) {
     if let Some(s) = session.take() {
         s.cancel.cancel();
-        let _ = s.handle.await;
+        // A graceful teardown (closing the endpoint, notifying the peer)
+        // normally finishes in well under a second. Bound the wait so a
+        // stalled close can never wedge this command loop — every queued UI
+        // command (and the iOS FFI's stop, which blocks on shutdown) sits
+        // behind this await.
+        let mut handle = s.handle;
+        if tokio::time::timeout(Duration::from_secs(3), &mut handle)
+            .await
+            .is_err()
+        {
+            handle.abort();
+        }
     }
 }
 
@@ -623,7 +634,7 @@ async fn run_client_session(
                                 .parse::<EndpointId>()
                                 .context("the peer's presence record holds an invalid node id"),
                             None => Err(anyhow::anyhow!(
-                                "'{peer_display}' is online but not hosting a connection — press Start on that device"
+                                "'{peer_display}' is not hosting a connection — press Start on that device"
                             )),
                         },
                         Ok(None) => Err(anyhow::anyhow!(

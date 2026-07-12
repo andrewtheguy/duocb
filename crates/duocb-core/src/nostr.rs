@@ -59,9 +59,6 @@ pub const PRESENCE_REPUBLISH_INTERVAL: Duration = Duration::from_secs(120);
 pub const PRESENCE_STARTUP_INTERVAL: Duration = Duration::from_secs(10);
 /// Number of startup-cadence cycles before settling on the steady heartbeat.
 pub const PRESENCE_STARTUP_CYCLES: u32 = 6;
-/// A device whose record is at most this old counts as online (≥ 2 missed
-/// heartbeats tolerated).
-pub const PRESENCE_ONLINE_WINDOW_SECS: u64 = 300;
 /// Records older than this are dropped from the peer list entirely.
 pub const PRESENCE_HIDE_AFTER_SECS: u64 = 7 * 24 * 3600;
 
@@ -173,11 +170,12 @@ pub struct PeerInfo {
     /// The peer's permanent suffix (stable selection key).
     pub suffix: String,
     /// `Some` while the peer hosts a connection — the id a joiner dials.
+    /// No freshness gate: relay timing is too unreliable to derive an
+    /// online/offline verdict from, so a join is always allowed and iroh's
+    /// dial is the actual liveness check.
     pub node_id: Option<String>,
     /// `created_at` of the peer's newest record, unix seconds.
     pub last_seen_unix: u64,
-    /// Whether the record is fresher than [`PRESENCE_ONLINE_WINDOW_SECS`].
-    pub online: bool,
 }
 
 impl PeerInfo {
@@ -284,9 +282,10 @@ pub async fn lookup_presence(
 
 /// Assemble the UI-facing peer list from fetched records: drop records older
 /// than [`PRESENCE_HIDE_AFTER_SECS`], keep only the newest record per suffix (a
-/// renamed device's old-identity record loses to its new one), exclude this
-/// device's own suffix, and compute the online flag. Sorted online-first, then
-/// by display name.
+/// renamed device's old-identity record loses to its new one), and exclude this
+/// device's own suffix. Sorted hosting-first (the joinable devices), then by
+/// display name. Deliberately no online/offline verdict — relay freshness is
+/// not reliable enough to gate anything on.
 pub fn build_peer_list(
     records: Vec<(PresenceRecord, u64)>,
     own_suffix: &str,
@@ -319,12 +318,12 @@ pub fn build_peer_list(
             suffix: record.suffix,
             node_id: record.node_id,
             last_seen_unix: created_at,
-            online: now_secs.saturating_sub(created_at) <= PRESENCE_ONLINE_WINDOW_SECS,
         })
         .collect();
     peers.sort_by(|a, b| {
-        b.online
-            .cmp(&a.online)
+        b.node_id
+            .is_some()
+            .cmp(&a.node_id.is_some())
             .then_with(|| a.display().cmp(&b.display()))
     });
     peers
@@ -636,11 +635,9 @@ mod tests {
                 record("new-name", "a7B2c3D4", "r1", Some(&host_id)),
                 now - 10,
             ),
-            // Offline but recent enough to list.
-            (
-                record("laptop", "x9Y8z7W6", "r2", None),
-                now - PRESENCE_ONLINE_WINDOW_SECS - 100,
-            ),
+            // Not hosting and not recent — still listed and joinable-looking,
+            // just sorted after the hosting entry.
+            (record("laptop", "x9Y8z7W6", "r2", None), now - 5_000),
             // Ancient record: hidden entirely.
             (
                 record("dusty", "q5R6s7T8", "r3", None),
@@ -651,16 +648,15 @@ mod tests {
         let peers = build_peer_list(records, "meMEmeM2", now);
         assert_eq!(peers.len(), 2, "peers were: {peers:?}");
 
+        // Hosting sorts first, regardless of record age.
         let renamed = &peers[0];
         assert_eq!(renamed.display(), "new-name_a7B2c3D4");
-        assert!(renamed.online);
         assert_eq!(renamed.node_id.as_deref(), Some(host_id.as_str()));
         assert_eq!(renamed.last_seen_unix, now - 10);
 
-        let offline = &peers[1];
-        assert_eq!(offline.display(), "laptop_x9Y8z7W6");
-        assert!(!offline.online, "stale record must show as offline");
-        assert_eq!(offline.node_id, None);
+        let idle = &peers[1];
+        assert_eq!(idle.display(), "laptop_x9Y8z7W6");
+        assert_eq!(idle.node_id, None);
     }
 
     #[test]
@@ -753,7 +749,6 @@ mod tests {
             .iter()
             .find(|p| p.suffix == host.suffix)
             .expect("published device appears in the peer list");
-        assert!(listed.online);
         assert_eq!(listed.node_id.as_deref(), Some(node_id.to_string().as_str()));
 
         let (looked_up, _) = lookup_presence(&token, &host.display(), &relays)

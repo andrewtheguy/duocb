@@ -96,6 +96,8 @@ pub struct DuocbApp {
     /// shows up as sent).
     pub(crate) pending_outbox: Option<String>,
     pub(crate) sent_flash: Option<Instant>,
+    /// When the secret was last copied, for the "✔ Copied" button feedback.
+    pub(crate) copied_flash: Option<Instant>,
 }
 
 impl DuocbApp {
@@ -174,6 +176,7 @@ impl DuocbApp {
             outbox: None,
             pending_outbox: None,
             sent_flash: None,
+            copied_flash: None,
         };
         // A fully configured device starts broadcasting presence right away,
         // plus one fetch to warm the device picker; after this the list is
@@ -319,11 +322,30 @@ impl DuocbApp {
     }
 
     /// Copy arbitrary text (an inbox item, the node id, the token) to the
-    /// system clipboard, surfacing failures in the error banner.
-    pub(crate) fn copy_to_clipboard(&mut self, text: &str) {
-        if let Err(e) = self.clipboard.write_text(text) {
-            self.error = Some(format!("Could not write the clipboard: {e:#}"));
+    /// system clipboard, surfacing failures in the error banner. Returns
+    /// whether the copy succeeded, so callers can show feedback.
+    pub(crate) fn copy_to_clipboard(&mut self, text: &str) -> bool {
+        match self.clipboard.write_text(text) {
+            Ok(()) => true,
+            Err(e) => {
+                self.error = Some(format!("Could not write the clipboard: {e:#}"));
+                false
+            }
         }
+    }
+
+    /// Copy the secret with visible feedback: the Copy buttons render
+    /// "✔ Copied" while the flash is fresh.
+    pub(crate) fn copy_secret_to_clipboard(&mut self, secret: &str) {
+        let secret = secret.to_string();
+        if self.copy_to_clipboard(&secret) {
+            self.copied_flash = Some(Instant::now());
+        }
+    }
+
+    /// Whether the "✔ Copied" feedback should currently show.
+    pub(crate) fn copied_flash_active(&self) -> bool {
+        self.copied_flash.is_some_and(|t| t.elapsed() < SENT_FLASH)
     }
 
     /// Ask the runtime for a fresh connection-path snapshot; the reply arrives
@@ -441,13 +463,16 @@ impl DuocbApp {
         self.configure_step = ConfigureStep::SetupChoice;
     }
 
-    /// The selected peer's display identity, only if it is currently hosting
-    /// (the only state a join can dial).
-    pub(crate) fn selected_hosting_peer_display(&self) -> Option<String> {
+    /// The selected peer's display identity. Any listed device may be joined —
+    /// the hosting badge is informational (and, like everything nostr-derived,
+    /// possibly stale): the dial re-resolves the record on every attempt and
+    /// retries with backoff, so a join placed before the other device presses
+    /// Start succeeds once it does.
+    pub(crate) fn selected_peer_display(&self) -> Option<String> {
         let suffix = self.selected_peer.as_deref()?;
         self.peers
             .iter()
-            .find(|p| p.suffix == suffix && p.node_id.is_some())
+            .find(|p| p.suffix == suffix)
             .map(|p| p.display())
     }
 
@@ -548,13 +573,13 @@ impl DuocbApp {
     }
 
     /// Build the dial spec from the current state, if it validates. Configure
-    /// mode dials exactly the peer selected in the hub (which must be hosting).
+    /// mode dials exactly the peer selected in the device picker.
     pub(crate) fn client_dial_spec(&self) -> Option<duocb_core::net::DialSpec> {
         use duocb_core::net::DialSpec;
         match self.mode {
             PairMode::NostrToken => Some(DialSpec::NostrToken {
                 identity: self.token_identity()?,
-                peer_display: self.selected_hosting_peer_display()?,
+                peer_display: self.selected_peer_display()?,
             }),
             PairMode::NostrPin => {
                 duocb_core::pin::normalize_pin(&self.in_pin).map(|canonical_pin| DialSpec::Pin {
@@ -712,7 +737,7 @@ impl DuocbApp {
                 if let Some(secret) = self.secret.clone()
                     && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::T))
                 {
-                    self.copy_to_clipboard(&secret);
+                    self.copy_secret_to_clipboard(&secret);
                 }
             }
             ConfigureStep::Join => {
@@ -878,7 +903,11 @@ impl eframe::App for DuocbApp {
 
         // Keep the PIN countdown, "sent" flash, and peek auto-hide ticking
         // without user input.
-        if self.pin_display.is_some() || self.sent_flash_active() || any_peeked {
+        if self.pin_display.is_some()
+            || self.sent_flash_active()
+            || self.copied_flash_active()
+            || any_peeked
+        {
             ctx.request_repaint_after(Duration::from_millis(500));
         }
     }

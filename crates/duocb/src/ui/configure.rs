@@ -80,8 +80,13 @@ fn setup_generate(app: &mut DuocbApp, ui: &mut Ui) {
         });
         ui.add_space(8.0);
         ui.horizontal(|ui| {
-            if ui.button("Copy secret").clicked() {
-                app.copy_to_clipboard(&token);
+            let copy_label = if app.copied_flash_active() {
+                "✔ Copied"
+            } else {
+                "Copy secret"
+            };
+            if ui.button(copy_label).clicked() {
+                app.copy_secret_to_clipboard(&token);
             }
             if ui.button("✔ I saved it — continue").clicked() {
                 app.wizard_token = None;
@@ -218,7 +223,7 @@ fn join_picker(app: &mut DuocbApp, ui: &mut Ui) {
     peer_list_group(app, ui);
     ui.add_space(12.0);
 
-    let join_ready = app.selected_hosting_peer_display().is_some();
+    let join_ready = app.selected_peer_display().is_some();
     ui.vertical_centered_justified(|ui| {
         if ui
             .add_enabled(
@@ -232,9 +237,13 @@ fn join_picker(app: &mut DuocbApp, ui: &mut Ui) {
         }
         if !join_ready {
             ui.label(
+                RichText::new("Select the device to join.").weak().small(),
+            );
+        } else {
+            ui.label(
                 RichText::new(
-                    "Select a device that is hosting a connection — press Start \
-                     on that device first.",
+                    "If it isn't hosting yet, press Start there — the join \
+                     keeps retrying until it is.",
                 )
                 .weak()
                 .small(),
@@ -261,8 +270,13 @@ fn identity_group(app: &mut DuocbApp, ui: &mut Ui) {
             ui.horizontal(|ui| {
                 ui.label("Secret:");
                 ui.monospace(masked_secret_hint(&secret));
-                if ui.small_button("Copy secret").clicked() {
-                    app.copy_to_clipboard(&secret);
+                let copy_label = if app.copied_flash_active() {
+                    "✔ Copied"
+                } else {
+                    "Copy secret"
+                };
+                if ui.small_button(copy_label).clicked() {
+                    app.copy_secret_to_clipboard(&secret);
                 }
                 if ui.small_button("Clear secret…").clicked() {
                     app.confirm_clear_secret = true;
@@ -319,17 +333,14 @@ fn peer_list_group(app: &mut DuocbApp, ui: &mut Ui) {
         let peers = app.peers.clone();
         for peer in &peers {
             let selected = app.selected_peer.as_deref() == Some(peer.suffix.as_str());
-            let dot = if peer.online { "●" } else { "○" };
-            let mut row = format!("{dot} {}", peer.display());
+            let mut row = peer.display();
             if peer.node_id.is_some() {
                 row.push_str("  — hosting");
             }
-            if peer.online {
-                row.push_str("  · online");
-            } else {
-                let age = now_unix().saturating_sub(peer.last_seen_unix);
-                row.push_str(&format!("  · last seen {}", ago(age)));
-            }
+            // The record's age, not an online/offline verdict — relay timing
+            // is too unreliable for one, and joining never requires it.
+            let age = now_unix().saturating_sub(peer.last_seen_unix);
+            row.push_str(&format!("  · seen {}", ago(age)));
             if ui
                 .selectable_label(selected, RichText::new(row).monospace())
                 .clicked()
@@ -341,12 +352,6 @@ fn peer_list_group(app: &mut DuocbApp, ui: &mut Ui) {
                 };
             }
         }
-        ui.add_space(2.0);
-        ui.label(
-            RichText::new("● fresh (seen in the last few minutes) · ○ offline")
-                .weak()
-                .small(),
-        );
     });
 }
 
