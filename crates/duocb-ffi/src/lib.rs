@@ -503,7 +503,6 @@ fn event_json(event: &NetEvent) -> Option<String> {
                         "display": p.display(),
                         "name": p.name,
                         "suffix": p.suffix,
-                        "hosting": p.node_id.is_some(),
                         "last_seen_unix": p.last_seen_unix,
                     })
                 })
@@ -603,7 +602,6 @@ mod tests {
             peers: vec![duocb_core::nostr::PeerInfo {
                 name: "mac".into(),
                 suffix: "a7B2c3D4".into(),
-                node_id: Some("abc".into()),
                 last_seen_unix: 42,
             }],
         })
@@ -611,7 +609,6 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["type"], "peer_list");
         assert_eq!(v["peers"][0]["display"], "mac_a7B2c3D4");
-        assert_eq!(v["peers"][0]["hosting"], true);
         assert_eq!(v["peers"][0]["last_seen_unix"], 42);
 
         let json = event_json(&NetEvent::PresenceConflict {

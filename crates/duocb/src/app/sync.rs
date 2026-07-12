@@ -103,9 +103,6 @@ impl App {
             .iter()
             .map(|p| {
                 let mut line = p.display();
-                if p.node_id.is_some() {
-                    line.push_str("  — hosting");
-                }
                 // The record's age, not an online/offline verdict — relay
                 // timing is too unreliable for one, and joining never
                 // requires it.

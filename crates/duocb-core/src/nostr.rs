@@ -164,17 +164,17 @@ impl PresenceRecord {
 }
 
 /// A peer as shown in the device list, decoded from its newest presence record.
+/// Deliberately carries no hosting/liveness signal: relay timing is too
+/// unreliable to derive an online/offline verdict from, so every listed device
+/// is joinable and the join re-resolves the record and lets iroh's dial be the
+/// actual liveness check (the dial target lives in the record, not here — see
+/// [`crate::net`]'s client session).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerInfo {
     /// The peer's short name.
     pub name: String,
     /// The peer's permanent suffix (stable selection key).
     pub suffix: String,
-    /// `Some` while the peer hosts a connection — the id a joiner dials.
-    /// No freshness gate: relay timing is too unreliable to derive an
-    /// online/offline verdict from, so a join is always allowed and iroh's
-    /// dial is the actual liveness check.
-    pub node_id: Option<String>,
     /// `created_at` of the peer's newest record, unix seconds.
     pub last_seen_unix: u64,
 }
@@ -284,9 +284,9 @@ pub async fn lookup_presence(
 /// Assemble the UI-facing peer list from fetched records: drop records older
 /// than [`PRESENCE_HIDE_AFTER_SECS`], keep only the newest record per suffix (a
 /// renamed device's old-identity record loses to its new one), and exclude this
-/// device's own suffix. Sorted hosting-first (the joinable devices), then by
-/// display name. Deliberately no online/offline verdict — relay freshness is
-/// not reliable enough to gate anything on.
+/// device's own suffix. Sorted by display name. Deliberately no online/offline
+/// or hosting verdict — relay freshness is not reliable enough to gate anything
+/// on, so every listed device is joinable.
 pub fn build_peer_list(
     records: Vec<(PresenceRecord, u64)>,
     own_suffix: &str,
@@ -317,16 +317,10 @@ pub fn build_peer_list(
         .map(|(record, created_at)| PeerInfo {
             name: record.name,
             suffix: record.suffix,
-            node_id: record.node_id,
             last_seen_unix: created_at,
         })
         .collect();
-    peers.sort_by(|a, b| {
-        b.node_id
-            .is_some()
-            .cmp(&a.node_id.is_some())
-            .then_with(|| a.display().cmp(&b.display()))
-    });
+    peers.sort_by_key(|p| p.display());
     peers
 }
 
@@ -573,8 +567,6 @@ mod tests {
                 record("new-name", "a7B2c3D4", "r1", Some(&host_id)),
                 now - 10,
             ),
-            // Not hosting and not recent — still listed and joinable-looking,
-            // just sorted after the hosting entry.
             (record("laptop", "x9Y8z7W6", "r2", None), now - 5_000),
             // Ancient record: hidden entirely.
             (
@@ -586,15 +578,15 @@ mod tests {
         let peers = build_peer_list(records, "meMEmeM2", now);
         assert_eq!(peers.len(), 2, "peers were: {peers:?}");
 
-        // Hosting sorts first, regardless of record age.
-        let renamed = &peers[0];
-        assert_eq!(renamed.display(), "new-name_a7B2c3D4");
-        assert_eq!(renamed.node_id.as_deref(), Some(host_id.as_str()));
-        assert_eq!(renamed.last_seen_unix, now - 10);
+        // Sorted by display name; the record's node id is not surfaced here.
+        let laptop = &peers[0];
+        assert_eq!(laptop.display(), "laptop_x9Y8z7W6");
+        assert_eq!(laptop.last_seen_unix, now - 5_000);
 
-        let idle = &peers[1];
-        assert_eq!(idle.display(), "laptop_x9Y8z7W6");
-        assert_eq!(idle.node_id, None);
+        // The renamed device keeps its newer record's name and timestamp.
+        let renamed = &peers[1];
+        assert_eq!(renamed.display(), "new-name_a7B2c3D4");
+        assert_eq!(renamed.last_seen_unix, now - 10);
     }
 
     #[test]
@@ -640,12 +632,13 @@ mod tests {
             .unwrap()
             .as_secs();
         let peers = build_peer_list(fetched, "notMYsfx", now);
-        let listed = peers
+        peers
             .iter()
             .find(|p| p.suffix == host.suffix)
             .expect("published device appears in the peer list");
-        assert_eq!(listed.node_id.as_deref(), Some(node_id.to_string().as_str()));
 
+        // The dial target lives in the record, not the peer list: a fresh
+        // lookup is what the joiner resolves the node id from.
         let (looked_up, _) = lookup_presence(&token, &host.display(), &relays)
             .await
             .expect("lookup presence")

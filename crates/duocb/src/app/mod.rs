@@ -558,11 +558,10 @@ impl App {
         self.configure_step = ConfigureStep::SetupChoice;
     }
 
-    /// The selected peer's display identity. Any listed device may be joined —
-    /// the hosting badge is informational (and, like everything nostr-derived,
-    /// possibly stale): the dial re-resolves the record on every attempt and
-    /// retries with backoff, so a join placed before the other device presses
-    /// Start succeeds once it does.
+    /// The selected peer's display identity. Any listed device may be joined:
+    /// the dial re-resolves the record on every attempt and retries with
+    /// backoff, so a join placed before the other device presses Start succeeds
+    /// once it does.
     pub(crate) fn selected_peer_display(&self) -> Option<String> {
         let suffix = self.selected_peer.as_deref()?;
         self.peers
@@ -832,11 +831,10 @@ pub(crate) mod tests {
         duocb_core::identity::generate_suffix()
     }
 
-    pub(crate) fn peer(name: &str, suffix: &str, hosting: bool) -> PeerInfo {
+    pub(crate) fn peer(name: &str, suffix: &str) -> PeerInfo {
         PeerInfo {
             name: name.to_string(),
             suffix: suffix.to_string(),
-            node_id: hosting.then(|| "node".to_string()),
             last_seen_unix: now_unix(),
         }
     }
@@ -900,13 +898,13 @@ pub(crate) mod tests {
         let mut app = test_app();
         app.selected_peer = Some("gone".into());
         app.apply_event(NetEvent::PeerList {
-            peers: vec![peer("mac", "here", false)],
+            peers: vec![peer("mac", "here")],
         });
         assert!(app.selected_peer.is_none());
 
         app.selected_peer = Some("here".into());
         app.apply_event(NetEvent::PeerList {
-            peers: vec![peer("mac", "here", true)],
+            peers: vec![peer("mac", "here")],
         });
         assert_eq!(app.selected_peer.as_deref(), Some("here"));
     }
@@ -963,7 +961,7 @@ pub(crate) mod tests {
     #[test]
     fn move_peer_selection_wraps() {
         let mut app = test_app();
-        app.peers = vec![peer("a", "s1", false), peer("b", "s2", false)];
+        app.peers = vec![peer("a", "s1"), peer("b", "s2")];
 
         app.move_peer_selection(1);
         assert_eq!(app.selected_peer.as_deref(), Some("s1"));
