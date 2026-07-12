@@ -30,6 +30,30 @@ fn short_id(id: &str) -> String {
     }
 }
 
+/// Feedback shown beneath a masked token entry field. The token itself is never
+/// rendered: once the input is a complete, checksum-valid token its fingerprint
+/// appears (so both devices can confirm they share it); a non-empty but invalid
+/// input shows a warning instead. Nothing is shown for an empty field.
+fn token_entry_feedback(ui: &mut Ui, token: &str) {
+    let token = token.trim();
+    if token.is_empty() {
+        return;
+    }
+    if crate::auth::validate_token(token).is_ok() {
+        ui.horizontal(|ui| {
+            ui.label("Token fingerprint:");
+            ui.monospace(crate::auth::token_fingerprint(token));
+        });
+        ui.label(
+            RichText::new("Confirm this matches on the other device.")
+                .weak()
+                .small(),
+        );
+    } else {
+        ui.colored_label(ui.visuals().warn_fg_color, "That is not a valid token");
+    }
+}
+
 /// Keep the standing-pairing identity visible after the editable form is gone.
 /// Mirrors duopipe's persistent config-mode header without ever showing the token.
 fn show_token_pairing_summary(app: &DuocbApp, ui: &mut Ui) {
@@ -205,6 +229,7 @@ pub fn show_server(app: &mut DuocbApp, ui: &mut Ui) {
                 ui.add(
                     TextEdit::singleline(&mut app.in_token)
                         .font(egui::TextStyle::Monospace)
+                        .password(true)
                         .desired_width(360.0)
                         .hint_text("d…"),
                 );
@@ -212,6 +237,7 @@ pub fn show_server(app: &mut DuocbApp, ui: &mut Ui) {
                     app.in_token = crate::auth::generate_token();
                 }
             });
+            token_entry_feedback(ui, &app.in_token);
             ui.label("This device's unique name:");
             ui.add(TextEdit::singleline(&mut app.in_my_name).hint_text("e.g. desktop"));
             ui.label(
@@ -219,11 +245,6 @@ pub fn show_server(app: &mut DuocbApp, ui: &mut Ui) {
                     .weak()
                     .small(),
             );
-            if !app.in_token.trim().is_empty()
-                && crate::auth::validate_token(app.in_token.trim()).is_err()
-            {
-                ui.colored_label(ui.visuals().warn_fg_color, "That is not a valid token");
-            }
             ui.add_space(8.0);
             if ui
                 .add_enabled(
@@ -282,8 +303,18 @@ pub fn show_server(app: &mut DuocbApp, ui: &mut Ui) {
             if let Some(node_id) = app.node_id.clone() {
                 copyable_value(app, ui, "Node id:", "Copy (Ctrl+I)", &node_id);
             }
+            // The one-time token is never shown in plain text. Until a peer pairs
+            // (which consumes it and clears `manual_token`) show its fingerprint
+            // with a copy CTA so the initiator can hand the secret over the
+            // clipboard without it ever appearing on screen.
             if let Some(token) = app.manual_token.clone() {
-                copyable_value(app, ui, "One-time token:", "Copy (Ctrl+T)", &token);
+                ui.horizontal(|ui| {
+                    ui.label("One-time token:");
+                    ui.monospace(crate::auth::token_fingerprint(&token));
+                    if ui.small_button("Copy token (Ctrl+T)").clicked() {
+                        app.copy_to_clipboard(&token);
+                    }
+                });
             }
             ui.label("Enter both on the other device. No internet needed on the same LAN.");
         }
@@ -317,9 +348,11 @@ pub fn show_client(app: &mut DuocbApp, ui: &mut Ui) {
                 ui.add(
                     TextEdit::singleline(&mut app.in_token)
                         .font(egui::TextStyle::Monospace)
+                        .password(true)
                         .desired_width(f32::INFINITY)
                         .hint_text("d…"),
                 );
+                token_entry_feedback(ui, &app.in_token);
                 ui.label("This device's unique name:");
                 ui.add(TextEdit::singleline(&mut app.in_my_name).hint_text("e.g. laptop"));
                 ui.label(
@@ -327,11 +360,6 @@ pub fn show_client(app: &mut DuocbApp, ui: &mut Ui) {
                         .weak()
                         .small(),
                 );
-                if !app.in_token.trim().is_empty()
-                    && crate::auth::validate_token(app.in_token.trim()).is_err()
-                {
-                    ui.colored_label(ui.visuals().warn_fg_color, "That is not a valid token");
-                }
             }
             PairMode::NostrPin => {
                 ui.label("PIN shown on the other device:");
@@ -359,14 +387,11 @@ pub fn show_client(app: &mut DuocbApp, ui: &mut Ui) {
                 ui.add(
                     TextEdit::singleline(&mut app.in_manual_token)
                         .font(egui::TextStyle::Monospace)
+                        .password(true)
                         .desired_width(f32::INFINITY)
                         .hint_text("d…"),
                 );
-                if !app.in_manual_token.trim().is_empty()
-                    && crate::auth::validate_token(app.in_manual_token.trim()).is_err()
-                {
-                    ui.colored_label(ui.visuals().warn_fg_color, "That is not a valid token");
-                }
+                token_entry_feedback(ui, &app.in_manual_token);
             }
         }
 

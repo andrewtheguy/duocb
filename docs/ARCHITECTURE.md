@@ -25,7 +25,7 @@ The transport/signaling/auth stack is a port of [duopipe](../../duopipe)'s peer 
 src/
   main.rs          eframe bootstrap (window, run_native)
   protocol.rs      length-prefixed JSON framing; auth/PIN control messages; ClipMsg
-  auth.rs          47-char token: generate / validate (CRC16) / fingerprint (SHA-256/8-hex)
+  auth.rs          47-char token: generate / validate (CRC16) / fingerprint (SHA-256/16-hex)
   pin.rs           Crockford-base32 PIN, check digit, 60s buckets, Argon2id KDFs
   pin_auth.rs      in-band mutual PIN challenge-response (NIP-44 sealed proofs)
   nostr.rs         kind-30078 token/name discovery; kind-9421 PIN rendezvous
@@ -128,7 +128,7 @@ No signaling. The server displays its node id + a generated one-time token; the 
 
 Knowing a node id never suffices; every connection authenticates on the session stream before any clipboard frame flows.
 
-**Token method** (token + manual modes): the client sends `AuthRequest::Token{auth_token}`; the server checks membership in its accepted set and replies `AuthResponse{accepted, reason}`. Tokens are 47 chars: `d` + base64url(32 random bytes + CRC16-CCITT-FALSE), with an 8-hex-digit SHA-256 fingerprint shown in the UI so both devices can confirm they hold the same token without re-revealing it.
+**Token method** (token + manual modes): the client sends `AuthRequest::Token{auth_token}`; the server checks membership in its accepted set and replies `AuthResponse{accepted, reason}`. Tokens are 47 chars: `d` + base64url(32 random bytes + CRC16-CCITT-FALSE), with a 16-hex-digit SHA-256 fingerprint (grouped `xxxx-xxxx-xxxx-xxxx`) shown in the UI so both devices can confirm they hold the same token without ever revealing it. The token is never displayed in plain text: entry fields are masked, and the fingerprint appears as soon as the input passes length and checksum validation.
 
 **PIN method**: a 4-message mutual challenge-response on the session stream —
 
@@ -151,7 +151,7 @@ S→C: PinConfirm       { accepted, proof_s }  proof_s = seal(k, "listener" | no
 | record `d` tag (token mode) | SHA-256 | `"duocb:peer-id:v1"` ‖ token ‖ name | token-salted name hash |
 | PIN rendezvous key | Argon2id 64 MiB/t3 | PIN, salt `"duocb:pin-rendezvous:v1"` ‖ bucket | per-bucket nostr keypair |
 | PIN auth key | Argon2id 64 MiB/t3 | PIN, salt `"duocb:pin-auth:v1"` | bucket-independent, distinct domain |
-| token fingerprint | SHA-256 (first 4 bytes) | token string | 8 lowercase hex digits, display only |
+| token fingerprint | SHA-256 (first 8 bytes) | token string | 16 lowercase hex digits, grouped `xxxx-xxxx-xxxx-xxxx`, display only |
 
 Argon2id makes the ~35-bit PIN expensive to brute-force offline from a captured relay record, and the 60 s rotation + 180 s record TTL bound the window; even a cracked record yields only a node id, never a credential.
 

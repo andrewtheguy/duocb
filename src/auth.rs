@@ -74,23 +74,30 @@ pub fn generate_token() -> String {
 
 /// Short, stable fingerprint of a token for cross-device verification.
 ///
-/// The token itself is shown only briefly (and never on the dialing side), so two
-/// devices cannot easily confirm they share the same token. This fingerprint — the
-/// first 4 bytes of the SHA-256 of the token string, as 8 lowercase hex digits — is
-/// displayed persistently in the UI: if it matches on both devices the tokens match,
-/// without ever re-revealing the secret.
+/// The token is never revealed in plain text, so two devices cannot compare the
+/// secret directly. This fingerprint — the first 8 bytes of the SHA-256 of the
+/// token string, as 16 lowercase hex digits grouped into four dash-separated
+/// quads (`xxxx-xxxx-xxxx-xxxx`) — is displayed instead: if it matches on both
+/// devices the tokens match, without ever exposing the secret. It stays local
+/// (never sent over the wire), so 8 bytes is ample against accidental collision.
 pub fn token_fingerprint(token: &str) -> String {
     use std::fmt::Write as _;
     let digest = Sha256::digest(token.as_bytes());
-    let mut hex = String::with_capacity(FINGERPRINT_LENGTH);
-    for b in &digest[..FINGERPRINT_LENGTH / 2] {
-        let _ = write!(hex, "{b:02x}");
+    // 16 hex digits + 3 group separators.
+    let mut out = String::with_capacity(FINGERPRINT_HEX_DIGITS + FINGERPRINT_HEX_DIGITS / 4 - 1);
+    for (i, b) in digest[..FINGERPRINT_HEX_DIGITS / 2].iter().enumerate() {
+        // A separator before every second byte (every 4 hex digits), except first.
+        if i > 0 && i % 2 == 0 {
+            out.push('-');
+        }
+        let _ = write!(out, "{b:02x}");
     }
-    hex
+    out
 }
 
-/// Number of hex digits in a token fingerprint (see [`token_fingerprint`]).
-pub const FINGERPRINT_LENGTH: usize = 8;
+/// Number of hex digits in a token fingerprint, before group separators
+/// (see [`token_fingerprint`]).
+pub const FINGERPRINT_HEX_DIGITS: usize = 16;
 
 /// Validate token format.
 ///
@@ -176,20 +183,27 @@ mod tests {
     }
 
     #[test]
-    fn test_token_fingerprint_stable_and_8_lower_hex() {
+    fn test_token_fingerprint_grouped_16_lower_hex() {
         let token = make_test_token([0xAB; RANDOM_BYTES_LEN]);
         let fp = token_fingerprint(&token);
-        assert_eq!(fp.len(), FINGERPRINT_LENGTH);
-        assert!(
-            fp.chars()
-                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
-        );
+        // 16 hex digits grouped into four dash-separated quads: xxxx-xxxx-xxxx-xxxx.
+        assert_eq!(fp.len(), FINGERPRINT_HEX_DIGITS + 3);
+        let groups: Vec<&str> = fp.split('-').collect();
+        assert_eq!(groups.len(), 4);
+        assert!(groups.iter().all(|g| {
+            g.len() == 4
+                && g.chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        }));
         // Deterministic: same token always yields the same fingerprint.
         assert_eq!(fp, token_fingerprint(&token));
-        // It is the first 4 bytes of the SHA-256 of the token string, as lowercase hex.
+        // It is the first 8 bytes of the SHA-256 of the token string, as lowercase hex.
         let digest = Sha256::digest(token.as_bytes());
-        let expected: String = digest[..4].iter().map(|b| format!("{b:02x}")).collect();
-        assert_eq!(fp, expected);
+        let expected: String = digest[..FINGERPRINT_HEX_DIGITS / 2]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(fp.replace('-', ""), expected);
     }
 
     #[test]
