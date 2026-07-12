@@ -13,7 +13,7 @@
 
 use eframe::egui::{self, RichText, TextEdit, Ui};
 
-use crate::nostr::DEFAULT_NOSTR_RELAYS;
+use duocb_core::nostr::DEFAULT_NOSTR_RELAYS;
 use crate::ui::app::{DuocbApp, session_panel_if_connected};
 use crate::ui::{PairMode, Screen};
 
@@ -39,10 +39,10 @@ fn token_entry_feedback(ui: &mut Ui, token: &str) {
     if token.is_empty() {
         return;
     }
-    if crate::auth::validate_token(token).is_ok() {
+    if duocb_core::auth::validate_token(token).is_ok() {
         ui.horizontal(|ui| {
             ui.label("Token fingerprint:");
-            ui.monospace(crate::auth::token_fingerprint(token));
+            ui.monospace(duocb_core::auth::token_fingerprint(token));
         });
         ui.label(
             RichText::new("Confirm this matches on the other device.")
@@ -55,13 +55,14 @@ fn token_entry_feedback(ui: &mut Ui, token: &str) {
 }
 
 /// Keep the standing-pairing identity visible after the editable form is gone.
-/// Mirrors duopipe's persistent config-mode header without ever showing the token.
-fn show_token_pairing_summary(app: &mut DuocbApp, ui: &mut Ui, token_copyable: bool) {
+/// Mirrors duopipe's persistent config-mode header without showing or exposing
+/// the token while a session is running.
+fn show_token_pairing_summary(app: &DuocbApp, ui: &mut Ui) {
     let token = app.in_token.trim().to_string();
     let fingerprint = app.token_fingerprint.clone().or_else(|| {
-        crate::auth::validate_token(&token)
+        duocb_core::auth::validate_token(&token)
             .is_ok()
-            .then(|| crate::auth::token_fingerprint(&token))
+            .then(|| duocb_core::auth::token_fingerprint(&token))
     });
 
     ui.group(|ui| {
@@ -84,9 +85,6 @@ fn show_token_pairing_summary(app: &mut DuocbApp, ui: &mut Ui, token_copyable: b
                 ui.monospace(short_id(peer));
             });
         }
-        if token_copyable && crate::auth::validate_token(&token).is_ok() {
-            token_copy_action(app, ui, &token);
-        }
         if let Some(fingerprint) = fingerprint {
             ui.horizontal(|ui| {
                 ui.label("Token fingerprint:");
@@ -99,7 +97,7 @@ fn show_token_pairing_summary(app: &mut DuocbApp, ui: &mut Ui, token_copyable: b
                 ui.label("Saved settings:");
                 ui.monospace(app.config_lock.path().display().to_string());
             });
-        } else if app.status == crate::net::ConnStatus::Connected {
+        } else if app.status == duocb_core::net::ConnStatus::Connected {
             ui.label(
                 RichText::new("Settings could not be saved; see the error above.")
                     .weak()
@@ -241,12 +239,12 @@ pub fn show_server(app: &mut DuocbApp, ui: &mut Ui) {
         if app.mode == PairMode::NostrToken {
             ui.label("Shared auth token (same on both devices):");
             let token = app.in_token.trim().to_string();
-            let token_valid = crate::auth::validate_token(&token).is_ok();
+            let token_valid = duocb_core::auth::validate_token(&token).is_ok();
             if token_valid {
                 token_copy_action(app, ui, &token);
                 ui.horizontal(|ui| {
                     ui.label("Token fingerprint:");
-                    ui.monospace(crate::auth::token_fingerprint(&token));
+                    ui.monospace(duocb_core::auth::token_fingerprint(&token));
                 });
             } else if !token.is_empty() {
                 ui.colored_label(
@@ -260,7 +258,7 @@ pub fn show_server(app: &mut DuocbApp, ui: &mut Ui) {
                 "Generate token"
             };
             if ui.button(generate_label).clicked() {
-                app.in_token = crate::auth::generate_token();
+                app.in_token = duocb_core::auth::generate_token();
             }
             ui.label("This device's unique name:");
             ui.add(TextEdit::singleline(&mut app.in_my_name).hint_text("e.g. desktop"));
@@ -286,7 +284,7 @@ pub fn show_server(app: &mut DuocbApp, ui: &mut Ui) {
     // Server running: mode-specific credentials display.
     match app.mode {
         PairMode::NostrToken => {
-            show_token_pairing_summary(app, ui, true);
+            show_token_pairing_summary(app, ui);
             ui.label(
                 RichText::new("The other device must use a different name.")
                     .weak()
@@ -336,7 +334,7 @@ pub fn show_server(app: &mut DuocbApp, ui: &mut Ui) {
                 token_copy_action(app, ui, &token);
                 ui.horizontal(|ui| {
                     ui.label("Token fingerprint:");
-                    ui.monospace(crate::auth::token_fingerprint(&token));
+                    ui.monospace(duocb_core::auth::token_fingerprint(&token));
                 });
             }
             ui.label("Enter both on the other device. No internet needed on the same LAN.");
@@ -345,7 +343,7 @@ pub fn show_server(app: &mut DuocbApp, ui: &mut Ui) {
 
     ui.add_space(8.0);
     if ui.button("⏹ Stop").clicked() {
-        app.net.send(crate::net::UiCommand::StopServer);
+        app.net.send(duocb_core::net::UiCommand::StopServer);
         // Quick modes have no pre-start form to return to, so stopping goes all
         // the way home rather than showing a bare restart button.
         if app.mode != PairMode::NostrToken {
@@ -399,7 +397,7 @@ pub fn show_client(app: &mut DuocbApp, ui: &mut Ui) {
                         .font(egui::TextStyle::Monospace)
                         .hint_text("XXXX-XXXX"),
                 );
-                if !app.in_pin.trim().is_empty() && crate::pin::normalize_pin(&app.in_pin).is_none()
+                if !app.in_pin.trim().is_empty() && duocb_core::pin::normalize_pin(&app.in_pin).is_none()
                 {
                     ui.colored_label(
                         ui.visuals().warn_fg_color,
@@ -448,7 +446,7 @@ pub fn show_client(app: &mut DuocbApp, ui: &mut Ui) {
     }
 
     if app.mode == PairMode::NostrToken {
-        show_token_pairing_summary(app, ui, false);
+        show_token_pairing_summary(app, ui);
     } else if let Some(peer) = app.peer_node_id.clone() {
         ui.horizontal(|ui| {
             ui.label("Paired with:");
@@ -456,7 +454,7 @@ pub fn show_client(app: &mut DuocbApp, ui: &mut Ui) {
         });
     }
     if ui.button("✕ Disconnect").clicked() {
-        app.net.send(crate::net::UiCommand::Disconnect);
+        app.net.send(duocb_core::net::UiCommand::Disconnect);
     }
 
     session_panel_if_connected(app, ui);

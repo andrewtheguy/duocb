@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 
 use crate::clipboard::SystemClipboard;
-use crate::net::endpoint::ConnPath;
-use crate::net::{ConnStatus, NetEvent, NetHandle, UiCommand, spawn_net_runtime};
+use duocb_core::net::endpoint::ConnPath;
+use duocb_core::net::{ConnStatus, NetEvent, NetHandle, UiCommand, spawn_net_runtime};
 use crate::ui::{ClipItem, PairMode, Screen, screens, session};
 
 /// How long the "sent ✓" flash stays visible.
@@ -71,7 +71,10 @@ pub struct DuocbApp {
 
 impl DuocbApp {
     pub fn new(cc: &eframe::CreationContext<'_>, mut config_lock: crate::config::ConfigLock) -> Self {
-        let net = spawn_net_runtime(cc.egui_ctx.clone());
+        let net = spawn_net_runtime(Some(std::sync::Arc::new({
+            let ctx = cc.egui_ctx.clone();
+            move || ctx.request_repaint()
+        })));
         let config = config_lock.load();
         Self {
             config_lock,
@@ -185,7 +188,12 @@ impl DuocbApp {
             NetEvent::ConnPath(paths) => {
                 self.conn_path = Some(paths);
             }
-            NetEvent::ItemReceived { text, .. } => {
+            NetEvent::ItemReceived { text, pulled } => {
+                // A resume re-delivery may duplicate content this inbox already
+                // holds (it was received before the connection dropped) — skip it.
+                if pulled && self.inbox.iter().any(|item| item.text == text) {
+                    return;
+                }
                 self.inbox.insert(0, ClipItem::new(text, jiff::Zoned::now()));
                 // Bounded retention (see MAX_INBOX_ITEMS): drop the oldest.
                 self.inbox.truncate(MAX_INBOX_ITEMS);
@@ -295,13 +303,13 @@ impl DuocbApp {
     }
 
     /// Build the server mode from the current inputs, if they validate.
-    pub(crate) fn server_mode_spec(&self) -> Option<crate::net::ServerMode> {
-        use crate::net::ServerMode;
+    pub(crate) fn server_mode_spec(&self) -> Option<duocb_core::net::ServerMode> {
+        use duocb_core::net::ServerMode;
         match self.mode {
             PairMode::NostrToken => {
                 let token = self.in_token.trim();
                 let name = self.in_my_name.trim();
-                (crate::auth::validate_token(token).is_ok() && !name.is_empty()).then(|| {
+                (duocb_core::auth::validate_token(token).is_ok() && !name.is_empty()).then(|| {
                     ServerMode::NostrToken {
                         token: token.to_string(),
                         name: name.to_string(),
@@ -317,13 +325,13 @@ impl DuocbApp {
     }
 
     /// Build the dial spec from the current inputs, if they validate.
-    pub(crate) fn client_dial_spec(&self) -> Option<crate::net::DialSpec> {
-        use crate::net::DialSpec;
+    pub(crate) fn client_dial_spec(&self) -> Option<duocb_core::net::DialSpec> {
+        use duocb_core::net::DialSpec;
         match self.mode {
             PairMode::NostrToken => {
                 let token = self.in_token.trim();
                 let name = self.in_my_name.trim();
-                (crate::auth::validate_token(token).is_ok() && !name.is_empty()).then(|| {
+                (duocb_core::auth::validate_token(token).is_ok() && !name.is_empty()).then(|| {
                     DialSpec::NostrToken {
                         token: token.to_string(),
                         own_name: name.to_string(),
@@ -332,7 +340,7 @@ impl DuocbApp {
                 })
             }
             PairMode::NostrPin => {
-                crate::pin::normalize_pin(&self.in_pin).map(|canonical_pin| DialSpec::Pin {
+                duocb_core::pin::normalize_pin(&self.in_pin).map(|canonical_pin| DialSpec::Pin {
                     canonical_pin,
                     relays: crate::ui::screens::default_relays(),
                 })
@@ -340,7 +348,7 @@ impl DuocbApp {
             PairMode::Manual => {
                 let node_id = self.in_node_id.trim();
                 let token = self.in_manual_token.trim();
-                (!node_id.is_empty() && crate::auth::validate_token(token).is_ok()).then(|| {
+                (!node_id.is_empty() && duocb_core::auth::validate_token(token).is_ok()).then(|| {
                     DialSpec::Manual {
                         node_id: node_id.to_string(),
                         token: token.to_string(),
@@ -365,7 +373,7 @@ impl DuocbApp {
         if let Some(mode) = self.server_mode_spec() {
             // The initiator owns the discoverable standing record, so its token
             // and name must be durable before the session is allowed to start.
-            if matches!(&mode, crate::net::ServerMode::NostrToken { .. }) {
+            if matches!(&mode, duocb_core::net::ServerMode::NostrToken { .. }) {
                 if !self.persist_token_settings() {
                     return;
                 }
@@ -440,10 +448,12 @@ impl DuocbApp {
                     self.copy_to_clipboard(&node_id);
                 }
                 let copyable_token = match self.mode {
-                    PairMode::NostrToken => Some(self.in_token.trim().to_string())
-                        .filter(|token| crate::auth::validate_token(token).is_ok()),
+                    PairMode::NostrToken if !self.server_running => {
+                        Some(self.in_token.trim().to_string())
+                            .filter(|token| duocb_core::auth::validate_token(token).is_ok())
+                    }
                     PairMode::Manual => self.manual_token.clone(),
-                    PairMode::NostrPin => None,
+                    PairMode::NostrToken | PairMode::NostrPin => None,
                 };
                 if let Some(token) = copyable_token
                     && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::T))
@@ -502,13 +512,13 @@ impl DuocbApp {
             } else {
                 for path in &paths {
                     let color = match path.kind {
-                        crate::net::endpoint::ConnPathKind::Direct => {
+                        duocb_core::net::endpoint::ConnPathKind::Direct => {
                             egui::Color32::from_rgb(0x2e, 0xa0, 0x43)
                         }
-                        crate::net::endpoint::ConnPathKind::Relay => {
+                        duocb_core::net::endpoint::ConnPathKind::Relay => {
                             egui::Color32::from_rgb(0xd2, 0x92, 0x22)
                         }
-                        crate::net::endpoint::ConnPathKind::Other => ui.visuals().weak_text_color(),
+                        duocb_core::net::endpoint::ConnPathKind::Other => ui.visuals().weak_text_color(),
                     };
                     ui.horizontal(|ui| {
                         let marker = if path.selected { "●" } else { "○" };

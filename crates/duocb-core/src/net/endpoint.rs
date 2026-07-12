@@ -161,26 +161,27 @@ pub fn connection_paths(conn: &iroh::endpoint::Connection) -> Vec<ConnPath> {
     snapshot_paths(&conn.paths())
 }
 
+/// Classify a path's transport address and render its human display line
+/// (`Direct 1.2.3.4:52186 (rtt 1ms)`, `Relay https://… (rtt 42ms)`). Shared by
+/// the on-demand status snapshot and the debug path logger.
+fn describe_path(remote: &TransportAddr, rtt: Duration) -> (ConnPathKind, String) {
+    match remote {
+        TransportAddr::Ip(addr) => (ConnPathKind::Direct, format!("Direct {addr} (rtt {rtt:.0?})")),
+        TransportAddr::Relay(url) => (ConnPathKind::Relay, format!("Relay {url} (rtt {rtt:.0?})")),
+        other => (ConnPathKind::Other, format!("{other:?} (rtt {rtt:.0?})")),
+    }
+}
+
 /// Convert a borrowed [`PathList`] snapshot into owned [`ConnPath`]s.
 fn snapshot_paths(paths: &PathList<'_>) -> Vec<ConnPath> {
     paths
         .iter()
         .map(|path| {
-            let rtt = path.rtt();
-            let selected = path.is_selected();
-            let (kind, display) = match path.remote_addr() {
-                TransportAddr::Ip(addr) => {
-                    (ConnPathKind::Direct, format!("Direct {addr} (rtt {rtt:.0?})"))
-                }
-                TransportAddr::Relay(url) => {
-                    (ConnPathKind::Relay, format!("Relay {url} (rtt {rtt:.0?})"))
-                }
-                other => (ConnPathKind::Other, format!("{other:?} (rtt {rtt:.0?})")),
-            };
+            let (kind, display) = describe_path(path.remote_addr(), path.rtt());
             ConnPath {
                 kind,
                 display,
-                selected,
+                selected: path.is_selected(),
             }
         })
         .collect()
@@ -195,14 +196,7 @@ fn format_paths(paths: &PathList<'_>) -> String {
     let parts: Vec<String> = paths
         .iter()
         .filter(|p| p.is_selected())
-        .map(|path| {
-            let rtt = path.rtt();
-            match path.remote_addr() {
-                TransportAddr::Ip(addr) => format!("Direct {} (rtt {:.0?})", addr, rtt),
-                TransportAddr::Relay(url) => format!("Relay {} (rtt {:.0?})", url, rtt),
-                other => format!("{:?} (rtt {:.0?})", other, rtt),
-            }
-        })
+        .map(|path| describe_path(path.remote_addr(), path.rtt()).1)
         .collect();
     if parts.is_empty() {
         "no selected path".to_string()

@@ -1,7 +1,18 @@
 - strict no backward compatibility
 
-- run cargo clippy and test after rust code changes
+- run `cargo clippy --workspace --all-targets` and `cargo test --workspace` after rust code changes
 - no cargo fmt
+
+## Workspace layout
+
+- `crates/duocb-core` — portable core (token auth, wire protocol, nostr signaling, headless tokio net runtime). No GUI/clipboard/config-file deps.
+- `crates/duocb` — desktop egui app (binary `duocb`); owns config.rs, clipboard.rs, ui/.
+- `crates/duocb-ffi` — iOS staticlib (`libduocb.a`, config/token mode only), hand-written `extern "C"`; the C header is hand-maintained at `ios/duocb.h` and must stay in sync.
+- Version bumps: edit the single `[workspace.package] version` in the root Cargo.toml.
+
+## iOS
+
+`./build-ios.sh [debug]` builds device + simulator slices of `duocb-ffi` and stages `dist/ios/libduocb.xcframework` + `duocb.h`. The sibling app repo `../duocb-ios` consumes the pinned GitHub release zip (`libduocb-ios.xcframework.zip`, produced by the release workflow) by default; for local FFI dev set `DUOCB_LOCAL_XCFRAMEWORK=1` there (both for `xcodegen generate` and `xcodebuild`) to use this repo's `dist/ios` build through a committed symlink.
 
 ## Config-based E2E tests on the same device
 

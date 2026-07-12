@@ -24,9 +24,9 @@ use crate::net::endpoint::{
 };
 use crate::net::{ConnStatus, DialSpec, EventSender, NetEvent, ServerMode, UiCommand};
 use crate::protocol::{
-    AuthRequest, AuthResponse, ClipMsg, MAX_CLIP_MESSAGE_SIZE, MAX_CONTROL_MESSAGE_SIZE,
-    decode_auth_request, decode_auth_response, decode_clip_msg, encode_auth_request,
-    encode_auth_response, encode_clip_msg, read_length_prefixed,
+    AuthRequest, AuthResponse, ClipBody, ClipMsg, MAX_CLIP_MESSAGE_SIZE,
+    MAX_CONTROL_MESSAGE_SIZE, decode_auth_request, decode_auth_response, decode_clip_msg,
+    encode_auth_request, encode_auth_response, encode_clip_msg, read_length_prefixed,
 };
 
 /// How many recent buckets' PIN keys the server retains for in-band PIN auth. Mirrors the
@@ -190,6 +190,11 @@ type ConnSlot = Arc<parking_lot::Mutex<Option<iroh::endpoint::Connection>>>;
 /// carries clipboard frames both ways for the life of the connection.
 type Bi = (iroh::endpoint::SendStream, iroh::endpoint::RecvStream);
 
+/// The latest item this session sent (text + original send time), kept for the
+/// session's lifetime — across reconnects — so a resuming peer can pull it.
+/// Never persisted; a fresh session starts empty.
+type LastSent = Arc<parking_lot::Mutex<Option<(String, u64)>>>;
+
 /// A running server or client session: its cancel token, task handle, the
 /// channel that feeds outbound clipboard items into the active connection, and
 /// the shared connection slot for on-demand path queries.
@@ -207,12 +212,13 @@ fn start_session(kind: SessionKind, events: EventSender) -> Session {
     let conn: ConnSlot = Arc::new(parking_lot::Mutex::new(None));
     let task_conn = conn.clone();
     let handle = tokio::spawn(async move {
+        let last_sent = LastSent::default();
         match kind {
             SessionKind::Server(mode) => {
-                run_server_session(mode, events, task_cancel, clip_rx, task_conn).await
+                run_server_session(mode, events, task_cancel, clip_rx, task_conn, last_sent).await
             }
             SessionKind::Client(spec) => {
-                run_client_session(spec, events, task_cancel, clip_rx, task_conn).await
+                run_client_session(spec, events, task_cancel, clip_rx, task_conn, last_sent).await
             }
         }
     });
@@ -294,6 +300,7 @@ async fn run_server_session(
     cancel: CancellationToken,
     mut clip_rx: mpsc::UnboundedReceiver<String>,
     conn_slot: ConnSlot,
+    last_sent: LastSent,
 ) {
     events.status(ConnStatus::Starting);
 
@@ -407,7 +414,7 @@ async fn run_server_session(
         *conn_slot.lock() = Some(conn.clone());
 
         events.status(ConnStatus::Connected);
-        match pump_clipboard(send, recv, &events, &mut clip_rx, &cancel).await {
+        match pump_clipboard(send, recv, &events, &mut clip_rx, &cancel, &last_sent).await {
             Ok(()) => log::info!("Clipboard session with {remote_id} ended"),
             Err(e) => log::warn!("Clipboard session with {remote_id} ended: {e:#}"),
         }
@@ -435,6 +442,7 @@ async fn run_client_session(
     cancel: CancellationToken,
     mut clip_rx: mpsc::UnboundedReceiver<String>,
     conn_slot: ConnSlot,
+    last_sent: LastSent,
 ) {
     events.status(ConnStatus::Starting);
 
@@ -571,7 +579,9 @@ async fn run_client_session(
                         attempts = 0;
                         backoff = Duration::from_secs(1);
 
-                        match pump_clipboard(send, recv, &events, &mut clip_rx, &cancel).await {
+                        match pump_clipboard(send, recv, &events, &mut clip_rx, &cancel, &last_sent)
+                            .await
+                        {
                             Ok(()) => log::info!("Clipboard session ended"),
                             Err(e) => log::warn!("Clipboard session ended: {e:#}"),
                         }
@@ -629,34 +639,78 @@ async fn run_client_session(
 
 /// Pump the established clipboard stream in both directions until the
 /// connection dies, the session is cancelled, or the clip channel closes.
+///
+/// On every (re-)opened stream the writer first sends [`ClipBody::PullLatest`],
+/// so a connection resumed after an interruption re-fetches the latest item the
+/// peer sent this session (delivered as [`ClipBody::Latest`] and surfaced with
+/// `pulled: true` for receiver-side deduplication). On a session's first
+/// pairing the peer has sent nothing yet, so the pull is a no-op.
 async fn pump_clipboard(
     mut qsend: iroh::endpoint::SendStream,
     mut qrecv: iroh::endpoint::RecvStream,
     events: &EventSender,
     clip_rx: &mut mpsc::UnboundedReceiver<String>,
     cancel: &CancellationToken,
+    last_sent: &LastSent,
 ) -> Result<()> {
+    // Reader -> writer nudge: a received PullLatest is answered by the writer
+    // (which owns the send stream) from the shared last-sent slot.
+    let (pull_tx, mut pull_rx) = mpsc::unbounded_channel::<()>();
+
     let writer = async {
+        let frame = encode_clip_msg(&ClipMsg::pull_latest()).expect("PullLatest always encodes");
+        qsend
+            .write_all(&frame)
+            .await
+            .context("writing resume pull")?;
         loop {
-            let Some(text) = clip_rx.recv().await else {
-                // Session dropped its sender: nothing more to send, ever.
-                return Ok::<(), anyhow::Error>(());
-            };
-            match encode_clip_msg(&ClipMsg::item(text, now_ms())) {
-                Err(e) => {
-                    // Oversize (or unserializable) content: report and keep the
-                    // session alive — nothing was written to the stream.
-                    events.error(format!(
-                        "Not sent — {e:#} (limit {} KiB)",
-                        MAX_CLIP_MESSAGE_SIZE / 1024
-                    ));
+            tokio::select! {
+                item = clip_rx.recv() => {
+                    let Some(text) = item else {
+                        // Session dropped its sender: nothing more to send, ever.
+                        return Ok::<(), anyhow::Error>(());
+                    };
+                    let sent_at_ms = now_ms();
+                    match encode_clip_msg(&ClipMsg::item(text.clone(), sent_at_ms)) {
+                        Err(e) => {
+                            // Oversize (or unserializable) content: report and keep the
+                            // session alive — nothing was written to the stream.
+                            events.error(format!(
+                                "Not sent — {e:#} (limit {} KiB)",
+                                MAX_CLIP_MESSAGE_SIZE / 1024
+                            ));
+                        }
+                        Ok(frame) => {
+                            qsend
+                                .write_all(&frame)
+                                .await
+                                .context("writing clipboard item")?;
+                            events.send(NetEvent::ItemSent);
+                            *last_sent.lock() = Some((text, sent_at_ms));
+                        }
+                    }
                 }
-                Ok(frame) => {
-                    qsend
-                        .write_all(&frame)
-                        .await
-                        .context("writing clipboard item")?;
-                    events.send(NetEvent::ItemSent);
+                nudge = pull_rx.recv() => {
+                    if nudge.is_none() {
+                        // Sender dropped (reader ended): stop rather than spin
+                        // on a closed channel; the pump is ending anyway.
+                        return Ok(());
+                    }
+                    let latest = last_sent.lock().clone();
+                    // Nothing sent this session: the pull needs no answer.
+                    let Some((text, sent_at_ms)) = latest else { continue };
+                    match encode_clip_msg(&ClipMsg::latest(text, sent_at_ms)) {
+                        // The "latest" tag is a few bytes longer than "item", so
+                        // content that squeaked under the cap on send can miss it
+                        // on re-delivery — not worth failing the session over.
+                        Err(e) => log::warn!("Skipping resume re-delivery: {e:#}"),
+                        Ok(frame) => {
+                            qsend
+                                .write_all(&frame)
+                                .await
+                                .context("writing resume re-delivery")?;
+                        }
+                    }
                 }
             }
         }
@@ -667,8 +721,20 @@ async fn pump_clipboard(
             let frame = read_length_prefixed(&mut qrecv, MAX_CLIP_MESSAGE_SIZE)
                 .await
                 .context("clipboard stream closed")?;
-            let msg = decode_clip_msg(&frame)?;
-            events.send(NetEvent::ItemReceived { text: msg.text });
+            match decode_clip_msg(&frame)?.body {
+                ClipBody::Item { text, .. } => {
+                    events.send(NetEvent::ItemReceived {
+                        text,
+                        pulled: false,
+                    });
+                }
+                ClipBody::PullLatest => {
+                    let _ = pull_tx.send(());
+                }
+                ClipBody::Latest { text, .. } => {
+                    events.send(NetEvent::ItemReceived { text, pulled: true });
+                }
+            }
         }
     };
 
@@ -765,10 +831,17 @@ async fn run_pin_publisher(
         });
 
         // Record this bucket's PIN auth key so an inbound dialer holding this
-        // PIN can be authenticated in-band, even after the code rotates.
-        match crate::pin_auth::derive_auth_keys(&pin) {
-            Ok(keys) => recent.push(keys),
-            Err(e) => log::warn!("Failed to derive PIN auth key: {e:#}"),
+        // PIN can be authenticated in-band, even after the code rotates. The
+        // Argon2id derivation runs off the async executor.
+        let derived = tokio::task::spawn_blocking({
+            let pin = pin.clone();
+            move || crate::pin_auth::derive_auth_keys(&pin)
+        })
+        .await;
+        match derived {
+            Ok(Ok(keys)) => recent.push(keys),
+            Ok(Err(e)) => log::warn!("Failed to derive PIN auth key: {e:#}"),
+            Err(e) => log::warn!("PIN key-derivation task failed: {e}"),
         }
 
         match crate::nostr::publish_pin_record(&pin, bucket, &node_id, &relays).await {
@@ -862,24 +935,26 @@ async fn auth_as_dialer(conn: &iroh::endpoint::Connection, auth_token: &str) -> 
 /// [`AuthFailure`] — fatal for this target, exactly like a wrong token. On success the opened
 /// stream is returned (not finished) for the clipboard.
 async fn auth_as_dialer_pin(conn: &iroh::endpoint::Connection, pin: &str) -> Result<Bi> {
-    let (mut send, mut recv) = conn.open_bi().await.context("opening session stream")?;
-    match tokio::time::timeout(
-        AUTH_TIMEOUT,
-        crate::pin_auth::dialer_handshake(&mut send, &mut recv, pin),
-    )
-    .await
-    {
-        Err(_) => return Err(auth_failure("PIN auth timed out")),
+    // One deadline over the whole exchange, including opening the stream — a
+    // stalled open_bi must not delay the point where the timeout starts.
+    let handshake = async {
+        let (mut send, mut recv) = conn.open_bi().await.context("opening session stream")?;
+        crate::pin_auth::dialer_handshake(&mut send, &mut recv, pin).await?;
+        Ok::<Bi, anyhow::Error>((send, recv))
+    };
+    match tokio::time::timeout(AUTH_TIMEOUT, handshake).await {
+        Err(_) => Err(auth_failure("PIN auth timed out")),
         Ok(Err(e)) => {
             if let Some(reason) = auth_close_reason(conn) {
                 return Err(auth_failure(reason));
             }
-            return Err(anyhow::Error::new(AuthFailure(format!("{e:#}"))));
+            Err(anyhow::Error::new(AuthFailure(format!("{e:#}"))))
         }
-        Ok(Ok(())) => {}
+        Ok(Ok(streams)) => {
+            log::info!("Authenticated with peer via PIN");
+            Ok(streams)
+        }
     }
-    log::info!("Authenticated with peer via PIN");
-    Ok((send, recv))
 }
 
 /// Authenticate as the listener. Accepts either a pre-shared token or (PIN mode) a PIN proof;
@@ -1102,6 +1177,78 @@ mod tests {
         assert_eq!(text, "from the server");
 
         // Teardown.
+        let mut cli = Some(cli_session);
+        let mut srv = Some(srv_session);
+        stop_session(&mut cli).await;
+        stop_session(&mut srv).await;
+    }
+
+    /// After an interrupted connection resumes, each side pulls the other's
+    /// latest sent item (surfaced with `pulled: true` for UI deduplication).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_pulls_latest_from_both_sides() {
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        let (srv_tx, srv_rx) = std::sync::mpsc::channel();
+        let srv_session = start_session(
+            SessionKind::Server(ServerMode::Manual),
+            EventSender::new(srv_tx, None),
+        );
+        let (node_id, token) = wait_for_event(&srv_rx, Duration::from_secs(30), |ev| {
+            if let NetEvent::ServerReady {
+                node_id,
+                manual_token: Some(token),
+                ..
+            } = ev
+            {
+                Some((node_id.clone(), token.clone()))
+            } else {
+                None
+            }
+        });
+
+        let (cli_tx, cli_rx) = std::sync::mpsc::channel();
+        let cli_session = start_session(
+            SessionKind::Client(DialSpec::Manual { node_id, token }),
+            EventSender::new(cli_tx, None),
+        );
+        wait_for_event(&cli_rx, Duration::from_secs(60), |ev| {
+            matches!(ev, NetEvent::Status(ConnStatus::Connected)).then_some(())
+        });
+
+        // One item each way, so both sessions hold a last-sent.
+        srv_session.clip_tx.send("server latest".to_string()).unwrap();
+        cli_session.clip_tx.send("client latest".to_string()).unwrap();
+        wait_for_event(&cli_rx, Duration::from_secs(15), |ev| {
+            matches!(ev, NetEvent::ItemReceived { pulled: false, .. }).then_some(())
+        });
+        wait_for_event(&srv_rx, Duration::from_secs(15), |ev| {
+            matches!(ev, NetEvent::ItemReceived { pulled: false, .. }).then_some(())
+        });
+
+        // Interrupt: kill the live connection out from under both pumps. Both
+        // sessions stay up; the client auto-reconnects to the same node id.
+        let conn = srv_session.conn.lock().clone().expect("paired connection");
+        conn.close(0u32.into(), b"test interruption");
+
+        // On resume each side pulls the other's latest.
+        let text = wait_for_event(&cli_rx, Duration::from_secs(60), |ev| {
+            if let NetEvent::ItemReceived { text, pulled: true } = ev {
+                Some(text.clone())
+            } else {
+                None
+            }
+        });
+        assert_eq!(text, "server latest");
+        let text = wait_for_event(&srv_rx, Duration::from_secs(30), |ev| {
+            if let NetEvent::ItemReceived { text, pulled: true } = ev {
+                Some(text.clone())
+            } else {
+                None
+            }
+        });
+        assert_eq!(text, "client latest");
+
         let mut cli = Some(cli_session);
         let mut srv = Some(srv_session);
         stop_session(&mut cli).await;

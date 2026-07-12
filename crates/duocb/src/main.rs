@@ -1,11 +1,5 @@
-mod auth;
 mod clipboard;
 mod config;
-mod net;
-mod nostr;
-mod pin;
-mod pin_auth;
-mod protocol;
 mod ui;
 
 use eframe::egui;
@@ -29,8 +23,10 @@ fn config_override() -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("duocb=info"))
-        .init();
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("duocb=info,duocb_core=info"),
+    )
+    .init();
 
     let config_path = config::resolve_path(config_override()?)?;
     // The lock is held (and moved into the app) until the GUI exits. A second

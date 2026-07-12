@@ -94,7 +94,8 @@ pub fn derive_keys(auth_token: &str) -> Result<Keys> {
 }
 
 /// Connect a no-signer nostr client to the given relays. Events are signed by the
-/// caller before sending, so no signer is configured here. Bails if none connect.
+/// caller before sending, so no signer is configured here. Bails if none can be
+/// added, or if none is actually connected once the connect wait elapses.
 async fn connect_client(relays: &[String]) -> Result<Client> {
     let client = Client::default();
     let mut added = 0;
@@ -104,13 +105,23 @@ async fn connect_client(relays: &[String]) -> Result<Client> {
         }
     }
     if added == 0 {
-        anyhow::bail!(
-            "no usable nostr relays among {} configured",
-            relays.len().max(1)
-        );
+        anyhow::bail!("no usable nostr relays among {} configured", relays.len());
     }
     client.connect().await;
     client.wait_for_connection(CONNECT_TIMEOUT).await;
+    let connected = client
+        .relays()
+        .await
+        .values()
+        .filter(|relay| relay.status() == RelayStatus::Connected)
+        .count();
+    if connected == 0 {
+        client.disconnect().await;
+        anyhow::bail!(
+            "could not connect to any of {added} nostr relays within {}s",
+            CONNECT_TIMEOUT.as_secs()
+        );
+    }
     Ok(client)
 }
 
@@ -290,7 +301,14 @@ pub async fn publish_pin_record(
     node_id: &EndpointId,
     relays: &[String],
 ) -> Result<()> {
-    let keys = pin_keys(canonical_pin, bucket)?;
+    // The PIN KDF is Argon2id (slow, memory-hard by design); derive off the
+    // async executor.
+    let keys = tokio::task::spawn_blocking({
+        let pin = canonical_pin.to_string();
+        move || pin_keys(&pin, bucket)
+    })
+    .await
+    .context("PIN key-derivation task failed")??;
     let payload = serde_json::to_string(&PinPayload {
         node_id: node_id.to_string(),
     })
@@ -330,11 +348,16 @@ pub async fn lookup_pin_record(
     let buckets = [current, current.wrapping_sub(1), current + 1];
 
     // Derive each bucket's keypair once; map public key -> keys so we can decrypt a returned
-    // event with the right bucket's secret.
+    // event with the right bucket's secret. Three Argon2id runs — off the async executor.
+    let all_keys = tokio::task::spawn_blocking({
+        let pin = canonical_pin.to_string();
+        move || -> Result<Vec<Keys>> { buckets.iter().map(|&b| pin_keys(&pin, b)).collect() }
+    })
+    .await
+    .context("PIN key-derivation task failed")??;
     let mut by_pubkey: std::collections::HashMap<PublicKey, Keys> =
         std::collections::HashMap::new();
-    for b in buckets {
-        let keys = pin_keys(canonical_pin, b)?;
+    for keys in all_keys {
         by_pubkey.insert(keys.public_key(), keys);
     }
 
