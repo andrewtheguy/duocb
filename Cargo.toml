@@ -1,6 +1,6 @@
 [package]
 name = "duocb"
-version = "0.0.5"
+version = "0.0.6"
 edition = "2024"
 description = "P2P clipboard sharing between two devices over iroh"
 
