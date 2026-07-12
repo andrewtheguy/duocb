@@ -36,7 +36,7 @@ Chosen on the home screen; the **starting** device displays credentials, the **j
 | **Manual / offline** | none | the starting device's node id + a generated token | shared token | **not required** on the same LAN (mDNS) |
 
 - **PIN quick pair** is the fastest ad-hoc pairing: the starting device shows a short code, you type it on the joining device. The PIN both locates the starting device (an encrypted rendezvous record on public nostr relays) and authenticates the connection in-band — no token ever exists. A captured relay record is an offline PIN-guessing target; Argon2id makes each guess expensive, and a guessed PIN is useful to an attacker only before the first peer claims the server. Once paired, the server stops publishing PINs and binds the session to that peer's QUIC-authenticated node id: a later PIN recovery alone cannot join, reconnect as a different identity, or decrypt the established QUIC session. Because this mode carries no shared standing state — just a fresh ephemeral identity and a rotating PIN — it is free of token-mode name conflicts and works just as well for pairing two devices owned by two *different* people as for your own two. That's a supported side effect, not the project's primary focus (which remains linking your own devices).
-- **Token + names** is for a standing pairing: both devices share one auth token (generate it in the app), and each enters its own distinct name. The joining device queries the shared token-derived nostr identity and automatically selects the newest record belonging to a different name; you never enter the other device's name. A restarted starting device is re-resolved automatically. The initiator always saves its valid token and name before starting; the connector saves them automatically only after a connection authenticates successfully.
+- **Token + names** is for a standing pairing: both devices share one auth token (generate and copy it on the starting device), and each enters its own distinct name. The joining device pastes the copied token, queries the shared token-derived nostr identity, and automatically selects the newest record belonging to a different name; you never enter the other device's name. A restarted starting device is re-resolved automatically. The initiator always saves its valid token and name before starting; the connector saves them automatically only after a connection authenticates successfully.
 - If two devices accidentally use the same name, the current join flow cannot distinguish that live collision from a stale self record. The planned actionable detection and resolution flow is documented in [docs/ROADMAP.md](docs/ROADMAP.md).
 - **Manual / offline** needs no signaling at all: the starting device displays its node id and a freshly generated token (shown as a fingerprint, with a **Copy token** action for transferring the secret); enter both on the joining device. The token stays valid for the whole session, so the paired peer can reconnect after a drop. On the same LAN the node id resolves via mDNS, so it works with the internet down.
 
@@ -59,7 +59,7 @@ On Linux CI/minimal systems, eframe needs: `libxkbcommon-dev libwayland-dev libx
 Run `duocb` on both devices.
 
 1. **Both devices:** pick the same pairing mode on the home screen: `1` selects quick mode, then `P` selects PIN or `M` selects manual; `2` selects token+names mode.
-2. **Starting device:** press `S`. PIN and manual modes start immediately; in token mode, fill the form and press `Ctrl/⌘+Enter`. The screen shows the credentials to transfer.
+2. **Starting device:** press `S`. PIN and manual modes start immediately; in token mode, generate or reuse the token, copy it to the joining device, enter this device's name, and press `Ctrl/⌘+Enter`.
 3. **Joining device:** press `C`, type the credentials, then press `Ctrl/⌘+Enter` to connect.
 4. **Paired:** both sides now show the same session panel — `Ctrl/⌘+S` (or the button) reads your clipboard and sends it; received items appear in the inbox where you can **Peek** (view without copying) and **Copy** (the only action that writes that received item to your clipboard). Either device can send at any time; the outbox above the inbox shows the last item you sent (size + CRC) so the other side can confirm it matches what arrived.
 
@@ -76,7 +76,7 @@ The joining device reconnects automatically with backoff if the connection drops
 | `S` / `C` | home | start a connection / join a connection |
 | `Ctrl/⌘+Enter` | token start form / any join form | start the token connection / connect |
 | `Esc` | any screen (no field focused) | back to home, stopping the session |
-| `Ctrl/⌘+I` / `Ctrl/⌘+T` | manual start screen | copy the node id / the token |
+| `Ctrl/⌘+I` / `Ctrl/⌘+T` | start screen (when available) | copy the node id / the token |
 | `Ctrl/⌘+S` | connected | send the current clipboard |
 | `Ctrl/⌘+P` | connected | peek/hide the newest inbox item |
 | `Ctrl/⌘+Y` | connected | copy the newest inbox item to the clipboard |
