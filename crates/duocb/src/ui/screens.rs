@@ -6,10 +6,11 @@
 //!
 //! Keyboard shortcuts (also listed in the UI): home picks the mode with 1
 //! (configure — the primary mode), 2 (PIN quick pair), or 3 (manual). In the
-//! configure wizard G generates a secret and I imports one; in the configured
-//! hub S starts hosting, C/Enter joins the selected device, R refreshes the
-//! list, and the arrow keys move the selection. Quick modes start/join with
-//! S / C. Ctrl/Command+Enter connects on join forms; Esc goes back;
+//! configure wizard G generates a secret and I imports one; on the configured
+//! hub S starts hosting and C opens the device picker, where C/Enter joins
+//! the selected device, R refreshes the list, the arrow keys move the
+//! selection, and Esc returns to the hub. Quick modes start/join with S / C.
+//! Ctrl/Command+Enter connects on join forms; Esc goes back;
 //! Ctrl/Command+I copies the node id, Ctrl/Command+T the token/secret,
 //! whenever they are available.
 

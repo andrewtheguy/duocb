@@ -23,7 +23,7 @@ cargo run -- --config /tmp/duocb-peer1.json   # or DUOCB_CONFIG=/tmp/duocb-peer1
 cargo run -- --config /tmp/duocb-peer2.json   # or DUOCB_CONFIG=/tmp/duocb-peer2.json
 ```
 
-`-c` is an alias for `--config`; the CLI flag wins over `DUOCB_CONFIG`. Without an override, both processes resolve to the same default location (see README) and collide. Joining is by picking the hosting peer from the device list on the home hub — no peer name is typed. Configs are per-machine, never copied between machines.
+`-c` is an alias for `--config`; the CLI flag wins over `DUOCB_CONFIG`. Without an override, both processes resolve to the same default location (see README) and collide. Joining is by choosing Join on the home hub, which opens the device picker, and selecting the hosting peer there — no peer name is typed. Configs are per-machine, never copied between machines.
 
 ## Running GUI apps for Linux
 

@@ -35,7 +35,7 @@ Chosen on the home screen. **Configure** is the primary mode; the quick options 
 | **PIN quick pair** | nostr relays | an 8-character PIN that rotates every 60 s | Argon2id PIN challenge-response (mutual, in-band) | required |
 | **Manual / offline** | none | the starting device's node id + a generated token | shared token | **not required** on the same LAN (mDNS) |
 
-- **Configure** links all of your devices under one **standing secret**. A setup wizard generates the secret on the first device (revealed once, with a fingerprint) or imports it on the next (masked paste, fingerprint confirmation); it stays in the config until you explicitly **Clear secret**. Each device gets a unique identity `<name>_<suffix>` — a short name you choose plus a permanent random 8-character suffix minted on first launch — and broadcasts an encrypted presence record on public nostr relays under a keypair derived from the secret (authorship *is* the proof of secret possession). The home screen then shows your device list: who is online, who is hosting, and when each was last seen. To pair, press **Start** on one device and pick it from the list on the other — you never type the other device's name, and identical short names can't collide (the suffix guarantees uniqueness). A restarted host is re-resolved automatically.
+- **Configure** links all of your devices under one **standing secret**. A setup wizard generates the secret on the first device (revealed once, with a fingerprint) or imports it on the next (masked paste, fingerprint confirmation); it stays in the config until you explicitly **Clear secret**. Each device gets a unique identity `<name>_<suffix>` — a short name you choose plus a permanent random 8-character suffix minted on first launch — and broadcasts an encrypted presence record on public nostr relays under a keypair derived from the secret (authorship *is* the proof of secret possession). The home screen is then the hub: your identity plus two actions — **Start** hosts a connection (nothing else needed on that device), **Join** opens the device picker showing your other devices (who is online, who is hosting, when each was last seen), where you select the hosting one. You never type the other device's name, and identical short names can't collide (the suffix guarantees uniqueness). A restarted host is re-resolved automatically.
 - **PIN quick pair** is the fastest ad-hoc pairing: the starting device shows a short code, you type it on the joining device. The PIN both locates the starting device (an encrypted rendezvous record on public nostr relays) and authenticates the connection in-band — no token ever exists. A captured relay record is an offline PIN-guessing target; Argon2id makes each guess expensive, and a guessed PIN is useful to an attacker only before the first peer claims the server. Once paired, the server stops publishing PINs and binds the session to that peer's QUIC-authenticated node id: a later PIN recovery alone cannot join, reconnect as a different identity, or decrypt the established QUIC session. Because this mode carries no shared standing state — just a fresh ephemeral identity and a rotating PIN — it works just as well for pairing two devices owned by two *different* people as for your own two. That's a supported side effect, not the project's primary focus (which remains linking your own devices).
 - **Manual / offline** needs no signaling at all: the starting device displays its node id and a freshly generated token (shown as a fingerprint, with a **Copy token** action for transferring the secret); enter both on the joining device. The token stays valid for the whole session, so the paired peer can reconnect after a drop. On the same LAN the node id resolves via mDNS, so it works with the internet down.
 
@@ -59,9 +59,9 @@ Run `duocb` on both devices.
 
 **Configure mode (primary):**
 
-1. **First device:** the setup wizard opens on launch. Press `G` to generate the secret (shown once — copy it somewhere safe), then name the device. The home screen becomes the hub: your identity (e.g. `mac-book_a7B2c3D4`), the secret's fingerprint, and your device list.
-2. **Other device:** press `I`, paste the same secret (confirm the fingerprint matches), and name it. Both devices now see each other in their lists.
-3. **Pair:** press `S` (Start) on one device; on the other, select it in the list (it shows a *hosting* badge — press `R` to refresh) and press `C` (Join).
+1. **First device:** the setup wizard opens on launch. Press `G` to generate the secret (copy it somewhere safe), then name the device. The home screen becomes the hub: your identity (e.g. `mac-book_a7B2c3D4`), the secret's fingerprint, and the Start/Join actions.
+2. **Other device:** press `I`, paste the same secret (confirm the fingerprint matches), and name it.
+3. **Pair:** press `S` (Start) on one device; on the other press `C` (Join) to open the device picker, select the starting device (it shows a *hosting* badge — press `R` to refresh), and press `Enter`.
 
 **Quick modes:** pick `2` (PIN) or `3` (manual) on both devices, press `S` on the starting device and `C` on the joining one, and type the displayed credentials.
 
@@ -78,8 +78,10 @@ The joining device reconnects automatically with backoff if the connection drops
 | `1` / `2` / `3` | home | select configure / PIN quick pair / manual mode |
 | `G` / `I` | home (configure setup) | generate a new secret / import an existing one |
 | `S` | home | start (host) a connection |
-| `C` / `Enter` | home (configure hub) | join the selected device |
-| `R` / `↑` `↓` | home (configure hub) | refresh the device list / move the selection |
+| `C` | home (configure hub) | open the device picker |
+| `C` / `Enter` | device picker | join the selected device |
+| `R` / `↑` `↓` | device picker | refresh the device list / move the selection |
+| `Esc` | device picker | back to the hub |
 | `C` | home (quick modes) | go to the join form |
 | `Ctrl/⌘+Enter` | quick-mode join forms | connect |
 | `Esc` | any screen (no field focused) | back to home, stopping the session |

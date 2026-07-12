@@ -1,6 +1,7 @@
 //! The configure mode's home-screen flow: the secret setup wizard (generate or
-//! import, gated until a secret exists) and the configured hub (device
-//! identity + discovered peer list + start/join actions).
+//! import, gated until a secret exists), the configured hub (device identity +
+//! start/join actions), and the device picker behind the Join action (the
+//! discovered peer list, only relevant when joining).
 
 use eframe::egui::{self, RichText, TextEdit, Ui};
 
@@ -15,6 +16,7 @@ pub fn show_configure(app: &mut DuocbApp, ui: &mut Ui) {
         ConfigureStep::SetupImport => setup_import(app, ui),
         ConfigureStep::SetupName => setup_name(app, ui),
         ConfigureStep::Ready => hub(app, ui),
+        ConfigureStep::Join => join_picker(app, ui),
     }
     clear_secret_modal(app, ui.ctx());
 }
@@ -176,11 +178,8 @@ fn setup_name(app: &mut DuocbApp, ui: &mut Ui) {
 
 fn hub(app: &mut DuocbApp, ui: &mut Ui) {
     identity_group(app, ui);
-    ui.add_space(8.0);
-    peer_list_group(app, ui);
     ui.add_space(12.0);
 
-    let join_ready = app.selected_hosting_peer_display().is_some();
     ui.vertical_centered_justified(|ui| {
         if ui
             .add_sized(
@@ -193,9 +192,39 @@ fn hub(app: &mut DuocbApp, ui: &mut Ui) {
         }
         ui.add_space(6.0);
         if ui
+            .add_sized(
+                [0.0, 40.0],
+                egui::Button::new("🔗 Join another device  —  C"),
+            )
+            .clicked()
+        {
+            app.enter_join_picker();
+        }
+        ui.label(
+            RichText::new(
+                "Start makes this device host the connection — the other device \
+                 joins it. Join shows your other devices and connects to the one \
+                 that started.",
+            )
+            .weak()
+            .small(),
+        );
+    });
+}
+
+/// The device picker behind the Join action: the discovered peer list plus
+/// the join button (enabled once a hosting device is selected).
+fn join_picker(app: &mut DuocbApp, ui: &mut Ui) {
+    peer_list_group(app, ui);
+    ui.add_space(12.0);
+
+    let join_ready = app.selected_hosting_peer_display().is_some();
+    ui.vertical_centered_justified(|ui| {
+        if ui
             .add_enabled(
                 join_ready,
-                egui::Button::new("🔗 Join the selected device  —  C").min_size([0.0, 40.0].into()),
+                egui::Button::new("🔗 Join the selected device  —  C / Enter")
+                    .min_size([0.0, 40.0].into()),
             )
             .clicked()
         {
@@ -203,10 +232,17 @@ fn hub(app: &mut DuocbApp, ui: &mut Ui) {
         }
         if !join_ready {
             ui.label(
-                RichText::new("Select a device that is hosting a connection to join it.")
-                    .weak()
-                    .small(),
+                RichText::new(
+                    "Select a device that is hosting a connection — press Start \
+                     on that device first.",
+                )
+                .weak()
+                .small(),
             );
+        }
+        ui.add_space(6.0);
+        if ui.button("Back (Esc)").clicked() {
+            app.configure_step = ConfigureStep::Ready;
         }
     });
 }

@@ -175,8 +175,9 @@ impl DuocbApp {
             pending_outbox: None,
             sent_flash: None,
         };
-        // A fully configured device starts broadcasting presence right away and
-        // fetches the peer list for the hub.
+        // A fully configured device starts broadcasting presence right away,
+        // plus one fetch to warm the device picker; after this the list is
+        // only refreshed while the picker is visible.
         if app.configure_step == ConfigureStep::Ready {
             app.sync_presence();
             app.refresh_peers();
@@ -450,7 +451,19 @@ impl DuocbApp {
             .map(|p| p.display())
     }
 
-    /// Join the selected hosting peer from the hub.
+    /// Open the device picker (the hub's Join action). Refreshes the list on
+    /// entry unless a fetch just went out.
+    pub(crate) fn enter_join_picker(&mut self) {
+        self.configure_step = ConfigureStep::Join;
+        let fresh = self
+            .peers_requested_at
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(5));
+        if !fresh {
+            self.refresh_peers();
+        }
+    }
+
+    /// Join the selected hosting peer from the device picker.
     pub(crate) fn join_selected_peer(&mut self) {
         if self.client_dial_spec().is_some() {
             self.screen = Screen::Client;
@@ -514,6 +527,10 @@ impl DuocbApp {
     pub(crate) fn go_back(&mut self) {
         self.stop_session();
         self.screen = Screen::Home;
+        // Home is the hub, not the device picker a join may have started from.
+        if self.configure_step == ConfigureStep::Join {
+            self.configure_step = ConfigureStep::Ready;
+        }
     }
 
     /// Build the server mode from the current state, if it validates.
@@ -689,6 +706,16 @@ impl DuocbApp {
                 if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::S)) {
                     self.begin_server();
                 }
+                if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::C)) {
+                    self.enter_join_picker();
+                }
+                if let Some(secret) = self.secret.clone()
+                    && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::T))
+                {
+                    self.copy_to_clipboard(&secret);
+                }
+            }
+            ConfigureStep::Join => {
                 if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::C))
                     || ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter))
                 {
@@ -703,10 +730,8 @@ impl DuocbApp {
                 if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowUp)) {
                     self.move_peer_selection(-1);
                 }
-                if let Some(secret) = self.secret.clone()
-                    && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::T))
-                {
-                    self.copy_to_clipboard(&secret);
+                if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+                    self.configure_step = ConfigureStep::Ready;
                 }
             }
         }
@@ -828,12 +853,13 @@ impl eframe::App for DuocbApp {
 
         self.handle_shortcuts(ctx);
 
-        // While the configure hub is visible, keep the peer list fresh (the
+        // While the device picker is visible, keep the peer list fresh (the
         // runtime ignores a refresh while one is already in flight) and its
-        // last-seen labels ticking.
+        // last-seen labels ticking. The hub itself shows no list, so nothing
+        // is polled there.
         if self.screen == Screen::Home
             && self.mode == PairMode::NostrToken
-            && self.configure_step == ConfigureStep::Ready
+            && self.configure_step == ConfigureStep::Join
         {
             let due = self
                 .peers_requested_at

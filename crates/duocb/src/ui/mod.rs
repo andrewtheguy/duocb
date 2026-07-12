@@ -47,8 +47,11 @@ pub enum ConfigureStep {
     SetupImport,
     /// Enter/confirm this device's short name.
     SetupName,
-    /// Fully configured: device identity + peer list + start/join actions.
+    /// Fully configured: the hub — device identity + start/join actions.
     Ready,
+    /// The device picker, shown only after choosing Join on the hub: the
+    /// peer list is fetched and refreshed only while this step is visible.
+    Join,
 }
 
 /// Max characters shown in the peek view. Larger payloads are truncated to
