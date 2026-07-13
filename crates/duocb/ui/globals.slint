@@ -11,6 +11,11 @@ export global UiState {
     // pick happens on the Rust side.
     in property <string> ui-font;
     in property <string> mono-font: "monospace";
+    /// The command-modifier label used in shortcut hints: "⌘" on macOS, "Ctrl"
+    /// elsewhere. Set once at startup from Rust, since Slint can't tell which
+    /// build target it is running on. Matches Slint's `control` modifier, which
+    /// is ⌘ on macOS and Ctrl on every other platform.
+    in property <string> cmd-label: "Ctrl";
 
     // Navigation / shared status.
     in property <Screen> screen;

@@ -45,7 +45,7 @@ export component ServerScreen inherits Rectangle {
             HorizontalLayout {
                 alignment: center;
                 Button {
-                    text: "Copy PIN (Ctrl/⌘+T)";
+                    text: "Copy PIN (" + UiState.cmd-label + "+T)";
                     clicked => { Actions.copy-pin(); }
                 }
             }
@@ -78,7 +78,7 @@ export component ServerScreen inherits Rectangle {
                 alignment: start;
                 Body { text: "Pairing code:"; vertical-alignment: center; }
                 Button {
-                    text: "Copy (Ctrl/⌘+T)";
+                    text: "Copy (" + UiState.cmd-label + "+T)";
                     clicked => { Actions.copy-pairing-code(); }
                 }
             }

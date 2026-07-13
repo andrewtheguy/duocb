@@ -68,7 +68,7 @@ export component SessionPanel inherits Rectangle {
             spacing: Theme.pad-s;
             alignment: start;
             Button {
-                text: "📤 Send clipboard (Ctrl/⌘+S)";
+                text: "📤 Send clipboard (" + UiState.cmd-label + "+S)";
                 primary: true;
                 clicked => { Actions.send-clipboard(); }
             }
@@ -117,11 +117,11 @@ export component SessionPanel inherits Rectangle {
             alignment: start;
             CardTitle { text: UiState.inbox-title; vertical-alignment: center; }
             if UiState.inbox.length > 0: Button {
-                text: "Clear inbox (Ctrl/⌘+L)";
+                text: "Clear inbox (" + UiState.cmd-label + "+L)";
                 clicked => { Actions.clear-inbox(); }
             }
             Small {
-                text: "newest: peek Ctrl/⌘+P · copy Ctrl/⌘+Y";
+                text: "newest: peek " + UiState.cmd-label + "+P · copy " + UiState.cmd-label + "+Y";
                 vertical-alignment: center;
             }
         }

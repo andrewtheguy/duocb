@@ -108,7 +108,7 @@ component PreConnect inherits VerticalLayout {
     if UiState.mode != PairMode.nostr-token: HorizontalLayout {
         alignment: start;
         Button {
-            text: "▶ Connect (Ctrl/⌘+Enter)";
+            text: "▶ Connect (" + UiState.cmd-label + "+Enter)";
             primary: true;
             enabled: UiState.dial-ready;
             clicked => { Actions.connect-client(); }
