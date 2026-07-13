@@ -3,7 +3,7 @@
  * Hand-maintained; keep in sync with crates/duocb-ffi/src/lib.rs.
  * Build with ./build-ios.sh (stages dist/ios/libduocb.xcframework + this header).
  *
- * Configure mode only: every device shares one standing secret (the token) and
+ * Configure mode: every device shares one standing secret (the token) and
  * broadcasts a presence record under its unique display identity
  * "<name>_<suffix>" (e.g. "mac-book_a7B2c3D4"). Role "hub" broadcasts presence
  * and browses the peer list without a session (the screen where the user picks
@@ -11,7 +11,13 @@
  * "join" dials exactly the device named by "peer". To move from browsing to a
  * session, stop the hub instance and start a fresh one with the chosen role
  * (and, for join, the peer display picked from the last "peer_list" event).
- * Quick mode (PIN / manual) is desktop-only and not exposed here.
+ *
+ * Quick mode: ephemeral device-to-device pairing with no standing state and no
+ * identity. Role "quick_host" publishes a rotating 8-char PIN (a "pin_rotated"
+ * event fires on every rotation until a peer pairs, then "pin_cleared"); role
+ * "quick_join" dials the PIN typed by the user. The rendezvous channel is
+ * fixed to nostr relays + LAN mDNS (the desktop "P" preset); the LAN-only /
+ * nostr-only presets and manual mode remain desktop-only.
  *
  * Lifecycle:
  *   1. duocb_init_logging()                                   (once, optional)
@@ -28,7 +34,7 @@
  *   -  duocb_query_conn_path(handle)           (answer arrives as a "conn_path" event)
  *   4. duocb_stop(handle)                      (frees the handle)
  *
- * Config JSON:
+ * Config JSON (configure mode):
  *   {"role":"hub"|"start"|"join","token":"d…47 chars","name":"mac1",
  *    "suffix":"a7B2c3D4",                      permanent 8-char device id; mint
  *                                              once with duocb_generate_suffix
@@ -36,6 +42,13 @@
  *    "peer":"mac2_x9Y8z7W6",                   join role only: the target
  *                                              device's display identity
  *    "relays":["wss://…"]}                     relays optional (built-in defaults)
+ *
+ * Config JSON (quick mode — no token/name/suffix/peer):
+ *   {"role":"quick_host"}
+ *   {"role":"quick_join","pin":"abcd-2345"}    pin: as typed by the user
+ *                                              (dashes/spaces/lowercase ok;
+ *                                              rejected with an error if the
+ *                                              check digit doesn't match)
  *
  * Events (one JSON object per duocb_next_event call), by "type":
  *   server_ready      {node_id, token_fingerprint}
@@ -53,6 +66,13 @@
  *                                               latest item — skip it if the
  *                                               inbox already holds that text)
  *   item_sent         {}
+ *   pin_rotated       {pin_display, seconds_left} (quick_host: the current PIN
+ *                                               as "XXXX-XXXX" and how long
+ *                                               until it rotates; fires again
+ *                                               on every rotation)
+ *   pin_cleared       {}                        (quick_host: a peer paired or
+ *                                               publishing stopped — hide the
+ *                                               PIN)
  *   peer_list         {peers: [{display, name, suffix,
  *                               last_seen_unix}]}   (no online/offline or
  *                                               hosting flag: relay freshness is
@@ -100,8 +120,15 @@ int duocb_validate_token(const char *token, char *err_buf, size_t err_len);
  * -1 = NULL argument or invalid token. */
 int duocb_token_fingerprint(const char *token, char *out_buf, size_t out_len);
 
-/* Start a config-mode session. Returns a non-NULL handle, or NULL with the
- * error message in err_buf. */
+/* Normalize a user-typed quick-pair PIN to canonical form (8 uppercase
+ * Crockford characters): strips dashes/spaces, uppercases, maps I/L->1 and
+ * O->0, and verifies the trailing check digit. Use for live validation of the
+ * join field; duocb_start re-normalizes anyway. 1 = valid (canonical PIN
+ * written), 0 = invalid PIN, -1 = NULL argument or buffer < 9 bytes. */
+int duocb_normalize_pin(const char *pin, char *out_buf, size_t out_len);
+
+/* Start a session (configure or quick mode, per the config's "role").
+ * Returns a non-NULL handle, or NULL with the error message in err_buf. */
 DuocbHandle *duocb_start(const char *config_json, char *err_buf, size_t err_len);
 
 /* Drain one pending event as JSON (see header comment for return codes). */
