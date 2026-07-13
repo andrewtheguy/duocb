@@ -113,6 +113,12 @@ pub enum UiCommand {
     StopServer,
     Connect { spec: DialSpec },
     Disconnect,
+    /// PIN quick mode: mint and publish a fresh PIN immediately, invalidating
+    /// every previously shown PIN — their auth keys are dropped and their LAN
+    /// advertisements withdrawn, so a stale code can resolve at most an auth
+    /// rejection. The new code arrives as the next [`NetEvent::PinRotated`].
+    /// An error event if no PIN server session is running.
+    RefreshPin,
     SendClipboard { text: String },
     /// Request a point-in-time snapshot of the live connection's paths, answered
     /// with [`NetEvent::ConnPath`]. Empty if no connection is up.

@@ -456,6 +456,22 @@ pub unsafe extern "C" fn duocb_refresh_peers(handle: *const DuocbHandle) -> c_in
     0
 }
 
+/// Quick-host only: mint and publish a fresh PIN immediately, invalidating
+/// every previously shown PIN. The new code arrives as the next `pin_rotated`
+/// event; an `error` event if no PIN is being published (wrong role, or a
+/// peer already paired). Returns 0 = requested, -1 = NULL handle.
+/// # Safety
+/// `handle` must be NULL or a live handle from [`duocb_start`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn duocb_refresh_pin(handle: *const DuocbHandle) -> c_int {
+    if handle.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*handle };
+    let _ = handle.cmd_tx.send(UiCommand::RefreshPin);
+    0
+}
+
 /// Request a point-in-time connection-path snapshot; the answer arrives as a
 /// `conn_path` event. Returns 0 = requested, -1 = NULL handle.
 /// # Safety

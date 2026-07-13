@@ -45,9 +45,14 @@ export component ServerScreen inherits ScrollView {
             }
             HorizontalLayout {
                 alignment: center;
+                spacing: Theme.pad-s;
                 Button {
                     text: "Copy PIN (" + UiState.cmd-label + "+T)";
                     clicked => { Actions.copy-pin(); }
+                }
+                Button {
+                    text: "↻ New PIN";
+                    clicked => { Actions.refresh-pin(); }
                 }
             }
             Body {
