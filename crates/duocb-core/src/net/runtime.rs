@@ -108,6 +108,13 @@ impl RecentPins {
     fn snapshot(&self) -> Vec<nostr_sdk::Keys> {
         self.0.read().iter().cloned().collect()
     }
+
+    /// Drop every retained key: no previously shown PIN can authenticate a
+    /// dialer anymore (an immediate refresh revokes, unlike natural rotation,
+    /// which keeps a look-back window).
+    fn clear(&self) {
+        self.0.write().clear();
+    }
 }
 
 /// The single peer a serve endpoint is paired with, for the lifetime of one server session.
@@ -204,6 +211,9 @@ struct Session {
     handle: JoinHandle<()>,
     clip_tx: mpsc::UnboundedSender<String>,
     conn: ConnSlot,
+    /// Kicks the PIN publisher into an immediate rotate-and-revoke (see
+    /// [`UiCommand::RefreshPin`]). `Some` only for a PIN-mode server session.
+    pin_refresh: Option<Arc<tokio::sync::Notify>>,
 }
 
 fn start_session(kind: SessionKind, events: EventSender, hosting: Option<HostingTx>) -> Session {
@@ -212,12 +222,22 @@ fn start_session(kind: SessionKind, events: EventSender, hosting: Option<Hosting
     let task_cancel = cancel.clone();
     let conn: ConnSlot = Arc::new(parking_lot::Mutex::new(None));
     let task_conn = conn.clone();
+    let pin_refresh = matches!(&kind, SessionKind::Server(ServerMode::Pin { .. }))
+        .then(|| Arc::new(tokio::sync::Notify::new()));
+    let task_pin_refresh = pin_refresh.clone();
     let handle = tokio::spawn(async move {
         let last_sent = LastSent::default();
         match kind {
             SessionKind::Server(mode) => {
                 run_server_session(
-                    mode, events, task_cancel, clip_rx, task_conn, last_sent, hosting,
+                    mode,
+                    events,
+                    task_cancel,
+                    clip_rx,
+                    task_conn,
+                    last_sent,
+                    hosting,
+                    task_pin_refresh,
                 )
                 .await
             }
@@ -231,6 +251,7 @@ fn start_session(kind: SessionKind, events: EventSender, hosting: Option<Hosting
         handle,
         clip_tx,
         conn,
+        pin_refresh,
     }
 }
 
@@ -332,6 +353,12 @@ pub async fn net_main(mut cmd_rx: mpsc::UnboundedReceiver<UiCommand>, events: Ev
                 stop_session(&mut session).await;
                 events.status(ConnStatus::Idle);
             }
+            UiCommand::RefreshPin => {
+                match session.as_ref().and_then(|s| s.pin_refresh.as_ref()) {
+                    Some(refresh) => refresh.notify_one(),
+                    None => events.error("No PIN is being published"),
+                }
+            }
             UiCommand::SendClipboard { text } => {
                 let sent = session
                     .as_ref()
@@ -430,6 +457,7 @@ impl Drop for HostingGuard {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_server_session(
     mode: ServerMode,
     events: EventSender,
@@ -438,6 +466,7 @@ async fn run_server_session(
     conn_slot: ConnSlot,
     last_sent: LastSent,
     hosting: Option<HostingTx>,
+    pin_refresh: Option<Arc<tokio::sync::Notify>>,
 ) {
     events.status(ConnStatus::Starting);
 
@@ -531,6 +560,7 @@ async fn run_server_session(
                 events.clone(),
                 cancel.clone(),
                 claim.paired_signal(),
+                pin_refresh.unwrap_or_default(),
             ))))
         }
         ServerMode::Manual => None,
@@ -1175,6 +1205,12 @@ async fn resolve_pin(
 /// previous bucket's advertisement is kept alive one extra period (`adverts`
 /// holds two guards), mirroring the look-back window the nostr record's TTL
 /// provides. All advertisements are withdrawn on exit.
+///
+/// `refresh` (the user's "new PIN now" CTA) cuts the current period short:
+/// the next loop turn mints a fresh PIN immediately, and — unlike natural
+/// rotation, which keeps a look-back window — every previously shown PIN is
+/// revoked first.
+#[allow(clippy::too_many_arguments)]
 async fn run_pin_publisher(
     endpoint: iroh::Endpoint,
     recent: RecentPins,
@@ -1183,6 +1219,7 @@ async fn run_pin_publisher(
     events: EventSender,
     cancel: CancellationToken,
     paired: CancellationToken,
+    refresh: Arc<tokio::sync::Notify>,
 ) {
     let node_id = endpoint.id();
     let mut adverts: VecDeque<crate::lan::PinAdvert> = VecDeque::new();
@@ -1283,6 +1320,16 @@ async fn run_pin_publisher(
                 break;
             }
             _ = tokio::time::sleep_until(rotate_at) => {}
+            _ = refresh.notified() => {
+                // Rotate now, and revoke everything shown so far: no retained
+                // auth key means a stale code can no longer authenticate, and
+                // dropping the advert guards withdraws the mDNS records (old
+                // nostr records just age out — resolving one only leads to an
+                // auth rejection).
+                recent.clear();
+                adverts.clear();
+                log::info!("Refreshing the PIN on request; previous PINs revoked");
+            }
         }
     }
 }
@@ -1546,6 +1593,47 @@ mod tests {
             }
         }
         panic!("timed out waiting for event; seen: {seen:?}");
+    }
+
+    /// A refresh request rotates the PIN immediately instead of waiting out
+    /// the current period, and the replacement is a different code.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn refresh_pin_rotates_immediately() {
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let events = EventSender::new(tx, None);
+        let session = start_session(
+            SessionKind::Server(ServerMode::Pin {
+                relays: Vec::new(),
+                channel: PinChannel::LanOnly,
+            }),
+            events,
+            None,
+        );
+
+        let pin_rotated = |ev: &NetEvent| {
+            if let NetEvent::PinRotated { pin_display, .. } = ev {
+                Some(pin_display.clone())
+            } else {
+                None
+            }
+        };
+        let first = wait_for_event(&rx, Duration::from_secs(30), pin_rotated);
+
+        session
+            .pin_refresh
+            .as_ref()
+            .expect("PIN server sessions expose a refresh handle")
+            .notify_one();
+
+        // Far sooner than the rotation period (BUCKET_SECS), so only the
+        // refresh can explain a new PIN arriving now.
+        let second = wait_for_event(&rx, Duration::from_secs(20), pin_rotated);
+        assert_ne!(first, second, "refresh must mint a different PIN");
+
+        session.cancel.cancel();
+        let _ = session.handle.await;
     }
 
     /// End-to-end manual mode within one process: a server session and a client

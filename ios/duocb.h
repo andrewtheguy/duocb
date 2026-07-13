@@ -140,6 +140,12 @@ int duocb_next_event(const DuocbHandle *handle, char *out_buf, size_t out_len);
  * 0 = requested, -1 = NULL handle. */
 int duocb_refresh_peers(const DuocbHandle *handle);
 
+/* Quick-host only: mint and publish a fresh PIN immediately, invalidating
+ * every previously shown PIN. The new code arrives as the next
+ * {"type":"pin_rotated"} event; an "error" event if no PIN is being published
+ * (wrong role, or a peer already paired). 0 = requested, -1 = NULL handle. */
+int duocb_refresh_pin(const DuocbHandle *handle);
+
 /* Queue a clipboard text for the peer. 0 = queued (outcome arrives as an
  * "item_sent" or "error" event), -1 = NULL/invalid argument. */
 int duocb_send_clipboard(const DuocbHandle *handle, const char *text);

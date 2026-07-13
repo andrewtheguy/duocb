@@ -147,6 +147,9 @@ pub(crate) fn wire(app: &Rc<RefCell<App>>, ui: &MainWindow) {
             app.copy_to_clipboard(&pin);
         }
     });
+    act!(on_refresh_pin, |app| {
+        app.net.send(duocb_core::net::UiCommand::RefreshPin);
+    });
 
     // Session panel.
     act!(on_send_clipboard, |app| app.send_clipboard());
