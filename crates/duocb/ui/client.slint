@@ -7,7 +7,7 @@ import { PairMode } from "types.slint";
 import { Theme } from "theme.slint";
 import { Card, Body, Weak, Small, Mono, BackHeader, TokenPairingSummary, LabeledValue } from "widgets.slint";
 import { SessionPanel } from "session.slint";
-import { Button, LineEdit } from "std-widgets.slint";
+import { Button, LineEdit, ScrollView } from "std-widgets.slint";
 
 component PreConnect inherits VerticalLayout {
     out property <bool> field-focused: pin-a.has-focus || pin-b.has-focus || code-entry.has-focus;
@@ -116,10 +116,14 @@ component PreConnect inherits VerticalLayout {
     }
 }
 
-export component ClientScreen inherits Rectangle {
+export component ClientScreen inherits ScrollView {
     out property <bool> field-focused: pre.field-focused || session.field-focused;
+    viewport-width: root.width;
+    viewport-height: max(root.height, content.preferred-height);
+    horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
+    mouse-drag-pan-enabled: true;
 
-    VerticalLayout {
+    content := VerticalLayout {
         alignment: start;
         spacing: Theme.pad-m;
 

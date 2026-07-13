@@ -5,6 +5,7 @@ import { UiState, Actions } from "globals.slint";
 import { PairMode, PinChannel } from "types.slint";
 import { Theme } from "theme.slint";
 import { Card, CardTitle, Weak, Small, Body, BigButton, WideButton, BackHeader, SelectableRow } from "widgets.slint";
+import { ScrollView } from "std-widgets.slint";
 
 component ModeRow inherits SelectableRow {
     in property <string> text;
@@ -16,13 +17,21 @@ component ModeRow inherits SelectableRow {
         font-size: Theme.font-body;
         vertical-alignment: center;
     }
-    Body { text: root.text; vertical-alignment: center; }
+    Body {
+        text: root.text;
+        horizontal-stretch: 1;
+        vertical-alignment: center;
+    }
 }
 
-export component QuickScreen inherits Rectangle {
+export component QuickScreen inherits ScrollView {
     out property <bool> field-focused: false;
+    viewport-width: root.width;
+    viewport-height: max(root.height, content.preferred-height);
+    horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
+    mouse-drag-pan-enabled: true;
 
-    VerticalLayout {
+    content := VerticalLayout {
         alignment: start;
         spacing: Theme.pad-m;
 
@@ -64,35 +73,36 @@ export component QuickScreen inherits Rectangle {
                 clicked => { Actions.toggle-quick-advanced(); }
                 Text {
                     text: UiState.quick-advanced-open ? "▾" : "▸";
-                    font-size: Theme.font-body;
+                    width: Theme.font-heading;
+                    font-size: Theme.font-heading;
+                    horizontal-alignment: center;
                     vertical-alignment: center;
                 }
-                CardTitle { text: "Uncommon options"; vertical-alignment: center; }
+                CardTitle { text: "Advanced options"; vertical-alignment: center; }
             }
-            if UiState.quick-advanced-open: VerticalLayout {
-                spacing: Theme.pad-xs;
-                Small { text: "Mostly for testing — the two above cover everyday pairing."; }
-                ModeRow {
-                    demoted: true;
-                    text: "I  Internet only";
-                    selected: UiState.mode == PairMode.nostr-pin && UiState.pin-channel == PinChannel.nostr-only;
-                    clicked => {
-                        Actions.set-mode(PairMode.nostr-pin);
-                        Actions.set-pin-channel(PinChannel.nostr-only);
-                    }
+            if UiState.quick-advanced-open: Small {
+                text: "Mostly for testing — the two above cover everyday pairing.";
+            }
+            if UiState.quick-advanced-open: ModeRow {
+                demoted: true;
+                text: "I  Internet only";
+                selected: UiState.mode == PairMode.nostr-pin && UiState.pin-channel == PinChannel.nostr-only;
+                clicked => {
+                    Actions.set-mode(PairMode.nostr-pin);
+                    Actions.set-pin-channel(PinChannel.nostr-only);
                 }
-                Small {
-                    text: "Finds the peer through a nostr relay only — its PIN is never advertised on the local network — so pairing needs the internet. The connection itself still uses iroh's default paths, so it can take a direct local route when both devices share a network.";
-                }
-                ModeRow {
-                    demoted: true;
-                    text: "M  Manual";
-                    selected: UiState.mode == PairMode.manual;
-                    clicked => { Actions.set-mode(PairMode.manual); }
-                }
-                Small {
-                    text: "No discovery at all: copy one pairing code between the devices out of band — on the same network or across the internet. Verifies connectivity with zero signaling.";
-                }
+            }
+            if UiState.quick-advanced-open: Small {
+                text: "Finds the peer through a nostr relay only — its PIN is never advertised on the local network — so pairing needs the internet. The connection itself still uses iroh's default paths, so it can take a direct local route when both devices share a network.";
+            }
+            if UiState.quick-advanced-open: ModeRow {
+                demoted: true;
+                text: "M  Manual";
+                selected: UiState.mode == PairMode.manual;
+                clicked => { Actions.set-mode(PairMode.manual); }
+            }
+            if UiState.quick-advanced-open: Small {
+                text: "No discovery at all: copy one pairing code between the devices out of band — on the same network or across the internet. Verifies connectivity with zero signaling.";
             }
         }
 
