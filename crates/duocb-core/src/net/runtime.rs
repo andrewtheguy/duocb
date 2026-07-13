@@ -48,14 +48,21 @@ const AUTH_TIMEOUT_CODE: u32 = 2;
 /// convention; the peer just sees the connection go away.
 const SHUTDOWN_CODE: u32 = 0;
 
-/// Maximum reconnect backoff for the dialing peer.
-const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
+/// Connection close code the listener uses to refuse a dialer that isn't its
+/// paired peer: this endpoint already pairs with one device at a time. The
+/// dialer recognizes it (see [`auth_close_reason`]) and gives up rather than
+/// retrying against a server that will never take it.
+const SERVER_BUSY_CODE: u32 = 3;
 
-/// Maximum number of attempts to establish the *first* connection before giving
-/// up. Once a connection has been established at least once, the client
-/// reconnects without limit. This bounds the startup phase so an unreachable
-/// peer fails fast instead of looping forever.
-const MAX_INITIAL_CONNECT_ATTEMPTS: u32 = 10;
+/// Fixed delay between reconnect attempts on the dialing peer.
+const RECONNECT_DELAY: Duration = Duration::from_secs(3);
+
+/// Maximum number of *consecutive* failed connect attempts before the client
+/// gives up. The counter resets on every successful connection, so this bounds
+/// only an unbroken run of failures (an unreachable peer) — not a flaky link
+/// that keeps recovering. Applied uniformly whether or not a connection has
+/// succeeded before, so a dropped session never retries without end.
+const MAX_CONNECT_ATTEMPTS: u32 = 10;
 
 /// Marker error for fatal authentication failures (wrong token/PIN, explicit
 /// rejection, auth timeout). The client session ends on these instead of
@@ -529,28 +536,25 @@ async fn run_server_session(
         ServerMode::Manual => None,
     };
 
-    // Accept loop: one connection served at a time (duocb pairs two devices).
-    // While a clipboard session is live we don't accept further connections; a
-    // reconnecting paired peer retries and gets through once the dead
-    // connection is torn down. The claim gate refuses any other node id.
+    // Accept loop: duocb pairs exactly two devices, so at most one clipboard
+    // session is served at a time. Crucially the accept keeps running *during*
+    // a live session (see the select below): any dialer that isn't the claimed
+    // peer is refused immediately with a BUSY close inside `accept_serveable` —
+    // the claim's node id is QUIC/TLS-authenticated, so no in-band auth is
+    // needed to turn it away — and it gives up instead of hanging until its
+    // connect times out. A fresh connection from the *paired* peer preempts the
+    // current one, so a resumed link doesn't wait on the dead connection's idle
+    // timeout to be reaped.
+    //
+    // `pending` carries a preempting reconnect from one loop turn to the next.
+    let mut pending: Option<iroh::endpoint::Connection> = None;
     loop {
-        let incoming = tokio::select! {
-            _ = cancel.cancelled() => break,
-            incoming = endpoint.accept() => match incoming {
-                Some(incoming) => incoming,
-                None => {
-                    log::info!("Endpoint closed");
-                    break;
-                }
+        let conn = match pending.take() {
+            Some(conn) => conn,
+            None => match accept_serveable(&endpoint, &claim, &cancel).await {
+                Some(conn) => conn,
+                None => break,
             },
-        };
-
-        let conn = match incoming.await {
-            Ok(conn) => conn,
-            Err(e) => {
-                log::warn!("Failed to accept connection: {e}");
-                continue;
-            }
         };
         let remote_id = conn.remote_id();
         log::info!("Peer connected: {remote_id} (awaiting auth)");
@@ -576,22 +580,94 @@ async fn run_server_session(
         *conn_slot.lock() = Some(conn.clone());
 
         events.status(ConnStatus::Connected);
-        match pump_clipboard(send, recv, &events, &mut clip_rx, &cancel, &last_sent).await {
-            Ok(()) => log::info!("Clipboard session with {remote_id} ended"),
-            Err(e) => log::warn!("Clipboard session with {remote_id} ended: {e:#}"),
-        }
+        // Pump this connection while still accepting. `accept_serveable` refuses
+        // every other dialer BUSY; it only ever *returns* here for a fresh
+        // connection from the paired peer, which preempts (seamless reconnect).
+        let pump = pump_clipboard(send, recv, &events, &mut clip_rx, &cancel, &last_sent);
+        tokio::pin!(pump);
+        let preempt = tokio::select! {
+            r = &mut pump => {
+                match r {
+                    Ok(()) => log::info!("Clipboard session with {remote_id} ended"),
+                    Err(e) => log::warn!("Clipboard session with {remote_id} ended: {e:#}"),
+                }
+                None
+            }
+            next = accept_serveable(&endpoint, &claim, &cancel) => next,
+        };
         *conn_slot.lock() = None;
 
         if cancel.is_cancelled() {
             conn.close(SHUTDOWN_CODE.into(), b"shutdown");
             break;
         }
-        events.send(NetEvent::PeerDisconnected);
-        events.status(ConnStatus::Listening);
+
+        match preempt {
+            // The paired peer reconnected: drop the old connection and serve the
+            // new one on the next turn, without flapping the UI to "waiting".
+            Some(next) => {
+                conn.close(SHUTDOWN_CODE.into(), b"superseded");
+                pending = Some(next);
+            }
+            // The session ended on its own: back to waiting for the paired peer.
+            None => {
+                events.send(NetEvent::PeerDisconnected);
+                events.status(ConnStatus::Listening);
+            }
+        }
     }
 
     endpoint.close().await;
     log::info!("Server session stopped");
+}
+
+/// Accept connections, refusing any that isn't the currently-claimed peer with
+/// a BUSY close, until a serveable one is obtained: a first-time dialer while
+/// the claim is still empty, or the claimed peer (re)connecting. Returns `None`
+/// when the session is cancelled or the endpoint closes.
+///
+/// This runs both between sessions and *concurrently with* a live pump (see the
+/// accept loop's select). During a live session the claim is held, so the only
+/// connection it returns is a fresh one from the paired peer — every other
+/// dialer is turned away here before it ever reaches auth.
+async fn accept_serveable(
+    endpoint: &iroh::Endpoint,
+    claim: &PairClaim,
+    cancel: &CancellationToken,
+) -> Option<iroh::endpoint::Connection> {
+    loop {
+        let incoming = tokio::select! {
+            _ = cancel.cancelled() => return None,
+            incoming = endpoint.accept() => match incoming {
+                Some(incoming) => incoming,
+                None => {
+                    log::info!("Endpoint closed");
+                    return None;
+                }
+            },
+        };
+        let conn = match incoming.await {
+            Ok(conn) => conn,
+            Err(e) => {
+                log::warn!("Failed to accept connection: {e}");
+                continue;
+            }
+        };
+        // The remote id is authenticated by the QUIC/TLS handshake, so a dialer
+        // that isn't the paired peer is turned away here — before any in-band
+        // auth — with a BUSY close it recognizes and gives up on.
+        if let Some(claimed) = claim.peek()
+            && claimed.node_id != conn.remote_id()
+        {
+            log::warn!(
+                "Refusing {}: already paired with another device",
+                conn.remote_id()
+            );
+            conn.close(SERVER_BUSY_CODE.into(), b"busy");
+            continue;
+        }
+        return Some(conn);
+    }
 }
 
 // ============================================================================
@@ -651,9 +727,9 @@ async fn run_client_session(
         token_fingerprint,
     });
 
-    let mut backoff = Duration::from_secs(1);
+    // Consecutive failed attempts, reset to zero on every successful connection
+    // (below). Fixed-interval retry, bounded by `MAX_CONNECT_ATTEMPTS`.
     let mut attempts: u32 = 0;
-    let mut connected_once = false;
     // For a PIN target: the node id resolved on the first successful pairing.
     // Reused on every reconnect thereafter — the typed PIN has since rotated
     // off the relay (so a fresh lookup would fail), but the server retains our
@@ -760,9 +836,7 @@ async fn run_client_session(
                         // `conn_slot` directly.
                         let _paths = watch_connection_paths(&conn);
                         *conn_slot.lock() = Some(conn.clone());
-                        connected_once = true;
                         attempts = 0;
-                        backoff = Duration::from_secs(1);
 
                         match pump_clipboard(send, recv, &events, &mut clip_rx, &cancel, &last_sent)
                             .await
@@ -794,27 +868,28 @@ async fn run_client_session(
             Err(e) => log::warn!("Failed to connect to peer: {e:#}"),
         }
 
-        // Backoff before the next attempt. Before the first successful
-        // connection, a bounded number of attempts; afterwards, unlimited.
-        if !connected_once {
-            attempts += 1;
-            if attempts >= MAX_INITIAL_CONNECT_ATTEMPTS {
-                events.error(format!(
-                    "Could not reach the peer after {MAX_INITIAL_CONNECT_ATTEMPTS} attempts"
-                ));
-                events.status(ConnStatus::Idle);
-                endpoint.close().await;
-                return;
-            }
+        // This attempt failed or the session dropped: fixed-interval retry,
+        // bounded by a run of consecutive failures. The count resets to zero on
+        // any successful connection above, so an unreachable (or already-paired)
+        // peer gives up after `MAX_CONNECT_ATTEMPTS`, while a flaky link that
+        // keeps recovering never does.
+        attempts += 1;
+        if attempts >= MAX_CONNECT_ATTEMPTS {
+            events.error(format!(
+                "Could not reach the peer after {MAX_CONNECT_ATTEMPTS} attempts — press Join to try again"
+            ));
+            events.status(ConnStatus::Idle);
+            endpoint.close().await;
+            return;
         }
         events.status(ConnStatus::Reconnecting {
-            backoff_secs: backoff.as_secs(),
+            attempt: attempts,
+            max: MAX_CONNECT_ATTEMPTS,
         });
         tokio::select! {
             _ = cancel.cancelled() => { endpoint.close().await; return; }
-            _ = tokio::time::sleep(backoff) => {}
+            _ = tokio::time::sleep(RECONNECT_DELAY) => {}
         }
-        backoff = (backoff * 2).min(MAX_RECONNECT_BACKOFF);
     }
 }
 
@@ -1233,6 +1308,12 @@ fn auth_close_reason(conn: &iroh::endpoint::Connection) -> Option<String> {
                 )
             } else if code == u64::from(AUTH_TIMEOUT_CODE) {
                 Some("Authentication timed out on the peer".to_string())
+            } else if code == u64::from(SERVER_BUSY_CODE) {
+                Some(
+                    "The other device is already paired with another device — it links only \
+                     one device at a time (Stop and Start it to pair with this one instead)"
+                        .to_string(),
+                )
             } else {
                 None
             }
@@ -1245,10 +1326,25 @@ fn auth_close_reason(conn: &iroh::endpoint::Connection) -> Option<String> {
 /// stream is returned (send side *not* finished): the same stream carries the
 /// clipboard afterward.
 async fn auth_as_dialer(conn: &iroh::endpoint::Connection, auth_token: &str) -> Result<Bi> {
-    let (mut send, mut recv) = conn.open_bi().await.context("opening session stream")?;
-
-    let request = AuthRequest::new(auth_token);
-    send.write_all(&encode_auth_request(&request)?).await?;
+    // Opening the stream and sending the request can fail if the listener has
+    // already closed the connection (e.g. a BUSY refusal, which the listener
+    // sends without ever accepting a stream). Surface that as the fatal reason
+    // it is, rather than a generic transport error the client would retry on.
+    let opened = async {
+        let (mut send, recv) = conn.open_bi().await.context("opening session stream")?;
+        let request = AuthRequest::new(auth_token);
+        send.write_all(&encode_auth_request(&request)?).await?;
+        Ok::<Bi, anyhow::Error>((send, recv))
+    };
+    let (send, mut recv) = match opened.await {
+        Ok(streams) => streams,
+        Err(e) => {
+            if let Some(reason) = auth_close_reason(conn) {
+                return Err(auth_failure(reason));
+            }
+            return Err(e);
+        }
+    };
 
     let response_bytes = match tokio::time::timeout(
         AUTH_TIMEOUT,
@@ -1732,6 +1828,79 @@ mod tests {
         let mut cli = Some(cli_session);
         let mut srv = Some(srv_session);
         stop_session(&mut cli).await;
+        stop_session(&mut srv).await;
+    }
+
+    /// A second device dialing a server that is already paired with someone
+    /// else is refused promptly with a fatal "busy" error (a `SERVER_BUSY`
+    /// close), not left hanging in the reconnect loop.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn busy_server_refuses_a_third_device() {
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        // Server.
+        let (srv_tx, srv_rx) = std::sync::mpsc::channel();
+        let srv_session = start_session(
+            SessionKind::Server(ServerMode::Manual),
+            EventSender::new(srv_tx, None),
+            None,
+        );
+        let code = wait_for_event(&srv_rx, Duration::from_secs(30), |ev| {
+            if let NetEvent::ServerReady {
+                pairing_code: Some(code),
+                ..
+            } = ev
+            {
+                Some(code.clone())
+            } else {
+                None
+            }
+        });
+        let (node_id, secret) =
+            crate::manual_code::decode(&code).expect("displayed pairing code is valid");
+
+        // First device pairs and holds the claim.
+        let (a_tx, a_rx) = std::sync::mpsc::channel();
+        let a_session = start_session(
+            SessionKind::Client(DialSpec::Manual {
+                node_id: node_id.clone(),
+                secret: secret.clone(),
+            }),
+            EventSender::new(a_tx, None),
+            None,
+        );
+        wait_for_event(&a_rx, Duration::from_secs(60), |ev| {
+            matches!(ev, NetEvent::Status(ConnStatus::Connected)).then_some(())
+        });
+        wait_for_event(&srv_rx, Duration::from_secs(30), |ev| {
+            matches!(ev, NetEvent::Status(ConnStatus::Connected)).then_some(())
+        });
+
+        // Second device dials the same server with the same (valid) secret —
+        // but a different node identity, so it must be turned away as busy.
+        let (b_tx, b_rx) = std::sync::mpsc::channel();
+        let b_session = start_session(
+            SessionKind::Client(DialSpec::Manual { node_id, secret }),
+            EventSender::new(b_tx, None),
+            None,
+        );
+        let err = wait_for_event(&b_rx, Duration::from_secs(60), |ev| {
+            if let NetEvent::Error(e) = ev {
+                Some(e.clone())
+            } else {
+                None
+            }
+        });
+        assert!(
+            err.contains("another device"),
+            "expected a busy/already-paired rejection, got: {err}"
+        );
+
+        let mut a = Some(a_session);
+        let mut b = Some(b_session);
+        let mut srv = Some(srv_session);
+        stop_session(&mut a).await;
+        stop_session(&mut b).await;
         stop_session(&mut srv).await;
     }
 

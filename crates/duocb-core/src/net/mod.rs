@@ -144,8 +144,9 @@ pub enum ConnStatus {
     Authenticating,
     /// Paired and the clipboard channel is up.
     Connected,
-    /// Client: waiting to retry after a failed/dropped connection.
-    Reconnecting { backoff_secs: u64 },
+    /// Client: waiting to retry after a failed/dropped connection, showing the
+    /// current attempt against the give-up bound (fixed-interval retry).
+    Reconnecting { attempt: u32, max: u32 },
 }
 
 /// Events from the networking runtime to the UI thread.

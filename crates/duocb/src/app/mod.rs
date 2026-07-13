@@ -559,9 +559,9 @@ impl App {
     }
 
     /// The selected peer's display identity. Any listed device may be joined:
-    /// the dial re-resolves the record on every attempt and retries with
-    /// backoff, so a join placed before the other device presses Start succeeds
-    /// once it does.
+    /// the dial re-resolves the record on every attempt and retries at a fixed
+    /// interval (a bounded number of times), so a join placed shortly before the
+    /// other device presses Start succeeds once it does.
     pub(crate) fn selected_peer_display(&self) -> Option<String> {
         let suffix = self.selected_peer.as_deref()?;
         self.peers
@@ -636,8 +636,8 @@ impl App {
             ConnStatus::Connecting => "Connecting…".to_string(),
             ConnStatus::Authenticating => "Authenticating…".to_string(),
             ConnStatus::Connected => "Connected".to_string(),
-            ConnStatus::Reconnecting { backoff_secs } => {
-                format!("Reconnecting in {backoff_secs}s…")
+            ConnStatus::Reconnecting { attempt, max } => {
+                format!("Reconnecting… (attempt {attempt} of {max})")
             }
         }
     }
