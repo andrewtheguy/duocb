@@ -3,22 +3,23 @@
 //! The app links `libduocb.xcframework` (containing `libduocb.a` slices) and
 //! drives the clipboard-pairing runtime with these calls:
 //!
-//! 1. [`duocb_start`] — parse the JSON config (`role` "hub", "start", or
-//!    "join", shared `token`, this device's short `name` and permanent 8-char
-//!    `suffix`, the `peer` display identity to dial for the join role,
-//!    optional `relays`), spawn the networking runtime
+//! 1. [`duocb_start`] — parse the JSON config, spawn the networking runtime
 //!    ([`duocb_core::net::runtime::net_main`]) on an embedded tokio runtime,
-//!    and start the presence broadcast. The "start"/"join" roles then issue
-//!    the initial `StartServer`/`Connect` command; the "hub" role runs
+//!    and issue the role's initial command. Configure-mode roles ("hub",
+//!    "start", "join") take the shared `token`, this device's short `name`
+//!    and permanent 8-char `suffix` (plus the `peer` display identity to dial
+//!    for "join") and start the presence broadcast; the "hub" role runs
 //!    presence + peer discovery only (an initial peer fetch is issued, its
 //!    result arriving as a `peer_list` event) so the app can show the device
-//!    list before the user commits to a role. Returns an opaque handle. At
-//!    most **one** instance may run at a time (a process-global guard rejects
-//!    a second).
+//!    list before the user commits to a role. Quick-mode roles ("quick_host",
+//!    "quick_join") are identity-less — no token/name/suffix, no presence:
+//!    "quick_host" publishes a rotating PIN rendezvous (nostr + LAN) and
+//!    "quick_join" dials the `pin` typed by the user. Returns an opaque
+//!    handle. At most **one** instance may run at a time (a process-global
+//!    guard rejects a second).
 //! 2. [`duocb_next_event`] — drain one pending [`NetEvent`] as a JSON string.
 //!    The runtime is event-driven; Swift polls this on a timer until it
-//!    returns 0. PIN/quick-mode events never occur in configure mode and are
-//!    skipped defensively.
+//!    returns 0.
 //! 3. [`duocb_refresh_peers`] — re-fetch the presence records on demand; the
 //!    result arrives as a `peer_list` event (valid in every role, though the
 //!    hub is the natural place to poll it).
@@ -26,8 +27,8 @@
 //!    commands; outcomes arrive as `item_sent`/`error` and `conn_path` events.
 //! 5. [`duocb_stop`] — shut the runtime down and free the handle.
 //!
-//! Configure-mode only: this surface constructs `ServerMode::NostrToken` and
-//! `DialSpec::NostrToken` exclusively. Quick mode (PIN / manual) is
+//! Quick mode is fixed to [`PinChannel::NostrAndLan`] (the desktop "P"
+//! preset); the LAN-only / nostr-only presets and manual mode remain
 //! desktop-only. Token/name/suffix persistence is the caller's job (Keychain
 //! on iOS); mint the suffix once with [`duocb_generate_suffix`] and reuse it
 //! forever.
@@ -50,7 +51,7 @@ use serde::Deserialize;
 
 use duocb_core::net::endpoint::ConnPathKind;
 use duocb_core::net::{
-    ConnStatus, DialSpec, EventSender, NetEvent, ServerMode, TokenIdentity, UiCommand,
+    ConnStatus, DialSpec, EventSender, NetEvent, PinChannel, ServerMode, TokenIdentity, UiCommand,
 };
 
 /// Process-global guard: at most one running session per process.
@@ -70,17 +71,25 @@ pub struct DuocbHandle {
 #[derive(Deserialize)]
 struct FfiConfig {
     role: Role,
-    /// 47-char duocb auth token (the standing secret) shared by all devices.
-    token: String,
-    /// This device's short name (`A-Za-z0-9-`, ≤ 24 chars).
-    name: String,
-    /// This device's permanent 8-char suffix (mint once with
-    /// `duocb_generate_suffix`, persist forever).
-    suffix: String,
+    /// Configure-mode roles: 47-char duocb auth token (the standing secret)
+    /// shared by all devices.
+    #[serde(default)]
+    token: Option<String>,
+    /// Configure-mode roles: this device's short name (`A-Za-z0-9-`, ≤ 24 chars).
+    #[serde(default)]
+    name: Option<String>,
+    /// Configure-mode roles: this device's permanent 8-char suffix (mint once
+    /// with `duocb_generate_suffix`, persist forever).
+    #[serde(default)]
+    suffix: Option<String>,
     /// Join role only: the target device's full display identity as shown in
     /// the peer list, e.g. `"mac-book_a7B2c3D4"`.
     #[serde(default)]
     peer: Option<String>,
+    /// QuickJoin role only: the PIN shown on the hosting device, in any
+    /// user-typed form (dashes/spaces/lowercase ok).
+    #[serde(default)]
+    pin: Option<String>,
     /// Empty/omitted means the built-in default relays.
     #[serde(default)]
     relays: Vec<String>,
@@ -94,6 +103,10 @@ enum Role {
     Hub,
     Start,
     Join,
+    /// Quick mode: host a rotating-PIN session (identity-less, no presence).
+    QuickHost,
+    /// Quick mode: dial the PIN shown on the hosting device.
+    QuickJoin,
 }
 
 /// Route Rust `log` output to stderr (visible in Xcode's console and the
@@ -189,8 +202,33 @@ pub unsafe extern "C" fn duocb_token_fingerprint(
     }
 }
 
-/// Start a config-mode session. Returns a non-NULL handle, or NULL with the
-/// error message written to `err_buf`.
+/// Normalize a user-typed quick-pair PIN to canonical form (8 uppercase
+/// Crockford characters): strips dashes/spaces, uppercases, maps the aliases
+/// I/L→1 and O→0, and verifies the trailing check digit. Use for live
+/// validation of the join field; `duocb_start` re-normalizes anyway.
+/// Returns 1 = valid (canonical PIN written to `out_buf`), 0 = invalid PIN,
+/// -1 = NULL/non-UTF-8 input or the buffer is too small (needs ≥ 9 bytes).
+/// # Safety
+/// `pin` must be NULL or a valid NUL-terminated C string; `out_buf` must be
+/// NULL or point to at least `out_len` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn duocb_normalize_pin(
+    pin: *const c_char,
+    out_buf: *mut c_char,
+    out_len: usize,
+) -> c_int {
+    let Some(pin) = (unsafe { cstr_arg(pin) }) else {
+        return -1;
+    };
+    let Some(canonical) = duocb_core::pin::normalize_pin(pin) else {
+        return 0;
+    };
+    if write_cstr(out_buf, out_len, &canonical) { 1 } else { -1 }
+}
+
+/// Start a session (configure or quick mode, per the config's `role`).
+/// Returns a non-NULL handle, or NULL with the error message written to
+/// `err_buf`.
 /// # Safety
 /// `config_json` must be NULL or a valid NUL-terminated C string; `err_buf`
 /// must be NULL or point to at least `err_len` writable bytes.
@@ -224,26 +262,7 @@ pub unsafe extern "C" fn duocb_start(
 fn start_inner(json: &str) -> Result<DuocbHandle, String> {
     let cfg: FfiConfig =
         serde_json::from_str(json).map_err(|e| format!("invalid config JSON: {e}"))?;
-    duocb_core::auth::validate_token(&cfg.token).map_err(|e| format!("invalid token: {e:#}"))?;
-    let name = cfg.name.trim().to_string();
-    duocb_core::identity::validate_name(&name).map_err(|e| format!("invalid name: {e:#}"))?;
-    if !duocb_core::identity::is_valid_suffix(&cfg.suffix) {
-        return Err("invalid suffix (mint one with duocb_generate_suffix)".into());
-    }
-    let relays = if cfg.relays.is_empty() {
-        duocb_core::nostr::DEFAULT_NOSTR_RELAYS
-            .iter()
-            .map(|s| s.to_string())
-            .collect()
-    } else {
-        cfg.relays
-    };
-    let identity = TokenIdentity {
-        token: cfg.token,
-        name,
-        suffix: cfg.suffix,
-        relays,
-    };
+    let (identity, cmd) = build_initial_commands(cfg)?;
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -255,10 +274,90 @@ fn start_inner(json: &str) -> Result<DuocbHandle, String> {
     let events = EventSender::new(event_tx, None);
     let task = runtime.spawn(duocb_core::net::runtime::net_main(cmd_rx, events));
 
+    // The presence broadcast makes this device visible in the other devices'
+    // lists and, for the start role, carries the hosting node id to the
+    // joiner. Quick mode is identity-less and runs no presence.
+    if let Some(identity) = identity {
+        cmd_tx
+            .send(UiCommand::SetPresence {
+                identity: Some(identity),
+            })
+            .map_err(|_| "runtime unavailable".to_string())?;
+    }
+    cmd_tx.send(cmd).map_err(|_| "runtime unavailable".to_string())?;
+
+    Ok(DuocbHandle {
+        runtime,
+        cmd_tx,
+        events: Mutex::new(event_rx),
+        pending: Mutex::new(None),
+        task,
+    })
+}
+
+/// Validate the config and resolve it into the presence identity (configure
+/// mode only) plus the role's initial runtime command.
+fn build_initial_commands(cfg: FfiConfig) -> Result<(Option<TokenIdentity>, UiCommand), String> {
+    let relays = if cfg.relays.is_empty() {
+        duocb_core::nostr::DEFAULT_NOSTR_RELAYS
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    } else {
+        cfg.relays
+    };
+
+    // Quick roles first: identity-less, so none of the token/name/suffix
+    // validation below applies.
+    match cfg.role {
+        Role::QuickHost => {
+            return Ok((
+                None,
+                UiCommand::StartServer {
+                    mode: ServerMode::Pin {
+                        relays,
+                        channel: PinChannel::NostrAndLan,
+                    },
+                },
+            ));
+        }
+        Role::QuickJoin => {
+            let canonical_pin =
+                duocb_core::pin::normalize_pin(cfg.pin.as_deref().unwrap_or_default())
+                    .ok_or("invalid PIN (enter the 8 characters shown on the other device)")?;
+            return Ok((
+                None,
+                UiCommand::Connect {
+                    spec: DialSpec::Pin {
+                        canonical_pin,
+                        relays,
+                        channel: PinChannel::NostrAndLan,
+                    },
+                },
+            ));
+        }
+        Role::Hub | Role::Start | Role::Join => {}
+    }
+
+    let token = cfg.token.ok_or("token is required")?;
+    duocb_core::auth::validate_token(&token).map_err(|e| format!("invalid token: {e:#}"))?;
+    let name = cfg.name.ok_or("name is required")?.trim().to_string();
+    duocb_core::identity::validate_name(&name).map_err(|e| format!("invalid name: {e:#}"))?;
+    let suffix = cfg.suffix.ok_or("suffix is required")?;
+    if !duocb_core::identity::is_valid_suffix(&suffix) {
+        return Err("invalid suffix (mint one with duocb_generate_suffix)".into());
+    }
+    let identity = TokenIdentity {
+        token,
+        name,
+        suffix,
+        relays,
+    };
+
     let cmd = match cfg.role {
-        // The hub browses: presence is already running (below), so just kick
-        // off the initial peer fetch — its result arrives as a `peer_list`
-        // event. duocb_refresh_peers re-runs it on demand.
+        // The hub browses: presence runs regardless (see start_inner), so just
+        // kick off the initial peer fetch — its result arrives as a
+        // `peer_list` event. duocb_refresh_peers re-runs it on demand.
         Role::Hub => UiCommand::RefreshPeers,
         Role::Start => UiCommand::StartServer {
             mode: ServerMode::NostrToken {
@@ -277,23 +376,9 @@ fn start_inner(json: &str) -> Result<DuocbHandle, String> {
                 identity: identity.clone(),
             },
         },
+        Role::QuickHost | Role::QuickJoin => unreachable!("handled above"),
     };
-    // The presence broadcast makes this device visible in the other devices'
-    // lists and, for the start role, carries the hosting node id to the joiner.
-    cmd_tx
-        .send(UiCommand::SetPresence {
-            identity: Some(identity),
-        })
-        .map_err(|_| "runtime unavailable".to_string())?;
-    cmd_tx.send(cmd).map_err(|_| "runtime unavailable".to_string())?;
-
-    Ok(DuocbHandle {
-        runtime,
-        cmd_tx,
-        events: Mutex::new(event_rx),
-        pending: Mutex::new(None),
-        task,
-    })
+    Ok((Some(identity), cmd))
 }
 
 /// Drain one pending event as a NUL-terminated JSON string.
@@ -318,17 +403,9 @@ pub unsafe extern "C" fn duocb_next_event(
         Some(json) => json,
         None => {
             let events = handle.events.lock().unwrap();
-            loop {
-                match events.try_recv() {
-                    // event_json is None for events that can't occur in token
-                    // mode (PIN rotations) — skip and keep draining.
-                    Ok(event) => {
-                        if let Some(json) = event_json(&event) {
-                            break json;
-                        }
-                    }
-                    Err(_) => return 0,
-                }
+            match events.try_recv() {
+                Ok(event) => event_json(&event),
+                Err(_) => return 0,
             }
         }
     };
@@ -428,9 +505,8 @@ pub unsafe extern "C" fn duocb_stop(handle: *mut DuocbHandle) {
     RUNNING.store(false, Ordering::Release);
 }
 
-/// Serialize a [`NetEvent`] for the Swift side. Returns `None` for events that
-/// cannot occur in token mode (PIN quick-mode chatter), which are dropped.
-fn event_json(event: &NetEvent) -> Option<String> {
+/// Serialize a [`NetEvent`] for the Swift side.
+fn event_json(event: &NetEvent) -> String {
     use serde_json::json;
     let value = match event {
         NetEvent::ServerReady {
@@ -450,7 +526,16 @@ fn event_json(event: &NetEvent) -> Option<String> {
             "node_id": node_id,
             "token_fingerprint": token_fingerprint,
         }),
-        NetEvent::PinRotated { .. } | NetEvent::PinCleared => return None,
+        NetEvent::PinRotated {
+            pin_display,
+            seconds_left,
+        } => json!({
+            "type": "pin_rotated",
+            "pin_display": pin_display,
+            "seconds_left": seconds_left,
+        }),
+        // A peer paired (or the host stopped publishing) — hide the PIN.
+        NetEvent::PinCleared => json!({ "type": "pin_cleared" }),
         NetEvent::Status(status) => {
             let state = match status {
                 ConnStatus::Idle => "idle",
@@ -514,7 +599,7 @@ fn event_json(event: &NetEvent) -> Option<String> {
         }
         NetEvent::Error(message) => json!({ "type": "error", "message": message }),
     };
-    Some(value.to_string())
+    value.to_string()
 }
 
 /// Borrow a C string argument as `&str`; `None` for NULL or non-UTF-8.
@@ -588,13 +673,93 @@ mod tests {
     }
 
     #[test]
+    fn config_parses_quick_roles_without_identity_fields() {
+        let cfg: FfiConfig = serde_json::from_str(r#"{"role":"quick_host"}"#).unwrap();
+        assert!(matches!(cfg.role, Role::QuickHost));
+        assert!(cfg.token.is_none());
+
+        let cfg: FfiConfig =
+            serde_json::from_str(r#"{"role":"quick_join","pin":"abcd-2345"}"#).unwrap();
+        assert!(matches!(cfg.role, Role::QuickJoin));
+        assert_eq!(cfg.pin.as_deref(), Some("abcd-2345"));
+    }
+
+    #[test]
     fn join_requires_a_peer_identity() {
         let token = duocb_core::auth::generate_token();
         let json = format!(
             r#"{{"role":"join","token":"{token}","name":"phone","suffix":"x9Y8z7W6"}}"#
         );
-        let err = start_inner(&json).err().expect("join without peer fails");
+        let cfg: FfiConfig = serde_json::from_str(&json).unwrap();
+        let err = build_initial_commands(cfg)
+            .err()
+            .expect("join without peer fails");
         assert!(err.contains("peer"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn identity_roles_require_a_token() {
+        let cfg: FfiConfig =
+            serde_json::from_str(r#"{"role":"hub","name":"phone","suffix":"x9Y8z7W6"}"#).unwrap();
+        let err = build_initial_commands(cfg).err().expect("hub needs token");
+        assert!(err.contains("token"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn quick_host_builds_a_pin_server_without_presence() {
+        let cfg: FfiConfig = serde_json::from_str(r#"{"role":"quick_host"}"#).unwrap();
+        let (identity, cmd) = build_initial_commands(cfg).unwrap();
+        assert!(identity.is_none());
+        match cmd {
+            UiCommand::StartServer {
+                mode: ServerMode::Pin { relays, channel },
+            } => {
+                assert!(!relays.is_empty(), "default relays expected");
+                assert_eq!(channel, PinChannel::NostrAndLan);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn quick_join_normalizes_the_pin_and_rejects_bad_ones() {
+        let pin = duocb_core::pin::generate_pin();
+        let typed = format!(
+            "{}-{}",
+            pin[..4].to_lowercase(),
+            pin[4..].to_lowercase()
+        );
+        let json = format!(r#"{{"role":"quick_join","pin":"{typed}"}}"#);
+        let cfg: FfiConfig = serde_json::from_str(&json).unwrap();
+        let (identity, cmd) = build_initial_commands(cfg).unwrap();
+        assert!(identity.is_none());
+        match cmd {
+            UiCommand::Connect {
+                spec:
+                    DialSpec::Pin {
+                        canonical_pin,
+                        channel,
+                        ..
+                    },
+            } => {
+                assert_eq!(canonical_pin, pin);
+                assert_eq!(channel, PinChannel::NostrAndLan);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        // A wrong check digit (any other Crockford char in the last slot) and
+        // a missing pin both fail.
+        let check = pin.chars().last().unwrap();
+        let corrupted = format!("{}{}", &pin[..7], if check == 'A' { 'B' } else { 'A' });
+        for bad in [
+            format!(r#"{{"role":"quick_join","pin":"{corrupted}"}}"#),
+            r#"{"role":"quick_join"}"#.to_string(),
+        ] {
+            let cfg: FfiConfig = serde_json::from_str(&bad).unwrap();
+            let err = build_initial_commands(cfg).err().expect("bad pin fails");
+            assert!(err.contains("PIN"), "unexpected error: {err}");
+        }
     }
 
     #[test]
@@ -605,8 +770,7 @@ mod tests {
                 suffix: "a7B2c3D4".into(),
                 last_seen_unix: 42,
             }],
-        })
-        .unwrap();
+        });
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["type"], "peer_list");
         assert_eq!(v["peers"][0]["display"], "mac_a7B2c3D4");
@@ -614,21 +778,19 @@ mod tests {
 
         let json = event_json(&NetEvent::PresenceConflict {
             message: "another process".into(),
-        })
-        .unwrap();
+        });
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["type"], "presence_conflict");
         assert_eq!(v["message"], "another process");
     }
 
     #[test]
-    fn event_json_maps_token_mode_events_and_drops_pin_events() {
+    fn event_json_maps_token_mode_and_pin_events() {
         let json = event_json(&NetEvent::ServerReady {
             node_id: "abc".into(),
             token_fingerprint: Some("aaaa-bbbb-cccc-dddd".into()),
             pairing_code: None,
-        })
-        .unwrap();
+        });
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["type"], "server_ready");
         assert_eq!(v["node_id"], "abc");
@@ -637,14 +799,13 @@ mod tests {
         let json = event_json(&NetEvent::Status(ConnStatus::Reconnecting {
             attempt: 4,
             max: 10,
-        }))
-        .unwrap();
+        }));
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["state"], "reconnecting");
         assert_eq!(v["attempt"], 4);
         assert_eq!(v["max"], 10);
 
-        let json = event_json(&NetEvent::Status(ConnStatus::Connected)).unwrap();
+        let json = event_json(&NetEvent::Status(ConnStatus::Connected));
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["state"], "connected");
         assert!(v.get("attempt").is_none());
@@ -652,20 +813,52 @@ mod tests {
         let json = event_json(&NetEvent::ItemReceived {
             text: "resumed".into(),
             pulled: true,
-        })
-        .unwrap();
+        });
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["type"], "item_received");
         assert_eq!(v["pulled"], true);
 
-        assert!(
-            event_json(&NetEvent::PinRotated {
-                pin_display: "AAAA-BBBB".into(),
-                seconds_left: 10,
-            })
-            .is_none()
+        let json = event_json(&NetEvent::PinRotated {
+            pin_display: "AAAA-BBBB".into(),
+            seconds_left: 10,
+        });
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "pin_rotated");
+        assert_eq!(v["pin_display"], "AAAA-BBBB");
+        assert_eq!(v["seconds_left"], 10);
+
+        let json = event_json(&NetEvent::PinCleared);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "pin_cleared");
+    }
+
+    #[test]
+    fn normalize_pin_ffi_roundtrips_and_reports_errors() {
+        let pin = duocb_core::pin::generate_pin();
+        let typed = format!("{}-{}\0", pin[..4].to_lowercase(), pin[4..].to_lowercase());
+        let mut out = [0 as c_char; 16];
+        let rc = unsafe {
+            duocb_normalize_pin(typed.as_ptr() as *const c_char, out.as_mut_ptr(), out.len())
+        };
+        assert_eq!(rc, 1);
+        let written = unsafe { CStr::from_ptr(out.as_ptr()) };
+        assert_eq!(written.to_str().unwrap(), pin);
+
+        // Garbage input → 0.
+        let rc = unsafe {
+            duocb_normalize_pin(c"nope".as_ptr(), out.as_mut_ptr(), out.len())
+        };
+        assert_eq!(rc, 0);
+
+        // NULL input and a too-small buffer → -1.
+        assert_eq!(
+            unsafe { duocb_normalize_pin(ptr::null(), out.as_mut_ptr(), out.len()) },
+            -1
         );
-        assert!(event_json(&NetEvent::PinCleared).is_none());
+        let rc = unsafe {
+            duocb_normalize_pin(typed.as_ptr() as *const c_char, out.as_mut_ptr(), 8)
+        };
+        assert_eq!(rc, -1);
     }
 
     #[test]
