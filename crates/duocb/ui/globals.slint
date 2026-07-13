@@ -145,10 +145,13 @@ export global Actions {
     callback join-selected();
 
     // Quick options / client.
-    callback set-mode(mode: PairMode);
     callback set-pin-channel(channel: PinChannel);
+    /// Select the advanced manual mode (the quick screen's M row).
+    callback select-manual();
     callback toggle-quick-advanced();
-    callback open-client();
+    /// Dial whatever the quick screen's join entry holds (PIN or pairing
+    /// code, per the selected mode), moving to the client screen.
+    callback join-quick();
     callback connect-client();
     callback disconnect();
 

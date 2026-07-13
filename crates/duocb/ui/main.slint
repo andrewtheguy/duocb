@@ -28,6 +28,7 @@ export component MainWindow inherits Window {
     /// fields count.
     out property <bool> any-field-focused:
         (UiState.screen == Screen.home && home.field-focused)
+        || (UiState.screen == Screen.quick && quick.field-focused)
         || (UiState.screen == Screen.server && server.field-focused)
         || (UiState.screen == Screen.client && client.field-focused);
 

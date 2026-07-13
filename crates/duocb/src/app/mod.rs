@@ -653,13 +653,32 @@ impl App {
     pub(crate) fn open_quick(&mut self) {
         self.screen = Screen::Quick;
         // Home implies configure mode; entering the quick screen picks its
-        // default so the Start/Join actions there never run configure mode.
+        // default so the actions there never run configure mode.
         if self.mode == PairMode::NostrToken {
             self.mode = PairMode::NostrPin;
         }
         // Start with the advanced options collapsed; they still reveal
         // themselves if an advanced option is the active selection.
         self.quick_advanced_expanded = false;
+    }
+
+    /// Select the PIN rendezvous channel (the quick screen's P/L/I rows); it
+    /// applies to both the host and join actions there. Also leaves manual
+    /// mode, so the rows and the M row act as one radio group.
+    pub(crate) fn set_pin_channel(&mut self, channel: PinChannel) {
+        self.mode = PairMode::NostrPin;
+        self.pin_channel = channel;
+    }
+
+    /// Quick join: dial whatever the quick screen's join entry holds (PIN or
+    /// pairing code, per the selected mode) and move to the client screen. A
+    /// no-op while the entry doesn't validate (the Join action is disabled
+    /// then — see `dial-ready`).
+    pub(crate) fn join_quick(&mut self) {
+        if self.client_dial_spec().is_some() {
+            self.connect_client();
+            self.screen = Screen::Client;
+        }
     }
 
     /// Whether the current quick-mode selection is one of the "uncommon"
