@@ -62,12 +62,12 @@ export component QuickScreen inherits Rectangle {
                 clicked => { Actions.set-pin-channel(PinChannel.nostr-only); }
             }
             ModeRow {
-                text: "3  Local network only — no internet needed";
+                text: "3  Local network only — uses no internet";
                 selected: UiState.pin-channel == PinChannel.lan-only;
                 clicked => { Actions.set-pin-channel(PinChannel.lan-only); }
             }
             Small {
-                text: "Pairing works as long as both devices share at least one transport — the default (internet + local network) overlaps with any choice.";
+                text: "Both devices must share at least one transport; using the default on both is simplest. The first two options use the internet (nostr for discovery, and relays to connect when a direct link can't be made). Local network only stays entirely off the internet — no nostr, no relay — so both devices must be on the same network.";
             }
         }
 

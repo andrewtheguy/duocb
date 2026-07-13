@@ -139,12 +139,12 @@ A PIN rendezvous event is an offline guessing target: its author key and ciphert
 
 ## Endpoint and discovery
 
-`net/endpoint.rs` builds both endpoints identically (`Endpoint::builder(presets::Empty)` with an explicit ring crypto provider — required by iroh 1.0 on the Empty preset):
+`net/endpoint.rs` builds both endpoints (`Endpoint::builder(presets::Empty)` with an explicit ring crypto provider — required by iroh 1.0 on the Empty preset), tuned by the mode's `EndpointReadiness`:
 
 - ALPN `duocb/1` (server side only; a mismatch fails the QUIC handshake).
 - Transport: idle timeout 30 s (prompt dead-peer reaping), keep-alive 15 s; default congestion control.
-- Relays: `RelayMode::Default` (n0 public relays as fallback path).
-- Discovery/address lookup: n0 pkarr publisher + DNS resolver, **plus mDNS always** — the offline path. The client dials a **bare `EndpointAddr::new(node_id)`**; iroh resolves actual addresses via these services and hole-punches, falling back to a relay.
+- Relays + discovery, **except LAN-only**: `RelayMode::Default` (n0 public relays as fallback path) plus n0 pkarr publisher + DNS resolver **and mDNS**. The client dials a **bare `EndpointAddr::new(node_id)`**; iroh resolves actual addresses via these services and hole-punches, falling back to a relay.
+- **LAN-only PIN (`EndpointReadiness::LanDirect`) touches no internet at all**: `RelayMode::Disabled` and *only* the mDNS address lookup — no relay, no n0 DNS/pkarr publish or resolve. Pairing is entirely mDNS discovery + a direct QUIC path, so this mode genuinely *uses* no internet rather than merely not requiring one. (Manual mode keeps the relay/DNS path, so its "no internet **needed** on a LAN" is the weaker, correct claim.)
 - The identity is never persisted: every session is a fresh Ed25519 key, so node ids (and everything derived from them) are per-run.
 
 Connection-path status is **pulled on demand**, not watched: `connection_paths(conn)` returns a point-in-time snapshot of the connection's paths (`ConnPath { kind, display, selected }`) — `Connection::paths()` is itself a snapshot, so no background task is involved. The UI's "Connection path" button issues `QueryConnPath`, the runtime answers with `ConnPath(paths)` read from the live connection, and the result is shown in a dismissible modal. A separate background watcher exists **only for logging** the selected path and its changes (relay → direct); it is spawned only when debug logging is enabled (`RUST_LOG=duocb=debug`) and logs at `debug!`, so normal runs are quiet.

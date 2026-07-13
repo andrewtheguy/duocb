@@ -41,11 +41,16 @@ pub const QUIC_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 /// clipboard link, unlike a long-idle tunnel, wants prompt dead-peer reaping.
 pub const QUIC_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Create a base endpoint builder with common configuration: default relays,
-/// keep-alive/idle transport tuning, and discovery via n0 DNS/pkarr **plus mDNS**.
-/// mDNS is what lets the manual/offline mode resolve the node id carried by its
-/// pairing code on the local network with zero internet connectivity.
-fn create_endpoint_builder() -> Result<EndpointBuilder> {
+/// Create a base endpoint builder with common configuration: keep-alive/idle
+/// transport tuning plus discovery, tuned to `readiness`.
+///
+/// Every mode enables mDNS (local-network discovery — the offline path). Modes
+/// other than LAN-only additionally use the default relays and n0 DNS/pkarr, so
+/// peers stay reachable across networks. **LAN-only touches no internet at all**:
+/// the relay is disabled and the n0 DNS/pkarr publish+lookup are omitted, leaving
+/// mDNS + direct paths only — so that mode genuinely uses no internet rather than
+/// merely not requiring it.
+fn create_endpoint_builder(readiness: EndpointReadiness) -> Result<EndpointBuilder> {
     let mut transport_config = QuicTransportConfig::builder();
     let idle_timeout = QUIC_IDLE_TIMEOUT
         .try_into()
@@ -60,13 +65,21 @@ fn create_endpoint_builder() -> Result<EndpointBuilder> {
     // `install_default()` is not consulted.
     let crypto_provider = Arc::new(rustls::crypto::ring::default_provider());
     let builder = Endpoint::builder(presets::Empty)
-        .relay_mode(RelayMode::Default)
         .transport_config(transport_config)
-        .crypto_provider(crypto_provider)
-        .address_lookup(PkarrPublisher::n0_dns())
-        .address_lookup(DnsAddressLookup::n0_dns())
-        // mDNS always enabled for local network discovery (the offline path).
-        .address_lookup(MdnsAddressLookup::builder());
+        .crypto_provider(crypto_provider);
+
+    let builder = if readiness == EndpointReadiness::LanDirect {
+        // LAN-only: no relay, no internet-backed discovery — mDNS + direct only.
+        builder
+            .relay_mode(RelayMode::Disabled)
+            .address_lookup(MdnsAddressLookup::builder())
+    } else {
+        builder
+            .relay_mode(RelayMode::Default)
+            .address_lookup(PkarrPublisher::n0_dns())
+            .address_lookup(DnsAddressLookup::n0_dns())
+            .address_lookup(MdnsAddressLookup::builder())
+    };
 
     Ok(builder)
 }
@@ -134,7 +147,7 @@ async fn wait_for_endpoint_ready(endpoint: &Endpoint, readiness: EndpointReadine
 /// Create a listening endpoint. The endpoint identity is ephemeral, so the node
 /// id changes every run.
 pub async fn create_server_endpoint(readiness: EndpointReadiness) -> Result<Endpoint> {
-    let builder = create_endpoint_builder()?.alpns(vec![ALPN.to_vec()]);
+    let builder = create_endpoint_builder(readiness)?.alpns(vec![ALPN.to_vec()]);
     let endpoint = builder
         .bind()
         .await
@@ -145,7 +158,7 @@ pub async fn create_server_endpoint(readiness: EndpointReadiness) -> Result<Endp
 
 /// Create a dialing endpoint. The endpoint identity is ephemeral.
 pub async fn create_client_endpoint(readiness: EndpointReadiness) -> Result<Endpoint> {
-    let builder = create_endpoint_builder()?;
+    let builder = create_endpoint_builder(readiness)?;
     let endpoint = builder
         .bind()
         .await
