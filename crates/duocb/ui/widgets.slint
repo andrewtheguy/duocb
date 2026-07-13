@@ -93,12 +93,12 @@ export component TokenPairingSummary inherits Card {
     if UiState.joined-peer != "": LabeledValue { label: "Joining:"; value: UiState.joined-peer; }
     if UiState.node-id-short != "": LabeledValue { label: "This node:"; value: UiState.node-id-short; }
     if UiState.peer-node-id-short != "": LabeledValue { label: "Paired with:"; value: UiState.peer-node-id-short; }
-    if UiState.session-fingerprint != "": HorizontalLayout {
-        spacing: Theme.pad-s;
-        alignment: start;
-        Text { text: "Secret fingerprint:"; font-size: Theme.font-body; vertical-alignment: center; }
-        Mono { text: UiState.session-fingerprint; vertical-alignment: center; }
-        Small { text: "(must match on both devices)"; vertical-alignment: center; }
+    if UiState.session-fingerprint != "": LabeledValue {
+        label: "Secret fingerprint:";
+        value: UiState.session-fingerprint;
+    }
+    if UiState.session-fingerprint != "": Small {
+        text: "Must match on both devices.";
     }
 }
 

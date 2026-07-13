@@ -29,6 +29,10 @@ component ClipItemRow inherits Card {
             vertical-alignment: center;
         }
         Rectangle { horizontal-stretch: 1; }
+    }
+    HorizontalLayout {
+        spacing: Theme.pad-s;
+        alignment: end;
         Button {
             text: root.item.expanded ? "Hide" : "Peek";
             clicked => { root.peek-clicked(); }
@@ -115,15 +119,18 @@ export component SessionPanel inherits Rectangle {
         HorizontalLayout {
             spacing: Theme.pad-s;
             alignment: start;
-            CardTitle { text: UiState.inbox-title; vertical-alignment: center; }
+            CardTitle {
+                text: UiState.inbox-title;
+                horizontal-stretch: 1;
+                vertical-alignment: center;
+            }
             if UiState.inbox.length > 0: Button {
                 text: "Clear inbox (" + UiState.cmd-label + "+L)";
                 clicked => { Actions.clear-inbox(); }
             }
-            Small {
-                text: "newest: peek " + UiState.cmd-label + "+P · copy " + UiState.cmd-label + "+Y";
-                vertical-alignment: center;
-            }
+        }
+        Small {
+            text: "Newest: peek " + UiState.cmd-label + "+P · copy " + UiState.cmd-label + "+Y";
         }
         if UiState.inbox.length == 0: Weak { text: "Nothing received yet."; }
         // Only the inbox list scrolls (capped height); the send/compose

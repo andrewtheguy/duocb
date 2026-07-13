@@ -45,15 +45,18 @@ component ImportStep inherits VerticalLayout {
             edited => { Actions.fields-edited(); }
             accepted => { Actions.use-imported(); }
         }
-        if UiState.import-fingerprint != "": VerticalLayout {
-            spacing: Theme.pad-xs;
-            LabeledValue { label: "Token fingerprint:"; value: UiState.import-fingerprint; }
-            Small { text: "Confirm this matches on the other device."; }
+        if UiState.import-fingerprint != "": LabeledValue {
+            label: "Token fingerprint:";
+            value: UiState.import-fingerprint;
+        }
+        if UiState.import-fingerprint != "": Small {
+            text: "Confirm this matches on the other device.";
         }
         if UiState.import-invalid: Text {
             text: "That is not a valid token";
             color: Theme.warn;
             font-size: Theme.font-body;
+            wrap: word-wrap;
         }
         Rectangle { height: Theme.pad-xs; }
         HorizontalLayout {
@@ -94,6 +97,7 @@ component NameStep inherits VerticalLayout {
             text: UiState.name-error;
             color: Theme.warn;
             font-size: Theme.font-body;
+            wrap: word-wrap;
         }
         Rectangle { height: Theme.pad-xs; }
         HorizontalLayout {
@@ -121,28 +125,37 @@ component HubStep inherits VerticalLayout {
             spacing: Theme.pad-s;
             alignment: start;
             Text { text: "This device:"; font-size: Theme.font-body; vertical-alignment: center; }
-            Mono { text: UiState.display-identity; font-weight: 700; vertical-alignment: center; }
+            Mono {
+                text: UiState.display-identity;
+                font-weight: 700;
+                horizontal-stretch: 1;
+                vertical-alignment: center;
+            }
             Button { text: "Rename"; clicked => { Actions.rename(); } }
         }
         if UiState.has-secret: HorizontalLayout {
             spacing: Theme.pad-s;
             alignment: start;
             Text { text: "Secret:"; font-size: Theme.font-body; vertical-alignment: center; }
-            Mono { text: UiState.secret-hint; vertical-alignment: center; }
+            Mono {
+                text: UiState.secret-hint;
+                horizontal-stretch: 1;
+                vertical-alignment: center;
+            }
             Button {
                 text: UiState.copied-flash ? "✔ Copied" : "Copy secret";
                 clicked => { Actions.copy-secret(); }
             }
             Button { text: "Clear secret…"; clicked => { Actions.request-clear-secret(); } }
         }
-        if UiState.has-secret: HorizontalLayout {
-            spacing: Theme.pad-s;
-            alignment: start;
-            Text { text: "Fingerprint:"; font-size: Theme.font-body; vertical-alignment: center; }
-            Mono { text: UiState.secret-fingerprint; vertical-alignment: center; }
-            Small { text: "(must match on every device)"; vertical-alignment: center; }
+        if UiState.has-secret: LabeledValue {
+            label: "Fingerprint:";
+            value: UiState.secret-fingerprint;
         }
-        Small { text: "Config: " + UiState.config-path; }
+        if UiState.has-secret: Small {
+            text: "Must match on every device.";
+        }
+        Small { text: "Config: " + UiState.config-path; wrap: char-wrap; }
         if UiState.presence-conflict != "": Text {
             text: UiState.presence-conflict;
             color: Theme.warn;
@@ -173,16 +186,24 @@ component JoinStep inherits VerticalLayout {
         HorizontalLayout {
             spacing: Theme.pad-s;
             alignment: start;
-            CardTitle { text: "Your devices"; vertical-alignment: center; }
+            CardTitle {
+                text: "Your devices";
+                horizontal-stretch: 1;
+                vertical-alignment: center;
+            }
             Button { text: "⟳ Refresh (R)"; clicked => { Actions.refresh-peers(); } }
-            Small { text: UiState.peers-updated; vertical-alignment: center; }
         }
+        if UiState.peers-updated != "": Small { text: UiState.peers-updated; }
         Rectangle { height: Theme.pad-xs; }
         if UiState.peers-empty-text != "": Weak { text: UiState.peers-empty-text; }
         for row in UiState.peers: SelectableRow {
             selected: row.selected;
             clicked => { Actions.toggle-peer(row.suffix); }
-            Mono { text: row.line; vertical-alignment: center; }
+            Mono {
+                text: row.line;
+                horizontal-stretch: 1;
+                vertical-alignment: center;
+            }
         }
     }
     BigButton {
