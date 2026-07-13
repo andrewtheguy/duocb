@@ -42,7 +42,7 @@
  *   client_ready      {node_id, token_fingerprint}
  *   status            {state: idle|starting|listening|resolving|connecting|
  *                             authenticating|connected|reconnecting,
- *                      backoff_secs?}          (backoff_secs only when reconnecting)
+ *                      attempt?, max?}          (attempt/max only when reconnecting)
  *   peer_paired       {peer_node_id}
  *   peer_disconnected {}
  *   conn_path         {paths: [{kind: direct|relay|other, display, selected}]}
