@@ -53,8 +53,6 @@ pub(crate) struct App {
     /// first launch with this config file).
     pub(crate) device_suffix: String,
     pub(crate) configure_step: ConfigureStep,
-    /// A freshly generated secret during its one-time reveal, not yet committed.
-    pub(crate) wizard_token: Option<String>,
     /// The discovered peer device list and when it was last received/asked for.
     pub(crate) peers: Vec<PeerInfo>,
     pub(crate) peers_refreshed_at: Option<Instant>,
@@ -160,7 +158,6 @@ impl App {
             saved_name: saved_name.clone(),
             device_suffix,
             configure_step,
-            wizard_token: None,
             peers: Vec::new(),
             peers_refreshed_at: None,
             peers_requested_at: None,
@@ -478,19 +475,12 @@ impl App {
         }
     }
 
-    /// Start the one-time reveal of a freshly generated secret.
+    /// Generate a fresh secret and go straight to naming this device. There is
+    /// no separate "save the secret" step: it is persisted immediately and can
+    /// be copied from the hub at any time (Copy secret), so a confirm-you-saved-
+    /// it screen would only add a click without safeguarding anything.
     pub(crate) fn begin_generate_secret(&mut self) {
-        self.wizard_token = Some(duocb_core::auth::generate_token());
-        self.configure_step = ConfigureStep::SetupGenerate;
-    }
-
-    /// Commit the generated secret from its one-time reveal.
-    pub(crate) fn commit_generated_secret(&mut self) {
-        if let Some(token) = self.wizard_token.take() {
-            self.set_secret(token);
-        } else {
-            self.configure_step = ConfigureStep::SetupChoice;
-        }
+        self.set_secret(duocb_core::auth::generate_token());
     }
 
     /// Commit the pasted secret from the import step, if it validates.
@@ -502,9 +492,8 @@ impl App {
         }
     }
 
-    /// Cancel the generate/import step back to the choice.
+    /// Cancel the import step back to the choice.
     pub(crate) fn cancel_setup(&mut self) {
-        self.wizard_token = None;
         self.in_import_token.clear();
         self.configure_step = ConfigureStep::SetupChoice;
     }
@@ -557,7 +546,6 @@ impl App {
         self.peers_refreshed_at = None;
         self.peers_requested_at = None;
         self.presence_conflict = None;
-        self.wizard_token = None;
         self.in_import_token.clear();
         self.configure_step = ConfigureStep::SetupChoice;
     }

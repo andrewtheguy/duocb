@@ -33,8 +33,6 @@ export global UiState {
     in property <string> config-path;
     in property <string> presence-conflict;
     in property <bool> copied-flash;
-    in property <string> wizard-secret-hint;
-    in property <string> wizard-fingerprint;
     in property <bool> name-valid;
     /// "Broadcast as" preview when the name is valid, "" otherwise.
     in property <string> name-preview;
@@ -120,7 +118,6 @@ export global Actions {
     callback begin-generate();
     callback open-import();
     callback cancel-setup();
-    callback commit-generated();
     callback use-imported();
     callback save-name();
     callback cancel-name();

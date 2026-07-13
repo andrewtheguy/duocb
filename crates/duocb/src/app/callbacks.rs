@@ -65,7 +65,6 @@ pub(crate) fn wire(app: &Rc<RefCell<App>>, ui: &MainWindow) {
         app.configure_step = crate::ConfigureStep::SetupImport;
     });
     nav!(on_cancel_setup, |app| app.cancel_setup());
-    nav!(on_commit_generated, |app| app.commit_generated_secret());
     nav!(on_use_imported, |app| app.use_imported_secret());
     nav!(on_save_name, |app| app.save_name());
     nav!(on_cancel_name, |app| app.cancel_name());
@@ -74,7 +73,7 @@ pub(crate) fn wire(app: &Rc<RefCell<App>>, ui: &MainWindow) {
         app.configure_step = crate::ConfigureStep::SetupName;
     });
     act!(on_copy_secret, |app| {
-        if let Some(secret) = app.secret.clone().or_else(|| app.wizard_token.clone()) {
+        if let Some(secret) = app.secret.clone() {
             app.copy_secret_to_clipboard(&secret);
         }
     });

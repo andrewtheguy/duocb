@@ -31,38 +31,6 @@ component ChoiceStep inherits VerticalLayout {
     }
 }
 
-component GenerateStep inherits VerticalLayout {
-    alignment: start;
-    spacing: Theme.pad-m;
-    Card {
-        CardTitle { text: "Your new secret"; }
-        Weak {
-            text: "Copy it somewhere safe now — you will paste it into your other device. The last four characters are shown so you can spot-check a paste where no fingerprint is available.";
-        }
-        Rectangle { height: Theme.pad-xs; }
-        LabeledValue { label: "Secret:"; value: UiState.wizard-secret-hint; }
-        LabeledValue { label: "Fingerprint:"; value: UiState.wizard-fingerprint; }
-        Rectangle { height: Theme.pad-xs; }
-        HorizontalLayout {
-            spacing: Theme.pad-s;
-            alignment: start;
-            Button {
-                text: UiState.copied-flash ? "✔ Copied" : "Copy secret";
-                clicked => { Actions.copy-secret(); }
-            }
-            Button {
-                text: "✔ I saved it — continue";
-                primary: true;
-                clicked => { Actions.commit-generated(); }
-            }
-            Button {
-                text: "Cancel (Esc)";
-                clicked => { Actions.cancel-setup(); }
-            }
-        }
-    }
-}
-
 component ImportStep inherits VerticalLayout {
     out property <bool> field-focused: entry.has-focus;
     alignment: start;
@@ -257,14 +225,12 @@ export component HomeScreen inherits Rectangle {
             // The steps overlap (all instantiated so field focus stays
             // referencable); size the container to the visible one.
             height: UiState.configure-step == ConfigureStep.setup-choice ? choice-step.preferred-height
-                : UiState.configure-step == ConfigureStep.setup-generate ? generate-step.preferred-height
                 : UiState.configure-step == ConfigureStep.setup-import ? import-step.preferred-height
                 : UiState.configure-step == ConfigureStep.setup-name ? name-step.preferred-height
                 : UiState.configure-step == ConfigureStep.ready ? hub-step.preferred-height
                 : join-step.preferred-height;
 
             choice-step := ChoiceStep { visible: UiState.configure-step == ConfigureStep.setup-choice; }
-            generate-step := GenerateStep { visible: UiState.configure-step == ConfigureStep.setup-generate; }
             import-step := ImportStep { visible: UiState.configure-step == ConfigureStep.setup-import; }
             name-step := NameStep { visible: UiState.configure-step == ConfigureStep.setup-name; }
             hub-step := HubStep { visible: UiState.configure-step == ConfigureStep.ready; }

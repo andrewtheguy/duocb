@@ -46,20 +46,6 @@ impl App {
         s.set_config_path(self.config_lock.path().display().to_string().into());
         s.set_presence_conflict(str_or_empty(&self.presence_conflict));
         s.set_copied_flash(self.copied_flash_active());
-        s.set_wizard_secret_hint(
-            self.wizard_token
-                .as_deref()
-                .map(masked_secret_hint)
-                .unwrap_or_default()
-                .into(),
-        );
-        s.set_wizard_fingerprint(
-            self.wizard_token
-                .as_deref()
-                .map(duocb_core::auth::token_fingerprint)
-                .unwrap_or_default()
-                .into(),
-        );
         let name = self.in_my_name.trim();
         match duocb_core::identity::validate_name(name) {
             Ok(()) => {

@@ -126,7 +126,7 @@ fn handle_configure_key(
             }
             true
         }
-        ConfigureStep::SetupGenerate | ConfigureStep::SetupImport => {
+        ConfigureStep::SetupImport => {
             if esc {
                 app.cancel_setup();
                 true
@@ -251,12 +251,18 @@ mod tests {
     fn wizard_keys_route() {
         let mut app = test_app();
         assert_eq!(app.configure_step, ConfigureStep::SetupChoice);
+        // Generate persists the secret and jumps straight to naming — no
+        // intermediate "save the secret" step.
         assert!(plain(&mut app, "g", false));
-        assert_eq!(app.configure_step, ConfigureStep::SetupGenerate);
-        assert!(plain(&mut app, ESC, false));
+        assert_eq!(app.configure_step, ConfigureStep::SetupName);
+        assert!(app.secret.is_some());
+        // Import opens the paste step, and Esc backs out to the choice.
+        app.clear_secret();
         assert_eq!(app.configure_step, ConfigureStep::SetupChoice);
         assert!(plain(&mut app, "i", false));
         assert_eq!(app.configure_step, ConfigureStep::SetupImport);
+        assert!(plain(&mut app, ESC, false));
+        assert_eq!(app.configure_step, ConfigureStep::SetupChoice);
     }
 
     #[test]
