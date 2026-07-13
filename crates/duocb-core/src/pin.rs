@@ -176,6 +176,21 @@ pub fn pin_input_len(input: &str) -> usize {
     sanitize_pin_chars(input).chars().count()
 }
 
+/// Place two already-[`sanitize_pin_chars`]d entry groups into their final `(first, second)`
+/// form, each capped to [`PIN_GROUP_LEN`]. When the first group has overflowed past a group's
+/// length and the second is still empty — a paste of the whole code into the first field — the
+/// overflow spills into the second group; otherwise each group is truncated independently. The
+/// returned pair is what the two entry fields should hold.
+pub fn split_pin_groups(first: &str, second: &str) -> (String, String) {
+    let cap = |s: &str| -> String { s.chars().take(PIN_GROUP_LEN).collect() };
+    if first.chars().count() > PIN_GROUP_LEN && second.is_empty() {
+        let overflow = first.chars().skip(PIN_GROUP_LEN).take(PIN_GROUP_LEN).collect();
+        (cap(first), overflow)
+    } else {
+        (cap(first), cap(second))
+    }
+}
+
 /// The current rotation bucket: whole 60-second windows since the Unix epoch. The server
 /// publishes under the current bucket; the client searches adjacent buckets.
 pub fn current_bucket() -> u64 {
@@ -331,6 +346,39 @@ mod tests {
         assert_eq!(pin_input_len("ab-c"), 3);
         assert_eq!(pin_input_len("K7P2-9QX!"), 7);
         assert_eq!(PIN_GROUP_LEN * 2, PIN_LEN);
+    }
+
+    #[test]
+    fn split_pin_groups_spills_overflow_and_truncates() {
+        let g = PIN_GROUP_LEN;
+        // Overflow: a full code pasted into the first field spills into the
+        // empty second group, each capped to a group's length.
+        assert_eq!(
+            split_pin_groups("ABCDEFGH", ""),
+            ("ABCD".to_string(), "EFGH".to_string())
+        );
+        // Overflow beyond a full PIN drops the excess (second group still caps).
+        assert_eq!(
+            split_pin_groups("ABCDEFGHJK", ""),
+            ("ABCD".to_string(), "EFGH".to_string())
+        );
+        // Empty second group, first within a group's length: no spill.
+        assert_eq!(
+            split_pin_groups("AB", ""),
+            ("AB".to_string(), String::new())
+        );
+        // Normal truncation: the second group is non-empty, so the first never
+        // spills into it — each is truncated independently.
+        assert_eq!(
+            split_pin_groups("ABCDEF", "GHIJKL"),
+            ("ABCD".to_string(), "GHIJ".to_string())
+        );
+        // Both already within bounds: returned unchanged.
+        assert_eq!(
+            split_pin_groups("ABCD", "EFGH"),
+            ("ABCD".to_string(), "EFGH".to_string())
+        );
+        assert_eq!(g, "ABCD".chars().count());
     }
 
     #[test]

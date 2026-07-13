@@ -46,8 +46,8 @@ pub(crate) fn handle_global_key(
     let handled = match app.screen {
         Screen::Home if focus_free => handle_configure_key(app, esc, enter, up, down, &letter, &command),
         Screen::Quick if focus_free => {
-            // Each letter/number picks a whole pairing preset (mode + channel),
-            // matching the rows on screen: P and L are the common choices; 2 and
+            // Each letter picks a whole pairing preset (mode + channel),
+            // matching the rows on screen: P and L are the common choices; I and
             // M are the uncommon (testing) ones, which the UI reveals when
             // selected. Selecting one keeps quick mode out of configure mode.
             if letter('p') {
