@@ -84,19 +84,33 @@ fn create_endpoint_builder(readiness: EndpointReadiness) -> Result<EndpointBuild
     Ok(builder)
 }
 
-/// What a freshly bound endpoint waits for before the session proceeds.
+/// What a freshly bound endpoint waits for before the session proceeds — and,
+/// for [`LanDirect`](Self::LanDirect), which transport stack it is built with.
+///
+/// **Transport.** Every mode uses the default iroh stack — relays
+/// (`RelayMode::Default`) plus n0 DNS/pkarr *and* mDNS discovery — so a
+/// connection can always fall back to a relay or resolve across networks. The
+/// **one exception is `LanDirect`** (quick mode's LAN-only PIN channel):
+/// `create_endpoint_builder` strips the endpoint to `RelayMode::Disabled` with
+/// mDNS as the *only* address lookup, so that mode touches no internet at all.
+/// Note this is orthogonal to the *rendezvous* channel: e.g. `RelayOnline`
+/// (internet-only PIN) still keeps mDNS + direct paths on the endpoint, so its
+/// connection can be local even though its PIN discovery is nostr-only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EndpointReadiness {
     /// Wait for the home relay (`Endpoint::online`) and fail without it. The
     /// gate for internet-dependent modes — but `online()` **only** resolves
-    /// once a relay connects, so it times out entirely offline.
+    /// once a relay connects, so it times out entirely offline. Full default
+    /// transport stack.
     RelayOnline,
     /// Prefer the home relay but tolerate its absence: on timeout, log and
     /// continue with whatever direct addresses exist. The gate for modes that
-    /// work both online and offline (the default nostr+LAN PIN channel).
+    /// work both online and offline (the default nostr+LAN PIN channel, and
+    /// manual mode). Full default transport stack.
     RelayPreferred,
-    /// Wait only for a first direct (IP) address. The gate for LAN-only modes,
-    /// which must come up promptly with zero internet and no relay.
+    /// Wait only for a first direct (IP) address, and build the endpoint
+    /// **relay-less, mDNS-only** (no n0 DNS/pkarr). The gate for the LAN-only
+    /// PIN channel, which must come up promptly and use no internet at all.
     LanDirect,
 }
 
