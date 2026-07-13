@@ -46,10 +46,11 @@ pub const QUIC_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 ///
 /// Every mode enables mDNS (local-network discovery — the offline path). Modes
 /// other than LAN-only additionally use the default relays and n0 DNS/pkarr, so
-/// peers stay reachable across networks. **LAN-only touches no internet at all**:
-/// the relay is disabled and the n0 DNS/pkarr publish+lookup are omitted, leaving
-/// mDNS + direct paths only — so that mode genuinely uses no internet rather than
-/// merely not requiring it.
+/// peers stay reachable across networks. **LAN-only involves no third-party
+/// server**: the relay is disabled and n0 DNS/pkarr publish+lookup are omitted,
+/// leaving mDNS discovery plus direct device-to-device paths. This is not a
+/// packet-level subnet boundary; direct addresses and inbound source paths are
+/// not filtered to on-link IPs.
 fn create_endpoint_builder(readiness: EndpointReadiness) -> Result<EndpointBuilder> {
     let mut transport_config = QuicTransportConfig::builder();
     let idle_timeout = QUIC_IDLE_TIMEOUT
@@ -92,7 +93,9 @@ fn create_endpoint_builder(readiness: EndpointReadiness) -> Result<EndpointBuild
 /// connection can always fall back to a relay or resolve across networks. The
 /// **one exception is `LanDirect`** (quick mode's LAN-only PIN channel):
 /// `create_endpoint_builder` strips the endpoint to `RelayMode::Disabled` with
-/// mDNS as the *only* address lookup, so that mode touches no internet at all.
+/// mDNS as the *only* address lookup, so no third-party server participates and
+/// traffic is never relayed through a middle server. This does not enforce that
+/// every direct path remains within a conventional LAN subnet.
 /// Note this is orthogonal to the *rendezvous* channel: e.g. `RelayOnline`
 /// (internet-only PIN) still keeps mDNS + direct paths on the endpoint, so its
 /// connection can be local even though its PIN discovery is nostr-only.
@@ -110,7 +113,8 @@ pub enum EndpointReadiness {
     RelayPreferred,
     /// Wait only for a first direct (IP) address, and build the endpoint
     /// **relay-less, mDNS-only** (no n0 DNS/pkarr). The gate for the LAN-only
-    /// PIN channel, which must come up promptly and use no internet at all.
+    /// PIN channel, which must come up promptly without a third-party service.
+    /// Its traffic is direct, but the path is not restricted by source subnet.
     LanDirect,
 }
 
