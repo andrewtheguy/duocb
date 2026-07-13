@@ -39,6 +39,11 @@ pub(crate) struct App {
     /// Which rendezvous transport(s) the PIN quick mode uses (both sides must
     /// have overlapping channels; the default covers everything).
     pub(crate) pin_channel: PinChannel,
+    /// Whether the user has expanded the quick screen's "Uncommon options"
+    /// section. The section also shows whenever an uncommon option is the
+    /// active selection (see `quick_advanced_open`), so a live choice is never
+    /// hidden regardless of this flag.
+    pub(crate) quick_advanced_expanded: bool,
 
     // Shared status.
     pub(crate) status: ConnStatus,
@@ -53,8 +58,6 @@ pub(crate) struct App {
     /// first launch with this config file).
     pub(crate) device_suffix: String,
     pub(crate) configure_step: ConfigureStep,
-    /// A freshly generated secret during its one-time reveal, not yet committed.
-    pub(crate) wizard_token: Option<String>,
     /// The discovered peer device list and when it was last received/asked for.
     pub(crate) peers: Vec<PeerInfo>,
     pub(crate) peers_refreshed_at: Option<Instant>,
@@ -88,7 +91,10 @@ pub(crate) struct App {
     // reach the fields).
     pub(crate) in_my_name: String,
     pub(crate) in_import_token: String,
-    pub(crate) in_pin: String,
+    /// The joiner's PIN entry, split into its two `XXXX` groups (one text field
+    /// each) so grouping never edits a field's text mid-keystroke.
+    pub(crate) in_pin_a: String,
+    pub(crate) in_pin_b: String,
     pub(crate) in_manual_code: String,
     /// Draft of the session panel's compose field (send typed text).
     pub(crate) in_compose: String,
@@ -151,13 +157,13 @@ impl App {
             screen: Screen::Home,
             mode: PairMode::NostrToken,
             pin_channel: PinChannel::Both,
+            quick_advanced_expanded: false,
             status: ConnStatus::Idle,
             error: startup_error,
             secret,
             saved_name: saved_name.clone(),
             device_suffix,
             configure_step,
-            wizard_token: None,
             peers: Vec::new(),
             peers_refreshed_at: None,
             peers_requested_at: None,
@@ -175,7 +181,8 @@ impl App {
             client_active: false,
             in_my_name: saved_name.unwrap_or_default(),
             in_import_token: String::new(),
-            in_pin: String::new(),
+            in_pin_a: String::new(),
+            in_pin_b: String::new(),
             in_manual_code: String::new(),
             in_compose: String::new(),
             peer_node_id: None,
@@ -474,19 +481,12 @@ impl App {
         }
     }
 
-    /// Start the one-time reveal of a freshly generated secret.
+    /// Generate a fresh secret and go straight to naming this device. There is
+    /// no separate "save the secret" step: it is persisted immediately and can
+    /// be copied from the hub at any time (Copy secret), so a confirm-you-saved-
+    /// it screen would only add a click without safeguarding anything.
     pub(crate) fn begin_generate_secret(&mut self) {
-        self.wizard_token = Some(duocb_core::auth::generate_token());
-        self.configure_step = ConfigureStep::SetupGenerate;
-    }
-
-    /// Commit the generated secret from its one-time reveal.
-    pub(crate) fn commit_generated_secret(&mut self) {
-        if let Some(token) = self.wizard_token.take() {
-            self.set_secret(token);
-        } else {
-            self.configure_step = ConfigureStep::SetupChoice;
-        }
+        self.set_secret(duocb_core::auth::generate_token());
     }
 
     /// Commit the pasted secret from the import step, if it validates.
@@ -498,9 +498,8 @@ impl App {
         }
     }
 
-    /// Cancel the generate/import step back to the choice.
+    /// Cancel the import step back to the choice.
     pub(crate) fn cancel_setup(&mut self) {
-        self.wizard_token = None;
         self.in_import_token.clear();
         self.configure_step = ConfigureStep::SetupChoice;
     }
@@ -553,15 +552,14 @@ impl App {
         self.peers_refreshed_at = None;
         self.peers_requested_at = None;
         self.presence_conflict = None;
-        self.wizard_token = None;
         self.in_import_token.clear();
         self.configure_step = ConfigureStep::SetupChoice;
     }
 
     /// The selected peer's display identity. Any listed device may be joined:
-    /// the dial re-resolves the record on every attempt and retries with
-    /// backoff, so a join placed before the other device presses Start succeeds
-    /// once it does.
+    /// the dial re-resolves the record on every attempt and retries at a fixed
+    /// interval (a bounded number of times), so a join placed shortly before the
+    /// other device presses Start succeeds once it does.
     pub(crate) fn selected_peer_display(&self) -> Option<String> {
         let suffix = self.selected_peer.as_deref()?;
         self.peers
@@ -636,8 +634,8 @@ impl App {
             ConnStatus::Connecting => "Connecting…".to_string(),
             ConnStatus::Authenticating => "Authenticating…".to_string(),
             ConnStatus::Connected => "Connected".to_string(),
-            ConnStatus::Reconnecting { backoff_secs } => {
-                format!("Reconnecting in {backoff_secs}s…")
+            ConnStatus::Reconnecting { attempt, max } => {
+                format!("Reconnecting… (attempt {attempt} of {max})")
             }
         }
     }
@@ -659,6 +657,23 @@ impl App {
         if self.mode == PairMode::NostrToken {
             self.mode = PairMode::NostrPin;
         }
+        // Start with the uncommon options collapsed; they still reveal
+        // themselves if an uncommon option is the active selection.
+        self.quick_advanced_expanded = false;
+    }
+
+    /// Whether the current quick-mode selection is one of the "uncommon"
+    /// (testing-leaning) options — internet-only PIN discovery, or manual mode.
+    /// Used to keep the quick screen's uncommon section open while such an
+    /// option is active, so the live choice is never hidden.
+    pub(crate) fn quick_uncommon_selected(&self) -> bool {
+        self.mode == PairMode::Manual
+            || (self.mode == PairMode::NostrPin && self.pin_channel == PinChannel::NostrOnly)
+    }
+
+    /// Whether the quick screen's uncommon section should render open.
+    pub(crate) fn quick_advanced_open(&self) -> bool {
+        self.quick_advanced_expanded || self.quick_uncommon_selected()
     }
 
     /// Navigate back one screen, stopping any running session. Role screens
@@ -717,7 +732,8 @@ impl App {
                 peer_display: self.selected_peer_display()?,
             }),
             PairMode::NostrPin => {
-                duocb_core::pin::normalize_pin(&self.in_pin).map(|canonical_pin| DialSpec::Pin {
+                duocb_core::pin::normalize_pin(&format!("{}{}", self.in_pin_a, self.in_pin_b))
+                    .map(|canonical_pin| DialSpec::Pin {
                     canonical_pin,
                     relays: default_relays(),
                     channel: self.core_pin_channel(),
@@ -938,7 +954,10 @@ pub(crate) mod tests {
         app.mode = PairMode::NostrPin;
         app.pin_channel = PinChannel::LanOnly;
         let canonical = duocb_core::pin::generate_pin();
-        app.in_pin = duocb_core::pin::format_pin(&canonical);
+        // The joiner types the PIN across the two group fields.
+        let g = duocb_core::pin::PIN_GROUP_LEN;
+        app.in_pin_a = canonical[..g].to_string();
+        app.in_pin_b = canonical[g..].to_string();
         match app.server_mode_spec() {
             Some(duocb_core::net::ServerMode::Pin { channel, .. }) => {
                 assert_eq!(channel, duocb_core::net::PinChannel::LanOnly);

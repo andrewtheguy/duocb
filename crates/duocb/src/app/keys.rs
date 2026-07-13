@@ -46,19 +46,21 @@ pub(crate) fn handle_global_key(
     let handled = match app.screen {
         Screen::Home if focus_free => handle_configure_key(app, esc, enter, up, down, &letter, &command),
         Screen::Quick if focus_free => {
-            // Digits pick the PIN discovery channel (only meaningful — and
-            // only visible — while the PIN mode is selected).
-            let pin_mode = app.mode == PairMode::NostrPin;
+            // Each letter picks a whole pairing preset (mode + channel),
+            // matching the rows on screen: P and L are the common choices; I and
+            // M are the uncommon (testing) ones, which the UI reveals when
+            // selected. Selecting one keeps quick mode out of configure mode.
             if letter('p') {
                 app.mode = PairMode::NostrPin;
+                app.pin_channel = PinChannel::Both;
+            } else if letter('l') {
+                app.mode = PairMode::NostrPin;
+                app.pin_channel = PinChannel::LanOnly;
+            } else if letter('i') {
+                app.mode = PairMode::NostrPin;
+                app.pin_channel = PinChannel::NostrOnly;
             } else if letter('m') {
                 app.mode = PairMode::Manual;
-            } else if pin_mode && letter('1') {
-                app.pin_channel = PinChannel::Both;
-            } else if pin_mode && letter('2') {
-                app.pin_channel = PinChannel::NostrOnly;
-            } else if pin_mode && letter('3') {
-                app.pin_channel = PinChannel::LanOnly;
             } else if letter('s') {
                 app.begin_server();
             } else if letter('c') {
@@ -69,10 +71,15 @@ pub(crate) fn handle_global_key(
             true
         }
         Screen::Server => {
-            // Copy the displayed pairing code without the mouse (manual mode).
+            // Copy the displayed credential without the mouse: the pairing code
+            // (manual mode) or the current rotating PIN (PIN mode).
             if command('t') && app.pairing_code.is_some() {
                 let code = app.pairing_code.clone().unwrap();
                 app.copy_to_clipboard(&code);
+                true
+            } else if command('t') && app.pin_display.is_some() {
+                let pin = app.pin_display.clone().unwrap();
+                app.copy_to_clipboard(&pin);
                 true
             } else {
                 false
@@ -121,7 +128,7 @@ fn handle_configure_key(
             }
             true
         }
-        ConfigureStep::SetupGenerate | ConfigureStep::SetupImport => {
+        ConfigureStep::SetupImport => {
             if esc {
                 app.cancel_setup();
                 true
@@ -218,16 +225,22 @@ mod tests {
         let mut app = test_app();
         app.open_quick();
         assert_eq!(app.mode, PairMode::NostrPin);
-        // Digits pick the PIN discovery channel while the PIN mode is selected…
-        assert!(plain(&mut app, "3", false));
+        // Each key selects a whole preset (mode + channel).
+        assert!(plain(&mut app, "l", false));
+        assert_eq!(app.mode, PairMode::NostrPin);
         assert_eq!(app.pin_channel, PinChannel::LanOnly);
-        assert!(plain(&mut app, "1", false));
+        // The uncommon "internet only" preset, and it auto-reveals the section.
+        assert!(plain(&mut app, "i", false));
+        assert_eq!(app.pin_channel, PinChannel::NostrOnly);
+        assert!(app.quick_advanced_open());
+        // Back to the default PIN preset closes the uncommon section again.
+        assert!(plain(&mut app, "p", false));
+        assert_eq!(app.mode, PairMode::NostrPin);
         assert_eq!(app.pin_channel, PinChannel::Both);
+        assert!(!app.quick_advanced_open());
         assert!(plain(&mut app, "m", false));
         assert_eq!(app.mode, PairMode::Manual);
-        // …but not while another mode is.
-        assert!(!plain(&mut app, "2", false));
-        assert_eq!(app.pin_channel, PinChannel::Both);
+        assert!(app.quick_advanced_open());
         assert!(plain(&mut app, "c", false));
         assert_eq!(app.screen, Screen::Client);
         assert!(plain(&mut app, ESC, false));
@@ -246,12 +259,18 @@ mod tests {
     fn wizard_keys_route() {
         let mut app = test_app();
         assert_eq!(app.configure_step, ConfigureStep::SetupChoice);
+        // Generate persists the secret and jumps straight to naming — no
+        // intermediate "save the secret" step.
         assert!(plain(&mut app, "g", false));
-        assert_eq!(app.configure_step, ConfigureStep::SetupGenerate);
-        assert!(plain(&mut app, ESC, false));
+        assert_eq!(app.configure_step, ConfigureStep::SetupName);
+        assert!(app.secret.is_some());
+        // Import opens the paste step, and Esc backs out to the choice.
+        app.clear_secret();
         assert_eq!(app.configure_step, ConfigureStep::SetupChoice);
         assert!(plain(&mut app, "i", false));
         assert_eq!(app.configure_step, ConfigureStep::SetupImport);
+        assert!(plain(&mut app, ESC, false));
+        assert_eq!(app.configure_step, ConfigureStep::SetupChoice);
     }
 
     #[test]

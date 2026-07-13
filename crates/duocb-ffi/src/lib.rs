@@ -463,8 +463,9 @@ fn event_json(event: &NetEvent) -> Option<String> {
                 ConnStatus::Reconnecting { .. } => "reconnecting",
             };
             let mut value = json!({ "type": "status", "state": state });
-            if let ConnStatus::Reconnecting { backoff_secs } = status {
-                value["backoff_secs"] = json!(backoff_secs);
+            if let ConnStatus::Reconnecting { attempt, max } = status {
+                value["attempt"] = json!(attempt);
+                value["max"] = json!(max);
             }
             value
         }
@@ -633,16 +634,20 @@ mod tests {
         assert_eq!(v["node_id"], "abc");
         assert_eq!(v["token_fingerprint"], "aaaa-bbbb-cccc-dddd");
 
-        let json = event_json(&NetEvent::Status(ConnStatus::Reconnecting { backoff_secs: 4 }))
-            .unwrap();
+        let json = event_json(&NetEvent::Status(ConnStatus::Reconnecting {
+            attempt: 4,
+            max: 10,
+        }))
+        .unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["state"], "reconnecting");
-        assert_eq!(v["backoff_secs"], 4);
+        assert_eq!(v["attempt"], 4);
+        assert_eq!(v["max"], 10);
 
         let json = event_json(&NetEvent::Status(ConnStatus::Connected)).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["state"], "connected");
-        assert!(v.get("backoff_secs").is_none());
+        assert!(v.get("attempt").is_none());
 
         let json = event_json(&NetEvent::ItemReceived {
             text: "resumed".into(),

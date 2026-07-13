@@ -20,6 +20,7 @@ impl App {
         s.set_configure_step(self.configure_step);
         s.set_mode(self.mode);
         s.set_pin_channel(self.pin_channel);
+        s.set_quick_advanced_open(self.quick_advanced_open());
         s.set_status_text(self.status_text().into());
         s.set_connected(self.status == ConnStatus::Connected);
         s.set_server_running(self.server_running);
@@ -46,20 +47,6 @@ impl App {
         s.set_config_path(self.config_lock.path().display().to_string().into());
         s.set_presence_conflict(str_or_empty(&self.presence_conflict));
         s.set_copied_flash(self.copied_flash_active());
-        s.set_wizard_secret_hint(
-            self.wizard_token
-                .as_deref()
-                .map(masked_secret_hint)
-                .unwrap_or_default()
-                .into(),
-        );
-        s.set_wizard_fingerprint(
-            self.wizard_token
-                .as_deref()
-                .map(duocb_core::auth::token_fingerprint)
-                .unwrap_or_default()
-                .into(),
-        );
         let name = self.in_my_name.trim();
         match duocb_core::identity::validate_name(name) {
             Ok(()) => {
@@ -171,9 +158,24 @@ impl App {
         });
         s.set_pin_paired(self.pin_paired);
 
-        // Client join forms.
-        let pin = self.in_pin.trim();
-        s.set_pin_invalid(!pin.is_empty() && duocb_core::pin::normalize_pin(pin).is_none());
+        // Client join forms. The two group fields together make the PIN.
+        // Distinguish "still typing" (fewer than a full PIN's characters) from
+        // "full length but a typo" so the hint under the fields is a neutral
+        // progress line while typing and only turns into a validation warning
+        // once the whole code is in.
+        let combined = format!("{}{}", self.in_pin_a, self.in_pin_b);
+        let pin_len = duocb_core::pin::pin_input_len(&combined);
+        let pin_full = pin_len == duocb_core::pin::PIN_LEN;
+        s.set_pin_incomplete(if pin_len > 0 && !pin_full {
+            format!("Keep typing — {pin_len} of {} characters", duocb_core::pin::PIN_LEN).into()
+        } else {
+            SharedString::default()
+        });
+        s.set_pin_invalid(pin_full && duocb_core::pin::normalize_pin(&combined).is_none());
+        // Drives the joiner's auto-advance from the first group to the second.
+        s.set_pin_a_full(
+            duocb_core::pin::pin_input_len(&self.in_pin_a) == duocb_core::pin::PIN_GROUP_LEN,
+        );
         let code = self.in_manual_code.trim();
         s.set_manual_code_invalid(
             !code.is_empty() && duocb_core::manual_code::decode(code).is_none(),
@@ -217,7 +219,8 @@ impl App {
         // resets (wizard cancels, compose clear) to the actual fields.
         s.set_in_my_name(self.in_my_name.clone().into());
         s.set_in_import_token(self.in_import_token.clone().into());
-        s.set_in_pin(self.in_pin.clone().into());
+        s.set_in_pin_a(self.in_pin_a.clone().into());
+        s.set_in_pin_b(self.in_pin_b.clone().into());
         s.set_in_manual_code(self.in_manual_code.clone().into());
         s.set_in_compose(self.in_compose.clone().into());
     }

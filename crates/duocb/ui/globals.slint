@@ -11,12 +11,21 @@ export global UiState {
     // pick happens on the Rust side.
     in property <string> ui-font;
     in property <string> mono-font: "monospace";
+    /// The command-modifier label used in shortcut hints: "⌘" on macOS, "Ctrl"
+    /// elsewhere. Set once at startup from Rust, since Slint can't tell which
+    /// build target it is running on. Matches Slint's `control` modifier, which
+    /// is ⌘ on macOS and Ctrl on every other platform.
+    in property <string> cmd-label: "Ctrl";
 
     // Navigation / shared status.
     in property <Screen> screen;
     in property <ConfigureStep> configure-step;
     in property <PairMode> mode;
     in property <PinChannel> pin-channel;
+    /// Whether the quick screen's "Uncommon options" section is expanded. Open
+    /// when the user expands it or when an uncommon option (internet-only PIN,
+    /// or manual) is currently selected, so an active choice is never hidden.
+    in property <bool> quick-advanced-open;
     in property <string> status-text;
     in property <bool> connected;
     in property <bool> server-running;
@@ -33,8 +42,6 @@ export global UiState {
     in property <string> config-path;
     in property <string> presence-conflict;
     in property <bool> copied-flash;
-    in property <string> wizard-secret-hint;
-    in property <string> wizard-fingerprint;
     in property <bool> name-valid;
     /// "Broadcast as" preview when the name is valid, "" otherwise.
     in property <string> name-preview;
@@ -74,8 +81,15 @@ export global UiState {
     in property <bool> pin-paired;
 
     // Client join forms.
-    /// True when the PIN entry is non-empty but not a valid PIN.
+    /// True when the PIN entry is full-length but fails validation (a typo).
     in property <bool> pin-invalid;
+    /// Neutral "keep typing — N of M characters" hint while the PIN entry is
+    /// non-empty but shorter than a full PIN; "" otherwise. Composed in Rust so
+    /// the PIN length lives in one place.
+    in property <string> pin-incomplete;
+    /// True once the first PIN group is full, so the entry auto-advances focus
+    /// to the second group (Apple-style code entry).
+    in property <bool> pin-a-full;
     /// True when the pairing-code entry is non-empty but not a valid code.
     in property <bool> manual-code-invalid;
     in property <bool> dial-ready;
@@ -97,7 +111,8 @@ export global UiState {
     // on every edit and writes them back on sync (authoritative after resets).
     in-out property <string> in-my-name;
     in-out property <string> in-import-token;
-    in-out property <string> in-pin;
+    in-out property <string> in-pin-a;
+    in-out property <string> in-pin-b;
     in-out property <string> in-manual-code;
     in-out property <string> in-compose;
 }
@@ -112,7 +127,6 @@ export global Actions {
     callback begin-generate();
     callback open-import();
     callback cancel-setup();
-    callback commit-generated();
     callback use-imported();
     callback save-name();
     callback cancel-name();
@@ -133,12 +147,14 @@ export global Actions {
     // Quick options / client.
     callback set-mode(mode: PairMode);
     callback set-pin-channel(channel: PinChannel);
+    callback toggle-quick-advanced();
     callback open-client();
     callback connect-client();
     callback disconnect();
 
     // Server credentials.
     callback copy-pairing-code();
+    callback copy-pin();
 
     // Session panel.
     callback send-clipboard();

@@ -42,6 +42,13 @@ export component ServerScreen inherits Rectangle {
                 font-weight: 700;
                 horizontal-alignment: center;
             }
+            HorizontalLayout {
+                alignment: center;
+                Button {
+                    text: "Copy PIN (" + UiState.cmd-label + "+T)";
+                    clicked => { Actions.copy-pin(); }
+                }
+            }
             Body {
                 text: UiState.pin-countdown;
                 horizontal-alignment: center;
@@ -71,12 +78,13 @@ export component ServerScreen inherits Rectangle {
                 alignment: start;
                 Body { text: "Pairing code:"; vertical-alignment: center; }
                 Button {
-                    text: "Copy (Ctrl/⌘+T)";
+                    text: "Copy (" + UiState.cmd-label + "+T)";
                     clicked => { Actions.copy-pairing-code(); }
                 }
             }
             Mono { text: UiState.pairing-code; wrap: char-wrap; }
-            Body { text: "Send it to the other device over any channel you trust and paste it there. No internet needed on the same LAN."; }
+            Body { text: "Send it to the other device over any channel you trust and paste it there."; }
+            Small { text: "Manual mode uses no signaling service (no nostr) — only iroh. It resolves the id in the code over the internet (iroh's DNS) or the local network (mDNS), then connects directly or through an iroh relay. Devices on the same network can link directly even while online, and can pair with no internet at all."; }
         }
 
         if UiState.server-running: HorizontalLayout {

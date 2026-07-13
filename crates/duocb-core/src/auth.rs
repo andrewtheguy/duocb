@@ -76,8 +76,8 @@ pub fn generate_token() -> String {
 ///
 /// The token is never revealed in plain text, so two devices cannot compare the
 /// secret directly. This fingerprint — the first 8 bytes of the SHA-256 of the
-/// token string, as 16 lowercase hex digits grouped into four dash-separated
-/// quads (`xxxx-xxxx-xxxx-xxxx`) — is displayed instead: if it matches on both
+/// token string, as 16 uppercase hex digits grouped into four dash-separated
+/// quads (`XXXX-XXXX-XXXX-XXXX`) — is displayed instead: if it matches on both
 /// devices the tokens match, without ever exposing the secret. It stays local
 /// (never sent over the wire), so 8 bytes is ample against accidental collision.
 pub fn token_fingerprint(token: &str) -> String {
@@ -90,7 +90,7 @@ pub fn token_fingerprint(token: &str) -> String {
         if i > 0 && i % 2 == 0 {
             out.push('-');
         }
-        let _ = write!(out, "{b:02x}");
+        let _ = write!(out, "{b:02X}");
     }
     out
 }
@@ -183,25 +183,25 @@ mod tests {
     }
 
     #[test]
-    fn test_token_fingerprint_grouped_16_lower_hex() {
+    fn test_token_fingerprint_grouped_16_upper_hex() {
         let token = make_test_token([0xAB; RANDOM_BYTES_LEN]);
         let fp = token_fingerprint(&token);
-        // 16 hex digits grouped into four dash-separated quads: xxxx-xxxx-xxxx-xxxx.
+        // 16 hex digits grouped into four dash-separated quads: XXXX-XXXX-XXXX-XXXX.
         assert_eq!(fp.len(), FINGERPRINT_HEX_DIGITS + 3);
         let groups: Vec<&str> = fp.split('-').collect();
         assert_eq!(groups.len(), 4);
         assert!(groups.iter().all(|g| {
             g.len() == 4
                 && g.chars()
-                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_lowercase())
         }));
         // Deterministic: same token always yields the same fingerprint.
         assert_eq!(fp, token_fingerprint(&token));
-        // It is the first 8 bytes of the SHA-256 of the token string, as lowercase hex.
+        // It is the first 8 bytes of the SHA-256 of the token string, as uppercase hex.
         let digest = Sha256::digest(token.as_bytes());
         let expected: String = digest[..FINGERPRINT_HEX_DIGITS / 2]
             .iter()
-            .map(|b| format!("{b:02x}"))
+            .map(|b| format!("{b:02X}"))
             .collect();
         assert_eq!(fp.replace('-', ""), expected);
     }

@@ -65,7 +65,6 @@ pub(crate) fn wire(app: &Rc<RefCell<App>>, ui: &MainWindow) {
         app.configure_step = crate::ConfigureStep::SetupImport;
     });
     nav!(on_cancel_setup, |app| app.cancel_setup());
-    nav!(on_commit_generated, |app| app.commit_generated_secret());
     nav!(on_use_imported, |app| app.use_imported_secret());
     nav!(on_save_name, |app| app.save_name());
     nav!(on_cancel_name, |app| app.cancel_name());
@@ -74,7 +73,7 @@ pub(crate) fn wire(app: &Rc<RefCell<App>>, ui: &MainWindow) {
         app.configure_step = crate::ConfigureStep::SetupName;
     });
     act!(on_copy_secret, |app| {
-        if let Some(secret) = app.secret.clone().or_else(|| app.wizard_token.clone()) {
+        if let Some(secret) = app.secret.clone() {
             app.copy_secret_to_clipboard(&secret);
         }
     });
@@ -126,6 +125,9 @@ pub(crate) fn wire(app: &Rc<RefCell<App>>, ui: &MainWindow) {
             app.borrow().sync(&ui);
         }
     });
+    act!(on_toggle_quick_advanced, |app| {
+        app.quick_advanced_expanded = !app.quick_advanced_expanded
+    });
     nav!(on_open_client, |app| {
         app.screen = crate::Screen::Client;
     });
@@ -138,6 +140,11 @@ pub(crate) fn wire(app: &Rc<RefCell<App>>, ui: &MainWindow) {
     act!(on_copy_pairing_code, |app| {
         if let Some(code) = app.pairing_code.clone() {
             app.copy_to_clipboard(&code);
+        }
+    });
+    act!(on_copy_pin, |app| {
+        if let Some(pin) = app.pin_display.clone() {
+            app.copy_to_clipboard(&pin);
         }
     });
 
@@ -198,7 +205,17 @@ pub(crate) fn wire(app: &Rc<RefCell<App>>, ui: &MainWindow) {
                 let mut app = app.borrow_mut();
                 app.in_my_name = s.get_in_my_name().into();
                 app.in_import_token = s.get_in_import_token().into();
-                app.in_pin = s.get_in_pin().into();
+                // Sanitize each PIN group (uppercase, map look-alikes, drop
+                // noise) then cap/spill them into the two fields. No separator is
+                // ever inserted into a field, so the cursor never shifts under
+                // the typist; a paste of the whole code into the first group
+                // spills its overflow into the empty second group.
+                let (a, b) = duocb_core::pin::split_pin_groups(
+                    &duocb_core::pin::sanitize_pin_chars(&s.get_in_pin_a()),
+                    &duocb_core::pin::sanitize_pin_chars(&s.get_in_pin_b()),
+                );
+                app.in_pin_a = a;
+                app.in_pin_b = b;
                 app.in_manual_code = s.get_in_manual_code().into();
                 app.in_compose = s.get_in_compose().into();
             }

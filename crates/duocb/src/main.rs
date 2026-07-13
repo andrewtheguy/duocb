@@ -52,6 +52,10 @@ fn set_platform_fonts(ui: &MainWindow) {
     let ui_font = std::env::var("DUOCB_UI_FONT").unwrap_or_else(|_| ui_font.to_string());
     state.set_ui_font(ui_font.into());
     state.set_mono_font(mono_font.into());
+    // The command-modifier label for shortcut hints: ⌘ on macOS, Ctrl elsewhere
+    // (matching Slint's `control` modifier), so hints show only the one that
+    // applies to this build instead of always "Ctrl/⌘".
+    state.set_cmd_label(if cfg!(target_os = "macos") { "⌘" } else { "Ctrl" }.into());
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
