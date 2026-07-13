@@ -203,10 +203,21 @@ pub(crate) fn wire(app: &Rc<RefCell<App>>, ui: &MainWindow) {
                 let mut app = app.borrow_mut();
                 app.in_my_name = s.get_in_my_name().into();
                 app.in_import_token = s.get_in_import_token().into();
-                // Live-reformat the PIN as it is typed: uppercase, map
-                // look-alikes, and auto-insert the group dash. The write-back in
-                // `sync` pushes the formatted value into the field.
-                app.in_pin = duocb_core::pin::format_pin_input(&s.get_in_pin());
+                // Sanitize each PIN group in place (uppercase, map look-alikes,
+                // drop noise) and cap it to a group's length. No separator is
+                // ever inserted into a field, so the cursor never shifts under
+                // the typist. A paste of the whole code into the first group
+                // spills its overflow into the empty second group.
+                let g = duocb_core::pin::PIN_GROUP_LEN;
+                let a = duocb_core::pin::sanitize_pin_chars(&s.get_in_pin_a());
+                let b = duocb_core::pin::sanitize_pin_chars(&s.get_in_pin_b());
+                if a.chars().count() > g && b.is_empty() {
+                    app.in_pin_a = a.chars().take(g).collect();
+                    app.in_pin_b = a.chars().skip(g).take(g).collect();
+                } else {
+                    app.in_pin_a = a.chars().take(g).collect();
+                    app.in_pin_b = b.chars().take(g).collect();
+                }
                 app.in_manual_code = s.get_in_manual_code().into();
                 app.in_compose = s.get_in_compose().into();
             }

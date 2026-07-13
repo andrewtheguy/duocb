@@ -171,18 +171,24 @@ impl App {
         });
         s.set_pin_paired(self.pin_paired);
 
-        // Client join forms. Distinguish "still typing" (fewer than a full
-        // PIN's characters) from "full length but a typo" so the hint under the
-        // field is a neutral progress line while typing and only turns into a
-        // validation warning once the whole code is in.
-        let pin_len = duocb_core::pin::pin_input_len(&self.in_pin);
+        // Client join forms. The two group fields together make the PIN.
+        // Distinguish "still typing" (fewer than a full PIN's characters) from
+        // "full length but a typo" so the hint under the fields is a neutral
+        // progress line while typing and only turns into a validation warning
+        // once the whole code is in.
+        let combined = format!("{}{}", self.in_pin_a, self.in_pin_b);
+        let pin_len = duocb_core::pin::pin_input_len(&combined);
         let pin_full = pin_len == duocb_core::pin::PIN_LEN;
         s.set_pin_incomplete(if pin_len > 0 && !pin_full {
             format!("Keep typing — {pin_len} of {} characters", duocb_core::pin::PIN_LEN).into()
         } else {
             SharedString::default()
         });
-        s.set_pin_invalid(pin_full && duocb_core::pin::normalize_pin(&self.in_pin).is_none());
+        s.set_pin_invalid(pin_full && duocb_core::pin::normalize_pin(&combined).is_none());
+        // Drives the joiner's auto-advance from the first group to the second.
+        s.set_pin_a_full(
+            duocb_core::pin::pin_input_len(&self.in_pin_a) == duocb_core::pin::PIN_GROUP_LEN,
+        );
         let code = self.in_manual_code.trim();
         s.set_manual_code_invalid(
             !code.is_empty() && duocb_core::manual_code::decode(code).is_none(),
@@ -226,7 +232,8 @@ impl App {
         // resets (wizard cancels, compose clear) to the actual fields.
         s.set_in_my_name(self.in_my_name.clone().into());
         s.set_in_import_token(self.in_import_token.clone().into());
-        s.set_in_pin(self.in_pin.clone().into());
+        s.set_in_pin_a(self.in_pin_a.clone().into());
+        s.set_in_pin_b(self.in_pin_b.clone().into());
         s.set_in_manual_code(self.in_manual_code.clone().into());
         s.set_in_compose(self.in_compose.clone().into());
     }

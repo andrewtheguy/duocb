@@ -88,7 +88,10 @@ pub(crate) struct App {
     // reach the fields).
     pub(crate) in_my_name: String,
     pub(crate) in_import_token: String,
-    pub(crate) in_pin: String,
+    /// The joiner's PIN entry, split into its two `XXXX` groups (one text field
+    /// each) so grouping never edits a field's text mid-keystroke.
+    pub(crate) in_pin_a: String,
+    pub(crate) in_pin_b: String,
     pub(crate) in_manual_code: String,
     /// Draft of the session panel's compose field (send typed text).
     pub(crate) in_compose: String,
@@ -175,7 +178,8 @@ impl App {
             client_active: false,
             in_my_name: saved_name.unwrap_or_default(),
             in_import_token: String::new(),
-            in_pin: String::new(),
+            in_pin_a: String::new(),
+            in_pin_b: String::new(),
             in_manual_code: String::new(),
             in_compose: String::new(),
             peer_node_id: None,
@@ -717,7 +721,8 @@ impl App {
                 peer_display: self.selected_peer_display()?,
             }),
             PairMode::NostrPin => {
-                duocb_core::pin::normalize_pin(&self.in_pin).map(|canonical_pin| DialSpec::Pin {
+                duocb_core::pin::normalize_pin(&format!("{}{}", self.in_pin_a, self.in_pin_b))
+                    .map(|canonical_pin| DialSpec::Pin {
                     canonical_pin,
                     relays: default_relays(),
                     channel: self.core_pin_channel(),
@@ -938,7 +943,10 @@ pub(crate) mod tests {
         app.mode = PairMode::NostrPin;
         app.pin_channel = PinChannel::LanOnly;
         let canonical = duocb_core::pin::generate_pin();
-        app.in_pin = duocb_core::pin::format_pin(&canonical);
+        // The joiner types the PIN across the two group fields.
+        let g = duocb_core::pin::PIN_GROUP_LEN;
+        app.in_pin_a = canonical[..g].to_string();
+        app.in_pin_b = canonical[g..].to_string();
         match app.server_mode_spec() {
             Some(duocb_core::net::ServerMode::Pin { channel, .. }) => {
                 assert_eq!(channel, duocb_core::net::PinChannel::LanOnly);

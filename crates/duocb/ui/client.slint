@@ -10,7 +10,7 @@ import { SessionPanel } from "session.slint";
 import { Button, LineEdit } from "std-widgets.slint";
 
 component PreConnect inherits VerticalLayout {
-    out property <bool> field-focused: pin-entry.has-focus || code-entry.has-focus;
+    out property <bool> field-focused: pin-a.has-focus || pin-b.has-focus || code-entry.has-focus;
     alignment: start;
     spacing: Theme.pad-m;
 
@@ -31,11 +31,48 @@ component PreConnect inherits VerticalLayout {
             alignment: start;
             spacing: Theme.pad-xs;
             Body { text: "PIN shown on the other device:"; }
-            pin-entry := LineEdit {
-                placeholder-text: "XXXX-XXXX";
-                text <=> UiState.in-pin;
-                edited => { Actions.fields-edited(); }
-                accepted => { Actions.connect-client(); }
+            // Two four-character groups instead of one dashed field: the dash is
+            // a static label between them, never inserted into a field's text, so
+            // grouping can't shift the cursor mid-keystroke. Focus auto-advances
+            // to the second group when the first fills, and a backspace on an
+            // empty second group hops back — Apple-style code entry.
+            HorizontalLayout {
+                alignment: start;
+                spacing: Theme.pad-xs;
+                pin-a := LineEdit {
+                    min-width: 96px;
+                    horizontal-alignment: center;
+                    font-family: UiState.mono-font;
+                    placeholder-text: "XXXX";
+                    text <=> UiState.in-pin-a;
+                    edited => {
+                        Actions.fields-edited();
+                        if UiState.pin-a-full { pin-b.focus(); }
+                    }
+                    accepted => { Actions.connect-client(); }
+                }
+                Text {
+                    text: "-";
+                    vertical-alignment: center;
+                    font-size: Theme.font-pin;
+                }
+                pin-b := LineEdit {
+                    min-width: 96px;
+                    horizontal-alignment: center;
+                    font-family: UiState.mono-font;
+                    placeholder-text: "XXXX";
+                    text <=> UiState.in-pin-b;
+                    edited => { Actions.fields-edited(); }
+                    key-pressed(event) => {
+                        if event.text == Key.Backspace && self.text == "" {
+                            pin-a.focus();
+                            EventResult.accept
+                        } else {
+                            EventResult.reject
+                        }
+                    }
+                    accepted => { Actions.connect-client(); }
+                }
             }
             // Neutral progress while typing; a warning only once the whole PIN
             // is in but fails its checksum.

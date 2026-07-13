@@ -80,6 +80,9 @@ export global UiState {
     /// non-empty but shorter than a full PIN; "" otherwise. Composed in Rust so
     /// the PIN length lives in one place.
     in property <string> pin-incomplete;
+    /// True once the first PIN group is full, so the entry auto-advances focus
+    /// to the second group (Apple-style code entry).
+    in property <bool> pin-a-full;
     /// True when the pairing-code entry is non-empty but not a valid code.
     in property <bool> manual-code-invalid;
     in property <bool> dial-ready;
@@ -101,7 +104,8 @@ export global UiState {
     // on every edit and writes them back on sync (authoritative after resets).
     in-out property <string> in-my-name;
     in-out property <string> in-import-token;
-    in-out property <string> in-pin;
+    in-out property <string> in-pin-a;
+    in-out property <string> in-pin-b;
     in-out property <string> in-manual-code;
     in-out property <string> in-compose;
 }
