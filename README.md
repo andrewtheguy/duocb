@@ -1,6 +1,6 @@
 # duocb
 
-**Clipboard sharing directly between your devices — private, encrypted, and peer to peer.**
+**Clipboard sharing directly between your devices — private, end-to-end encrypted, and peer to peer.**
 
 duocb links **two devices belonging to the same person** (desktop ↔ laptop, workstation ↔ homelab box) so they can share clipboard text directly, without accounts, servers that see your data, public IPs, or port forwarding. The two roles are only about setup: one device **starts a connection** (displays pairing credentials), the other **joins** it (enters them). Once paired, **both** sides can send and receive — either can push its clipboard to the other over a single encrypted QUIC connection.
 
