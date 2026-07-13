@@ -145,6 +145,52 @@ pub fn format_pin(canonical: &str) -> String {
     format!("{}-{}", &canonical[..mid], &canonical[mid..])
 }
 
+/// Format *in-progress* user input for a PIN entry field, for live reformatting on every
+/// keystroke: uppercase, map the look-alikes `I`/`L` → `1` and `O` → `0`, drop separators
+/// and any non-alphabet character, cap at `PIN_LEN` characters, and regroup with a dash
+/// (`XXXX-XXXX`). Unlike [`normalize_pin`] it never rejects — it keeps however many valid
+/// characters have been typed so far — so the caller reformats as the user types and judges
+/// completeness (`pin_input_len`) and validity ([`normalize_pin`]) separately.
+pub fn format_pin_input(input: &str) -> String {
+    let mut chars = String::with_capacity(PIN_LEN);
+    for ch in input.chars() {
+        let mapped = match ch.to_ascii_uppercase() {
+            'I' | 'L' => '1',
+            'O' => '0',
+            other => other,
+        };
+        if ALPHABET.contains(&(mapped as u8)) {
+            chars.push(mapped);
+            if chars.len() == PIN_LEN {
+                break;
+            }
+        }
+    }
+    let mid = PIN_LEN / 2;
+    if chars.len() > mid {
+        format!("{}-{}", &chars[..mid], &chars[mid..])
+    } else {
+        chars
+    }
+}
+
+/// Count the significant (canonical) characters in a PIN entry, ignoring dashes, spaces, and
+/// anything else that isn't a real PIN character — so the caller can tell "still typing"
+/// (`< PIN_LEN`) apart from "full length, verify the checksum" (`== PIN_LEN`).
+pub fn pin_input_len(input: &str) -> usize {
+    input
+        .chars()
+        .filter(|&ch| {
+            let mapped = match ch.to_ascii_uppercase() {
+                'I' | 'L' => '1',
+                'O' => '0',
+                other => other,
+            };
+            ALPHABET.contains(&(mapped as u8))
+        })
+        .count()
+}
+
 /// The current rotation bucket: whole 60-second windows since the Unix epoch. The server
 /// publishes under the current bucket; the client searches adjacent buckets.
 pub fn current_bucket() -> u64 {
@@ -283,6 +329,28 @@ mod tests {
             normalize_pin(&format_pin(&canonical)).as_deref(),
             Some(canonical.as_str())
         );
+    }
+
+    #[test]
+    fn format_pin_input_sanitizes_maps_and_groups_progressively() {
+        // Grows a group at a time; the dash appears once past the midpoint.
+        assert_eq!(format_pin_input("ab"), "AB");
+        assert_eq!(format_pin_input("abcd"), "ABCD");
+        assert_eq!(format_pin_input("abcde"), "ABCD-E");
+        // Separators and stray characters are dropped; look-alikes map to digits.
+        assert_eq!(format_pin_input("ab cd-e"), "ABCD-E");
+        assert_eq!(format_pin_input("iLoO12!3"), "1100-123");
+        // `format_pin_input` caps at PIN_LEN significant characters (extra input
+        // is ignored); the count of that formatted value is then exactly PIN_LEN
+        // — this is how the field's completeness is judged.
+        assert_eq!(format_pin_input("abcdefghjk"), "ABCD-EFGH");
+        assert_eq!(pin_input_len(&format_pin_input("abcdefghjk")), PIN_LEN);
+        // Already-formatted input is a fixed point (safe to reapply every keystroke).
+        assert_eq!(format_pin_input("ABCD-EFGH"), "ABCD-EFGH");
+        // The length count ignores dashes/spaces and matches the significant chars.
+        assert_eq!(pin_input_len(""), 0);
+        assert_eq!(pin_input_len("ab-c"), 3);
+        assert_eq!(pin_input_len("K7P2-9QX!"), 7);
     }
 
     #[test]

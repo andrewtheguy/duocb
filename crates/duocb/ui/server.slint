@@ -42,6 +42,13 @@ export component ServerScreen inherits Rectangle {
                 font-weight: 700;
                 horizontal-alignment: center;
             }
+            HorizontalLayout {
+                alignment: center;
+                Button {
+                    text: "Copy PIN (Ctrl/⌘+T)";
+                    clicked => { Actions.copy-pin(); }
+                }
+            }
             Body {
                 text: UiState.pin-countdown;
                 horizontal-alignment: center;

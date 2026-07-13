@@ -140,6 +140,11 @@ pub(crate) fn wire(app: &Rc<RefCell<App>>, ui: &MainWindow) {
             app.copy_to_clipboard(&code);
         }
     });
+    act!(on_copy_pin, |app| {
+        if let Some(pin) = app.pin_display.clone() {
+            app.copy_to_clipboard(&pin);
+        }
+    });
 
     // Session panel.
     act!(on_send_clipboard, |app| app.send_clipboard());
@@ -198,7 +203,10 @@ pub(crate) fn wire(app: &Rc<RefCell<App>>, ui: &MainWindow) {
                 let mut app = app.borrow_mut();
                 app.in_my_name = s.get_in_my_name().into();
                 app.in_import_token = s.get_in_import_token().into();
-                app.in_pin = s.get_in_pin().into();
+                // Live-reformat the PIN as it is typed: uppercase, map
+                // look-alikes, and auto-insert the group dash. The write-back in
+                // `sync` pushes the formatted value into the field.
+                app.in_pin = duocb_core::pin::format_pin_input(&s.get_in_pin());
                 app.in_manual_code = s.get_in_manual_code().into();
                 app.in_compose = s.get_in_compose().into();
             }

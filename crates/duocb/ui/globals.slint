@@ -74,8 +74,12 @@ export global UiState {
     in property <bool> pin-paired;
 
     // Client join forms.
-    /// True when the PIN entry is non-empty but not a valid PIN.
+    /// True when the PIN entry is full-length but fails validation (a typo).
     in property <bool> pin-invalid;
+    /// Neutral "keep typing — N of M characters" hint while the PIN entry is
+    /// non-empty but shorter than a full PIN; "" otherwise. Composed in Rust so
+    /// the PIN length lives in one place.
+    in property <string> pin-incomplete;
     /// True when the pairing-code entry is non-empty but not a valid code.
     in property <bool> manual-code-invalid;
     in property <bool> dial-ready;
@@ -139,6 +143,7 @@ export global Actions {
 
     // Server credentials.
     callback copy-pairing-code();
+    callback copy-pin();
 
     // Session panel.
     callback send-clipboard();

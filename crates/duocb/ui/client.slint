@@ -37,6 +37,11 @@ component PreConnect inherits VerticalLayout {
                 edited => { Actions.fields-edited(); }
                 accepted => { Actions.connect-client(); }
             }
+            // Neutral progress while typing; a warning only once the whole PIN
+            // is in but fails its checksum.
+            if UiState.pin-incomplete != "": Weak {
+                text: UiState.pin-incomplete;
+            }
             if UiState.pin-invalid: Text {
                 text: "Not a valid PIN (check for typos)";
                 color: Theme.warn;

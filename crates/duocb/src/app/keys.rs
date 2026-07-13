@@ -69,10 +69,15 @@ pub(crate) fn handle_global_key(
             true
         }
         Screen::Server => {
-            // Copy the displayed pairing code without the mouse (manual mode).
+            // Copy the displayed credential without the mouse: the pairing code
+            // (manual mode) or the current rotating PIN (PIN mode).
             if command('t') && app.pairing_code.is_some() {
                 let code = app.pairing_code.clone().unwrap();
                 app.copy_to_clipboard(&code);
+                true
+            } else if command('t') && app.pin_display.is_some() {
+                let pin = app.pin_display.clone().unwrap();
+                app.copy_to_clipboard(&pin);
                 true
             } else {
                 false
