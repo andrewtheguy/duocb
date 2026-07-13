@@ -75,20 +75,26 @@ export component ServerScreen inherits ScrollView {
         // for the whole session so the paired peer can be re-sent it and
         // reconnect after a drop.
         if UiState.server-running && UiState.mode == PairMode.manual
-            && UiState.pairing-code != "": VerticalLayout {
-            spacing: Theme.pad-xs;
-            HorizontalLayout {
-                spacing: Theme.pad-s;
-                alignment: start;
-                Body { text: "Pairing code:"; vertical-alignment: center; }
-                Button {
-                    text: "Copy (" + UiState.cmd-label + "+T)";
-                    clicked => { Actions.copy-pairing-code(); }
-                }
+            && UiState.pairing-code != "": HorizontalLayout {
+            spacing: Theme.pad-s;
+            alignment: start;
+            Body { text: "Pairing code:"; vertical-alignment: center; }
+            Button {
+                text: "Copy (" + UiState.cmd-label + "+T)";
+                clicked => { Actions.copy-pairing-code(); }
             }
-            Mono { text: UiState.pairing-code; wrap: char-wrap; }
-            Body { text: "Send it to the other device over any channel you trust and paste it there."; }
-            Small { text: "Manual mode uses no signaling service (no nostr) — only iroh. It resolves the id in the code over the internet (iroh's DNS) or the local network (mDNS), then connects directly or through an iroh relay. Devices on the same network can link directly even while online, and can pair with no internet at all."; }
+        }
+        if UiState.server-running && UiState.mode == PairMode.manual
+            && UiState.pairing-code != "": Mono {
+            text: UiState.pairing-code;
+        }
+        if UiState.server-running && UiState.mode == PairMode.manual
+            && UiState.pairing-code != "": Body {
+            text: "Send it to the other device over any channel you trust and paste it there.";
+        }
+        if UiState.server-running && UiState.mode == PairMode.manual
+            && UiState.pairing-code != "": Small {
+            text: "Manual mode uses no signaling service (no nostr) — only iroh. It resolves the id in the code over the internet (iroh's DNS) or the local network (mDNS), then connects directly or through an iroh relay. Devices on the same network can link directly even while online, and can pair with no internet at all.";
         }
 
         if UiState.server-running: HorizontalLayout {
