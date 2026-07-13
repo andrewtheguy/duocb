@@ -22,6 +22,10 @@ export global UiState {
     in property <ConfigureStep> configure-step;
     in property <PairMode> mode;
     in property <PinChannel> pin-channel;
+    /// Whether the quick screen's "Uncommon options" section is expanded. Open
+    /// when the user expands it or when an uncommon option (internet-only PIN,
+    /// or manual) is currently selected, so an active choice is never hidden.
+    in property <bool> quick-advanced-open;
     in property <string> status-text;
     in property <bool> connected;
     in property <bool> server-running;
@@ -143,6 +147,7 @@ export global Actions {
     // Quick options / client.
     callback set-mode(mode: PairMode);
     callback set-pin-channel(channel: PinChannel);
+    callback toggle-quick-advanced();
     callback open-client();
     callback connect-client();
     callback disconnect();

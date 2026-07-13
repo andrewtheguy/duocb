@@ -125,6 +125,9 @@ pub(crate) fn wire(app: &Rc<RefCell<App>>, ui: &MainWindow) {
             app.borrow().sync(&ui);
         }
     });
+    act!(on_toggle_quick_advanced, |app| {
+        app.quick_advanced_expanded = !app.quick_advanced_expanded
+    });
     nav!(on_open_client, |app| {
         app.screen = crate::Screen::Client;
     });

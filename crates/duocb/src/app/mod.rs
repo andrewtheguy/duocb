@@ -39,6 +39,11 @@ pub(crate) struct App {
     /// Which rendezvous transport(s) the PIN quick mode uses (both sides must
     /// have overlapping channels; the default covers everything).
     pub(crate) pin_channel: PinChannel,
+    /// Whether the user has expanded the quick screen's "Uncommon options"
+    /// section. The section also shows whenever an uncommon option is the
+    /// active selection (see `quick_advanced_open`), so a live choice is never
+    /// hidden regardless of this flag.
+    pub(crate) quick_advanced_expanded: bool,
 
     // Shared status.
     pub(crate) status: ConnStatus,
@@ -152,6 +157,7 @@ impl App {
             screen: Screen::Home,
             mode: PairMode::NostrToken,
             pin_channel: PinChannel::Both,
+            quick_advanced_expanded: false,
             status: ConnStatus::Idle,
             error: startup_error,
             secret,
@@ -651,6 +657,23 @@ impl App {
         if self.mode == PairMode::NostrToken {
             self.mode = PairMode::NostrPin;
         }
+        // Start with the uncommon options collapsed; they still reveal
+        // themselves if an uncommon option is the active selection.
+        self.quick_advanced_expanded = false;
+    }
+
+    /// Whether the current quick-mode selection is one of the "uncommon"
+    /// (testing-leaning) options — internet-only PIN discovery, or manual mode.
+    /// Used to keep the quick screen's uncommon section open while such an
+    /// option is active, so the live choice is never hidden.
+    pub(crate) fn quick_uncommon_selected(&self) -> bool {
+        self.mode == PairMode::Manual
+            || (self.mode == PairMode::NostrPin && self.pin_channel == PinChannel::NostrOnly)
+    }
+
+    /// Whether the quick screen's uncommon section should render open.
+    pub(crate) fn quick_advanced_open(&self) -> bool {
+        self.quick_advanced_expanded || self.quick_uncommon_selected()
     }
 
     /// Navigate back one screen, stopping any running session. Role screens

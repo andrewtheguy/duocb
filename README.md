@@ -65,7 +65,7 @@ Run `duocb` on both devices.
 2. **Other device:** press `I`, paste the same secret (confirm the fingerprint matches), and name it.
 3. **Pair:** press `S` (Start) on one device; on the other press `C` (Join) to open the device picker, select it (`R` refreshes the list), and press `Enter`. Joining first and starting shortly afterward also works: the join retries every few seconds for up to 10 attempts. If it gives up first, press Join again after the host starts.
 
-**Quick options:** press `Q` on both devices (PIN is preselected; `M` switches to the manual testing mode). In PIN mode, `1`/`2`/`3` picks the discovery channel — internet + local network (default), internet only, or local network only (works with no internet). The two choices must overlap; using the default on both devices is simplest. Then press `S` on the starting device and `C` on the joining one, and type the displayed PIN (or, in manual mode, paste the pairing code).
+**Quick options:** press `Q` on both devices. The two everyday choices are `P` PIN quick pair (internet + local network — the default) and `L` local network only (the same rotating-code PIN pairing kept to your network, private, uses no internet). Two uncommon, mostly-for-testing options sit behind an "Uncommon options" section: `I` internet only (the PIN is found through a nostr relay only, not advertised on the LAN — though the connection can still take a direct local path) and `M` manual (carry one pairing code yourself). Both devices' choices must share a transport; using the default on both is simplest. Then press `S` on the starting device and `C` on the joining one, and type the displayed PIN (or, in manual mode, paste the pairing code).
 
 **Paired:** both sides now show the same session panel — `Ctrl/⌘+S` (or the button) reads your clipboard and sends it, and a compose field sends typed text directly (Enter) without touching the clipboard; received items appear in the inbox where you can **Peek** (view without copying) and **Copy** (the only action that writes that received item to your clipboard). Either device can send at any time; the outbox above the inbox shows the last item you sent (size + CRC) so the other side can confirm it matches what arrived.
 
@@ -84,8 +84,8 @@ The joining device reconnects automatically if the connection drops — a fixed 
 | `R` / `↑` `↓` | device picker | refresh the device list / move the selection |
 | `Esc` | device picker | back to the hub |
 | `Q` | home | open the quick options |
-| `P` / `M` | quick options | pick PIN quick pair / the manual testing mode |
-| `1` / `2` / `3` | quick options (PIN mode) | discovery: internet + local network / internet only / local network only |
+| `P` / `L` | quick options | PIN quick pair (internet + local network) / local network only |
+| `I` / `M` | quick options (uncommon) | internet only (PIN over a nostr relay) / manual testing mode |
 | `C` | quick options | go to the join form |
 | `Ctrl/⌘+Enter` | quick-mode join forms | connect |
 | `Esc` | any screen (no field focused) | back to home, stopping the session |
