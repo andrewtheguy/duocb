@@ -46,25 +46,22 @@ pub(crate) fn handle_global_key(
     let handled = match app.screen {
         Screen::Home if focus_free => handle_configure_key(app, esc, enter, up, down, &letter, &command),
         Screen::Quick if focus_free => {
-            // Each letter picks a whole pairing preset (mode + channel),
-            // matching the rows on screen: P and L are the common choices; I and
-            // M are the uncommon (testing) ones, which the UI reveals when
-            // selected. Selecting one keeps quick mode out of configure mode.
+            // Letters mirror the rows on screen: P and L are the common
+            // choices; I and M are the uncommon (testing) ones, which the UI
+            // reveals when selected. S hosts and C joins with whatever the
+            // selection (and the join entry) holds.
             if letter('p') {
-                app.mode = PairMode::NostrPin;
-                app.pin_channel = PinChannel::Both;
+                app.set_pin_channel(PinChannel::Both);
             } else if letter('l') {
-                app.mode = PairMode::NostrPin;
-                app.pin_channel = PinChannel::LanOnly;
+                app.set_pin_channel(PinChannel::LanOnly);
             } else if letter('i') {
-                app.mode = PairMode::NostrPin;
-                app.pin_channel = PinChannel::NostrOnly;
+                app.set_pin_channel(PinChannel::NostrOnly);
             } else if letter('m') {
                 app.mode = PairMode::Manual;
             } else if letter('s') {
                 app.begin_server();
             } else if letter('c') {
-                app.screen = Screen::Client;
+                app.join_quick();
             } else {
                 return handle_session_key(app, focus_free, &command);
             }
@@ -225,25 +222,57 @@ mod tests {
         let mut app = test_app();
         app.open_quick();
         assert_eq!(app.mode, PairMode::NostrPin);
-        // Each key selects a whole preset (mode + channel).
+        // P/L/I select the PIN rendezvous channel.
         assert!(plain(&mut app, "l", false));
         assert_eq!(app.mode, PairMode::NostrPin);
         assert_eq!(app.pin_channel, PinChannel::LanOnly);
-        // The uncommon "internet only" preset, and it auto-reveals the section.
+        // The uncommon "internet only" channel auto-reveals the section.
         assert!(plain(&mut app, "i", false));
         assert_eq!(app.pin_channel, PinChannel::NostrOnly);
         assert!(app.quick_advanced_open());
-        // Back to the default PIN preset closes the uncommon section again.
+        // Back to the default channel closes the uncommon section again.
         assert!(plain(&mut app, "p", false));
         assert_eq!(app.mode, PairMode::NostrPin);
         assert_eq!(app.pin_channel, PinChannel::Both);
         assert!(!app.quick_advanced_open());
+        // M selects manual mode (revealing the section); picking a channel
+        // returns to PIN mode — the rows act as one radio group.
         assert!(plain(&mut app, "m", false));
         assert_eq!(app.mode, PairMode::Manual);
         assert!(app.quick_advanced_open());
+        assert!(plain(&mut app, "p", false));
+        assert_eq!(app.mode, PairMode::NostrPin);
+        // C joins with the current entry — empty here, so it stays put.
         assert!(plain(&mut app, "c", false));
+        assert_eq!(app.screen, Screen::Quick);
+    }
+
+    #[test]
+    fn quick_join_navigates_only_on_a_valid_entry() {
+        let mut app = test_app();
+        app.open_quick();
+        // An invalid PIN entry never leaves the quick screen.
+        app.in_pin_a = "XXXX".into();
+        app.in_pin_b = "XXXX".into();
+        app.join_quick();
+        assert_eq!(app.screen, Screen::Quick);
+        assert!(!app.client_active);
+        // A valid PIN dials and moves to the client screen.
+        let pin = duocb_core::pin::generate_pin();
+        let g = duocb_core::pin::PIN_GROUP_LEN;
+        app.in_pin_a = pin[..g].to_string();
+        app.in_pin_b = pin[g..].to_string();
+        app.join_quick();
         assert_eq!(app.screen, Screen::Client);
-        assert!(plain(&mut app, ESC, false));
+        assert!(app.client_active);
+        // In manual mode the same action validates the pasted code instead,
+        // so the still-valid PIN entry no longer counts. (`client_active`
+        // lingers until the runtime's Idle event is drained; the screen not
+        // moving is what join_quick guarantees.)
+        app.go_back();
+        assert_eq!(app.screen, Screen::Quick);
+        app.mode = PairMode::Manual;
+        app.join_quick();
         assert_eq!(app.screen, Screen::Quick);
     }
 
