@@ -39,8 +39,8 @@ pub(crate) struct App {
     /// Which rendezvous transport(s) the PIN quick mode uses (both sides must
     /// have overlapping channels; the default covers everything).
     pub(crate) pin_channel: PinChannel,
-    /// Whether the user has expanded the quick screen's "Uncommon options"
-    /// section. The section also shows whenever an uncommon option is the
+    /// Whether the user has expanded the quick screen's "Advanced options"
+    /// section. The section also shows whenever an advanced option is the
     /// active selection (see `quick_advanced_open`), so a live choice is never
     /// hidden regardless of this flag.
     pub(crate) quick_advanced_expanded: bool,
@@ -657,8 +657,8 @@ impl App {
         if self.mode == PairMode::NostrToken {
             self.mode = PairMode::NostrPin;
         }
-        // Start with the uncommon options collapsed; they still reveal
-        // themselves if an uncommon option is the active selection.
+        // Start with the advanced options collapsed; they still reveal
+        // themselves if an advanced option is the active selection.
         self.quick_advanced_expanded = false;
     }
 
