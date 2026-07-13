@@ -692,8 +692,7 @@ mod tests {
         );
         let cfg: FfiConfig = serde_json::from_str(&json).unwrap();
         let err = build_initial_commands(cfg)
-            .err()
-            .expect("join without peer fails");
+            .expect_err("join without peer fails");
         assert!(err.contains("peer"), "unexpected error: {err}");
     }
 
@@ -701,7 +700,7 @@ mod tests {
     fn identity_roles_require_a_token() {
         let cfg: FfiConfig =
             serde_json::from_str(r#"{"role":"hub","name":"phone","suffix":"x9Y8z7W6"}"#).unwrap();
-        let err = build_initial_commands(cfg).err().expect("hub needs token");
+        let err = build_initial_commands(cfg).expect_err("hub needs token");
         assert!(err.contains("token"), "unexpected error: {err}");
     }
 
@@ -757,7 +756,7 @@ mod tests {
             r#"{"role":"quick_join"}"#.to_string(),
         ] {
             let cfg: FfiConfig = serde_json::from_str(&bad).unwrap();
-            let err = build_initial_commands(cfg).err().expect("bad pin fails");
+            let err = build_initial_commands(cfg).expect_err("bad pin fails");
             assert!(err.contains("PIN"), "unexpected error: {err}");
         }
     }

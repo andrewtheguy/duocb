@@ -1,8 +1,9 @@
 //! mDNS transport for the encrypted PIN rendezvous record — the LAN-only
 //! sibling of the nostr transport in `crate::nostr`. Used by the "PIN over
-//! LAN" quick mode: no relays, no internet — the server advertises the record
-//! as a DNS-SD service on the local network and a client holding the PIN
-//! derives the same `(pin, bucket)` key to find and decrypt it.
+//! LAN" quick mode: no third-party server participates — the server advertises
+//! the record as a DNS-SD service over mDNS and a client holding the PIN derives
+//! the same `(pin, bucket)` key to find and decrypt it. Session traffic remains
+//! direct between devices, but there is no packet-level on-link subnet filter.
 //!
 //! The record appears as `<instance>._duocb-pin._udp.local.` where the
 //! instance label is derived from the `(pin, bucket)` public key — the same

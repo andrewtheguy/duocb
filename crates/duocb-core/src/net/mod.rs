@@ -46,7 +46,8 @@ pub enum PinChannel {
     NostrAndLan,
     /// Nostr relays only (internet required).
     NostrOnly,
-    /// Local network only (mDNS): zero internet, both devices on one network.
+    /// mDNS-only discovery with direct device-to-device traffic and no
+    /// third-party server. This is not a packet-level subnet boundary.
     LanOnly,
 }
 
