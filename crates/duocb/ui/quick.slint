@@ -73,7 +73,9 @@ export component QuickScreen inherits ScrollView {
                 clicked => { Actions.toggle-quick-advanced(); }
                 Text {
                     text: UiState.quick-advanced-open ? "▾" : "▸";
-                    font-size: Theme.font-body;
+                    width: Theme.font-heading;
+                    font-size: Theme.font-heading;
+                    horizontal-alignment: center;
                     vertical-alignment: center;
                 }
                 CardTitle { text: "Advanced options"; vertical-alignment: center; }
