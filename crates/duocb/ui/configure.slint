@@ -7,7 +7,7 @@ import { UiState, Actions } from "globals.slint";
 import { ConfigureStep } from "types.slint";
 import { Theme } from "theme.slint";
 import { Card, CardTitle, Body, Weak, Small, Mono, BigButton, WideButton, LabeledValue, SelectableRow } from "widgets.slint";
-import { Button, LineEdit } from "std-widgets.slint";
+import { Button, LineEdit, ScrollView } from "std-widgets.slint";
 
 component ChoiceStep inherits VerticalLayout {
     alignment: start;
@@ -203,14 +203,18 @@ component JoinStep inherits VerticalLayout {
     }
 }
 
-export component HomeScreen inherits Rectangle {
+export component HomeScreen inherits ScrollView {
     /// Whether any text field on this screen has keyboard focus (gates the
     /// plain-letter shortcuts). Only the visible step's field counts.
     out property <bool> field-focused:
         (UiState.configure-step == ConfigureStep.setup-import && import-step.field-focused)
         || (UiState.configure-step == ConfigureStep.setup-name && name-step.field-focused);
+    viewport-width: root.width;
+    viewport-height: max(root.height, content.preferred-height);
+    horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
+    mouse-drag-pan-enabled: true;
 
-    VerticalLayout {
+    content := VerticalLayout {
         alignment: start;
         spacing: Theme.pad-s;
 

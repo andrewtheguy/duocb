@@ -42,12 +42,14 @@ export component Small inherits Text {
 export component CardTitle inherits Text {
     font-size: Theme.font-body;
     font-weight: 700;
+    wrap: word-wrap;
 }
 
 /// Monospace value text (identities, fingerprints, hashes).
 export component Mono inherits Text {
     font-size: Theme.font-body;
     font-family: UiState.mono-font;
+    wrap: char-wrap;
 }
 
 /// A "Label: value" row with a monospace value.
@@ -57,7 +59,11 @@ export component LabeledValue inherits HorizontalLayout {
     spacing: Theme.pad-s;
     alignment: start;
     Text { text: root.label; font-size: Theme.font-body; vertical-alignment: center; }
-    Mono { text: root.value; vertical-alignment: center; }
+    Mono {
+        text: root.value;
+        horizontal-stretch: 1;
+        vertical-alignment: center;
+    }
 }
 
 /// Screen header: a back button plus the screen title.
@@ -73,6 +79,8 @@ export component BackHeader inherits HorizontalLayout {
         text: root.title;
         font-size: Theme.font-heading;
         font-weight: 700;
+        wrap: word-wrap;
+        horizontal-stretch: 1;
         vertical-alignment: center;
     }
 }
@@ -109,8 +117,9 @@ component CtaButtonBase inherits Rectangle {
     out property <bool> focused: fs.has-focus;
     callback clicked();
 
-    height: Theme.cta-height;
+    min-height: Theme.cta-height;
     border-radius: Theme.radius;
+    clip: true;
     opacity: root.enabled ? 1.0 : 0.4;
 
     accessible-role: button;
@@ -136,6 +145,8 @@ component CtaButtonBase inherits Rectangle {
         HorizontalLayout {
             padding-left: Theme.pad-l;
             padding-right: Theme.pad-l;
+            padding-top: Theme.pad-xs;
+            padding-bottom: Theme.pad-xs;
             spacing: Theme.pad-s;
             alignment: center;
             Text {
@@ -143,6 +154,9 @@ component CtaButtonBase inherits Rectangle {
                 color: root.label-color;
                 font-size: Theme.font-body;
                 font-weight: 600;
+                wrap: word-wrap;
+                horizontal-stretch: 1;
+                horizontal-alignment: center;
                 vertical-alignment: center;
             }
             if root.hint != "": Text {
@@ -185,8 +199,9 @@ export component SelectableRow inherits Rectangle {
     in property <bool> selected;
     callback clicked();
 
-    height: 34px;
+    min-height: 34px;
     border-radius: Theme.radius - 2px;
+    clip: true;
     background: root.selected ? Theme.accent.with-alpha(0.25)
         : touch.has-hover ? Theme.card-fill : transparent;
 
@@ -197,6 +212,8 @@ export component SelectableRow inherits Rectangle {
     HorizontalLayout {
         padding-left: Theme.pad-s;
         padding-right: Theme.pad-s;
+        padding-top: Theme.pad-xs;
+        padding-bottom: Theme.pad-xs;
         spacing: Theme.pad-s;
         alignment: start;
         @children

@@ -7,12 +7,16 @@ import { PairMode } from "types.slint";
 import { Theme } from "theme.slint";
 import { Card, Body, Weak, Small, Mono, BackHeader, TokenPairingSummary, LabeledValue } from "widgets.slint";
 import { SessionPanel } from "session.slint";
-import { Button, LineEdit } from "std-widgets.slint";
+import { Button, LineEdit, ScrollView } from "std-widgets.slint";
 
-export component ServerScreen inherits Rectangle {
+export component ServerScreen inherits ScrollView {
     out property <bool> field-focused: session.field-focused;
+    viewport-width: root.width;
+    viewport-height: max(root.height, content.preferred-height);
+    horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
+    mouse-drag-pan-enabled: true;
 
-    VerticalLayout {
+    content := VerticalLayout {
         alignment: start;
         spacing: Theme.pad-m;
 
