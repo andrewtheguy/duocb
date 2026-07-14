@@ -5,7 +5,7 @@
 import { UiState, Actions } from "globals.slint";
 import { PairMode } from "types.slint";
 import { Theme } from "theme.slint";
-import { Card, Body, Weak, Small, Mono, BackHeader, TokenPairingSummary, LabeledValue } from "widgets.slint";
+import { Card, Body, Weak, Small, Mono, BackHeader, TokenPairingSummary, LabeledValue, JoinModeToggle } from "widgets.slint";
 import { SessionPanel } from "session.slint";
 import { Button, LineEdit, ScrollView } from "std-widgets.slint";
 
@@ -19,33 +19,25 @@ component PreConnect inherits VerticalLayout {
     // code — the same choice-free entry as the quick screen.
     property <bool> quick: UiState.mode != PairMode.nostr-token;
 
-    forms := VerticalLayout {
-        alignment: start;
-        spacing: Theme.pad-m;
+    token-hint := Weak {
+        visible: !root.quick;
+        // A configure-mode join launches from the home hub with the
+        // selected peer; this state is a brief transient.
+        text: "Pick a device to join from the home screen.";
+    }
 
-        token-hint := Weak {
-            visible: !root.quick;
-            // A configure-mode join launches from the home hub with the
-            // selected peer; this state is a brief transient.
-            text: "Pick a device to join from the home screen.";
-        }
+    // PIN by default; the toggle switches to the pairing-code entry (same
+    // choice-free join as the quick screen, sharing its state).
+    if root.quick: JoinModeToggle { }
 
-        // PIN by default; the toggle switches to the pairing-code entry (same
-        // choice-free join as the quick screen, sharing its state).
-        if root.quick: HorizontalLayout {
-            spacing: Theme.pad-s;
-            Button {
-                text: "PIN";
-                primary: !UiState.join-by-code;
-                clicked => { Actions.set-join-by-code(false); }
-            }
-            Button {
-                text: "Pairing code";
-                primary: UiState.join-by-code;
-                clicked => { Actions.set-join-by-code(true); }
-            }
-            Rectangle { horizontal-stretch: 1; }
-        }
+    // Both entries stay instantiated (visibility-toggled) so their fields can
+    // report focus for shortcut gating; only the active one is shown, and the
+    // container collapses to that form's height (0 when neither is active) so
+    // the hidden form never reserves space.
+    forms := Rectangle {
+        height: root.quick
+            ? (UiState.join-by-code ? manual-form.preferred-height : pin-form.preferred-height)
+            : 0px;
 
         pin-form := VerticalLayout {
             visible: root.quick && !UiState.join-by-code;
