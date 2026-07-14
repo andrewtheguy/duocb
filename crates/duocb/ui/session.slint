@@ -38,7 +38,7 @@ component ClipItemRow inherits Card {
             clicked => { root.peek-clicked(); }
         }
         Button {
-            text: "Copy";
+            text: root.item.copied ? "✔ Copied" : "Copy";
             clicked => { root.copy-clicked(); }
         }
     }

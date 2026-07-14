@@ -41,7 +41,11 @@ export global UiState {
     in property <string> secret-fingerprint;
     in property <string> config-path;
     in property <string> presence-conflict;
-    in property <bool> copied-flash;
+    // Per-button "✔ Copied" feedback: exactly one is true while a copy is fresh
+    // (inbox/outbox rows carry their own `copied` flag in ClipRow).
+    in property <bool> copied-secret;
+    in property <bool> copied-pin;
+    in property <bool> copied-pairing-code;
     in property <bool> name-valid;
     /// "Broadcast as" preview when the name is valid, "" otherwise.
     in property <string> name-preview;

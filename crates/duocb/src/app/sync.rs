@@ -6,7 +6,9 @@
 use slint::{Color, ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use std::time::Instant;
 
-use super::{App, ago, item::ClipItem, item::PEEK_LIMIT, masked_secret_hint, now_unix, short_id};
+use super::{
+    App, CopyTarget, ago, item::ClipItem, item::PEEK_LIMIT, masked_secret_hint, now_unix, short_id,
+};
 use crate::{ClipRow, MainWindow, PathRow, PeerRow, UiState};
 use duocb_core::net::ConnStatus;
 use duocb_core::net::endpoint::ConnPathKind;
@@ -46,7 +48,10 @@ impl App {
         );
         s.set_config_path(self.config_lock.path().display().to_string().into());
         s.set_presence_conflict(str_or_empty(&self.presence_conflict));
-        s.set_copied_flash(self.copied_flash_active());
+        let copied = self.copied_target();
+        s.set_copied_secret(copied == Some(CopyTarget::Secret));
+        s.set_copied_pin(copied == Some(CopyTarget::Pin));
+        s.set_copied_pairing_code(copied == Some(CopyTarget::PairingCode));
         let name = self.in_my_name.trim();
         match duocb_core::identity::validate_name(name) {
             Ok(()) => {
@@ -185,8 +190,26 @@ impl App {
         // Session panel.
         s.set_sent_flash(self.sent_flash_active());
         s.set_outbox_present(self.outbox.is_some());
-        s.set_outbox(self.outbox.as_ref().map(clip_row).unwrap_or_default());
-        let inbox: Vec<ClipRow> = self.inbox.iter().map(clip_row).collect();
+        s.set_outbox(
+            self.outbox
+                .as_ref()
+                .map(|item| {
+                    let mut row = clip_row(item);
+                    row.copied = copied == Some(CopyTarget::Outbox);
+                    row
+                })
+                .unwrap_or_default(),
+        );
+        let inbox: Vec<ClipRow> = self
+            .inbox
+            .iter()
+            .enumerate()
+            .map(|(i, item)| {
+                let mut row = clip_row(item);
+                row.copied = copied == Some(CopyTarget::Inbox(i));
+                row
+            })
+            .collect();
         s.set_inbox_title(format!("Inbox ({})", inbox.len()).into());
         if let Some(model) = diffed_model(&s.get_inbox(), inbox) {
             s.set_inbox(model);
@@ -281,5 +304,7 @@ fn clip_row(item: &ClipItem) -> ClipRow {
         peek_text: peek_text.into(),
         peek_lines,
         truncated_note: truncated_note.into(),
+        // Set by the caller from the active copy flash; not derivable from the item.
+        copied: false,
     }
 }

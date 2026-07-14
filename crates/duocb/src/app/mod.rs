@@ -118,8 +118,21 @@ pub(crate) struct App {
     /// shows up as sent).
     pub(crate) pending_outbox: Option<String>,
     pub(crate) sent_flash: Option<Instant>,
-    /// When the secret was last copied, for the "✔ Copied" button feedback.
-    pub(crate) copied_flash: Option<Instant>,
+    /// Which copy button was last used and when, for the per-button "✔ Copied"
+    /// feedback. Only a successful copy sets this; a failure raises the error
+    /// banner instead (see [`App::copy_with_flash`]).
+    pub(crate) copied_flash: Option<(CopyTarget, Instant)>,
+}
+
+/// Which copy button a successful copy came from, so only that button shows the
+/// "✔ Copied" flash. `Inbox` carries the row index (the newest is 0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CopyTarget {
+    Secret,
+    Pin,
+    PairingCode,
+    Outbox,
+    Inbox(usize),
 }
 
 impl App {
@@ -405,18 +418,22 @@ impl App {
         }
     }
 
-    /// Copy the secret with visible feedback: the Copy buttons render
-    /// "✔ Copied" while the flash is fresh.
-    pub(crate) fn copy_secret_to_clipboard(&mut self, secret: &str) {
-        let secret = secret.to_string();
-        if self.copy_to_clipboard(&secret) {
-            self.copied_flash = Some(Instant::now());
+    /// Copy `text` and, on success, flash "✔ Copied" on the originating button
+    /// (`target`); on failure the error banner shows the reason instead. Every
+    /// copy button routes through here so all of them confirm the result.
+    pub(crate) fn copy_with_flash(&mut self, text: &str, target: CopyTarget) {
+        let text = text.to_string();
+        if self.copy_to_clipboard(&text) {
+            self.copied_flash = Some((target, Instant::now()));
         }
     }
 
-    /// Whether the "✔ Copied" feedback should currently show.
-    pub(crate) fn copied_flash_active(&self) -> bool {
-        self.copied_flash.is_some_and(|t| t.elapsed() < SENT_FLASH)
+    /// The copy button that should currently show "✔ Copied", if any (the flash
+    /// is fresh). Buttons compare their own [`CopyTarget`] against this.
+    pub(crate) fn copied_target(&self) -> Option<CopyTarget> {
+        self.copied_flash
+            .filter(|(_, t)| t.elapsed() < SENT_FLASH)
+            .map(|(target, _)| target)
     }
 
     /// Ask the runtime for a fresh connection-path snapshot; the reply arrives
@@ -1142,6 +1159,27 @@ pub(crate) mod tests {
         app.go_back();
         assert_eq!(app.screen, Screen::Home);
         assert_eq!(app.mode, PairMode::NostrToken);
+    }
+
+    #[test]
+    fn copy_flash_targets_only_the_button_that_copied() {
+        let mut app = test_app();
+        assert_eq!(app.copied_target(), None, "no flash before any copy");
+
+        // Each successful copy flashes exactly its own target, replacing the last.
+        app.copy_with_flash("d-secret", CopyTarget::Secret);
+        assert_eq!(app.copied_target(), Some(CopyTarget::Secret));
+        app.copy_with_flash("ABCD-EFGH", CopyTarget::Pin);
+        assert_eq!(app.copied_target(), Some(CopyTarget::Pin));
+
+        // Inbox feedback is keyed by row index — only the copied row flashes.
+        app.copy_with_flash("hello", CopyTarget::Inbox(2));
+        assert_eq!(app.copied_target(), Some(CopyTarget::Inbox(2)));
+        assert_ne!(app.copied_target(), Some(CopyTarget::Inbox(0)));
+
+        // A stale flash (older than the flash window) no longer shows.
+        app.copied_flash = Some((CopyTarget::Pin, Instant::now() - SENT_FLASH));
+        assert_eq!(app.copied_target(), None, "expired flash clears");
     }
 
     #[test]
