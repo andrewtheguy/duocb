@@ -33,12 +33,14 @@ mod desktop {
     };
     use crate::pin_record;
 
-    /// The process-wide responder. Created on first use and kept for the
-    /// process lifetime: adverts register/unregister against it (a rotation
-    /// every period would otherwise spawn and tear down socket threads), and
-    /// lookups browse on it. A failed first bind stays failed — the daemon
-    /// binds 5353 with SO_REUSEADDR/SO_REUSEPORT, so failure means something
-    /// unusual that a retry within this process won't fix.
+    /// The process-wide responder for *adverts*. Created on first use and
+    /// kept for the process lifetime: adverts register/unregister against it
+    /// (a rotation every period would otherwise spawn and tear down socket
+    /// threads). Lookups use their own short-lived daemon instead — a shared
+    /// browse would let one lookup's `stop_browse` kill a concurrent one's.
+    /// A failed first bind stays failed — the daemon binds 5353 with
+    /// SO_REUSEADDR/SO_REUSEPORT, so failure means something unusual that a
+    /// retry within this process won't fix.
     fn daemon() -> Result<&'static ServiceDaemon> {
         static DAEMON: OnceLock<Option<ServiceDaemon>> = OnceLock::new();
         DAEMON
@@ -65,7 +67,10 @@ mod desktop {
         }
     }
 
-    pub(in crate::lan) fn advertise(
+    /// Async for signature parity with the iOS backend (which must pump the
+    /// daemon's registration verdict); the mdns-sd registration itself is a
+    /// non-blocking channel send.
+    pub(in crate::lan) async fn advertise(
         keys: &Keys,
         node_id: &EndpointId,
         addrs: &[SocketAddr],
@@ -108,7 +113,9 @@ mod desktop {
             .map(|keys| (instance_name(keys), keys))
             .collect();
 
-        let daemon = daemon()?;
+        // A lookup-private daemon (see `daemon` docs); shut down at the end.
+        let daemon = ServiceDaemon::new()
+            .map_err(|e| anyhow!("starting the DNS-SD browser: {e}"))?;
         let receiver = daemon
             .browse(DNSSD_SERVICE_TYPE)
             .map_err(|e| anyhow!("starting DNS-SD PIN browse: {e}"))?;
@@ -152,13 +159,100 @@ mod desktop {
                 addrs: assemble_addrs(&ips, info.get_port(), port6),
             });
         };
-        let _ = daemon.stop_browse(DNSSD_SERVICE_TYPE);
+        let _ = daemon.shutdown();
         Ok(found)
     }
 
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// Interop with the platform Bonjour daemon — the desktop side of the
+        /// iOS-host scenario. `dns-sd -R` registers through macOS's
+        /// mDNSResponder exactly like `DNSServiceRegister` does on iOS, so a
+        /// lookup that finds it here proves the desktop joiner can see an iOS
+        /// LAN-only host.
+        #[cfg(target_os = "macos")]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn lookup_finds_daemon_registered_advert() {
+            let _ = env_logger::builder().is_test(true).try_init();
+            let pin = "M3TDPWFA";
+            let node_id = iroh::SecretKey::generate().public();
+
+            let candidates = pin_record::candidate_keys(pin).await.unwrap();
+            let content = pin_record::encrypt_pin_payload(&candidates[0], &node_id).unwrap();
+            let instance = instance_name(&candidates[0]);
+            let mut host = std::process::Command::new("dns-sd")
+                .args([
+                    "-R",
+                    &instance,
+                    "_duocb-pin._udp",
+                    "local",
+                    "4433",
+                    &format!("{TXT_KEY}={content}"),
+                ])
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .expect("dns-sd CLI (ships with macOS)");
+            // Give the daemon a beat to register before browsing.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+            let found = lookup(&candidates).await;
+            let _ = host.kill();
+            let _ = host.wait();
+            let found = found.unwrap().expect("daemon-registered record on LAN");
+            assert_eq!(found.node_id, node_id);
+            assert!(
+                found.addrs.iter().all(|a| a.port() == 4433),
+                "addrs should carry the SRV port: {:?}",
+                found.addrs
+            );
+            assert!(!found.addrs.is_empty(), "no dialable addresses resolved");
+        }
+
+        /// Debug probe: run the real lookup against a live host's PIN, passed
+        /// via DUOCB_TEST_PIN. Run manually with `-- --ignored --nocapture`.
+        #[ignore]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn lookup_by_env_pin() {
+            let _ = env_logger::builder().is_test(true).try_init();
+            let pin = crate::pin::normalize_pin(&std::env::var("DUOCB_TEST_PIN").unwrap())
+                .expect("valid PIN");
+            let candidates = pin_record::candidate_keys(&pin).await.unwrap();
+            let found = lookup(&candidates).await.unwrap();
+            match found {
+                Some(f) => println!("FOUND node_id={} addrs={:?}", f.node_id, f.addrs),
+                None => println!("MISS"),
+            }
+        }
+
+        /// Debug probe: raw-browse the PIN service type and dump every event.
+        /// Run manually with `-- --ignored --nocapture` while a host is up.
+        #[ignore]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn raw_browse_probe() {
+            let _ = env_logger::builder().is_test(true).try_init();
+            let daemon = ServiceDaemon::new().unwrap();
+            let receiver = daemon.browse(DNSSD_SERVICE_TYPE).unwrap();
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+            while let Ok(Ok(event)) = tokio::time::timeout_at(deadline, receiver.recv_async()).await
+            {
+                match event {
+                    ServiceEvent::ServiceResolved(info) => {
+                        println!(
+                            "RESOLVED {} port={} addrs={:?} e={:?} p6={:?}",
+                            info.get_fullname(),
+                            info.get_port(),
+                            info.get_addresses(),
+                            info.get_property_val_str(TXT_KEY).map(|s| s.len()),
+                            info.get_property_val_str(TXT_KEY_PORT6),
+                        );
+                    }
+                    other => println!("EVENT {other:?}"),
+                }
+            }
+            let _ = daemon.shutdown();
+        }
 
         /// End-to-end rendezvous through the real DNS-SD responder: advertise
         /// a record for the current bucket, then look it up with the PIN's
@@ -172,7 +266,7 @@ mod desktop {
 
             let candidates = pin_record::candidate_keys(pin).await.unwrap();
             // candidate_keys leads with the current bucket — the one to advertise.
-            let _advert = advertise(&candidates[0], &node_id, &[addr]).unwrap();
+            let _advert = advertise(&candidates[0], &node_id, &[addr]).await.unwrap();
 
             let found = lookup(&candidates).await.unwrap().expect("record on LAN");
             assert_eq!(found.node_id, node_id);
@@ -206,6 +300,15 @@ mod ios {
     /// `_duocb-pin._udp` — the dns_sd.h calls take the regtype and the domain
     /// (`local.`) as separate arguments.
     const REGTYPE: &str = "_duocb-pin._udp";
+    /// kDNSServiceErr_PolicyDenied: the daemon refused the operation because
+    /// the app lacks Local Network permission. iOS reports this only through
+    /// the operation's callback — registrations never pop the permission
+    /// prompt themselves (browses do).
+    const ERR_POLICY_DENIED: DNSServiceErrorType = -65570;
+    /// How long to pump a fresh registration for the daemon's verdict. The
+    /// callback normally lands well within this (probing takes ~1s); with no
+    /// verdict by then the registration is assumed live.
+    const REGISTER_VERDICT_WAIT: Duration = Duration::from_secs(2);
 
     // Hand-written bindings for the slice of dns_sd.h this module uses. The
     // symbols live in libSystem on Apple platforms; every call is IPC to the
@@ -252,6 +355,16 @@ mod ios {
         *const c_char,
         *mut c_void,
     );
+    type BrowseReply = unsafe extern "C" fn(
+        DNSServiceRef,
+        DNSServiceFlags,
+        u32,
+        DNSServiceErrorType,
+        *const c_char,
+        *const c_char,
+        *const c_char,
+        *mut c_void,
+    );
 
     unsafe extern "C" {
         fn DNSServiceRegister(
@@ -276,6 +389,15 @@ mod ios {
             regtype: *const c_char,
             domain: *const c_char,
             callback: Option<ResolveReply>,
+            context: *mut c_void,
+        ) -> DNSServiceErrorType;
+        fn DNSServiceBrowse(
+            sd_ref: *mut DNSServiceRef,
+            flags: DNSServiceFlags,
+            interface_index: u32,
+            regtype: *const c_char,
+            domain: *const c_char,
+            callback: Option<BrowseReply>,
             context: *mut c_void,
         ) -> DNSServiceErrorType;
         fn DNSServiceGetAddrInfo(
@@ -308,8 +430,80 @@ mod ios {
         }
     }
 
-    /// A live registration with the system daemon.
-    pub(in crate::lan) struct Advert(#[expect(dead_code, reason = "held for Drop")] Op);
+    /// A live registration with the system daemon. `_outcome` is the
+    /// registration callback's context; it must outlive the op even though
+    /// the socket is no longer pumped once the verdict window closes
+    /// (callbacks only ever run inside `DNSServiceProcessResult`).
+    pub(in crate::lan) struct Advert {
+        #[expect(dead_code, reason = "held for Drop")]
+        op: Op,
+        #[expect(dead_code, reason = "callback context, held for Drop")]
+        outcome: Box<RegisterOutcome>,
+    }
+
+    /// The daemon's verdict on a registration, written by `register_cb`.
+    #[derive(Default)]
+    struct RegisterOutcome {
+        err: Option<DNSServiceErrorType>,
+    }
+
+    unsafe extern "C" fn register_cb(
+        _sd_ref: DNSServiceRef,
+        _flags: DNSServiceFlags,
+        err: DNSServiceErrorType,
+        _name: *const c_char,
+        _regtype: *const c_char,
+        _domain: *const c_char,
+        context: *mut c_void,
+    ) {
+        let outcome = unsafe { &mut *context.cast::<RegisterOutcome>() };
+        outcome.err = Some(err);
+    }
+
+    unsafe extern "C" fn noop_browse_cb(
+        _sd_ref: DNSServiceRef,
+        _flags: DNSServiceFlags,
+        _interface_index: u32,
+        _err: DNSServiceErrorType,
+        _service_name: *const c_char,
+        _regtype: *const c_char,
+        _domain: *const c_char,
+        _context: *mut c_void,
+    ) {
+    }
+
+    /// iOS never shows the Local Network prompt for a *registration* — it
+    /// silently denies it — but a *browse* is a sanctioned prompt trigger
+    /// (and our type is listed under NSBonjourServices). Browse briefly so
+    /// the system can ask; the caller reports the denial and the publisher's
+    /// next rotation re-registers once the user grants access.
+    fn trigger_local_network_prompt() {
+        let Ok(regtype) = CString::new(REGTYPE) else {
+            return;
+        };
+        let mut sd_ref: DNSServiceRef = ptr::null_mut();
+        let err = unsafe {
+            DNSServiceBrowse(
+                &mut sd_ref,
+                0,
+                0,
+                regtype.as_ptr(),
+                ptr::null(),
+                Some(noop_browse_cb),
+                ptr::null_mut(),
+            )
+        };
+        if err != 0 {
+            log::warn!("DNSServiceBrowse (permission-prompt trigger) failed: {err}");
+            return;
+        }
+        let op = Op(sd_ref);
+        // The prompt fires on the daemon receiving the request; holding the
+        // browse a moment is enough, and dropping it doesn't dismiss the
+        // prompt. This runs on the blocking pool, so sleeping is fine.
+        std::thread::sleep(Duration::from_millis(1500));
+        drop(op);
+    }
 
     /// One length-prefixed `key=value` string in TXT wire format.
     fn push_txt(buf: &mut Vec<u8>, key: &str, value: &str) -> Result<()> {
@@ -325,7 +519,22 @@ mod ios {
         Ok(())
     }
 
-    pub(in crate::lan) fn advertise(
+    pub(in crate::lan) async fn advertise(
+        keys: &Keys,
+        node_id: &EndpointId,
+        addrs: &[SocketAddr],
+    ) -> Result<Advert> {
+        // The registration verdict is pumped with blocking poll(2), and the
+        // permission-prompt fallback sleeps — keep it all off the executor.
+        let keys = keys.clone();
+        let node_id = *node_id;
+        let addrs = addrs.to_vec();
+        tokio::task::spawn_blocking(move || blocking_advertise(&keys, &node_id, &addrs))
+            .await
+            .context("DNS-SD advertise task failed")?
+    }
+
+    fn blocking_advertise(
         keys: &Keys,
         node_id: &EndpointId,
         addrs: &[SocketAddr],
@@ -342,12 +551,11 @@ mod ios {
         let name = CString::new(instance_name(keys))?;
         let regtype = CString::new(REGTYPE)?;
 
+        let mut outcome = Box::new(RegisterOutcome::default());
         let mut sd_ref: DNSServiceRef = ptr::null_mut();
         // host NULL → the daemon advertises this device's own hostname and
         // serves its A/AAAA records — exactly the addresses a joiner should
-        // dial; only the SRV port comes from us. No callback: the instance
-        // name is collision-free by construction (128-bit derived label), so
-        // registration outcomes carry no actionable signal.
+        // dial; only the SRV port comes from us.
         let err = unsafe {
             DNSServiceRegister(
                 &mut sd_ref,
@@ -360,12 +568,32 @@ mod ios {
                 srv_port.to_be(),
                 txt.len() as u16,
                 txt.as_ptr().cast(),
-                None,
-                ptr::null_mut(),
+                Some(register_cb),
+                ptr::from_mut::<RegisterOutcome>(&mut outcome).cast(),
             )
         };
         ensure!(err == 0, "DNSServiceRegister failed: {err}");
-        Ok(Advert(Op(sd_ref)))
+        let op = Op(sd_ref);
+
+        // Wait for the daemon's verdict: iOS gates advertising behind Local
+        // Network permission and reports a denial *only* here — without this
+        // pump a denied registration would look successful and the host would
+        // be silently invisible to joiners.
+        let deadline = Instant::now() + REGISTER_VERDICT_WAIT;
+        while outcome.err.is_none() && poll_and_process(&[op.0], deadline)? {}
+        match outcome.err {
+            // A quiet window means no error so far; proceed optimistically.
+            Some(0) | None => Ok(Advert { op, outcome }),
+            Some(ERR_POLICY_DENIED) => {
+                trigger_local_network_prompt();
+                anyhow::bail!(
+                    "Local Network permission is not granted — allow it in the prompt (or in \
+                     Settings > Privacy & Security > Local Network); the next PIN retries \
+                     within a minute"
+                )
+            }
+            Some(err) => anyhow::bail!("DNS-SD registration failed: {err}"),
+        }
     }
 
     pub(in crate::lan) async fn lookup(candidates: &[Keys]) -> Result<Option<PinFound>> {

@@ -160,12 +160,20 @@ pub async fn lookup_pin_record(candidates: &[Keys]) -> Result<Option<EndpointId>
 /// spec-compliant DNS-SD service instance. Unlike the swarm backend the
 /// advertised SRV/A/AAAA data is load-bearing: the joiner dials the resolved
 /// addresses directly. `addrs` must hold at least one direct socket address.
-pub fn dnssd_advertise_pin_record(
+///
+/// On iOS this waits for the system daemon's registration verdict: iOS gates
+/// advertising behind the Local Network permission and only reports a denial
+/// asynchronously. A denial fails the advertisement (after nudging the system
+/// permission prompt, which registrations alone never trigger) — the caller
+/// should surface the error, and the next PIN rotation retries.
+pub async fn dnssd_advertise_pin_record(
     keys: &Keys,
     node_id: &EndpointId,
     addrs: &[SocketAddr],
 ) -> Result<PinAdvert> {
-    dnssd::advertise(keys, node_id, addrs).map(|a| PinAdvert(AdvertKind::Dnssd(a)))
+    dnssd::advertise(keys, node_id, addrs)
+        .await
+        .map(|a| PinAdvert(AdvertKind::Dnssd(a)))
 }
 
 /// Look up the PIN rendezvous record for the LAN-only channel over DNS-SD.

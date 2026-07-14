@@ -1325,7 +1325,7 @@ async fn run_pin_publisher(
                 let addr = endpoint.addr();
                 let addrs: Vec<_> = addr.ip_addrs().copied().collect();
                 let advert = if matches!(channel, PinChannel::LanOnly) {
-                    crate::lan::dnssd_advertise_pin_record(&keys, &node_id, &addrs)
+                    crate::lan::dnssd_advertise_pin_record(&keys, &node_id, &addrs).await
                 } else {
                     crate::lan::advertise_pin_record(&keys, &node_id, &addrs)
                 };
@@ -1339,6 +1339,16 @@ async fn run_pin_publisher(
                             "Advertising rotating PIN on the local network (refreshes in {}s)",
                             crate::pin::BUCKET_SECS
                         );
+                    }
+                    // On the LAN-only channel the advertisement IS the
+                    // rendezvous — a shown PIN nobody can resolve must fail
+                    // loudly (e.g. iOS denying the registration until Local
+                    // Network permission is granted). The default channel
+                    // still has nostr carrying the record, so a warn will do.
+                    Err(e) if matches!(channel, PinChannel::LanOnly) => {
+                        events.error(format!(
+                            "Could not publish the PIN on the local network: {e:#}"
+                        ));
                     }
                     Err(e) => log::warn!("Failed to advertise PIN on the local network: {e:#}"),
                 }
