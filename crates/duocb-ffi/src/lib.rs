@@ -13,10 +13,10 @@
 //!    result arriving as a `peer_list` event) so the app can show the device
 //!    list before the user commits to a role. Quick-mode roles ("quick_host",
 //!    "quick_join") are identity-less — no token/name/suffix, no presence:
-//!    "quick_host" publishes a rotating PIN rendezvous (nostr + LAN) and
-//!    "quick_join" dials the `pin` typed by the user. Returns an opaque
-//!    handle. At most **one** instance may run at a time (a process-global
-//!    guard rejects a second).
+//!    "quick_host" publishes a rotating PIN rendezvous and "quick_join" dials
+//!    the `pin` typed by the user, both on the `channel` selected in the
+//!    config (see [`QuickChannel`]). Returns an opaque handle. At most **one**
+//!    instance may run at a time (a process-global guard rejects a second).
 //! 2. [`duocb_next_event`] — drain one pending [`NetEvent`] as a JSON string.
 //!    The runtime is event-driven; Swift polls this on a timer until it
 //!    returns 0.
@@ -27,11 +27,15 @@
 //!    commands; outcomes arrive as `item_sent`/`error` and `conn_path` events.
 //! 5. [`duocb_stop`] — shut the runtime down and free the handle.
 //!
-//! Quick mode is fixed to [`PinChannel::NostrAndLan`] (the desktop "P"
-//! preset); the LAN-only / nostr-only presets and manual mode remain
-//! desktop-only. Token/name/suffix persistence is the caller's job (Keychain
-//! on iOS); mint the suffix once with [`duocb_generate_suffix`] and reuse it
-//! forever.
+//! Quick mode supports the default nostr+LAN channel (the desktop "P" preset)
+//! and the LAN-only channel (the desktop "L" preset) via the `channel` config
+//! key. LAN-only signaling goes through the system mDNSResponder daemon
+//! (Bonjour), so it needs no multicast entitlement — but the app must list
+//! `_duocb-pin._udp` under `NSBonjourServices` and set
+//! `NSLocalNetworkUsageDescription`. The nostr-only preset and manual mode
+//! remain desktop-only. Token/name/suffix persistence is the caller's job
+//! (Keychain on iOS); mint the suffix once with [`duocb_generate_suffix`] and
+//! reuse it forever.
 //!
 //! The intended app flow mirrors the desktop hub: run a "hub" instance while
 //! the device list is on screen, and when the user picks an action stop it
@@ -90,9 +94,41 @@ struct FfiConfig {
     /// user-typed form (dashes/spaces/lowercase ok).
     #[serde(default)]
     pin: Option<String>,
+    /// Quick roles only: which channel carries the rotating-PIN rendezvous.
+    /// Omitted means `nostr_lan`.
+    #[serde(default)]
+    channel: Option<QuickChannel>,
     /// Empty/omitted means the built-in default relays.
     #[serde(default)]
     relays: Vec<String>,
+}
+
+/// The quick-mode rendezvous channel (JSON `channel` config key).
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum QuickChannel {
+    /// Nostr relays + local network — the default; works across the internet
+    /// and still pairs on the same network offline. On iOS the LAN half of
+    /// the rendezvous is inert (nostr carries it); the connection itself can
+    /// still be LAN-direct.
+    NostrLan,
+    /// LAN only (the desktop "L" preset): no third-party server at all. The
+    /// rendezvous is a Bonjour/DNS-SD service registered through the system
+    /// mDNSResponder daemon — no multicast entitlement needed — and the join
+    /// dials the direct addresses it resolves. The app must declare the
+    /// service under `NSBonjourServices` (`_duocb-pin._udp`) and set
+    /// `NSLocalNetworkUsageDescription`; joining prompts for Local Network
+    /// permission on first use.
+    Lan,
+}
+
+impl QuickChannel {
+    fn to_core(self) -> PinChannel {
+        match self {
+            QuickChannel::NostrLan => PinChannel::NostrAndLan,
+            QuickChannel::Lan => PinChannel::LanOnly,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -309,15 +345,13 @@ fn build_initial_commands(cfg: FfiConfig) -> Result<(Option<TokenIdentity>, UiCo
 
     // Quick roles first: identity-less, so none of the token/name/suffix
     // validation below applies.
+    let channel = cfg.channel.unwrap_or(QuickChannel::NostrLan).to_core();
     match cfg.role {
         Role::QuickHost => {
             return Ok((
                 None,
                 UiCommand::StartServer {
-                    mode: ServerMode::Pin {
-                        relays,
-                        channel: PinChannel::NostrAndLan,
-                    },
+                    mode: ServerMode::Pin { relays, channel },
                 },
             ));
         }
@@ -331,7 +365,7 @@ fn build_initial_commands(cfg: FfiConfig) -> Result<(Option<TokenIdentity>, UiCo
                     spec: DialSpec::Pin {
                         canonical_pin,
                         relays,
-                        channel: PinChannel::NostrAndLan,
+                        channel,
                     },
                 },
             ));

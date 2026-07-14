@@ -758,8 +758,13 @@ impl App {
                     channel: self.core_pin_channel(),
                 })
             }
-            PairMode::Manual => duocb_core::manual_code::decode(&self.in_manual_code)
-                .map(|(node_id, secret)| DialSpec::Manual { node_id, secret }),
+            PairMode::Manual => duocb_core::manual_code::decode(&self.in_manual_code).map(
+                |(node_id, secret, addrs)| DialSpec::Manual {
+                    node_id,
+                    secret,
+                    addrs,
+                },
+            ),
         }
     }
 

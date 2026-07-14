@@ -30,8 +30,13 @@ arboard = "3.6.1"
 iroh = "1.0.2"
 iroh-mdns-address-lookup = "0.4.0"
 # Also the engine under iroh-mdns-address-lookup; kept on the same version so
-# the two mDNS responders share one stack.
+# the two mDNS responders share one stack. Desktop-only (in-process multicast
+# needs the restricted entitlement on iOS).
 swarm-discovery = "0.6.3"
+# Spec-compliant DNS-SD for the LAN-only PIN channel: interoperates with the
+# Bonjour advertisement an iOS host registers through the system daemon.
+# Desktop-only; iOS talks to mDNSResponder via dns_sd.h instead.
+mdns-sd = "0.20.1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 futures = "0.3"
 

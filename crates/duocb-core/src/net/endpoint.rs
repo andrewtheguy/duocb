@@ -7,10 +7,11 @@
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use iroh::{
-    Endpoint, EndpointAddr, EndpointId, RelayMode, TransportAddr, Watcher,
+    Endpoint, EndpointAddr, RelayMode, TransportAddr, Watcher,
     address_lookup::{DnsAddressLookup, PkarrPublisher},
     endpoint::{Builder as EndpointBuilder, PathList, QuicTransportConfig, presets},
 };
+#[cfg(not(target_os = "ios"))]
 use iroh_mdns_address_lookup::MdnsAddressLookup;
 use log::{debug, info};
 use std::sync::Arc;
@@ -44,13 +45,17 @@ pub const QUIC_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Create a base endpoint builder with common configuration: keep-alive/idle
 /// transport tuning plus discovery, tuned to `readiness`.
 ///
-/// Every mode enables mDNS (local-network discovery — the offline path). Modes
+/// On desktop every mode enables mDNS (local-network discovery — the offline
+/// path). On iOS the in-process mDNS responder is omitted everywhere: it would
+/// need the restricted multicast entitlement, so LAN dials there rely on
+/// explicit direct addresses carried by the rendezvous (the LAN-only PIN
+/// channel's DNS-SD records, or a pairing code) — see `crate::lan`. Modes
 /// other than LAN-only additionally use the default relays and n0 DNS/pkarr, so
 /// peers stay reachable across networks. **LAN-only involves no third-party
 /// server**: the relay is disabled and n0 DNS/pkarr publish+lookup are omitted,
-/// leaving mDNS discovery plus direct device-to-device paths. This is not a
-/// packet-level subnet boundary; direct addresses and inbound source paths are
-/// not filtered to on-link IPs.
+/// leaving mDNS discovery (desktop) plus direct device-to-device paths. This is
+/// not a packet-level subnet boundary; direct addresses and inbound source
+/// paths are not filtered to on-link IPs.
 fn create_endpoint_builder(readiness: EndpointReadiness) -> Result<EndpointBuilder> {
     let mut transport_config = QuicTransportConfig::builder();
     let idle_timeout = QUIC_IDLE_TIMEOUT
@@ -70,16 +75,20 @@ fn create_endpoint_builder(readiness: EndpointReadiness) -> Result<EndpointBuild
         .crypto_provider(crypto_provider);
 
     let builder = if readiness == EndpointReadiness::LanDirect {
-        // LAN-only: no relay, no internet-backed discovery — mDNS + direct only.
+        // LAN-only: no relay, no internet-backed discovery — mDNS (desktop)
+        // + direct only.
+        let builder = builder.relay_mode(RelayMode::Disabled);
+        #[cfg(not(target_os = "ios"))]
+        let builder = builder.address_lookup(MdnsAddressLookup::builder());
         builder
-            .relay_mode(RelayMode::Disabled)
-            .address_lookup(MdnsAddressLookup::builder())
     } else {
-        builder
+        let builder = builder
             .relay_mode(RelayMode::Default)
             .address_lookup(PkarrPublisher::n0_dns())
-            .address_lookup(DnsAddressLookup::n0_dns())
-            .address_lookup(MdnsAddressLookup::builder())
+            .address_lookup(DnsAddressLookup::n0_dns());
+        #[cfg(not(target_os = "ios"))]
+        let builder = builder.address_lookup(MdnsAddressLookup::builder());
+        builder
     };
 
     Ok(builder)
@@ -119,9 +128,12 @@ pub enum EndpointReadiness {
     /// relay connects concurrently for any later cross-network dial.
     DirectAddr,
     /// Wait only for a first direct (IP) address, and build the endpoint
-    /// **relay-less, mDNS-only** (no n0 DNS/pkarr). The gate for the LAN-only
-    /// PIN channel, which must come up promptly without a third-party service.
-    /// Its traffic is direct, but the path is not restricted by source subnet.
+    /// **relay-less** with no internet-backed discovery (no n0 DNS/pkarr):
+    /// mDNS-only on desktop, no address lookup at all on iOS — there the dial
+    /// carries the DNS-SD-resolved direct addresses instead. The gate for the
+    /// LAN-only PIN channel, which must come up promptly without a third-party
+    /// service. Its traffic is direct, but the path is not restricted by
+    /// source subnet.
     LanDirect,
 }
 
@@ -194,20 +206,23 @@ pub async fn create_client_endpoint(readiness: EndpointReadiness) -> Result<Endp
     Ok(endpoint)
 }
 
-/// Connect to a listening endpoint by bare node id. iroh resolves the actual
-/// transport addresses via the endpoint's discovery services (n0 DNS/pkarr when
-/// online, mDNS on the local network) and hole-punches, falling back to a relay.
+/// Connect to a listening endpoint. `server_addr` usually carries a bare node
+/// id — iroh then resolves the transport addresses via the endpoint's
+/// discovery services (n0 DNS/pkarr when online, mDNS on the local network on
+/// desktop) and hole-punches, falling back to a relay. When the rendezvous
+/// already produced direct addresses (the LAN-only DNS-SD lookup, a pairing
+/// code with embedded addresses), they ride along and are dialed immediately —
+/// the only working path on an endpoint without LAN discovery (iOS LAN-only).
 pub async fn connect_to_server(
     endpoint: &Endpoint,
-    server_id: EndpointId,
+    server_addr: EndpointAddr,
 ) -> Result<iroh::endpoint::Connection> {
     info!(
         "Connecting to server {} (timeout: {}s)...",
-        server_id,
+        server_addr.id,
         CONNECT_TIMEOUT.as_secs()
     );
-    let endpoint_addr = EndpointAddr::new(server_id);
-    match tokio::time::timeout(CONNECT_TIMEOUT, endpoint.connect(endpoint_addr, ALPN)).await {
+    match tokio::time::timeout(CONNECT_TIMEOUT, endpoint.connect(server_addr, ALPN)).await {
         Ok(Ok(conn)) => Ok(conn),
         Ok(Err(e)) => Err(anyhow::Error::from(e).context("Failed to connect to server")),
         Err(_) => anyhow::bail!(
