@@ -508,7 +508,7 @@ async fn run_server_session(
         ServerMode::Pin { .. } | ServerMode::Manual => (HashSet::new(), None),
     };
     let pairing_code = if matches!(mode, ServerMode::Manual) {
-        let secret = crate::pin::generate_pin();
+        let secret = crate::manual_code::generate_secret();
         // Argon2id — off the async executor. The key must be in place before
         // the code is surfaced, or a fast joiner could beat it to the auth.
         let derived = tokio::task::spawn_blocking({
@@ -1269,7 +1269,7 @@ async fn run_pin_publisher(
             break;
         }
 
-        let pin = crate::pin::generate_pin();
+        let pin = crate::pin::generate_pin(matches!(channel, PinChannel::LanOnly));
         let bucket = crate::pin::current_bucket();
         // Show the new code right away (before the network publish) and give it a
         // full rotation period from *now*, not from the wall-clock bucket boundary:
@@ -1996,7 +1996,7 @@ mod tests {
         let cli_session = start_session(
             SessionKind::Client(DialSpec::Manual {
                 node_id,
-                secret: crate::pin::generate_pin(), // not the server's secret
+                secret: crate::manual_code::generate_secret(), // not the server's secret
                 addrs: Vec::new(),
             }),
             EventSender::new(cli_tx, None),

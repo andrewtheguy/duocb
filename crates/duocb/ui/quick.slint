@@ -48,9 +48,10 @@ export component QuickScreen inherits ScrollView {
             text: "Pair on the spot — nothing is saved, and the credentials last one session.";
         }
 
-        // The P/L channel choice, applying to the actions below.
+        // The P/L channel choice for the PIN you show. The joiner doesn't pick a
+        // channel — it reads it from the PIN's first character.
         Card {
-            CardTitle { text: "How the devices find each other"; }
+            CardTitle { text: "How the devices find each other (when showing a PIN)"; }
             ModeRow {
                 text: "P  Internet + local network (default)";
                 selected: UiState.mode == PairMode.nostr-pin && UiState.pin-channel == PinChannel.both;
@@ -65,7 +66,7 @@ export component QuickScreen inherits ScrollView {
                 clicked => { Actions.set-pin-channel(PinChannel.lan-only); }
             }
             Small {
-                text: "Private means no third-party server participates: discovery is a Bonjour (DNS-SD) service on the local network only and traffic is always direct between the devices, never relayed. Pairs with the iOS app's \"Local network only\" channel. LAN-only is not a packet-level subnet boundary; reflected mDNS, a VPN/overlay, or globally routed addresses can extend the direct path beyond a conventional LAN. Both devices must pick the local-network-only channel — a P device and an L device do not find each other.";
+                text: "Private means no third-party server participates: discovery is a Bonjour (DNS-SD) service on the local network only and traffic is always direct between the devices, never relayed. Pairs with the iOS app's \"Local network only\" channel. LAN-only is not a packet-level subnet boundary; reflected mDNS, a VPN/overlay, or globally routed addresses can extend the direct path beyond a conventional LAN. The PIN shown here encodes this choice, so the joiner just types it — no need to pick a channel on both devices.";
             }
         }
 

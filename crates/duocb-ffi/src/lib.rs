@@ -94,8 +94,9 @@ struct FfiConfig {
     /// user-typed form (dashes/spaces/lowercase ok).
     #[serde(default)]
     pin: Option<String>,
-    /// Quick roles only: which channel carries the rotating-PIN rendezvous.
-    /// Omitted means `nostr_lan`.
+    /// QuickHost role only: which channel carries the rotating-PIN rendezvous.
+    /// Omitted means `nostr_lan`. Ignored for QuickJoin — the join channel is
+    /// read from the PIN's first character (see `duocb_core::pin`).
     #[serde(default)]
     channel: Option<QuickChannel>,
     /// Empty/omitted means the built-in default relays.
@@ -345,9 +346,10 @@ fn build_initial_commands(cfg: FfiConfig) -> Result<(Option<TokenIdentity>, UiCo
 
     // Quick roles first: identity-less, so none of the token/name/suffix
     // validation below applies.
-    let channel = cfg.channel.unwrap_or(QuickChannel::NostrLan).to_core();
     match cfg.role {
         Role::QuickHost => {
+            // The host picks the channel (the `channel` config key).
+            let channel = cfg.channel.unwrap_or(QuickChannel::NostrLan).to_core();
             return Ok((
                 None,
                 UiCommand::StartServer {
@@ -359,6 +361,14 @@ fn build_initial_commands(cfg: FfiConfig) -> Result<(Option<TokenIdentity>, UiCo
             let canonical_pin =
                 duocb_core::pin::normalize_pin(cfg.pin.as_deref().unwrap_or_default())
                     .ok_or("invalid PIN (enter the 8 characters shown on the other device)")?;
+            // The join channel is not configured — it is read from the PIN's
+            // first character (a LAN-only PIN uses the DNS-SD path, anything
+            // else the nostr+LAN race). The `channel` config key is ignored here.
+            let channel = if duocb_core::pin::pin_is_lan_only(&canonical_pin) {
+                PinChannel::LanOnly
+            } else {
+                PinChannel::NostrAndLan
+            };
             return Ok((
                 None,
                 UiCommand::Connect {
@@ -772,7 +782,7 @@ mod tests {
 
     #[test]
     fn quick_join_normalizes_the_pin_and_rejects_bad_ones() {
-        let pin = duocb_core::pin::generate_pin();
+        let pin = duocb_core::pin::generate_pin(false);
         let typed = format!(
             "{}-{}",
             pin[..4].to_lowercase(),
@@ -792,6 +802,7 @@ mod tests {
                     },
             } => {
                 assert_eq!(canonical_pin, pin);
+                // A lower-half PIN infers the nostr+LAN channel.
                 assert_eq!(channel, PinChannel::NostrAndLan);
             }
             other => panic!("unexpected command: {other:?}"),
@@ -808,6 +819,23 @@ mod tests {
             let cfg: FfiConfig = serde_json::from_str(&bad).unwrap();
             let err = build_initial_commands(cfg).expect_err("bad pin fails");
             assert!(err.contains("PIN"), "unexpected error: {err}");
+        }
+    }
+
+    #[test]
+    fn quick_join_infers_lan_only_from_the_pin_ignoring_config_channel() {
+        // A LAN-only PIN (upper-half first char) resolves to the LAN-only
+        // channel even when the config asks for the nostr+LAN channel — the
+        // `channel` key is ignored on join.
+        let pin = duocb_core::pin::generate_pin(true);
+        let json = format!(r#"{{"role":"quick_join","pin":"{pin}","channel":"nostr_lan"}}"#);
+        let cfg: FfiConfig = serde_json::from_str(&json).unwrap();
+        let (_, cmd) = build_initial_commands(cfg).unwrap();
+        match cmd {
+            UiCommand::Connect {
+                spec: DialSpec::Pin { channel, .. },
+            } => assert_eq!(channel, PinChannel::LanOnly),
+            other => panic!("unexpected command: {other:?}"),
         }
     }
 
@@ -883,7 +911,7 @@ mod tests {
 
     #[test]
     fn normalize_pin_ffi_roundtrips_and_reports_errors() {
-        let pin = duocb_core::pin::generate_pin();
+        let pin = duocb_core::pin::generate_pin(false);
         let typed = format!("{}-{}\0", pin[..4].to_lowercase(), pin[4..].to_lowercase());
         let mut out = [0 as c_char; 16];
         let rc = unsafe {

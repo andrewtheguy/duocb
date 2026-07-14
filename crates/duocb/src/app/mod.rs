@@ -796,12 +796,24 @@ impl App {
                 peer_display: self.selected_peer_display()?,
             }),
             PairMode::NostrPin => {
+                // The channel is not chosen when joining — it is read from the PIN's
+                // first character (see `duocb_core::pin`). A LAN-only PIN dials the
+                // LAN-only DNS-SD path; anything else uses the nostr+LAN race, which
+                // also resolves a nostr-only host via its nostr half.
+                use duocb_core::net::PinChannel as Core;
                 duocb_core::pin::normalize_pin(&format!("{}{}", self.in_pin_a, self.in_pin_b))
-                    .map(|canonical_pin| DialSpec::Pin {
-                    canonical_pin,
-                    relays: default_relays(),
-                    channel: self.core_pin_channel(),
-                })
+                    .map(|canonical_pin| {
+                        let channel = if duocb_core::pin::pin_is_lan_only(&canonical_pin) {
+                            Core::LanOnly
+                        } else {
+                            Core::NostrAndLan
+                        };
+                        DialSpec::Pin {
+                            canonical_pin,
+                            relays: default_relays(),
+                            channel,
+                        }
+                    })
             }
             PairMode::Manual => duocb_core::manual_code::decode(&self.in_manual_code).map(
                 |(node_id, secret, addrs)| DialSpec::Manual {
@@ -1133,31 +1145,46 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn pin_specs_carry_the_selected_channel() {
+    fn host_spec_uses_the_selected_channel() {
         let mut app = test_app();
         app.mode = PairMode::NostrPin;
         app.pin_channel = PinChannel::LanOnly;
-        let canonical = duocb_core::pin::generate_pin();
-        // The joiner types the PIN across the two group fields.
-        let g = duocb_core::pin::PIN_GROUP_LEN;
-        app.in_pin_a = canonical[..g].to_string();
-        app.in_pin_b = canonical[g..].to_string();
         match app.server_mode_spec() {
             Some(duocb_core::net::ServerMode::Pin { channel, .. }) => {
                 assert_eq!(channel, duocb_core::net::PinChannel::LanOnly);
             }
             other => panic!("unexpected server mode: {other:?}"),
         }
-        match app.client_dial_spec() {
-            Some(duocb_core::net::DialSpec::Pin {
-                channel,
-                canonical_pin,
-                ..
-            }) => {
-                assert_eq!(channel, duocb_core::net::PinChannel::LanOnly);
-                assert_eq!(canonical_pin, canonical);
+    }
+
+    #[test]
+    fn join_spec_infers_the_channel_from_the_pin() {
+        use duocb_core::net::PinChannel as Core;
+        let g = duocb_core::pin::PIN_GROUP_LEN;
+        // The typed PIN — not the on-screen channel selection — decides the join
+        // channel. A LAN-only PIN dials LAN-only even when a nostr channel is
+        // selected, and vice versa.
+        for (lan_only, selected, expected) in [
+            (true, PinChannel::NostrOnly, Core::LanOnly),
+            (false, PinChannel::LanOnly, Core::NostrAndLan),
+        ] {
+            let mut app = test_app();
+            app.mode = PairMode::NostrPin;
+            app.pin_channel = selected;
+            let canonical = duocb_core::pin::generate_pin(lan_only);
+            app.in_pin_a = canonical[..g].to_string();
+            app.in_pin_b = canonical[g..].to_string();
+            match app.client_dial_spec() {
+                Some(duocb_core::net::DialSpec::Pin {
+                    channel,
+                    canonical_pin,
+                    ..
+                }) => {
+                    assert_eq!(channel, expected);
+                    assert_eq!(canonical_pin, canonical);
+                }
+                other => panic!("unexpected dial spec: {other:?}"),
             }
-            other => panic!("unexpected dial spec: {other:?}"),
         }
     }
 

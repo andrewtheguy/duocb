@@ -258,7 +258,7 @@ mod tests {
         assert_eq!(app.screen, Screen::Quick);
         assert!(!app.client_active);
         // A valid PIN dials and moves to the client screen.
-        let pin = duocb_core::pin::generate_pin();
+        let pin = duocb_core::pin::generate_pin(false);
         let g = duocb_core::pin::PIN_GROUP_LEN;
         app.in_pin_a = pin[..g].to_string();
         app.in_pin_b = pin[g..].to_string();
