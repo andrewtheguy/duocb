@@ -75,11 +75,12 @@ pub enum ServerMode {
         channel: PinChannel,
     },
     /// Manual/offline mode: no signaling at all. The server displays a single
-    /// pairing code — its node id plus a fresh session secret (see
-    /// `crate::manual_code`, reported via [`NetEvent::ServerReady`]) — which
-    /// the user carries to the other device out of band. Auth is the same
-    /// in-band PIN challenge-response as the PIN mode. Discovery falls back to
-    /// mDNS on the LAN, so this works with zero internet.
+    /// pairing code — its node id, a fresh session secret, and its direct
+    /// socket addresses (see `crate::manual_code`, reported via
+    /// [`NetEvent::ServerReady`]) — which the user carries to the other device
+    /// out of band. Auth is the same in-band PIN challenge-response as the PIN
+    /// mode. The embedded addresses (plus mDNS on desktop) make this work with
+    /// zero internet, even where mDNS is blocked.
     Manual,
 }
 
@@ -102,8 +103,14 @@ pub enum DialSpec {
         channel: PinChannel,
     },
     /// Dial the node id carried by a pasted pairing code and prove its session
-    /// secret in-band (the same PIN challenge-response as the PIN mode).
-    Manual { node_id: String, secret: String },
+    /// secret in-band (the same PIN challenge-response as the PIN mode). The
+    /// code's embedded direct addresses are dialed as-is, so this works with
+    /// no discovery at all — the fallback when mDNS is blocked on the network.
+    Manual {
+        node_id: String,
+        secret: String,
+        addrs: Vec<std::net::SocketAddr>,
+    },
 }
 
 /// Commands from the UI thread to the networking runtime.

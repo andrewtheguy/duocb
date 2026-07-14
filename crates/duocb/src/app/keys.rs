@@ -164,7 +164,7 @@ fn handle_configure_key(
             } else if up {
                 app.move_peer_selection(-1);
             } else if esc {
-                app.configure_step = ConfigureStep::Ready;
+                app.leave_join_picker();
             } else {
                 return false;
             }

@@ -6,8 +6,6 @@ description.workspace = true
 
 [dependencies]
 iroh.workspace = true
-iroh-mdns-address-lookup.workspace = true
-swarm-discovery.workspace = true
 rustls.workspace = true
 futures.workspace = true
 nostr-sdk.workspace = true
@@ -15,6 +13,7 @@ sha2.workspace = true
 argon2.workspace = true
 subtle.workspace = true
 base64.workspace = true
+crc32fast.workspace = true
 rand.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
@@ -23,6 +22,18 @@ serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 log.workspace = true
+
+# In-process mDNS responders (multicast sockets) are desktop-only: on iOS they
+# would need the restricted multicast entitlement. iOS speaks to the system
+# mDNSResponder daemon through dns_sd.h instead (see src/lan/dnssd.rs).
+[target.'cfg(not(target_os = "ios"))'.dependencies]
+iroh-mdns-address-lookup.workspace = true
+swarm-discovery.workspace = true
+mdns-sd.workspace = true
+
+# poll(2) for driving dns_sd.h operation sockets.
+[target.'cfg(target_os = "ios")'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 env_logger.workspace = true

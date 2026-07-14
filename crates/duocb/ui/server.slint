@@ -100,7 +100,7 @@ export component ServerScreen inherits ScrollView {
         }
         if UiState.server-running && UiState.mode == PairMode.manual
             && UiState.pairing-code != "": Small {
-            text: "Manual mode uses no signaling service (no nostr) — only iroh. It resolves the id in the code over the internet (iroh's DNS) or the local network (mDNS), then connects directly or through an iroh relay. Devices on the same network can link directly even while online, and can pair with no internet at all.";
+            text: "Manual mode uses no signaling service (no nostr) — only iroh. The code embeds this device's direct addresses, which the other device dials straight away — no discovery at all, so it pairs offline even where mDNS is blocked — with iroh's DNS and relay as fallback across networks. The code stays valid for this whole session.";
         }
 
         if UiState.server-running: HorizontalLayout {

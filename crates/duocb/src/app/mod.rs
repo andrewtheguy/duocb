@@ -69,6 +69,11 @@ pub(crate) struct App {
     /// Warning from the presence publisher (another live process broadcasts
     /// under this device's identity); cleared when presence is reconfigured.
     pub(crate) presence_conflict: Option<String>,
+    /// Whether the presence publisher is running. Stays `false` at launch —
+    /// nostr is dormant until the user picks Start or Join on the hub — so
+    /// [`ensure_presence`](App::ensure_presence) can start it exactly once
+    /// without needlessly restarting (and risking a false self-conflict).
+    pub(crate) presence_active: bool,
     pub(crate) confirm_clear_secret: bool,
 
     // Server presentation state.
@@ -150,7 +155,11 @@ impl App {
             (None, _) => ConfigureStep::SetupChoice,
         };
 
-        let mut app = Self {
+        // Nostr stays dormant at launch: the presence broadcast and the peer
+        // fetch only start when the user picks Start a connection or Join
+        // another device on the hub, so opening the app (or using only quick
+        // mode) never touches the relays.
+        Self {
             config_lock,
             net,
             clipboard: SystemClipboard::new(),
@@ -170,6 +179,7 @@ impl App {
             selected_peer: None,
             joined_peer: None,
             presence_conflict: None,
+            presence_active: false,
             confirm_clear_secret: false,
             server_running: false,
             node_id: None,
@@ -192,15 +202,7 @@ impl App {
             pending_outbox: None,
             sent_flash: None,
             copied_flash: None,
-        };
-        // A fully configured device starts broadcasting presence right away,
-        // plus one fetch to warm the device picker; after this the list is
-        // only refreshed while the picker is visible.
-        if app.configure_step == ConfigureStep::Ready {
-            app.sync_presence();
-            app.refresh_peers();
         }
-        app
     }
 
     /// Drain every event the runtime has queued. Returns whether any arrived
@@ -468,9 +470,19 @@ impl App {
     /// (Re)start or stop the presence broadcast to match the current identity.
     pub(crate) fn sync_presence(&mut self) {
         self.presence_conflict = None;
-        self.net.send(UiCommand::SetPresence {
-            identity: self.token_identity(),
-        });
+        let identity = self.token_identity();
+        self.presence_active = identity.is_some();
+        self.net.send(UiCommand::SetPresence { identity });
+    }
+
+    /// Start the presence broadcast if it isn't already running. This is the
+    /// single entry point that wakes nostr up, called when the user first acts
+    /// on the hub (Start a connection or Join another device); it is idempotent
+    /// so re-entering the picker never restarts a healthy publisher.
+    pub(crate) fn ensure_presence(&mut self) {
+        if !self.presence_active && self.token_identity().is_some() {
+            self.sync_presence();
+        }
     }
 
     /// Ask the runtime for a fresh peer device list.
@@ -508,7 +520,6 @@ impl App {
     pub(crate) fn set_secret(&mut self, token: String) {
         self.secret = Some(token);
         self.save_configure_config();
-        self.sync_presence();
         self.reset_name_field();
         self.configure_step = ConfigureStep::SetupName;
     }
@@ -518,7 +529,8 @@ impl App {
         self.in_my_name = self.saved_name.clone().unwrap_or_default();
     }
 
-    /// Confirm the name field: persist it, enter the hub, and start broadcasting.
+    /// Confirm the name field: persist it and enter the hub. Presence stays
+    /// dormant until the user picks Start or Join there (see `ensure_presence`).
     pub(crate) fn save_name(&mut self) {
         let name = self.in_my_name.trim().to_string();
         if duocb_core::identity::validate_name(&name).is_err() {
@@ -527,8 +539,12 @@ impl App {
         self.saved_name = Some(name);
         if self.save_configure_config() {
             self.configure_step = ConfigureStep::Ready;
-            self.sync_presence();
-            self.refresh_peers();
+            // A rename while nostr is already awake (the user paired earlier
+            // this session) rebroadcasts under the new name; otherwise presence
+            // stays dormant until the next Start/Join.
+            if self.presence_active {
+                self.sync_presence();
+            }
         }
     }
 
@@ -546,6 +562,7 @@ impl App {
     pub(crate) fn clear_secret(&mut self) {
         self.secret = None;
         self.save_configure_config();
+        self.presence_active = false;
         self.net.send(UiCommand::SetPresence { identity: None });
         self.peers.clear();
         self.selected_peer = None;
@@ -568,16 +585,24 @@ impl App {
             .map(|p| p.display())
     }
 
-    /// Open the device picker (the hub's Join action). Refreshes the list on
-    /// entry unless a fetch just went out.
+    /// Open the device picker (the hub's Join action). Wakes nostr up (this is
+    /// one of the two entry points that do) and refreshes the list on entry
+    /// unless a fetch just went out.
     pub(crate) fn enter_join_picker(&mut self) {
         self.configure_step = ConfigureStep::Join;
+        self.ensure_presence();
         let fresh = self
             .peers_requested_at
             .is_some_and(|at| at.elapsed() < Duration::from_secs(5));
         if !fresh {
             self.refresh_peers();
         }
+    }
+
+    /// Leave the device picker back to the hub, putting nostr back to sleep.
+    pub(crate) fn leave_join_picker(&mut self) {
+        self.configure_step = ConfigureStep::Ready;
+        self.stop_presence();
     }
 
     /// Toggle the picker selection for a peer row (by stable suffix).
@@ -649,6 +674,20 @@ impl App {
         }
     }
 
+    /// Put nostr back to sleep: stop the presence broadcast and peer discovery.
+    /// Called when the user leaves every nostr flow (Start/Join) back to the
+    /// hub, so the plain home screen holds no relay connections. Idempotent.
+    pub(crate) fn stop_presence(&mut self) {
+        if !self.presence_active {
+            return;
+        }
+        self.presence_active = false;
+        self.presence_conflict = None;
+        // Force the next Join to re-fetch: the list is no longer kept fresh.
+        self.peers_requested_at = None;
+        self.net.send(UiCommand::SetPresence { identity: None });
+    }
+
     /// Open the quick-options screen (ad-hoc PIN/manual pairing).
     pub(crate) fn open_quick(&mut self) {
         self.screen = Screen::Quick;
@@ -714,6 +753,12 @@ impl App {
         if self.configure_step == ConfigureStep::Join {
             self.configure_step = ConfigureStep::Ready;
         }
+        // Back on the plain hub, nostr goes dormant again until the next
+        // Start/Join. (Leaving a quick-mode role lands on Quick, not Home, and
+        // never ran presence anyway.)
+        if self.screen == Screen::Home {
+            self.stop_presence();
+        }
     }
 
     /// The selected PIN channel as the core's enum.
@@ -758,8 +803,13 @@ impl App {
                     channel: self.core_pin_channel(),
                 })
             }
-            PairMode::Manual => duocb_core::manual_code::decode(&self.in_manual_code)
-                .map(|(node_id, secret)| DialSpec::Manual { node_id, secret }),
+            PairMode::Manual => duocb_core::manual_code::decode(&self.in_manual_code).map(
+                |(node_id, secret, addrs)| DialSpec::Manual {
+                    node_id,
+                    secret,
+                    addrs,
+                },
+            ),
         }
     }
 
@@ -774,9 +824,14 @@ impl App {
         self.start_server();
     }
 
-    /// Start the server session if the state validates.
+    /// Start the server session if the state validates. The configure-mode
+    /// host is the other nostr wake-up point: its presence record is how the
+    /// joiner finds this device's node id, so start the broadcast first.
     pub(crate) fn start_server(&mut self) {
         if let Some(mode) = self.server_mode_spec() {
+            if self.mode == PairMode::NostrToken {
+                self.ensure_presence();
+            }
             self.server_running = true;
             self.net.send(UiCommand::StartServer { mode });
         }
@@ -786,6 +841,10 @@ impl App {
     pub(crate) fn connect_client(&mut self) {
         if let Some(spec) = self.client_dial_spec() {
             if let duocb_core::net::DialSpec::NostrToken { peer_display, .. } = &spec {
+                // The dial resolves the peer through the presence relays, so
+                // make sure the broadcast is awake (normally already is, from
+                // entering the picker). Quick-mode dials never reach here.
+                self.ensure_presence();
                 self.joined_peer = Some(peer_display.clone());
             }
             self.client_active = true;
@@ -942,6 +1001,112 @@ pub(crate) mod tests {
             peers: vec![peer("mac", "here")],
         });
         assert_eq!(app.selected_peer.as_deref(), Some("here"));
+    }
+
+    /// Build an App whose command receiver we keep, so no real runtime spawns
+    /// and the exact `UiCommand` stream can be read back. Returns a configured
+    /// (secret + name) app on the idle hub, plus the command receiver.
+    fn app_with_cmd_spy() -> (App, tokio::sync::mpsc::UnboundedReceiver<UiCommand>) {
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        // These tests never poll events, so the sender can drop right away.
+        let (_event_tx, event_rx) = std::sync::mpsc::channel();
+        let net = NetHandle {
+            cmd_tx,
+            events: event_rx,
+            thread: None,
+        };
+        let dir = std::env::temp_dir().join(format!(
+            "duocb-cmdspy-{}-{}",
+            std::process::id(),
+            rand_suffix()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = crate::config::acquire_lock(&dir.join("config.json")).unwrap();
+        let mut app = App::new(lock, net);
+        app.secret = Some(duocb_core::auth::generate_token());
+        app.saved_name = Some("mac".into());
+        app.configure_step = ConfigureStep::Ready;
+        app.mode = PairMode::NostrToken;
+        (app, cmd_rx)
+    }
+
+    fn drain(rx: &mut tokio::sync::mpsc::UnboundedReceiver<UiCommand>) -> Vec<UiCommand> {
+        let mut cmds = Vec::new();
+        while let Ok(c) = rx.try_recv() {
+            cmds.push(c);
+        }
+        cmds
+    }
+
+    #[test]
+    fn nostr_is_dormant_until_start_or_join_and_stops_on_return() {
+        let (mut app, mut cmd_rx) = app_with_cmd_spy();
+
+        // Idle hub: nothing is broadcast until the user acts.
+        assert!(!app.presence_active);
+        assert!(
+            drain(&mut cmd_rx).is_empty(),
+            "no relay activity before a hub action"
+        );
+
+        // Join wakes presence (Some identity) and asks for the peer list.
+        app.enter_join_picker();
+        assert!(app.presence_active);
+        let cmds = drain(&mut cmd_rx);
+        assert!(
+            matches!(
+                cmds.first(),
+                Some(UiCommand::SetPresence { identity: Some(_) })
+            ),
+            "Join must wake presence first: {cmds:?}"
+        );
+        assert!(cmds.iter().any(|c| matches!(c, UiCommand::RefreshPeers)));
+
+        // Leaving the picker for the hub puts nostr back to sleep.
+        app.leave_join_picker();
+        assert!(!app.presence_active);
+        assert_eq!(app.configure_step, ConfigureStep::Ready);
+        assert!(
+            drain(&mut cmd_rx)
+                .iter()
+                .any(|c| matches!(c, UiCommand::SetPresence { identity: None })),
+            "leaving Join must stop presence"
+        );
+
+        // Start wakes presence, then hosts; going back stops it again.
+        app.begin_server();
+        assert!(app.presence_active);
+        let cmds = drain(&mut cmd_rx);
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, UiCommand::SetPresence { identity: Some(_) })));
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, UiCommand::StartServer { .. })));
+
+        app.go_back();
+        assert_eq!(app.screen, Screen::Home);
+        assert!(!app.presence_active);
+        assert!(
+            drain(&mut cmd_rx)
+                .iter()
+                .any(|c| matches!(c, UiCommand::SetPresence { identity: None })),
+            "returning to the hub must stop presence"
+        );
+    }
+
+    #[test]
+    fn quick_mode_never_wakes_presence() {
+        let (mut app, mut cmd_rx) = app_with_cmd_spy();
+        app.open_quick(); // mode → NostrPin
+        app.begin_server(); // quick host under a PIN
+        assert!(!app.presence_active);
+        assert!(
+            !drain(&mut cmd_rx)
+                .iter()
+                .any(|c| matches!(c, UiCommand::SetPresence { identity: Some(_) })),
+            "quick mode must never broadcast presence"
+        );
     }
 
     #[test]
