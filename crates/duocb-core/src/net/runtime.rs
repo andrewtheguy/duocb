@@ -470,13 +470,14 @@ async fn run_server_session(
 ) {
     events.status(ConnStatus::Starting);
 
-    // Modes that must come up with zero internet (manual, and PIN with the LAN
-    // channel) can't hard-require the home relay: `online()` never resolves
-    // offline, which would fail the whole session despite mDNS being enough on
-    // a LAN. Only configure mode (nostr-dependent anyway) requires it.
+    // Only the modes that hard-require the internet gate on the relay coming
+    // online (`online()` never resolves offline, so they fail fast without
+    // it). The quick modes gate on a first local address only — the PIN or
+    // pairing code shows immediately and LAN signaling needs no internet,
+    // while the relay connects in the background for a cross-network dial.
     let readiness = match &mode {
         ServerMode::Pin { channel, .. } => pin_channel_readiness(*channel),
-        ServerMode::Manual => EndpointReadiness::RelayPreferred,
+        ServerMode::Manual => EndpointReadiness::DirectAddr,
         ServerMode::NostrToken { .. } => EndpointReadiness::RelayOnline,
     };
     let endpoint = match create_server_endpoint(readiness).await {
@@ -728,13 +729,13 @@ async fn run_client_session(
         _ => None,
     };
 
-    // Modes that must come up with zero internet (manual, and PIN with the LAN
-    // channel) can't hard-require the home relay: `online()` never resolves
-    // offline, which would fail the whole session despite mDNS being enough on
-    // a LAN. Only configure mode (nostr-dependent anyway) requires it.
+    // Same policy as the server side: only the internet-requiring modes gate
+    // on the relay; the quick modes start resolving and dialing right away
+    // (the relay connects in the background, and a cross-network dial's own
+    // timeout covers it coming up).
     let readiness = match &spec {
         DialSpec::Pin { channel, .. } => pin_channel_readiness(*channel),
-        DialSpec::Manual { .. } => EndpointReadiness::RelayPreferred,
+        DialSpec::Manual { .. } => EndpointReadiness::DirectAddr,
         DialSpec::NostrToken { .. } => EndpointReadiness::RelayOnline,
     };
     let endpoint = match create_client_endpoint(readiness).await {
@@ -1113,7 +1114,7 @@ async fn run_presence_publisher(
 fn pin_channel_readiness(channel: PinChannel) -> EndpointReadiness {
     match channel {
         PinChannel::NostrOnly => EndpointReadiness::RelayOnline,
-        PinChannel::NostrAndLan => EndpointReadiness::RelayPreferred,
+        PinChannel::NostrAndLan => EndpointReadiness::DirectAddr,
         PinChannel::LanOnly => EndpointReadiness::LanDirect,
     }
 }
