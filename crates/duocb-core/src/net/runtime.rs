@@ -470,13 +470,14 @@ async fn run_server_session(
 ) {
     events.status(ConnStatus::Starting);
 
-    // Modes that must come up with zero internet (manual, and PIN with the LAN
-    // channel) can't hard-require the home relay: `online()` never resolves
-    // offline, which would fail the whole session despite mDNS being enough on
-    // a LAN. Only configure mode (nostr-dependent anyway) requires it.
+    // Only the modes that hard-require the internet gate on the relay coming
+    // online (`online()` never resolves offline, so they fail fast without
+    // it). The quick modes gate on a first local address only — the PIN or
+    // pairing code shows immediately and LAN signaling needs no internet,
+    // while the relay connects in the background for a cross-network dial.
     let readiness = match &mode {
         ServerMode::Pin { channel, .. } => pin_channel_readiness(*channel),
-        ServerMode::Manual => EndpointReadiness::RelayPreferred,
+        ServerMode::Manual => EndpointReadiness::DirectAddr,
         ServerMode::NostrToken { .. } => EndpointReadiness::RelayOnline,
     };
     let endpoint = match create_server_endpoint(readiness).await {
@@ -728,13 +729,13 @@ async fn run_client_session(
         _ => None,
     };
 
-    // Modes that must come up with zero internet (manual, and PIN with the LAN
-    // channel) can't hard-require the home relay: `online()` never resolves
-    // offline, which would fail the whole session despite mDNS being enough on
-    // a LAN. Only configure mode (nostr-dependent anyway) requires it.
+    // Same policy as the server side: only the internet-requiring modes gate
+    // on the relay; the quick modes start resolving and dialing right away
+    // (the relay connects in the background, and a cross-network dial's own
+    // timeout covers it coming up).
     let readiness = match &spec {
         DialSpec::Pin { channel, .. } => pin_channel_readiness(*channel),
-        DialSpec::Manual { .. } => EndpointReadiness::RelayPreferred,
+        DialSpec::Manual { .. } => EndpointReadiness::DirectAddr,
         DialSpec::NostrToken { .. } => EndpointReadiness::RelayOnline,
     };
     let endpoint = match create_client_endpoint(readiness).await {
@@ -1056,33 +1057,47 @@ async fn run_presence_publisher(
     let display = identity.display();
     let mut publishes: u32 = 0;
     loop {
-        if publishes > 0 {
-            match crate::nostr::lookup_presence(&identity.token, &display, &identity.relays).await
-            {
-                Ok(Some((record, _))) if record.run_id != run_id => {
-                    events.send(NetEvent::PresenceConflict {
-                        message: format!(
-                            "Another process is broadcasting as '{display}' — stopped publishing \
-                             presence. Is a second instance using this device's config?"
-                        ),
-                    });
-                    return;
+        // The nostr round-trips (conflict lookup + publish) run raced against
+        // the cancel token: stopping the publisher must not wait out a relay
+        // round-trip — the iOS FFI's stop (and with it the app's screen
+        // transition away from the hub) blocks on this task ending.
+        let cycle = async {
+            if publishes > 0 {
+                match crate::nostr::lookup_presence(&identity.token, &display, &identity.relays)
+                    .await
+                {
+                    Ok(Some((record, _))) if record.run_id != run_id => {
+                        events.send(NetEvent::PresenceConflict {
+                            message: format!(
+                                "Another process is broadcasting as '{display}' — stopped \
+                                 publishing presence. Is a second instance using this device's \
+                                 config?"
+                            ),
+                        });
+                        return false;
+                    }
+                    // Our own record, no record, or a network error: nothing provable.
+                    _ => {}
                 }
-                // Our own record, no record, or a network error: nothing provable.
-                _ => {}
             }
-        }
 
-        let record = crate::nostr::PresenceRecord {
-            version: crate::nostr::PRESENCE_VERSION,
-            name: identity.name.clone(),
-            suffix: identity.suffix.clone(),
-            run_id: run_id.clone(),
-            node_id: hosting_rx.borrow_and_update().map(|id| id.to_string()),
+            let record = crate::nostr::PresenceRecord {
+                version: crate::nostr::PRESENCE_VERSION,
+                name: identity.name.clone(),
+                suffix: identity.suffix.clone(),
+                run_id: run_id.clone(),
+                node_id: hosting_rx.borrow_and_update().map(|id| id.to_string()),
+            };
+            match crate::nostr::publish_presence(&identity.token, &record, &identity.relays).await
+            {
+                Ok(()) => log::info!("Published presence to nostr"),
+                Err(e) => log::warn!("Failed to publish presence to nostr: {e:#}"),
+            }
+            true
         };
-        match crate::nostr::publish_presence(&identity.token, &record, &identity.relays).await {
-            Ok(()) => log::info!("Published presence to nostr"),
-            Err(e) => log::warn!("Failed to publish presence to nostr: {e:#}"),
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            keep_publishing = cycle => if !keep_publishing { return },
         }
         publishes = publishes.saturating_add(1);
 
@@ -1113,7 +1128,7 @@ async fn run_presence_publisher(
 fn pin_channel_readiness(channel: PinChannel) -> EndpointReadiness {
     match channel {
         PinChannel::NostrOnly => EndpointReadiness::RelayOnline,
-        PinChannel::NostrAndLan => EndpointReadiness::RelayPreferred,
+        PinChannel::NostrAndLan => EndpointReadiness::DirectAddr,
         PinChannel::LanOnly => EndpointReadiness::LanDirect,
     }
 }
@@ -1634,6 +1649,39 @@ mod tests {
 
         session.cancel.cancel();
         let _ = session.handle.await;
+    }
+
+    /// Stopping the presence publisher returns promptly even while it is in
+    /// the middle of a nostr round-trip (here: a publish hanging on an
+    /// unroutable relay). The iOS FFI's stop — and with it the app's screen
+    /// transition away from the hub — blocks on this task ending, so a relay
+    /// round-trip must never be waited out.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stopping_presence_mid_publish_is_prompt() {
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let events = EventSender::new(tx, None);
+        let hosting: HostingTx = Arc::new(tokio::sync::watch::channel(None).0);
+        let identity = TokenIdentity {
+            token: "test-token".to_string(),
+            name: "test".to_string(),
+            suffix: "a7B2c3D4".to_string(),
+            // TEST-NET-1: unroutable, so the first publish hangs in its
+            // connect wait (CONNECT_TIMEOUT is 10s) when the stop lands.
+            relays: vec!["wss://192.0.2.1".to_string()],
+        };
+        let mut presence = Some(spawn_presence(identity, &hosting, events));
+
+        // Let the publisher enter the publish's connect wait.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let start = Instant::now();
+        stop_presence(&mut presence).await;
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "stop_presence took {:?} — the publish round-trip was waited out",
+            start.elapsed()
+        );
     }
 
     /// End-to-end manual mode within one process: a server session and a client

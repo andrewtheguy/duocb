@@ -99,6 +99,12 @@ fn create_endpoint_builder(readiness: EndpointReadiness) -> Result<EndpointBuild
 /// Note this is orthogonal to the *rendezvous* channel: e.g. `RelayOnline`
 /// (internet-only PIN) still keeps mDNS + direct paths on the endpoint, so its
 /// connection can be local even though its PIN discovery is nostr-only.
+///
+/// **The relay is never waited on unless the mode hard-requires the internet.**
+/// The quick modes that also work offline ([`DirectAddr`](Self::DirectAddr))
+/// gate only on a first local address — milliseconds — and let the relay and
+/// n0 discovery come online in the background, ready by the time a
+/// cross-network dial actually needs them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EndpointReadiness {
     /// Wait for the home relay (`Endpoint::online`) and fail without it. The
@@ -106,11 +112,12 @@ pub enum EndpointReadiness {
     /// once a relay connects, so it times out entirely offline. Full default
     /// transport stack.
     RelayOnline,
-    /// Prefer the home relay but tolerate its absence: on timeout, log and
-    /// continue with whatever direct addresses exist. The gate for modes that
-    /// work both online and offline (the default nostr+LAN PIN channel, and
-    /// manual mode). Full default transport stack.
-    RelayPreferred,
+    /// Wait only for a first direct (IP) address — effectively instant — on
+    /// the full default transport stack. The gate for modes that work both
+    /// online and offline (the default nostr+LAN PIN channel, and manual
+    /// mode): their credentials and LAN signaling need no internet, and the
+    /// relay connects concurrently for any later cross-network dial.
+    DirectAddr,
     /// Wait only for a first direct (IP) address, and build the endpoint
     /// **relay-less, mDNS-only** (no n0 DNS/pkarr). The gate for the LAN-only
     /// PIN channel, which must come up promptly without a third-party service.
@@ -140,25 +147,27 @@ async fn wait_for_endpoint_ready(endpoint: &Endpoint, readiness: EndpointReadine
     );
     let ready = async {
         match readiness {
-            EndpointReadiness::RelayOnline | EndpointReadiness::RelayPreferred => {
-                endpoint.online().await
+            EndpointReadiness::RelayOnline => endpoint.online().await,
+            EndpointReadiness::DirectAddr | EndpointReadiness::LanDirect => {
+                wait_for_direct_address(endpoint).await
             }
-            EndpointReadiness::LanDirect => wait_for_direct_address(endpoint).await,
         }
     };
     match tokio::time::timeout(CONNECT_TIMEOUT, ready).await {
         Ok(()) => Ok(()),
-        Err(_) if readiness == EndpointReadiness::RelayPreferred => {
+        Err(_) if readiness == EndpointReadiness::RelayOnline => anyhow::bail!(
+            "Endpoint failed to come online after {}s - check network connectivity",
+            CONNECT_TIMEOUT.as_secs()
+        ),
+        Err(_) => {
+            // A bound endpoint without any local address is all but impossible;
+            // proceed and let discovery fill the addresses in.
             info!(
-                "No relay came online after {}s — continuing offline (LAN pairing still works)",
+                "No direct address after {}s — continuing anyway",
                 CONNECT_TIMEOUT.as_secs()
             );
             Ok(())
         }
-        Err(_) => anyhow::bail!(
-            "Endpoint failed to come online after {}s - check network connectivity",
-            CONNECT_TIMEOUT.as_secs()
-        ),
     }
 }
 
