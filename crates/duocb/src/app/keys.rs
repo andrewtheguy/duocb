@@ -9,7 +9,7 @@
 
 use slint::platform::Key;
 
-use super::App;
+use super::{App, CopyTarget};
 use crate::{ConfigureStep, PairMode, PinChannel, Screen};
 use duocb_core::net::ConnStatus;
 
@@ -72,11 +72,11 @@ pub(crate) fn handle_global_key(
             // (manual mode) or the current rotating PIN (PIN mode).
             if command('t') && app.pairing_code.is_some() {
                 let code = app.pairing_code.clone().unwrap();
-                app.copy_to_clipboard(&code);
+                app.copy_with_flash(&code, CopyTarget::PairingCode);
                 true
             } else if command('t') && app.pin_display.is_some() {
                 let pin = app.pin_display.clone().unwrap();
-                app.copy_to_clipboard(&pin);
+                app.copy_with_flash(&pin, CopyTarget::Pin);
                 true
             } else {
                 false
@@ -148,7 +148,7 @@ fn handle_configure_key(
                 app.enter_join_picker();
             } else if command('t') && app.secret.is_some() {
                 let secret = app.secret.clone().unwrap();
-                app.copy_secret_to_clipboard(&secret);
+                app.copy_with_flash(&secret, CopyTarget::Secret);
             } else {
                 return false;
             }
@@ -190,7 +190,7 @@ fn handle_session_key(app: &mut App, focus_free: bool, command: &dyn Fn(char) ->
         // Ctrl/Command+Y ("yank") instead of the platform Copy shortcut, which
         // belongs to the focused text widgets.
         if let Some(text) = app.inbox.first().map(|i| i.text.clone()) {
-            app.copy_to_clipboard(&text);
+            app.copy_with_flash(&text, CopyTarget::Inbox(0));
         }
     } else if command('l') {
         app.inbox.clear();
@@ -258,22 +258,21 @@ mod tests {
         assert_eq!(app.screen, Screen::Quick);
         assert!(!app.client_active);
         // A valid PIN dials and moves to the client screen.
-        let pin = duocb_core::pin::generate_pin();
+        let pin = duocb_core::pin::generate_pin(false);
         let g = duocb_core::pin::PIN_GROUP_LEN;
         app.in_pin_a = pin[..g].to_string();
         app.in_pin_b = pin[g..].to_string();
         app.join_quick();
         assert_eq!(app.screen, Screen::Client);
         assert!(app.client_active);
-        // In manual mode the same action validates the pasted code instead,
-        // so the still-valid PIN entry no longer counts. (`client_active`
-        // lingers until the runtime's Idle event is drained; the screen not
-        // moving is what join_quick guarantees.)
+        // The join entry is independent of the show-side choice: the same valid
+        // PIN still joins even when Manual is selected (that choice only governs
+        // what this device would *show*, not what it accepts to join).
         app.go_back();
         assert_eq!(app.screen, Screen::Quick);
         app.mode = PairMode::Manual;
         app.join_quick();
-        assert_eq!(app.screen, Screen::Quick);
+        assert_eq!(app.screen, Screen::Client);
     }
 
     #[test]

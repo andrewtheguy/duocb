@@ -47,7 +47,7 @@ export component ServerScreen inherits ScrollView {
                 alignment: center;
                 spacing: Theme.pad-s;
                 Button {
-                    text: "Copy PIN (" + UiState.cmd-label + "+T)";
+                    text: UiState.copied-pin ? "✔ Copied" : "Copy PIN (" + UiState.cmd-label + "+T)";
                     clicked => { Actions.copy-pin(); }
                 }
                 Button {
@@ -86,7 +86,7 @@ export component ServerScreen inherits ScrollView {
             alignment: start;
             Body { text: "Pairing code:"; vertical-alignment: center; }
             Button {
-                text: "Copy (" + UiState.cmd-label + "+T)";
+                text: UiState.copied-pairing-code ? "✔ Copied" : "Copy (" + UiState.cmd-label + "+T)";
                 clicked => { Actions.copy-pairing-code(); }
             }
         }

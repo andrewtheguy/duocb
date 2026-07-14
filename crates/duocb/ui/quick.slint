@@ -7,7 +7,7 @@
 import { UiState, Actions } from "globals.slint";
 import { PairMode, PinChannel } from "types.slint";
 import { Theme } from "theme.slint";
-import { Card, CardTitle, Weak, Small, Body, BigButton, WideButton, BackHeader, SelectableRow } from "widgets.slint";
+import { Card, CardTitle, Weak, Small, Body, BigButton, WideButton, BackHeader, SelectableRow, JoinModeToggle } from "widgets.slint";
 import { LineEdit, ScrollView } from "std-widgets.slint";
 
 component ModeRow inherits SelectableRow {
@@ -48,9 +48,10 @@ export component QuickScreen inherits ScrollView {
             text: "Pair on the spot — nothing is saved, and the credentials last one session.";
         }
 
-        // The P/L channel choice, applying to the actions below.
+        // The P/L channel choice for the PIN you show. The joiner doesn't pick a
+        // channel — it reads it from the PIN's first character.
         Card {
-            CardTitle { text: "How the devices find each other"; }
+            CardTitle { text: "How the devices find each other (when showing a PIN)"; }
             ModeRow {
                 text: "P  Internet + local network (default)";
                 selected: UiState.mode == PairMode.nostr-pin && UiState.pin-channel == PinChannel.both;
@@ -65,7 +66,7 @@ export component QuickScreen inherits ScrollView {
                 clicked => { Actions.set-pin-channel(PinChannel.lan-only); }
             }
             Small {
-                text: "Private means no third-party server participates: discovery is a Bonjour (DNS-SD) service on the local network only and traffic is always direct between the devices, never relayed. Pairs with the iOS app's \"Local network only\" channel. LAN-only is not a packet-level subnet boundary; reflected mDNS, a VPN/overlay, or globally routed addresses can extend the direct path beyond a conventional LAN. Both devices must pick the local-network-only channel — a P device and an L device do not find each other.";
+                text: "Private means no third-party server participates: discovery is a Bonjour (DNS-SD) service on the local network only and traffic is always direct between the devices, never relayed. Pairs with the iOS app's \"Local network only\" channel. LAN-only is not a packet-level subnet boundary; reflected mDNS, a VPN/overlay, or globally routed addresses can extend the direct path beyond a conventional LAN. The PIN shown here encodes this choice, so the joiner just types it — no need to pick a channel on both devices.";
             }
         }
 
@@ -122,20 +123,25 @@ export component QuickScreen inherits ScrollView {
             }
         }
 
+        // Joining is independent of the choices above: type the PIN shown on the
+        // other device, or (via the toggle) paste a manual pairing code. The
+        // channel/mode is read from the entry itself, never picked. PIN is the
+        // default; the toggle picks which entry shows and which the join reads.
         Card {
-            CardTitle { text: root.manual ? "Enter a pairing code" : "Enter a PIN"; }
-            // Both entries stay instantiated (visibility-toggled) so their
-            // fields can report focus for shortcut gating.
+            CardTitle { text: UiState.join-by-code ? "Enter a pairing code" : "Enter a PIN"; }
+            JoinModeToggle { }
+            // Both entries stay instantiated (visibility-toggled) so their fields
+            // can report focus for shortcut gating; only the active one is shown
+            // and sized.
             forms := Rectangle {
-                height: root.manual ? manual-form.preferred-height : pin-form.preferred-height;
+                height: UiState.join-by-code ? manual-form.preferred-height : pin-form.preferred-height;
 
                 pin-form := VerticalLayout {
-                    visible: !root.manual;
+                    visible: !UiState.join-by-code;
                     alignment: start;
                     spacing: Theme.pad-xs;
-                    // The same two-group entry as the join screen's (dash as a
-                    // static label, auto-advance, backspace hop), bound to the
-                    // same shared draft; Enter in either group joins.
+                    // Two four-character groups (dash as a static label,
+                    // auto-advance, backspace hop); Enter in either group joins.
                     HorizontalLayout {
                         alignment: start;
                         spacing: Theme.pad-xs;
@@ -187,11 +193,11 @@ export component QuickScreen inherits ScrollView {
                 }
 
                 manual-form := VerticalLayout {
-                    visible: root.manual;
+                    visible: UiState.join-by-code;
                     alignment: start;
                     spacing: Theme.pad-xs;
                     code-entry := LineEdit {
-                        placeholder-text: "…";
+                        placeholder-text: "Paste a pairing code…";
                         text <=> UiState.in-manual-code;
                         edited => { Actions.fields-edited(); }
                         accepted => { Actions.join-quick(); }
@@ -203,13 +209,14 @@ export component QuickScreen inherits ScrollView {
                     }
                 }
             }
+
             WideButton {
                 text: "🔗 Join";
                 enabled: UiState.dial-ready;
                 clicked => { Actions.join-quick(); }
             }
             Small {
-                text: root.manual
+                text: UiState.join-by-code
                     ? "Paste the pairing code copied from the hosting device."
                     : "Type the PIN shown on the hosting device.";
             }

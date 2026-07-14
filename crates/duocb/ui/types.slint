@@ -65,6 +65,9 @@ export struct ClipRow {
     peek-text: string,
     peek-lines: int,
     truncated-note: string,
+    /// Whether this row's Copy button should flash "✔ Copied" (set from the
+    /// active copy feedback during sync).
+    copied: bool,
 }
 
 /// One connection-path row for the on-demand modal; the marker/color encode

@@ -8,7 +8,7 @@ use std::rc::Rc;
 
 use slint::ComponentHandle;
 
-use super::App;
+use super::{App, CopyTarget};
 use crate::{Actions, MainWindow, UiState};
 
 pub(crate) fn wire(app: &Rc<RefCell<App>>, ui: &MainWindow) {
@@ -74,7 +74,7 @@ pub(crate) fn wire(app: &Rc<RefCell<App>>, ui: &MainWindow) {
     });
     act!(on_copy_secret, |app| {
         if let Some(secret) = app.secret.clone() {
-            app.copy_secret_to_clipboard(&secret);
+            app.copy_with_flash(&secret, CopyTarget::Secret);
         }
     });
     act!(on_request_clear_secret, |app| {
@@ -127,16 +127,24 @@ pub(crate) fn wire(app: &Rc<RefCell<App>>, ui: &MainWindow) {
     // Server credentials.
     act!(on_copy_pairing_code, |app| {
         if let Some(code) = app.pairing_code.clone() {
-            app.copy_to_clipboard(&code);
+            app.copy_with_flash(&code, CopyTarget::PairingCode);
         }
     });
     act!(on_copy_pin, |app| {
         if let Some(pin) = app.pin_display.clone() {
-            app.copy_to_clipboard(&pin);
+            app.copy_with_flash(&pin, CopyTarget::Pin);
         }
     });
     act!(on_refresh_pin, |app| {
         app.net.send(duocb_core::net::UiCommand::RefreshPin);
+    });
+    actions.on_set_join_by_code({
+        let app = Rc::clone(app);
+        let weak = ui.as_weak();
+        move |by_code| {
+            app.borrow_mut().join_by_code = by_code;
+            app.borrow().sync(&weak.unwrap());
+        }
     });
 
     // Session panel.
@@ -147,7 +155,7 @@ pub(crate) fn wire(app: &Rc<RefCell<App>>, ui: &MainWindow) {
     act!(on_close_conn_path, |app| app.conn_path = None);
     act!(on_outbox_copy, |app| {
         if let Some(text) = app.outbox.as_ref().map(|i| i.text.clone()) {
-            app.copy_to_clipboard(&text);
+            app.copy_with_flash(&text, CopyTarget::Outbox);
         }
     });
     act!(on_outbox_peek, |app| {
@@ -163,7 +171,7 @@ pub(crate) fn wire(app: &Rc<RefCell<App>>, ui: &MainWindow) {
             {
                 let mut app = app.borrow_mut();
                 if let Some(text) = app.inbox.get(index as usize).map(|i| i.text.clone()) {
-                    app.copy_to_clipboard(&text);
+                    app.copy_with_flash(&text, CopyTarget::Inbox(index as usize));
                 }
             }
             app.borrow().sync(&ui);

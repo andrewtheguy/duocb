@@ -242,7 +242,7 @@ mod tests {
 
     // A valid canonical PIN (7 data chars + check digit) for tests.
     fn test_pin() -> String {
-        crate::pin::generate_pin()
+        crate::pin::generate_pin(false)
     }
 
     /// Read the opening AuthRequest and return its PIN nonce, mirroring how the runtime reads the

@@ -15,15 +15,17 @@
  * Quick mode: ephemeral device-to-device pairing with no standing state and no
  * identity. Role "quick_host" publishes a rotating 8-char PIN (a "pin_rotated"
  * event fires on every rotation until a peer pairs, then "pin_cleared"); role
- * "quick_join" dials the PIN typed by the user. The rendezvous "channel" is
- * "nostr_lan" (default, the desktop "P" preset — nostr relays carry the
- * rendezvous on iOS; the connection can still be LAN-direct) or "lan"
+ * "quick_join" dials the PIN typed by the user. For quick_host the rendezvous
+ * "channel" is "nostr_lan" (default, the desktop "P" preset — nostr relays
+ * carry the rendezvous on iOS; the connection can still be LAN-direct) or "lan"
  * (LAN-only, the desktop "L" preset: a Bonjour/DNS-SD service through the
  * system daemon, no third-party server, direct addresses dialed as resolved).
- * "lan" needs Info.plist keys: NSBonjourServices must list "_duocb-pin._udp"
- * and NSLocalNetworkUsageDescription must be set; joining triggers the Local
- * Network permission prompt on first use. The nostr-only preset and manual
- * mode remain desktop-only.
+ * quick_join takes NO channel — it is read from the PIN's first character (a
+ * LAN-only PIN uses the "lan" path, anything else "nostr_lan"), so the two
+ * sides can never mismatch. "lan" needs Info.plist keys: NSBonjourServices must
+ * list "_duocb-pin._udp" and NSLocalNetworkUsageDescription must be set; joining
+ * triggers the Local Network permission prompt on first use. The nostr-only
+ * preset and manual mode remain desktop-only.
  *
  * Lifecycle:
  *   1. duocb_init_logging()                                   (once, optional)
@@ -55,9 +57,9 @@
  *   {"role":"quick_join","pin":"abcd-2345"}    pin: as typed by the user
  *                                              (dashes/spaces/lowercase ok;
  *                                              rejected with an error if the
- *                                              check digit doesn't match)
- *   {"role":"quick_join","pin":"…","channel":"lan"}
- *                                              channel must match the host's
+ *                                              check digit doesn't match). No
+ *                                              "channel" key — it is inferred
+ *                                              from the PIN's first character.
  *
  * Events (one JSON object per duocb_next_event call), by "type":
  *   server_ready      {node_id, token_fingerprint}

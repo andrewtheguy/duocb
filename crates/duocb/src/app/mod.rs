@@ -101,6 +101,10 @@ pub(crate) struct App {
     pub(crate) in_pin_a: String,
     pub(crate) in_pin_b: String,
     pub(crate) in_manual_code: String,
+    /// Which join entry the quick screen shows: PIN (default) or a pasted
+    /// pairing code. A toggle flips it; it also selects which credential
+    /// [`App::quick_dial_spec`] reads.
+    pub(crate) join_by_code: bool,
     /// Draft of the session panel's compose field (send typed text).
     pub(crate) in_compose: String,
 
@@ -118,8 +122,21 @@ pub(crate) struct App {
     /// shows up as sent).
     pub(crate) pending_outbox: Option<String>,
     pub(crate) sent_flash: Option<Instant>,
-    /// When the secret was last copied, for the "✔ Copied" button feedback.
-    pub(crate) copied_flash: Option<Instant>,
+    /// Which copy button was last used and when, for the per-button "✔ Copied"
+    /// feedback. Only a successful copy sets this; a failure raises the error
+    /// banner instead (see [`App::copy_with_flash`]).
+    pub(crate) copied_flash: Option<(CopyTarget, Instant)>,
+}
+
+/// Which copy button a successful copy came from, so only that button shows the
+/// "✔ Copied" flash. `Inbox` carries the row index (the newest is 0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CopyTarget {
+    Secret,
+    Pin,
+    PairingCode,
+    Outbox,
+    Inbox(usize),
 }
 
 impl App {
@@ -194,6 +211,7 @@ impl App {
             in_pin_a: String::new(),
             in_pin_b: String::new(),
             in_manual_code: String::new(),
+            join_by_code: false,
             in_compose: String::new(),
             peer_node_id: None,
             conn_path: None,
@@ -405,18 +423,22 @@ impl App {
         }
     }
 
-    /// Copy the secret with visible feedback: the Copy buttons render
-    /// "✔ Copied" while the flash is fresh.
-    pub(crate) fn copy_secret_to_clipboard(&mut self, secret: &str) {
-        let secret = secret.to_string();
-        if self.copy_to_clipboard(&secret) {
-            self.copied_flash = Some(Instant::now());
+    /// Copy `text` and, on success, flash "✔ Copied" on the originating button
+    /// (`target`); on failure the error banner shows the reason instead. Every
+    /// copy button routes through here so all of them confirm the result.
+    pub(crate) fn copy_with_flash(&mut self, text: &str, target: CopyTarget) {
+        let text = text.to_string();
+        if self.copy_to_clipboard(&text) {
+            self.copied_flash = Some((target, Instant::now()));
         }
     }
 
-    /// Whether the "✔ Copied" feedback should currently show.
-    pub(crate) fn copied_flash_active(&self) -> bool {
-        self.copied_flash.is_some_and(|t| t.elapsed() < SENT_FLASH)
+    /// The copy button that should currently show "✔ Copied", if any (the flash
+    /// is fresh). Buttons compare their own [`CopyTarget`] against this.
+    pub(crate) fn copied_target(&self) -> Option<CopyTarget> {
+        self.copied_flash
+            .filter(|(_, t)| t.elapsed() < SENT_FLASH)
+            .map(|(target, _)| target)
     }
 
     /// Ask the runtime for a fresh connection-path snapshot; the reply arrives
@@ -787,7 +809,9 @@ impl App {
     }
 
     /// Build the dial spec from the current state, if it validates. Configure
-    /// mode dials exactly the peer selected in the device picker.
+    /// mode dials exactly the peer selected in the device picker; the quick
+    /// modes join from what was *entered*, independent of the show-side channel
+    /// choice (see [`App::quick_dial_spec`]).
     pub(crate) fn client_dial_spec(&self) -> Option<duocb_core::net::DialSpec> {
         use duocb_core::net::DialSpec;
         match self.mode {
@@ -795,22 +819,38 @@ impl App {
                 identity: self.token_identity()?,
                 peer_display: self.selected_peer_display()?,
             }),
-            PairMode::NostrPin => {
-                duocb_core::pin::normalize_pin(&format!("{}{}", self.in_pin_a, self.in_pin_b))
-                    .map(|canonical_pin| DialSpec::Pin {
-                    canonical_pin,
-                    relays: default_relays(),
-                    channel: self.core_pin_channel(),
-                })
-            }
-            PairMode::Manual => duocb_core::manual_code::decode(&self.in_manual_code).map(
+            PairMode::NostrPin | PairMode::Manual => self.quick_dial_spec(),
+        }
+    }
+
+    /// The quick-join dial spec, derived purely from the active join entry —
+    /// never from the show-side P/L/I/M choice. The [`App::join_by_code`] toggle
+    /// selects which credential is read: a pasted pairing code, or the typed PIN
+    /// (whose first character selects the channel; see `duocb_core::pin`). `None`
+    /// when that entry is not a valid, complete credential.
+    fn quick_dial_spec(&self) -> Option<duocb_core::net::DialSpec> {
+        use duocb_core::net::{DialSpec, PinChannel as Core};
+        if self.join_by_code {
+            return duocb_core::manual_code::decode(&self.in_manual_code).map(
                 |(node_id, secret, addrs)| DialSpec::Manual {
                     node_id,
                     secret,
                     addrs,
                 },
-            ),
+            );
         }
+        let canonical_pin =
+            duocb_core::pin::normalize_pin(&format!("{}{}", self.in_pin_a, self.in_pin_b))?;
+        let channel = if duocb_core::pin::pin_is_lan_only(&canonical_pin) {
+            Core::LanOnly
+        } else {
+            Core::NostrAndLan
+        };
+        Some(DialSpec::Pin {
+            canonical_pin,
+            relays: default_relays(),
+            channel,
+        })
     }
 
     /// Go to the start screen and launch. Every mode starts immediately: the
@@ -1133,32 +1173,90 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn pin_specs_carry_the_selected_channel() {
+    fn copy_flash_targets_only_the_button_that_copied() {
+        let mut app = test_app();
+        assert_eq!(app.copied_target(), None, "no flash before any copy");
+
+        // Each successful copy flashes exactly its own target, replacing the last.
+        app.copy_with_flash("d-secret", CopyTarget::Secret);
+        assert_eq!(app.copied_target(), Some(CopyTarget::Secret));
+        app.copy_with_flash("ABCD-EFGH", CopyTarget::Pin);
+        assert_eq!(app.copied_target(), Some(CopyTarget::Pin));
+
+        // Inbox feedback is keyed by row index — only the copied row flashes.
+        app.copy_with_flash("hello", CopyTarget::Inbox(2));
+        assert_eq!(app.copied_target(), Some(CopyTarget::Inbox(2)));
+        assert_ne!(app.copied_target(), Some(CopyTarget::Inbox(0)));
+
+        // A stale flash (older than the flash window) no longer shows.
+        app.copied_flash = Some((CopyTarget::Pin, Instant::now() - SENT_FLASH));
+        assert_eq!(app.copied_target(), None, "expired flash clears");
+    }
+
+    #[test]
+    fn host_spec_uses_the_selected_channel() {
         let mut app = test_app();
         app.mode = PairMode::NostrPin;
         app.pin_channel = PinChannel::LanOnly;
-        let canonical = duocb_core::pin::generate_pin();
-        // The joiner types the PIN across the two group fields.
-        let g = duocb_core::pin::PIN_GROUP_LEN;
-        app.in_pin_a = canonical[..g].to_string();
-        app.in_pin_b = canonical[g..].to_string();
         match app.server_mode_spec() {
             Some(duocb_core::net::ServerMode::Pin { channel, .. }) => {
                 assert_eq!(channel, duocb_core::net::PinChannel::LanOnly);
             }
             other => panic!("unexpected server mode: {other:?}"),
         }
-        match app.client_dial_spec() {
-            Some(duocb_core::net::DialSpec::Pin {
-                channel,
-                canonical_pin,
-                ..
-            }) => {
-                assert_eq!(channel, duocb_core::net::PinChannel::LanOnly);
-                assert_eq!(canonical_pin, canonical);
+    }
+
+    #[test]
+    fn join_spec_infers_the_channel_from_the_pin() {
+        use duocb_core::net::PinChannel as Core;
+        let g = duocb_core::pin::PIN_GROUP_LEN;
+        // The typed PIN — not the on-screen channel selection — decides the join
+        // channel. A LAN-only PIN dials LAN-only even when a nostr channel is
+        // selected, and vice versa.
+        for (lan_only, selected, expected) in [
+            (true, PinChannel::NostrOnly, Core::LanOnly),
+            (false, PinChannel::LanOnly, Core::NostrAndLan),
+        ] {
+            let mut app = test_app();
+            app.mode = PairMode::NostrPin;
+            app.pin_channel = selected;
+            let canonical = duocb_core::pin::generate_pin(lan_only);
+            app.in_pin_a = canonical[..g].to_string();
+            app.in_pin_b = canonical[g..].to_string();
+            match app.client_dial_spec() {
+                Some(duocb_core::net::DialSpec::Pin {
+                    channel,
+                    canonical_pin,
+                    ..
+                }) => {
+                    assert_eq!(channel, expected);
+                    assert_eq!(canonical_pin, canonical);
+                }
+                other => panic!("unexpected dial spec: {other:?}"),
             }
-            other => panic!("unexpected dial spec: {other:?}"),
         }
+    }
+
+    #[test]
+    fn join_entry_toggle_selects_which_credential_is_read() {
+        let g = duocb_core::pin::PIN_GROUP_LEN;
+        let mut app = test_app();
+        app.mode = PairMode::NostrPin;
+        let canonical = duocb_core::pin::generate_pin(false);
+        app.in_pin_a = canonical[..g].to_string();
+        app.in_pin_b = canonical[g..].to_string();
+
+        // Default (PIN) entry: the typed PIN drives the dial.
+        assert!(!app.join_by_code);
+        assert!(matches!(
+            app.client_dial_spec(),
+            Some(duocb_core::net::DialSpec::Pin { .. })
+        ));
+
+        // Switched to the code entry: the PIN is ignored and, with no code
+        // entered, there is nothing to dial.
+        app.join_by_code = true;
+        assert!(app.client_dial_spec().is_none());
     }
 
     #[test]

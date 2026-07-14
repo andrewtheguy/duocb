@@ -41,7 +41,11 @@ export global UiState {
     in property <string> secret-fingerprint;
     in property <string> config-path;
     in property <string> presence-conflict;
-    in property <bool> copied-flash;
+    // Per-button "✔ Copied" feedback: exactly one is true while a copy is fresh
+    // (inbox/outbox rows carry their own `copied` flag in ClipRow).
+    in property <bool> copied-secret;
+    in property <bool> copied-pin;
+    in property <bool> copied-pairing-code;
     in property <bool> name-valid;
     /// "Broadcast as" preview when the name is valid, "" otherwise.
     in property <string> name-preview;
@@ -115,6 +119,9 @@ export global UiState {
     in-out property <string> in-pin-b;
     in-out property <string> in-manual-code;
     in-out property <string> in-compose;
+    /// Quick join entry: false shows the PIN fields (default), true the
+    /// pairing-code field. Also selects which credential the join reads.
+    in property <bool> join-by-code;
 }
 
 export global Actions {
@@ -149,6 +156,8 @@ export global Actions {
     /// Select the advanced manual mode (the quick screen's M row).
     callback select-manual();
     callback toggle-quick-advanced();
+    /// Switch the join entry between the PIN fields and the pairing-code field.
+    callback set-join-by-code(by-code: bool);
     /// Dial whatever the quick screen's join entry holds (PIN or pairing
     /// code, per the selected mode), moving to the client screen.
     callback join-quick();

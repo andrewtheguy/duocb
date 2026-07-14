@@ -143,7 +143,7 @@ component HubStep inherits VerticalLayout {
                 vertical-alignment: center;
             }
             Button {
-                text: UiState.copied-flash ? "✔ Copied" : "Copy secret";
+                text: UiState.copied-secret ? "✔ Copied" : "Copy secret";
                 clicked => { Actions.copy-secret(); }
             }
             Button { text: "Clear secret…"; clicked => { Actions.request-clear-secret(); } }
