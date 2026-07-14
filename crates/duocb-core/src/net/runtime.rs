@@ -793,23 +793,18 @@ async fn run_client_session(
                 peer_display,
             } => {
                 events.status(ConnStatus::Resolving);
+                // The dial target lives in the peer's hosting record, not the
+                // directory: re-resolved each attempt so a restarted host's fresh
+                // node id is found, and absent (no readable record) means the peer
+                // is not currently hosting.
                 tokio::select! {
                     _ = cancel.cancelled() => return,
-                    r = crate::nostr::lookup_presence(&identity.token, peer_display, &identity.relays) => match r {
-                        Ok(Some((record, _))) => match record.node_id {
-                            Some(id) => id
-                                .trim()
-                                .parse::<EndpointId>()
-                                .map(EndpointAddr::new)
-                                .context("the peer's presence record holds an invalid node id"),
-                            None => Err(anyhow::anyhow!(
-                                "'{peer_display}' is not hosting a connection — press Start on that device"
-                            )),
-                        },
+                    r = crate::nostr::lookup_hosting(&identity.token, peer_display, &identity.relays) => match r {
+                        Ok(Some(id)) => Ok(EndpointAddr::new(id)),
                         Ok(None) => Err(anyhow::anyhow!(
-                            "no presence record found for '{peer_display}' — is it running with the same secret?"
+                            "'{peer_display}' is not hosting a connection — press Start on that device (and confirm it uses the same secret)"
                         )),
-                        Err(e) => Err(e.context("nostr presence lookup failed")),
+                        Err(e) => Err(e.context("nostr hosting lookup failed")),
                     },
                 }
             }
@@ -1099,17 +1094,35 @@ async fn run_presence_publisher(
                 }
             }
 
+            // Snapshot (and mark seen, so the wait below only fires on the next
+            // change) the current hosting state before publishing.
+            let hosting: Option<EndpointId> = *hosting_rx.borrow_and_update();
             let record = crate::nostr::PresenceRecord {
                 version: crate::nostr::PRESENCE_VERSION,
                 name: identity.name.clone(),
                 suffix: identity.suffix.clone(),
                 run_id: run_id.clone(),
-                node_id: hosting_rx.borrow_and_update().map(|id| id.to_string()),
             };
             match crate::nostr::publish_presence(&identity.token, &record, &identity.relays).await
             {
                 Ok(()) => log::info!("Published presence to nostr"),
                 Err(e) => log::warn!("Failed to publish presence to nostr: {e:#}"),
+            }
+            // While hosting, refresh the out-of-directory hosting record that
+            // carries the dial target; when idle, publish nothing and let the
+            // last record expire (NIP-40) so no standing liveness lingers.
+            if let Some(node_id) = hosting {
+                match crate::nostr::publish_hosting(
+                    &identity.token,
+                    &display,
+                    &node_id,
+                    &identity.relays,
+                )
+                .await
+                {
+                    Ok(()) => log::info!("Published hosting record to nostr"),
+                    Err(e) => log::warn!("Failed to publish hosting record to nostr: {e:#}"),
+                }
             }
             true
         };

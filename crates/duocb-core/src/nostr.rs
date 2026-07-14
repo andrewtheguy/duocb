@@ -12,13 +12,21 @@
 //!
 //! The record content is NIP-44 **self-encrypted** under the token-derived
 //! keypair and carries a JSON [`PresenceRecord`]: the plaintext display name
-//! (readable only by token holders), the permanent per-device suffix, a random
-//! per-publisher-run id, and — while the device is hosting a connection — its
-//! current ephemeral iroh node id. One record therefore serves both presence
-//! ("this device exists / was last seen at `created_at`") and rendezvous ("dial
-//! this node id"): a peer fetches every record under the shared author key,
-//! decrypts them into a device list, and the user picks the specific hosting
-//! device to join. The `auth_token` still gates the actual connection in-band.
+//! (readable only by token holders), the permanent per-device suffix, and a
+//! random per-publisher-run id. It is a directory entry only — it says "this
+//! device exists / was last seen at `created_at`" and carries **no** dial target
+//! or hosting/liveness signal. A peer fetches every record under the shared
+//! author key, decrypts them into a device list, and the user picks a device to
+//! join.
+//!
+//! The dial target is negotiated separately, out of the directory: while a
+//! device is hosting a connection it publishes a short-lived **hosting record**
+//! (see [`publish_hosting`]) keyed off the same token+identity, carrying only its
+//! current ephemeral iroh node id and self-expiring via NIP-40 so it leaves no
+//! standing liveness on relays. On join, the client resolves that record for the
+//! selected identity (see [`lookup_hosting`]) to learn the node id to dial; its
+//! absence means the device is not currently hosting. The `auth_token` still
+//! gates the actual connection in-band.
 
 use std::time::Duration;
 
@@ -41,17 +49,30 @@ pub const DEFAULT_NOSTR_RELAYS: &[&str] = &[
 /// Parameterized-replaceable event kind (NIP-78 application-specific data) used to
 /// carry presence records. Replaceable, so the latest publish supersedes the previous.
 const PRESENCE_KIND_U16: u16 = 30078;
-/// Base of the `d` tag identifying duocb presence records; the per-device identity
-/// hash is appended (see [`presence_dtag`]).
+/// Base of the `d` tag identifying duocb presence (directory) records; the
+/// per-device identity hash is appended (see [`presence_dtag`]).
 const PRESENCE_DTAG_BASE: &str = "duocb:presence";
+/// Base of the `d` tag identifying duocb hosting records; the per-device identity
+/// hash is appended (see [`hosting_dtag`]). A separate slot from presence so the
+/// dial target lives outside the directory listing.
+const HOSTING_DTAG_BASE: &str = "duocb:hosting";
 /// Domain separation for deriving the nostr key from the auth token.
 const KEY_DERIVATION_DOMAIN: &[u8] = b"duocb:nostr-rendezvous:v1";
-/// Domain separation for hashing a device's display identity into its `d` tag.
+/// Domain separation for hashing a device's display identity into its presence `d` tag.
 const PRESENCE_DOMAIN: &[u8] = b"duocb:presence-id:v1";
+/// Domain separation for hashing a device's display identity into its hosting `d`
+/// tag. Distinct from [`PRESENCE_DOMAIN`] so the two records for one device hash
+/// to unrelated tags and cannot be correlated on relays.
+const HOSTING_DOMAIN: &[u8] = b"duocb:hosting-id:v1";
 
 /// Payload schema version; records with any other value are rejected on decode
 /// (strict no backward compatibility).
-pub const PRESENCE_VERSION: u32 = 1;
+pub const PRESENCE_VERSION: u32 = 2;
+
+/// How long a hosting record stays on relays (NIP-40). Comfortably longer than
+/// [`PRESENCE_REPUBLISH_INTERVAL`] so it stays alive across the heartbeat while a
+/// device keeps hosting, then self-cleans shortly after hosting stops.
+const HOSTING_EVENT_TTL_SECS: u64 = 300;
 
 /// Steady-state heartbeat between presence republishes.
 pub const PRESENCE_REPUBLISH_INTERVAL: Duration = Duration::from_secs(120);
@@ -72,24 +93,35 @@ fn presence_kind() -> Kind {
     Kind::from_u16(PRESENCE_KIND_U16)
 }
 
-/// Build the `d` tag for a device's presence record: the base tag plus a hex
-/// SHA-256 of the (trimmed) display identity, salted with the shared `auth_token`.
-/// The salt means an identity cannot be guessed or enumerated on relays without
-/// the token; all parties share the token, so all derive the same tag.
-fn presence_dtag(auth_token: &str, identity: &str) -> String {
+/// Build a `d` tag for a device: the given `base` tag plus a hex SHA-256 of the
+/// (trimmed) display identity, salted with the `domain` and the shared
+/// `auth_token`. The salt means an identity cannot be guessed or enumerated on
+/// relays without the token; all parties share the token, so all derive the same
+/// tag. The `domain` also decouples the presence and hosting tags for one device.
+fn identity_dtag(base: &str, domain: &[u8], auth_token: &str, identity: &str) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(PRESENCE_DOMAIN);
+    hasher.update(domain);
     hasher.update(auth_token.as_bytes());
     hasher.update(identity.trim().as_bytes());
     let digest = hasher.finalize();
-    let mut tag = String::with_capacity(PRESENCE_DTAG_BASE.len() + 1 + digest.len() * 2);
-    tag.push_str(PRESENCE_DTAG_BASE);
+    let mut tag = String::with_capacity(base.len() + 1 + digest.len() * 2);
+    tag.push_str(base);
     tag.push(':');
     for b in digest {
         use std::fmt::Write as _;
         let _ = write!(tag, "{b:02x}");
     }
     tag
+}
+
+/// The `d` tag for a device's presence (directory) record.
+fn presence_dtag(auth_token: &str, identity: &str) -> String {
+    identity_dtag(PRESENCE_DTAG_BASE, PRESENCE_DOMAIN, auth_token, identity)
+}
+
+/// The `d` tag for a device's hosting record (the out-of-directory dial target).
+fn hosting_dtag(auth_token: &str, identity: &str) -> String {
+    identity_dtag(HOSTING_DTAG_BASE, HOSTING_DOMAIN, auth_token, identity)
 }
 
 /// Derive the shared nostr identity from the `auth_token`. Both peers run this on
@@ -137,10 +169,12 @@ async fn connect_client(relays: &[String]) -> Result<Client> {
     Ok(client)
 }
 
-/// The NIP-44-encrypted content of a presence record. Authorship under the
-/// token-derived key proves secret possession; the payload itself carries the
-/// plaintext display name (readable only by token holders) plus everything a
-/// peer needs to list and dial this device.
+/// The NIP-44-encrypted content of a presence (directory) record. Authorship
+/// under the token-derived key proves secret possession; the payload carries the
+/// plaintext display name (readable only by token holders) plus the minimum a
+/// peer needs to *list* this device. It deliberately carries no dial target or
+/// hosting/liveness signal — that is the hosting record's job (see
+/// [`publish_hosting`]).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct PresenceRecord {
     /// Must equal [`PRESENCE_VERSION`]; anything else is rejected on decode.
@@ -152,8 +186,6 @@ pub struct PresenceRecord {
     /// Random id minted per publisher start. A record under our own `d` tag
     /// carrying a foreign `run_id` means another live process publishes as us.
     pub run_id: String,
-    /// The device's current ephemeral iroh node id while it hosts a connection.
-    pub node_id: Option<String>,
 }
 
 impl PresenceRecord {
@@ -279,6 +311,58 @@ pub async fn lookup_presence(
     let events = events.context("querying nostr relays for the peer's presence record")?;
     let latest = events.iter().max_by_key(|e| e.created_at);
     Ok(latest.and_then(|event| presence_from_events(&keys, [event]).pop()))
+}
+
+/// Publish (or replace) this device's hosting record: its current ephemeral iroh
+/// node id, NIP-44 self-encrypted under the token-derived key and tagged under
+/// this device's hosting `d` tag. A parameterized-replaceable event (same kind as
+/// presence, distinct `d` tag) so a new node id supersedes the previous, with a
+/// NIP-40 expiration so the record self-cleans once the device stops refreshing
+/// it (i.e. stops hosting) — leaving no standing dial target or liveness behind.
+pub async fn publish_hosting(
+    auth_token: &str,
+    identity: &str,
+    node_id: &EndpointId,
+    relays: &[String],
+) -> Result<()> {
+    let keys = derive_keys(auth_token)?;
+    // Same `{node_id}` self-encrypted payload the PIN rendezvous uses; reused
+    // here for the out-of-directory hosting record (see `crate::pin_record`).
+    let content = crate::pin_record::encrypt_pin_payload(&keys, node_id)?;
+    let expiration = Timestamp::now() + HOSTING_EVENT_TTL_SECS;
+    let client = connect_client(relays).await?;
+    let event = EventBuilder::new(presence_kind(), content)
+        .tags([Tag::identifier(hosting_dtag(auth_token, identity))])
+        .tag(Tag::expiration(expiration))
+        .sign_with_keys(&keys)
+        .context("signing hosting event")?;
+    let res = client.send_event(&event).await;
+    client.disconnect().await;
+    res.context("publishing hosting event to relays")?;
+    Ok(())
+}
+
+/// Resolve the dial target for a device by its display identity: the node id from
+/// its current hosting record. Returns `Ok(None)` when no readable record exists
+/// — the device is not hosting (or has stopped and the record expired). A relay
+/// failure is an `Err`, so callers can tell "not hosting" from "no answer".
+pub async fn lookup_hosting(
+    auth_token: &str,
+    identity: &str,
+    relays: &[String],
+) -> Result<Option<EndpointId>> {
+    let keys = derive_keys(auth_token)?;
+    let client = connect_client(relays).await?;
+    let filter = Filter::new()
+        .kind(presence_kind())
+        .author(keys.public_key())
+        .identifier(hosting_dtag(auth_token, identity))
+        .limit(1);
+    let events = client.fetch_events(filter, LOOKUP_TIMEOUT).await;
+    client.disconnect().await;
+    let events = events.context("querying nostr relays for the peer's hosting record")?;
+    let latest = events.iter().max_by_key(|e| e.created_at);
+    Ok(latest.and_then(|event| crate::pin_record::decrypt_pin_payload(&keys, &event.content)))
 }
 
 /// Assemble the UI-facing peer list from fetched records: drop records older
@@ -435,13 +519,12 @@ mod tests {
         );
     }
 
-    fn record(name: &str, suffix: &str, run_id: &str, node_id: Option<&str>) -> PresenceRecord {
+    fn record(name: &str, suffix: &str, run_id: &str) -> PresenceRecord {
         PresenceRecord {
             version: PRESENCE_VERSION,
             name: name.to_string(),
             suffix: suffix.to_string(),
             run_id: run_id.to_string(),
-            node_id: node_id.map(str::to_string),
         }
     }
 
@@ -490,16 +573,11 @@ mod tests {
     fn presence_record_round_trips_through_encrypted_event_content() {
         let token = "round-trip-token";
         let keys = derive_keys(token).unwrap();
-        let node_id = iroh::SecretKey::generate().public();
-        let rec = record("mac-book", "a7B2c3D4", "run1", Some(&node_id.to_string()));
+        let rec = record("mac-book", "a7B2c3D4", "run1");
         let event = presence_event(token, &keys, &rec, 100);
 
-        // Neither the plaintext name nor the node id may appear on the relay.
+        // The plaintext name must not appear on the relay.
         assert!(!event.content.contains("mac-book"), "name leaked in clear");
-        assert!(
-            !event.content.contains(&node_id.to_string()),
-            "node id leaked in clear"
-        );
 
         let decoded = presence_from_events(&keys, [&event]);
         assert_eq!(decoded, vec![(rec, 100)]);
@@ -510,7 +588,7 @@ mod tests {
         let token = "shared-token";
         let keys = derive_keys(token).unwrap();
 
-        let good = record("mac1", "a7B2c3D4", "run1", None);
+        let good = record("mac1", "a7B2c3D4", "run1");
         let good_event = presence_event(token, &keys, &good, 300);
 
         // Encrypted under a different token: must be skipped, not error.
@@ -536,7 +614,7 @@ mod tests {
             .unwrap();
 
         // Wrong payload version: parses but must be rejected.
-        let mut future = record("mac9", "q5R6s7T8", "run9", None);
+        let mut future = record("mac9", "q5R6s7T8", "run9");
         future.version = PRESENCE_VERSION + 1;
         let future_event = presence_event(token, &keys, &future, 500);
 
@@ -556,21 +634,17 @@ mod tests {
     #[test]
     fn build_peer_list_dedupes_by_suffix_excludes_self_and_ages_records() {
         let now = 1_000_000u64;
-        let host_id = iroh::SecretKey::generate().public().to_string();
         let records = vec![
             // Own record: excluded regardless of freshness.
-            (record("me", "meMEmeM2", "r0", None), now),
+            (record("me", "meMEmeM2", "r0"), now),
             // A device renamed from "old-name" to "new-name": same suffix, the
             // newer record must win and carry the new name.
-            (record("old-name", "a7B2c3D4", "r1", None), now - 5_000),
-            (
-                record("new-name", "a7B2c3D4", "r1", Some(&host_id)),
-                now - 10,
-            ),
-            (record("laptop", "x9Y8z7W6", "r2", None), now - 5_000),
+            (record("old-name", "a7B2c3D4", "r1"), now - 5_000),
+            (record("new-name", "a7B2c3D4", "r1"), now - 10),
+            (record("laptop", "x9Y8z7W6", "r2"), now - 5_000),
             // Ancient record: hidden entirely.
             (
-                record("dusty", "q5R6s7T8", "r3", None),
+                record("dusty", "q5R6s7T8", "r3"),
                 now - PRESENCE_HIDE_AFTER_SECS - 1,
             ),
         ];
@@ -578,7 +652,7 @@ mod tests {
         let peers = build_peer_list(records, "meMEmeM2", now);
         assert_eq!(peers.len(), 2, "peers were: {peers:?}");
 
-        // Sorted by display name; the record's node id is not surfaced here.
+        // Sorted by display name.
         let laptop = &peers[0];
         assert_eq!(laptop.display(), "laptop_x9Y8z7W6");
         assert_eq!(laptop.last_seen_unix, now - 5_000);
@@ -592,7 +666,7 @@ mod tests {
     #[test]
     fn wrong_auth_token_cannot_decrypt_presence() {
         let publisher = derive_keys("the-real-token").unwrap();
-        let rec = record("mac1", "a7B2c3D4", "run1", None);
+        let rec = record("mac1", "a7B2c3D4", "run1");
         let event = presence_event("the-real-token", &publisher, &rec, 100);
         // A peer with a different auth token derives a different key and cannot read it.
         let attacker = derive_keys("a-different-token").unwrap();
@@ -612,13 +686,7 @@ mod tests {
             .map(|relay| relay.to_string())
             .collect();
         let token = crate::auth::generate_token();
-        let node_id = iroh::SecretKey::generate().public();
-        let host = record(
-            "relay-host",
-            &crate::identity::generate_suffix(),
-            "run1",
-            Some(&node_id.to_string()),
-        );
+        let host = record("relay-host", &crate::identity::generate_suffix(), "run1");
 
         publish_presence(&token, &host, &relays)
             .await
@@ -637,12 +705,32 @@ mod tests {
             .find(|p| p.suffix == host.suffix)
             .expect("published device appears in the peer list");
 
-        // The dial target lives in the record, not the peer list: a fresh
-        // lookup is what the joiner resolves the node id from.
+        // The directory record round-trips as-is (no dial target inside it).
         let (looked_up, _) = lookup_presence(&token, &host.display(), &relays)
             .await
             .expect("lookup presence")
             .expect("record exists");
         assert_eq!(looked_up, host);
+
+        // The dial target is negotiated out-of-directory: before hosting, no
+        // hosting record exists; after publishing one, the node id round-trips.
+        assert_eq!(
+            lookup_hosting(&token, &host.display(), &relays)
+                .await
+                .expect("lookup hosting"),
+            None,
+            "no hosting record before the device hosts"
+        );
+        let node_id = iroh::SecretKey::generate().public();
+        publish_hosting(&token, &host.display(), &node_id, &relays)
+            .await
+            .expect("publish hosting record");
+        assert_eq!(
+            lookup_hosting(&token, &host.display(), &relays)
+                .await
+                .expect("lookup hosting"),
+            Some(node_id),
+            "the hosting record resolves the dial target",
+        );
     }
 }
