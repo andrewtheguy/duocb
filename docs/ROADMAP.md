@@ -5,43 +5,55 @@ documented in [README.md](../README.md) and [ARCHITECTURE.md](./ARCHITECTURE.md)
 
 ## Follow-ups
 
-### LAN manual-IP mode (replace manual mode; PIN+IP side channel for the node id)
+### Manual IP entry for the LAN-only channel (PIN+IP side channel for the node id)
 
-Remove the current manual mode (the copy/paste JSON pairing code:
-`crate::manual_code`, `ServerMode::Manual`, `DialSpec::Manual`, desktop
-`PairMode::Manual` and its `quick.slint`/`server.slint` UI) and replace it with a
-LAN mode that needs no mDNS: the host shows a PIN and its LAN IPv4, and the
-joiner types the PIN and that IP. It sits alongside the LAN-only (mDNS/DNS-SD)
-channel as the fallback for networks where multicast is blocked or the joiner
-would rather name the address than discover it.
+Give the existing **LAN-only (L) channel** a manual-IP path so it no longer
+depends on multicast, and remove the current manual mode (the copy/paste JSON
+pairing code: `crate::manual_code`, `ServerMode::Manual`, `DialSpec::Manual`,
+desktop `PairMode::Manual` and its `quick.slint`/`server.slint` UI). Manual
+mode's job — pairing where multicast is blocked — moves here, but with a short
+PIN instead of a copy/pasted JSON blob.
 
-**The node-id problem.** iroh dials by *node id* (a 64-hex public key), not by
-IP — `endpoint.connect(EndpointAddr, ALPN)` pins the QUIC/TLS handshake to that
-key (`net/endpoint.rs`). An IP only says *where* to send packets. Today the
-LAN-only channel gets the node id (and dialable addrs) from the DNS-SD record;
-the PIN only carries the auth secret. With mDNS removed, the node id still has to
-reach the joiner.
+**No new show-side mode; the host keeps P and L.** When the host picks **L
+(LAN-only)** it does both at once: advertises over mDNS/DNS-SD as it does today,
+*and* runs a unicast side-channel listener while displaying its LAN IPv4. So the
+host never has to commit to how the joiner will find it — either path is live.
 
-**Side channel keyed by PIN + IP.** The host runs a small unicast listener on
-its LAN IP that serves the same PIN-encrypted node-id record the mDNS path
-advertises. The joiner connects to the typed IP, decrypts with the PIN, and
+**The join side chooses mDNS or IP.** Given a LAN-only PIN, the joiner either
+leaves the IP blank → resolve via **mDNS** (today's behavior), or enters the
+host's IP → resolve via the **side channel** (works where multicast is blocked).
+Same PIN either way; the typed IP is the only thing that selects the path. This
+extends the existing decoupling — the show-side channel choice is already
+independent of the join-side entry, and the join card already toggles PIN vs
+pasted-code (`join_by_code`), so an optional IP field for the L case is the same
+pattern.
+
+**The node-id problem the side channel solves.** iroh dials by *node id* (a
+64-hex public key), not by IP — `endpoint.connect(EndpointAddr, ALPN)` pins the
+QUIC/TLS handshake to that key (`net/endpoint.rs`). An IP only says *where* to
+send packets. The mDNS/DNS-SD record supplies the node id (and dialable addrs);
+the PIN only carries the auth secret. So when the joiner names an IP instead of
+browsing, the node id still has to reach it: the host runs a small unicast
+listener on its LAN IP serving the *same* PIN-encrypted node-id record the mDNS
+path advertises. The joiner connects to the typed IP, decrypts with the PIN, and
 learns the node id plus direct addrs — then dials iroh exactly as the DNS-SD
-path does. This is unicast rendezvous standing in for multicast discovery.
+path does. Unicast rendezvous standing in for multicast discovery.
 
-**What the joiner types:** two fields, both shown on the host.
+**What the joiner enters for the IP path:** the PIN plus one optional field.
 
 - **The PIN** — the same short Crockford PIN as the other quick modes (e.g.
   `M3TD-PWFA`), entered in the existing two-group PIN form. It keys the side
   channel (`candidate_keys`) *and* proves the in-band session auth; it is not
   typed twice.
-- **The host's LAN IPv4** — a single dotted-quad (e.g. `192.168.1.42`), no port.
-  The side-channel port is fixed, and the iroh port comes back inside the
-  fetched record, so the joiner never types a port. Validated as a well-formed
-  IPv4 as it is entered (the Join button stays disabled until both the PIN
-  normalizes and the IP parses); a malformed or unreachable IP surfaces the same
-  way a bad PIN does today. No node id, secret, or JSON blob is ever typed or
-  pasted — the removed manual mode's 64-hex node id and full-strength token both
-  move into the side channel.
+- **The host's LAN IPv4** (optional) — a single dotted-quad (e.g.
+  `192.168.1.42`), no port. Left blank, the join resolves via mDNS; filled, it
+  resolves via the side channel. The side-channel port is derived from the PIN
+  and the iroh port comes back inside the fetched record, so the joiner never
+  types a port. Validated as a well-formed IPv4 as it is entered (the Join button
+  stays disabled until the PIN normalizes and, if present, the IP parses); a
+  malformed or unreachable IP surfaces the same way a bad PIN does today. No node
+  id, secret, or JSON blob is ever typed or pasted — the removed manual mode's
+  64-hex node id and full-strength token both move into the side channel.
 
 Design notes, reusing existing machinery:
 
@@ -80,10 +92,14 @@ Design notes, reusing existing machinery:
   private-range heuristic over `endpoint.addr().ip_addrs()`. The joiner's entry
   is validated as a well-formed IPv4 but not hard-rejected for being
   out-of-subnet.
-- **Enum shape:** the joiner supplies the IP, which `DialSpec::Pin` does not
-  carry today — either add a field or a dedicated variant/channel. Decide during
-  implementation; the LAN-only `PinChannel::LanOnly` plumbing is the closest
-  template.
+- **Enum shape:** the joiner optionally supplies an IP that `DialSpec::Pin` does
+  not carry today. Since this is the LAN-only channel gaining a path (not a new
+  channel), the natural shape is an optional target IP on the `LanOnly` dial —
+  e.g. `DialSpec::Pin { channel: LanOnly, target_ip: Option<IpAddr>, .. }` —
+  where `Some` runs the side-channel lookup and `None` runs mDNS. The host side
+  needs no new mode; `ServerMode::Pin { channel: LanOnly }` additionally starts
+  the listener. Decide the exact field/enum during implementation; the existing
+  `PinChannel::LanOnly` plumbing is the template.
 - **PIN channel encoding.** Today the PIN's first character encodes *one bit* of
   channel so the joiner infers which discovery to run before resolving: `pin.rs`
   splits the 32-char Crockford `ALPHABET` in half at `HALF` (lower 16 =
@@ -112,11 +128,13 @@ Design notes, reusing existing machinery:
       16); a third region drops it to ~3.4 bits (1 of ~10), still inconsequential
       for a 60 s-rotated ephemeral secret but worth stating.
 
-**iOS parity (`../duocb-ios`).** The FFI must gain a role/config to pass the
-typed IP (`duocb-ffi/src/lib.rs` `build_initial_commands`, `FfiConfig`) with the
+**iOS parity (`../duocb-ios`).** The FFI's existing `lan` channel gains an
+optional `ip` on the quick-join config so a LAN-only join can name the host
+(`duocb-ffi/src/lib.rs` `build_initial_commands`, `FfiConfig`) with the
 hand-maintained `ios/duocb.h` kept in sync, plus `event_json` forwarding the
-host's LAN IPv4 so `SessionView` can display it. Swift adds host IP display
-(model on `QuickPairView`/`SessionView`) and joiner IP entry. Note iOS Local
+host's LAN IPv4 so `SessionView` can display it. The quick-host `lan` path also
+starts the listener. Swift adds host IP display (model on
+`QuickPairView`/`SessionView`) and an optional joiner IP field. Note iOS Local
 Network permission: a raw unicast dial to a LAN IP triggers the prompt, but with
 no DNS-SD browse in this mode the prompt may need an explicit trigger (the
 existing browse-based trigger in `lan/dnssd.rs` `trigger_local_network_prompt`,
