@@ -65,7 +65,7 @@ export component QuickScreen inherits ScrollView {
                 clicked => { Actions.set-pin-channel(PinChannel.lan-only); }
             }
             Small {
-                text: "Private means no third-party server participates: discovery is mDNS-only and traffic is always direct between the devices, never relayed. LAN-only is not a packet-level subnet boundary; reflected mDNS, a VPN/overlay, or globally routed addresses can extend the direct path beyond a conventional LAN. Does not pair with the iOS app — use P for that.";
+                text: "Private means no third-party server participates: discovery is a Bonjour (DNS-SD) service on the local network only and traffic is always direct between the devices, never relayed. Pairs with the iOS app's \"Local network only\" channel. LAN-only is not a packet-level subnet boundary; reflected mDNS, a VPN/overlay, or globally routed addresses can extend the direct path beyond a conventional LAN. Both devices must pick the local-network-only channel — a P device and an L device do not find each other.";
             }
         }
 
