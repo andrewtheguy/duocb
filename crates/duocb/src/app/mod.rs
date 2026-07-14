@@ -804,7 +804,9 @@ impl App {
     }
 
     /// Build the dial spec from the current state, if it validates. Configure
-    /// mode dials exactly the peer selected in the device picker.
+    /// mode dials exactly the peer selected in the device picker; the quick
+    /// modes join from what was *entered*, independent of the show-side channel
+    /// choice (see [`App::quick_dial_spec`]).
     pub(crate) fn client_dial_spec(&self) -> Option<duocb_core::net::DialSpec> {
         use duocb_core::net::DialSpec;
         match self.mode {
@@ -812,34 +814,38 @@ impl App {
                 identity: self.token_identity()?,
                 peer_display: self.selected_peer_display()?,
             }),
-            PairMode::NostrPin => {
-                // The channel is not chosen when joining — it is read from the PIN's
-                // first character (see `duocb_core::pin`). A LAN-only PIN dials the
-                // LAN-only DNS-SD path; anything else uses the nostr+LAN race, which
-                // also resolves a nostr-only host via its nostr half.
-                use duocb_core::net::PinChannel as Core;
-                duocb_core::pin::normalize_pin(&format!("{}{}", self.in_pin_a, self.in_pin_b))
-                    .map(|canonical_pin| {
-                        let channel = if duocb_core::pin::pin_is_lan_only(&canonical_pin) {
-                            Core::LanOnly
-                        } else {
-                            Core::NostrAndLan
-                        };
-                        DialSpec::Pin {
-                            canonical_pin,
-                            relays: default_relays(),
-                            channel,
-                        }
-                    })
-            }
-            PairMode::Manual => duocb_core::manual_code::decode(&self.in_manual_code).map(
-                |(node_id, secret, addrs)| DialSpec::Manual {
-                    node_id,
-                    secret,
-                    addrs,
-                },
-            ),
+            PairMode::NostrPin | PairMode::Manual => self.quick_dial_spec(),
         }
+    }
+
+    /// The quick-join dial spec, derived purely from the join entry — never from
+    /// the show-side P/L/I/M choice. A typed PIN takes precedence (its first
+    /// character selects the channel; see `duocb_core::pin`); otherwise a pasted
+    /// pairing code is decoded. `None` when neither entry is a valid, complete
+    /// credential.
+    fn quick_dial_spec(&self) -> Option<duocb_core::net::DialSpec> {
+        use duocb_core::net::{DialSpec, PinChannel as Core};
+        if let Some(canonical_pin) =
+            duocb_core::pin::normalize_pin(&format!("{}{}", self.in_pin_a, self.in_pin_b))
+        {
+            let channel = if duocb_core::pin::pin_is_lan_only(&canonical_pin) {
+                Core::LanOnly
+            } else {
+                Core::NostrAndLan
+            };
+            return Some(DialSpec::Pin {
+                canonical_pin,
+                relays: default_relays(),
+                channel,
+            });
+        }
+        duocb_core::manual_code::decode(&self.in_manual_code).map(|(node_id, secret, addrs)| {
+            DialSpec::Manual {
+                node_id,
+                secret,
+                addrs,
+            }
+        })
     }
 
     /// Go to the start screen and launch. Every mode starts immediately: the

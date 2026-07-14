@@ -14,20 +14,24 @@ component PreConnect inherits VerticalLayout {
     alignment: start;
     spacing: Theme.pad-m;
 
-    forms := Rectangle {
-        height: UiState.mode == PairMode.nostr-pin ? pin-form.preferred-height
-            : UiState.mode == PairMode.manual ? manual-form.preferred-height
-            : token-hint.preferred-height;
+    // Configure mode joins from the home hub (token-hint only). The quick modes
+    // enter here: type the PIN shown on the other device, or paste a pairing
+    // code — the same choice-free entry as the quick screen.
+    property <bool> quick: UiState.mode != PairMode.nostr-token;
+
+    forms := VerticalLayout {
+        alignment: start;
+        spacing: Theme.pad-m;
 
         token-hint := Weak {
-            visible: UiState.mode == PairMode.nostr-token;
+            visible: !root.quick;
             // A configure-mode join launches from the home hub with the
             // selected peer; this state is a brief transient.
             text: "Pick a device to join from the home screen.";
         }
 
         pin-form := VerticalLayout {
-            visible: UiState.mode == PairMode.nostr-pin;
+            visible: root.quick;
             alignment: start;
             spacing: Theme.pad-xs;
             Body { text: "PIN shown on the other device:"; }
@@ -86,8 +90,14 @@ component PreConnect inherits VerticalLayout {
             }
         }
 
+        Weak {
+            visible: root.quick;
+            text: "— or —";
+            horizontal-alignment: center;
+        }
+
         manual-form := VerticalLayout {
-            visible: UiState.mode == PairMode.manual;
+            visible: root.quick;
             alignment: start;
             spacing: Theme.pad-xs;
             Body { text: "Pairing code copied from the other device:"; }

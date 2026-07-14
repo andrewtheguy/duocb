@@ -265,15 +265,14 @@ mod tests {
         app.join_quick();
         assert_eq!(app.screen, Screen::Client);
         assert!(app.client_active);
-        // In manual mode the same action validates the pasted code instead,
-        // so the still-valid PIN entry no longer counts. (`client_active`
-        // lingers until the runtime's Idle event is drained; the screen not
-        // moving is what join_quick guarantees.)
+        // The join entry is independent of the show-side choice: the same valid
+        // PIN still joins even when Manual is selected (that choice only governs
+        // what this device would *show*, not what it accepts to join).
         app.go_back();
         assert_eq!(app.screen, Screen::Quick);
         app.mode = PairMode::Manual;
         app.join_quick();
-        assert_eq!(app.screen, Screen::Quick);
+        assert_eq!(app.screen, Screen::Client);
     }
 
     #[test]
