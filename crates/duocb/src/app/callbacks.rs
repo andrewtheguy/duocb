@@ -91,9 +91,7 @@ pub(crate) fn wire(app: &Rc<RefCell<App>>, ui: &MainWindow) {
     // Hub / device picker.
     nav!(on_begin_server, |app| app.begin_server());
     nav!(on_enter_join_picker, |app| app.enter_join_picker());
-    nav!(on_leave_join_picker, |app| {
-        app.configure_step = crate::ConfigureStep::Ready;
-    });
+    nav!(on_leave_join_picker, |app| app.leave_join_picker());
     act!(on_refresh_peers, |app| app.refresh_peers());
     nav!(on_join_selected, |app| app.join_selected_peer());
     actions.on_toggle_peer({
