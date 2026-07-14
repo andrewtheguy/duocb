@@ -30,8 +30,25 @@ component PreConnect inherits VerticalLayout {
             text: "Pick a device to join from the home screen.";
         }
 
+        // PIN by default; the toggle switches to the pairing-code entry (same
+        // choice-free join as the quick screen, sharing its state).
+        if root.quick: HorizontalLayout {
+            spacing: Theme.pad-s;
+            Button {
+                text: "PIN";
+                primary: !UiState.join-by-code;
+                clicked => { Actions.set-join-by-code(false); }
+            }
+            Button {
+                text: "Pairing code";
+                primary: UiState.join-by-code;
+                clicked => { Actions.set-join-by-code(true); }
+            }
+            Rectangle { horizontal-stretch: 1; }
+        }
+
         pin-form := VerticalLayout {
-            visible: root.quick;
+            visible: root.quick && !UiState.join-by-code;
             alignment: start;
             spacing: Theme.pad-xs;
             Body { text: "PIN shown on the other device:"; }
@@ -90,14 +107,8 @@ component PreConnect inherits VerticalLayout {
             }
         }
 
-        Weak {
-            visible: root.quick;
-            text: "— or —";
-            horizontal-alignment: center;
-        }
-
         manual-form := VerticalLayout {
-            visible: root.quick;
+            visible: root.quick && UiState.join-by-code;
             alignment: start;
             spacing: Theme.pad-xs;
             Body { text: "Pairing code copied from the other device:"; }

@@ -138,6 +138,14 @@ pub(crate) fn wire(app: &Rc<RefCell<App>>, ui: &MainWindow) {
     act!(on_refresh_pin, |app| {
         app.net.send(duocb_core::net::UiCommand::RefreshPin);
     });
+    actions.on_set_join_by_code({
+        let app = Rc::clone(app);
+        let weak = ui.as_weak();
+        move |by_code| {
+            app.borrow_mut().join_by_code = by_code;
+            app.borrow().sync(&weak.unwrap());
+        }
+    });
 
     // Session panel.
     act!(on_send_clipboard, |app| app.send_clipboard());

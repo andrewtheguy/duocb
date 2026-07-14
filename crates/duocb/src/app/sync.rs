@@ -185,6 +185,7 @@ impl App {
         s.set_manual_code_invalid(
             !code.is_empty() && duocb_core::manual_code::decode(code).is_none(),
         );
+        s.set_join_by_code(self.join_by_code);
         s.set_dial_ready(self.client_dial_spec().is_some());
 
         // Session panel.

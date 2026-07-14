@@ -101,6 +101,10 @@ pub(crate) struct App {
     pub(crate) in_pin_a: String,
     pub(crate) in_pin_b: String,
     pub(crate) in_manual_code: String,
+    /// Which join entry the quick screen shows: PIN (default) or a pasted
+    /// pairing code. A toggle flips it; it also selects which credential
+    /// [`App::quick_dial_spec`] reads.
+    pub(crate) join_by_code: bool,
     /// Draft of the session panel's compose field (send typed text).
     pub(crate) in_compose: String,
 
@@ -207,6 +211,7 @@ impl App {
             in_pin_a: String::new(),
             in_pin_b: String::new(),
             in_manual_code: String::new(),
+            join_by_code: false,
             in_compose: String::new(),
             peer_node_id: None,
             conn_path: None,
@@ -818,33 +823,33 @@ impl App {
         }
     }
 
-    /// The quick-join dial spec, derived purely from the join entry — never from
-    /// the show-side P/L/I/M choice. A typed PIN takes precedence (its first
-    /// character selects the channel; see `duocb_core::pin`); otherwise a pasted
-    /// pairing code is decoded. `None` when neither entry is a valid, complete
-    /// credential.
+    /// The quick-join dial spec, derived purely from the active join entry —
+    /// never from the show-side P/L/I/M choice. The [`App::join_by_code`] toggle
+    /// selects which credential is read: a pasted pairing code, or the typed PIN
+    /// (whose first character selects the channel; see `duocb_core::pin`). `None`
+    /// when that entry is not a valid, complete credential.
     fn quick_dial_spec(&self) -> Option<duocb_core::net::DialSpec> {
         use duocb_core::net::{DialSpec, PinChannel as Core};
-        if let Some(canonical_pin) =
-            duocb_core::pin::normalize_pin(&format!("{}{}", self.in_pin_a, self.in_pin_b))
-        {
-            let channel = if duocb_core::pin::pin_is_lan_only(&canonical_pin) {
-                Core::LanOnly
-            } else {
-                Core::NostrAndLan
-            };
-            return Some(DialSpec::Pin {
-                canonical_pin,
-                relays: default_relays(),
-                channel,
-            });
+        if self.join_by_code {
+            return duocb_core::manual_code::decode(&self.in_manual_code).map(
+                |(node_id, secret, addrs)| DialSpec::Manual {
+                    node_id,
+                    secret,
+                    addrs,
+                },
+            );
         }
-        duocb_core::manual_code::decode(&self.in_manual_code).map(|(node_id, secret, addrs)| {
-            DialSpec::Manual {
-                node_id,
-                secret,
-                addrs,
-            }
+        let canonical_pin =
+            duocb_core::pin::normalize_pin(&format!("{}{}", self.in_pin_a, self.in_pin_b))?;
+        let channel = if duocb_core::pin::pin_is_lan_only(&canonical_pin) {
+            Core::LanOnly
+        } else {
+            Core::NostrAndLan
+        };
+        Some(DialSpec::Pin {
+            canonical_pin,
+            relays: default_relays(),
+            channel,
         })
     }
 
@@ -1230,6 +1235,28 @@ pub(crate) mod tests {
                 other => panic!("unexpected dial spec: {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn join_entry_toggle_selects_which_credential_is_read() {
+        let g = duocb_core::pin::PIN_GROUP_LEN;
+        let mut app = test_app();
+        app.mode = PairMode::NostrPin;
+        let canonical = duocb_core::pin::generate_pin(false);
+        app.in_pin_a = canonical[..g].to_string();
+        app.in_pin_b = canonical[g..].to_string();
+
+        // Default (PIN) entry: the typed PIN drives the dial.
+        assert!(!app.join_by_code);
+        assert!(matches!(
+            app.client_dial_spec(),
+            Some(duocb_core::net::DialSpec::Pin { .. })
+        ));
+
+        // Switched to the code entry: the PIN is ignored and, with no code
+        // entered, there is nothing to dial.
+        app.join_by_code = true;
+        assert!(app.client_dial_spec().is_none());
     }
 
     #[test]

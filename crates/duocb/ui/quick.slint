@@ -8,7 +8,7 @@ import { UiState, Actions } from "globals.slint";
 import { PairMode, PinChannel } from "types.slint";
 import { Theme } from "theme.slint";
 import { Card, CardTitle, Weak, Small, Body, BigButton, WideButton, BackHeader, SelectableRow } from "widgets.slint";
-import { LineEdit, ScrollView } from "std-widgets.slint";
+import { Button, LineEdit, ScrollView } from "std-widgets.slint";
 
 component ModeRow inherits SelectableRow {
     in property <string> text;
@@ -124,82 +124,102 @@ export component QuickScreen inherits ScrollView {
         }
 
         // Joining is independent of the choices above: type the PIN shown on the
-        // other device, or paste a manual pairing code — whichever you were
-        // given. The channel/mode is read from the entry itself, never picked.
+        // other device, or (via the toggle) paste a manual pairing code. The
+        // channel/mode is read from the entry itself, never picked. PIN is the
+        // default; the toggle picks which entry shows and which the join reads.
         Card {
-            CardTitle { text: "Enter a PIN or paste a code"; }
-            pin-form := VerticalLayout {
-                alignment: start;
-                spacing: Theme.pad-xs;
-                Body { text: "PIN shown on the other device:"; }
-                // Two four-character groups (dash as a static label, auto-advance,
-                // backspace hop); Enter in either group joins.
-                HorizontalLayout {
+            CardTitle { text: UiState.join-by-code ? "Enter a pairing code" : "Enter a PIN"; }
+            HorizontalLayout {
+                spacing: Theme.pad-s;
+                Button {
+                    text: "PIN";
+                    primary: !UiState.join-by-code;
+                    clicked => { Actions.set-join-by-code(false); }
+                }
+                Button {
+                    text: "Pairing code";
+                    primary: UiState.join-by-code;
+                    clicked => { Actions.set-join-by-code(true); }
+                }
+                Rectangle { horizontal-stretch: 1; }
+            }
+            // Both entries stay instantiated (visibility-toggled) so their fields
+            // can report focus for shortcut gating; only the active one is shown
+            // and sized.
+            forms := Rectangle {
+                height: UiState.join-by-code ? manual-form.preferred-height : pin-form.preferred-height;
+
+                pin-form := VerticalLayout {
+                    visible: !UiState.join-by-code;
                     alignment: start;
                     spacing: Theme.pad-xs;
-                    pin-a := LineEdit {
-                        min-width: 96px;
-                        horizontal-alignment: center;
-                        font-family: UiState.mono-font;
-                        placeholder-text: "XXXX";
-                        text <=> UiState.in-pin-a;
-                        edited => {
-                            Actions.fields-edited();
-                            if UiState.pin-a-full { pin-b.focus(); }
-                        }
-                        accepted => { Actions.join-quick(); }
-                    }
-                    Text {
-                        text: "-";
-                        vertical-alignment: center;
-                        font-size: Theme.font-pin;
-                    }
-                    pin-b := LineEdit {
-                        min-width: 96px;
-                        horizontal-alignment: center;
-                        font-family: UiState.mono-font;
-                        placeholder-text: "XXXX";
-                        text <=> UiState.in-pin-b;
-                        edited => { Actions.fields-edited(); }
-                        key-pressed(event) => {
-                            if event.text == Key.Backspace && self.text == "" {
-                                pin-a.focus();
-                                EventResult.accept
-                            } else {
-                                EventResult.reject
+                    // Two four-character groups (dash as a static label,
+                    // auto-advance, backspace hop); Enter in either group joins.
+                    HorizontalLayout {
+                        alignment: start;
+                        spacing: Theme.pad-xs;
+                        pin-a := LineEdit {
+                            min-width: 96px;
+                            horizontal-alignment: center;
+                            font-family: UiState.mono-font;
+                            placeholder-text: "XXXX";
+                            text <=> UiState.in-pin-a;
+                            edited => {
+                                Actions.fields-edited();
+                                if UiState.pin-a-full { pin-b.focus(); }
                             }
+                            accepted => { Actions.join-quick(); }
                         }
-                        accepted => { Actions.join-quick(); }
+                        Text {
+                            text: "-";
+                            vertical-alignment: center;
+                            font-size: Theme.font-pin;
+                        }
+                        pin-b := LineEdit {
+                            min-width: 96px;
+                            horizontal-alignment: center;
+                            font-family: UiState.mono-font;
+                            placeholder-text: "XXXX";
+                            text <=> UiState.in-pin-b;
+                            edited => { Actions.fields-edited(); }
+                            key-pressed(event) => {
+                                if event.text == Key.Backspace && self.text == "" {
+                                    pin-a.focus();
+                                    EventResult.accept
+                                } else {
+                                    EventResult.reject
+                                }
+                            }
+                            accepted => { Actions.join-quick(); }
+                        }
+                    }
+                    // Neutral progress while typing; a warning only once the
+                    // whole PIN is in but fails its checksum.
+                    if UiState.pin-incomplete != "": Weak {
+                        text: UiState.pin-incomplete;
+                    }
+                    if UiState.pin-invalid: Text {
+                        text: "Not a valid PIN (check for typos)";
+                        color: Theme.warn;
+                        font-size: Theme.font-body;
                     }
                 }
-                // Neutral progress while typing; a warning only once the whole
-                // PIN is in but fails its checksum.
-                if UiState.pin-incomplete != "": Weak {
-                    text: UiState.pin-incomplete;
-                }
-                if UiState.pin-invalid: Text {
-                    text: "Not a valid PIN (check for typos)";
-                    color: Theme.warn;
-                    font-size: Theme.font-body;
-                }
-            }
 
-            Weak { text: "— or —"; horizontal-alignment: center; }
-
-            manual-form := VerticalLayout {
-                alignment: start;
-                spacing: Theme.pad-xs;
-                Body { text: "Pairing code copied from the other device:"; }
-                code-entry := LineEdit {
-                    placeholder-text: "Paste a pairing code…";
-                    text <=> UiState.in-manual-code;
-                    edited => { Actions.fields-edited(); }
-                    accepted => { Actions.join-quick(); }
-                }
-                if UiState.manual-code-invalid: Text {
-                    text: "Not a complete pairing code (check for missing characters)";
-                    color: Theme.warn;
-                    font-size: Theme.font-body;
+                manual-form := VerticalLayout {
+                    visible: UiState.join-by-code;
+                    alignment: start;
+                    spacing: Theme.pad-xs;
+                    code-entry := LineEdit {
+                        placeholder-text: "Paste a pairing code…";
+                        text <=> UiState.in-manual-code;
+                        edited => { Actions.fields-edited(); }
+                        accepted => { Actions.join-quick(); }
+                    }
+                    if UiState.manual-code-invalid: Text {
+                        text: "Not a complete pairing code (check for missing characters)";
+                        color: Theme.warn;
+                        font-size: Theme.font-body;
+                    }
                 }
             }
 
@@ -207,6 +227,11 @@ export component QuickScreen inherits ScrollView {
                 text: "🔗 Join";
                 enabled: UiState.dial-ready;
                 clicked => { Actions.join-quick(); }
+            }
+            Small {
+                text: UiState.join-by-code
+                    ? "Paste the pairing code copied from the hosting device."
+                    : "Type the PIN shown on the hosting device.";
             }
         }
     }
