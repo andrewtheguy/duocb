@@ -239,15 +239,7 @@ export component HomeScreen inherits ScrollView {
         alignment: start;
         spacing: Theme.pad-s;
 
-        HorizontalLayout {
-            spacing: Theme.pad-s;
-            Text { text: "duocb"; font-size: Theme.font-title; font-weight: 800; }
-            Small {
-                text: "v" + UiState.app-version;
-                vertical-alignment: bottom;
-                horizontal-stretch: 1;
-            }
-        }
+        Text { text: "duocb"; font-size: Theme.font-title; font-weight: 800; }
         Body { text: "Peer-to-peer clipboard sharing between two devices."; }
         Weak {
             text: "Both devices can send and receive. One device starts a connection; the other joins it.";
@@ -276,6 +268,11 @@ export component HomeScreen inherits ScrollView {
             text: "⚡ Quick options — pair on the spot, nothing saved";
             hint: "Q";
             clicked => { Actions.open-quick(); }
+        }
+        // Only on the hub (the configured home), matching mobile.
+        if UiState.configure-step == ConfigureStep.ready: Small {
+            text: "duocb v" + UiState.app-version;
+            horizontal-alignment: center;
         }
     }
 }
