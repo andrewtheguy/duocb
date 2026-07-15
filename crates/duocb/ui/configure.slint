@@ -239,7 +239,15 @@ export component HomeScreen inherits ScrollView {
         alignment: start;
         spacing: Theme.pad-s;
 
-        Text { text: "duocb"; font-size: Theme.font-title; font-weight: 800; }
+        HorizontalLayout {
+            spacing: Theme.pad-s;
+            Text { text: "duocb"; font-size: Theme.font-title; font-weight: 800; }
+            Small {
+                text: "v" + UiState.app-version;
+                vertical-alignment: bottom;
+                horizontal-stretch: 1;
+            }
+        }
         Body { text: "Peer-to-peer clipboard sharing between two devices."; }
         Weak {
             text: "Both devices can send and receive. One device starts a connection; the other joins it.";

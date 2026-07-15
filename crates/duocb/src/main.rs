@@ -56,6 +56,7 @@ fn set_platform_fonts(ui: &MainWindow) {
     // (matching Slint's `control` modifier), so hints show only the one that
     // applies to this build instead of always "Ctrl/⌘".
     state.set_cmd_label(if cfg!(target_os = "macos") { "⌘" } else { "Ctrl" }.into());
+    state.set_app_version(env!("CARGO_PKG_VERSION").into());
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

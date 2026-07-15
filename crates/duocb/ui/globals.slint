@@ -16,6 +16,9 @@ export global UiState {
     /// build target it is running on. Matches Slint's `control` modifier, which
     /// is ⌘ on macOS and Ctrl on every other platform.
     in property <string> cmd-label: "Ctrl";
+    /// This build's version (e.g. "0.0.26"), set once at startup from Rust's
+    /// `CARGO_PKG_VERSION`. Shown on the home screen.
+    in property <string> app-version;
 
     // Navigation / shared status.
     in property <Screen> screen;
