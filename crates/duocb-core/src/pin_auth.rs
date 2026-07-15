@@ -26,9 +26,11 @@
 //! takes `id_l` from `remote_id()` (the id it dialed) and `id_d` from its own endpoint. A proof
 //! therefore verifies only when the PIN-derived key matches *and* both peers agree on the two node
 //! ids — so the listener effectively validates that the dialer's claimed identity is the one QUIC
-//! authenticated (and vice versa). This binds PIN possession to the specific authenticated iroh
-//! connection: a relayed or man-in-the-middle handshake that terminates the QUIC session at a
-//! different node id fails, even against a party that knows the PIN.
+//! authenticated (and vice versa). This binds each proof to that specific pair of authenticated
+//! node ids, so a proof captured on one connection cannot be forwarded or replayed onto a
+//! connection with different endpoints. That only defends against a party that does **not** hold
+//! the PIN: anyone who knows the PIN can derive `k` and mint fresh proofs for whatever node ids
+//! it presents, so the binding does not defeat a relay or intermediary that possesses the PIN.
 //!
 //! Because the listener mints a fresh PIN every rotation bucket, it verifies `proof_d` against the
 //! last few buckets' keys (its recent-PIN cache) — mirroring the dialer's adjacent-bucket look-back

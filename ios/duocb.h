@@ -96,8 +96,8 @@
  *                                               host_lan_ip is the host's LAN
  *                                               IPv4 on the "lan" channel — show
  *                                               it so the joiner can type it for
- *                                               the manual-IP side channel — and
- *                                               null on other channels)
+ *                                               the typed-IP unicast fallback —
+ *                                               and null on other channels)
  *   pin_cleared       {}                        (quick_host: a peer paired or
  *                                               publishing stopped — hide the
  *                                               PIN)
@@ -158,7 +158,8 @@ int duocb_normalize_pin(const char *pin, char *out_buf, size_t out_len);
 /* Whether a quick-pair PIN is LAN-only (its first character encodes the
  * channel). Use to reveal the optional host-IP field on the join screen. The
  * PIN is normalized first, so any user-typed form is accepted. 1 = LAN-only,
- * 0 = not LAN-only or the PIN is invalid/incomplete, -1 = NULL argument. */
+ * 0 = not LAN-only or the PIN is invalid/incomplete, -1 = NULL or non-UTF-8
+ * argument. */
 int duocb_pin_is_lan_only(const char *pin);
 
 /* Start a session (configure or quick mode, per the config's "role").

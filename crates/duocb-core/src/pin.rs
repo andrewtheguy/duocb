@@ -285,8 +285,14 @@ const EPHEMERAL_LEN: u16 = u16::MAX - EPHEMERAL_START + 1;
 /// on one LAN coexist. Keyed on the PIN string alone (bucket-independent, like the auth key),
 /// so a rotation-boundary race never changes the port for a given displayed PIN.
 ///
-/// This is not a security boundary: port-scanning it gains nothing, since the served record is
-/// PIN-encrypted and the iroh session is challenge-response authenticated regardless.
+/// This is not a security boundary, and it deliberately leaks a little: the port is a **fast**
+/// (non-Argon2) projection of the PIN, so an on-LAN attacker who scans for the open port learns
+/// which ~14-bit bucket (one of 16384) the PIN hashes to — a cheap pre-filter that
+/// narrows an offline PIN search by that many bits *before* paying the Argon2 cost per surviving
+/// guess. That is the extent of it: the served record is still PIN-encrypted and the iroh session
+/// is challenge-response authenticated, so the open port alone grants nothing. (A single fixed
+/// listener port would avoid even this projection leak, at the cost of two hosts on one LAN
+/// colliding on the port.)
 pub fn side_channel_port(canonical_pin: &str) -> u16 {
     let mut hasher = Sha256::new();
     hasher.update(PORT_SALT);
