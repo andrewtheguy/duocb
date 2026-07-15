@@ -88,7 +88,10 @@ const EPHEMERAL_LEN: u16 = u16::MAX - EPHEMERAL_START + 1;
 /// mapping a candidate PIN to its port costs an Argon2 evaluation and the open port leaks no cheap
 /// pre-filter of the PIN. The key already varies per rotation bucket, so the port does too; the
 /// joiner tries each candidate bucket's port (see `unicast::lookup`), mirroring the mDNS
-/// candidate-label match. Different PINs land on different ports, so hosts on one LAN coexist.
+/// candidate-label match. Different PINs almost always map to different ports, so hosts on one LAN
+/// normally coexist; the range is finite (16384 ports), so a collision is possible and would make
+/// a second host's listener fail to bind on the shared port (the publisher only warns, and mDNS
+/// still carries the rendezvous).
 fn side_channel_port(keys: &Keys) -> u16 {
     let mut hasher = Sha256::new();
     hasher.update(PORT_SALT);
