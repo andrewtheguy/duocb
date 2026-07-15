@@ -190,7 +190,7 @@ impl App {
         s.set_pin_is_lan_only(duocb_core::pin::pin_is_lan_only(&combined));
         s.set_join_ip_prefix(self.join_ip_ctx.locked_prefix().into());
         s.set_join_ip_hint(self.join_ip_ctx.hint().into());
-        s.set_join_ip_error(match self.join_ip_ctx.resolve(&self.in_join_ip) {
+        s.set_join_ip_error(match self.join_ip_outcome() {
             JoinIpOutcome::OutOfRange => {
                 format!("IP out of range for {}", self.join_ip_ctx.label()).into()
             }

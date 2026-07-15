@@ -823,6 +823,13 @@ impl App {
         }
     }
 
+    /// The current validation outcome of the host-IP entry against the detected
+    /// subnet constraint — the single source for both the displayed error
+    /// (`sync`) and the dial's `target_ip` (`quick_dial_spec`).
+    pub(crate) fn join_ip_outcome(&self) -> duocb_core::subnet::JoinIpOutcome {
+        self.join_ip_ctx.resolve(&self.in_join_ip)
+    }
+
     /// The quick-join dial spec, derived purely from the join entry — never from
     /// the show-side P/L/I choice. The typed PIN's first character selects the
     /// channel (see `duocb_core::pin`); for a LAN-only PIN the optional host-IP
@@ -842,7 +849,7 @@ impl App {
         // in-range address selects the side channel; anything malformed or out of
         // range yields `None` so Join stays disabled.
         let target_ip = if lan_only {
-            match self.join_ip_ctx.resolve(&self.in_join_ip) {
+            match self.join_ip_outcome() {
                 JoinIpOutcome::Empty => None,
                 JoinIpOutcome::InRange(ip) => Some(std::net::IpAddr::V4(ip)),
                 JoinIpOutcome::OutOfRange | JoinIpOutcome::Malformed => return None,
