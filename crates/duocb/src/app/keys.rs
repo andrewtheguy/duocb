@@ -10,7 +10,7 @@
 use slint::platform::Key;
 
 use super::{App, CopyTarget};
-use crate::{ConfigureStep, PairMode, PinChannel, Screen};
+use crate::{ConfigureStep, PinChannel, Screen};
 use duocb_core::net::ConnStatus;
 
 /// Handle one key event. `plain` = no modifier held at all; `command` =
@@ -47,17 +47,15 @@ pub(crate) fn handle_global_key(
         Screen::Home if focus_free => handle_configure_key(app, esc, enter, up, down, &letter, &command),
         Screen::Quick if focus_free => {
             // Letters mirror the rows on screen: P and L are the common
-            // choices; I and M are the uncommon (testing) ones, which the UI
-            // reveals when selected. S hosts and C joins with whatever the
-            // selection (and the join entry) holds.
+            // choices; I is the uncommon (testing) one, which the UI reveals
+            // when selected. S hosts and C joins with whatever the selection
+            // (and the join entry) holds.
             if letter('p') {
                 app.set_pin_channel(PinChannel::Both);
             } else if letter('l') {
                 app.set_pin_channel(PinChannel::LanOnly);
             } else if letter('i') {
                 app.set_pin_channel(PinChannel::NostrOnly);
-            } else if letter('m') {
-                app.mode = PairMode::Manual;
             } else if letter('s') {
                 app.begin_server();
             } else if letter('c') {
@@ -68,13 +66,8 @@ pub(crate) fn handle_global_key(
             true
         }
         Screen::Server => {
-            // Copy the displayed credential without the mouse: the pairing code
-            // (manual mode) or the current rotating PIN (PIN mode).
-            if command('t') && app.pairing_code.is_some() {
-                let code = app.pairing_code.clone().unwrap();
-                app.copy_with_flash(&code, CopyTarget::PairingCode);
-                true
-            } else if command('t') && app.pin_display.is_some() {
+            // Copy the current rotating PIN without the mouse.
+            if command('t') && app.pin_display.is_some() {
                 let pin = app.pin_display.clone().unwrap();
                 app.copy_with_flash(&pin, CopyTarget::Pin);
                 true
@@ -204,6 +197,7 @@ fn handle_session_key(app: &mut App, focus_free: bool, command: &dyn Fn(char) ->
 mod tests {
     use super::*;
     use crate::app::tests::test_app;
+    use crate::PairMode;
 
     const ESC: &str = "\u{1b}";
 
@@ -235,13 +229,6 @@ mod tests {
         assert_eq!(app.mode, PairMode::NostrPin);
         assert_eq!(app.pin_channel, PinChannel::Both);
         assert!(!app.quick_advanced_open());
-        // M selects manual mode (revealing the section); picking a channel
-        // returns to PIN mode — the rows act as one radio group.
-        assert!(plain(&mut app, "m", false));
-        assert_eq!(app.mode, PairMode::Manual);
-        assert!(app.quick_advanced_open());
-        assert!(plain(&mut app, "p", false));
-        assert_eq!(app.mode, PairMode::NostrPin);
         // C joins with the current entry — empty here, so it stays put.
         assert!(plain(&mut app, "c", false));
         assert_eq!(app.screen, Screen::Quick);
@@ -265,22 +252,15 @@ mod tests {
         app.join_quick();
         assert_eq!(app.screen, Screen::Client);
         assert!(app.client_active);
-        // The join entry is independent of the show-side choice: the same valid
-        // PIN still joins even when Manual is selected (that choice only governs
-        // what this device would *show*, not what it accepts to join).
-        app.go_back();
-        assert_eq!(app.screen, Screen::Quick);
-        app.mode = PairMode::Manual;
-        app.join_quick();
-        assert_eq!(app.screen, Screen::Client);
     }
 
     #[test]
     fn letters_ignored_while_field_focused() {
         let mut app = test_app();
         app.open_quick();
-        assert!(!plain(&mut app, "m", true));
-        assert_eq!(app.mode, PairMode::NostrPin);
+        // A channel letter that would route while unfocused is ignored here.
+        assert!(!plain(&mut app, "l", true));
+        assert_eq!(app.pin_channel, PinChannel::Both);
     }
 
     #[test]

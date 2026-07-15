@@ -472,12 +472,11 @@ async fn run_server_session(
 
     // Only the modes that hard-require the internet gate on the relay coming
     // online (`online()` never resolves offline, so they fail fast without
-    // it). The quick modes gate on a first local address only — the PIN or
-    // pairing code shows immediately and LAN signaling needs no internet,
-    // while the relay connects in the background for a cross-network dial.
+    // it). The PIN quick mode gates on a first local address only — the PIN
+    // shows immediately and LAN signaling needs no internet, while the relay
+    // connects in the background for a cross-network dial.
     let readiness = match &mode {
         ServerMode::Pin { channel, .. } => pin_channel_readiness(*channel),
-        ServerMode::Manual => EndpointReadiness::DirectAddr,
         ServerMode::NostrToken { .. } => EndpointReadiness::RelayOnline,
     };
     let endpoint = match create_server_endpoint(readiness).await {
@@ -495,59 +494,22 @@ async fn run_server_session(
     let claim = PairClaim::default();
     let recent_pins = RecentPins::default();
 
-    // Tokens accepted from clients — configure mode only. The quick modes both
-    // authenticate with the in-band PIN challenge-response: manual mode mints
-    // a fresh session secret here, records its auth key like a (non-rotating)
-    // PIN, and bundles it with the node id into the pairing code the user
-    // carries to the other device out of band.
+    // Tokens accepted from clients — configure mode only. The PIN quick mode
+    // authenticates with the in-band PIN challenge-response instead.
     let (tokens, token_fingerprint): (HashSet<String>, Option<String>) = match &mode {
         ServerMode::NostrToken { identity } => {
             let fingerprint = crate::auth::token_fingerprint(&identity.token);
             (HashSet::from([identity.token.clone()]), Some(fingerprint))
         }
-        ServerMode::Pin { .. } | ServerMode::Manual => (HashSet::new(), None),
-    };
-    let pairing_code = if matches!(mode, ServerMode::Manual) {
-        let secret = crate::manual_code::generate_secret();
-        // Argon2id — off the async executor. The key must be in place before
-        // the code is surfaced, or a fast joiner could beat it to the auth.
-        let derived = tokio::task::spawn_blocking({
-            let secret = secret.clone();
-            move || crate::pin_auth::derive_auth_keys(&secret)
-        })
-        .await;
-        match derived {
-            Ok(Ok(keys)) => recent_pins.push(keys),
-            Ok(Err(e)) => {
-                events.error(format!("Failed to start: {e:#}"));
-                events.status(ConnStatus::Idle);
-                return;
-            }
-            Err(e) => {
-                events.error(format!("Failed to start: {e}"));
-                events.status(ConnStatus::Idle);
-                return;
-            }
-        }
-        // The endpoint's direct addresses ride in the code (beam-rs-style
-        // serverless pairing): the joiner dials them with zero discovery, so
-        // manual mode still pairs when mDNS is blocked and there is no
-        // internet. The DirectAddr readiness gate above means at least one
-        // address is normally known by now.
-        let addrs: Vec<_> = endpoint.addr().ip_addrs().copied().collect();
-        Some(crate::manual_code::encode(&node_id, &secret, &addrs))
-    } else {
-        None
+        ServerMode::Pin { .. } => (HashSet::new(), None),
     };
     events.send(NetEvent::ServerReady {
         node_id: node_id.to_string(),
         token_fingerprint,
-        pairing_code,
     });
     events.status(ConnStatus::Listening);
 
-    let pin_cache = matches!(mode, ServerMode::Pin { .. } | ServerMode::Manual)
-        .then(|| recent_pins.clone());
+    let pin_cache = matches!(mode, ServerMode::Pin { .. }).then(|| recent_pins.clone());
 
     // Configure mode: mark this device as hosting for the session's lifetime.
     // The standing presence publisher (owned by the command loop) picks the
@@ -570,7 +532,6 @@ async fn run_server_session(
                 pin_refresh.unwrap_or_default(),
             ))))
         }
-        ServerMode::Manual => None,
     };
 
     // Accept loop: duocb pairs exactly two devices, so at most one clipboard
@@ -599,8 +560,8 @@ async fn run_server_session(
 
         // Auth runs on the single session stream; on success the same stream
         // stays open for clipboard frames (no separate data stream / handshake).
-        let (send, recv) = match auth_as_listener(&conn, &tokens, pin_cache.as_ref(), &claim).await
-        {
+        let (send, recv) =
+            match auth_as_listener(&conn, &tokens, pin_cache.as_ref(), &claim, node_id).await {
             Ok(streams) => streams,
             Err(e) => {
                 log::warn!("Auth failed for {remote_id}: {e:#}");
@@ -721,35 +682,13 @@ async fn run_client_session(
 ) {
     events.status(ConnStatus::Starting);
 
-    // The pairing code's node id is parsed once up front: if it's malformed it
-    // will never work, so fail the session immediately. The code's embedded
-    // direct addresses ride along on every dial — the no-discovery path that
-    // still works when mDNS is blocked and there is no internet.
-    let manual_addr: Option<EndpointAddr> = match &spec {
-        DialSpec::Manual { node_id, addrs, .. } => match node_id.trim().parse::<EndpointId>() {
-            Ok(id) => {
-                let mut addr = EndpointAddr::new(id);
-                for a in addrs {
-                    addr = addr.with_ip_addr(*a);
-                }
-                Some(addr)
-            }
-            Err(e) => {
-                events.error(format!("Invalid pairing code: {e}"));
-                events.status(ConnStatus::Idle);
-                return;
-            }
-        },
-        _ => None,
-    };
-
-    // Same policy as the server side: only the internet-requiring modes gate
-    // on the relay; the quick modes start resolving and dialing right away
-    // (the relay connects in the background, and a cross-network dial's own
-    // timeout covers it coming up).
+    // Same policy as the server side: only the internet-requiring mode gates on
+    // the relay; the PIN quick mode starts resolving and dialing right away (the
+    // relay connects in the background, and a cross-network dial's own timeout
+    // covers it coming up). The LAN-only channel is relay-less either way (mDNS
+    // or the typed-IP side channel), so its readiness is `LanDirect`.
     let readiness = match &spec {
         DialSpec::Pin { channel, .. } => pin_channel_readiness(*channel),
-        DialSpec::Manual { .. } => EndpointReadiness::DirectAddr,
         DialSpec::NostrToken { .. } => EndpointReadiness::RelayOnline,
     };
     let endpoint = match create_client_endpoint(readiness).await {
@@ -765,7 +704,7 @@ async fn run_client_session(
         DialSpec::NostrToken { identity, .. } => {
             Some(crate::auth::token_fingerprint(&identity.token))
         }
-        DialSpec::Pin { .. } | DialSpec::Manual { .. } => None,
+        DialSpec::Pin { .. } => None,
     };
     events.send(NetEvent::ClientReady {
         node_id: own_id.to_string(),
@@ -787,7 +726,6 @@ async fn run_client_session(
         // Resolve the target each attempt: configure mode re-queries the chosen
         // peer's presence record, so a restarted host's fresh node id is found.
         let resolved: Result<EndpointAddr> = match &spec {
-            DialSpec::Manual { .. } => Ok(manual_addr.clone().expect("validated above")),
             DialSpec::NostrToken {
                 identity,
                 peer_display,
@@ -815,11 +753,12 @@ async fn run_client_session(
                 canonical_pin,
                 relays,
                 channel,
+                target_ip,
             } => {
                 events.status(ConnStatus::Resolving);
                 tokio::select! {
                     _ = cancel.cancelled() => return,
-                    r = resolve_pin(canonical_pin, relays, *channel) => r,
+                    r = resolve_pin(canonical_pin, relays, *channel, *target_ip) => r,
                 }
             }
         };
@@ -855,12 +794,9 @@ async fn run_client_session(
                     DialSpec::NostrToken { identity, .. } => {
                         auth_as_dialer(&conn, &identity.token).await
                     }
-                    // Both quick modes prove a PIN-shaped secret in-band —
-                    // manual's just arrived via the pasted pairing code.
                     DialSpec::Pin { canonical_pin, .. } => {
-                        auth_as_dialer_pin(&conn, canonical_pin).await
+                        auth_as_dialer_pin(&conn, canonical_pin, own_id).await
                     }
-                    DialSpec::Manual { secret, .. } => auth_as_dialer_pin(&conn, secret).await,
                 };
                 match auth_result {
                     Ok((send, recv)) => {
@@ -1169,20 +1105,29 @@ fn pin_channel_readiness(channel: PinChannel) -> EndpointReadiness {
 /// relays and/or the local network — racing them when both are enabled, first
 /// hit wins.
 ///
-/// The result is a full dial target: on the LAN-only channel the DNS-SD
-/// records carry the host's direct addresses and they ride along (the only
-/// dialable path against an iOS host, which runs no iroh mDNS responder);
-/// the other channels return a bare node id for iroh's discovery to resolve.
+/// The result is a full dial target: on the LAN-only channel both the DNS-SD
+/// and unicast records carry the host's direct addresses and they ride along
+/// (the only dialable path against an iOS host, which runs no iroh mDNS
+/// responder); the other channels return a bare node id for iroh's discovery to
+/// resolve.
+///
+/// `target_ip` (LAN-only only): `Some(ip)` fetches the record from the host's
+/// unicast side channel at that IP — the manual-IP path that works where
+/// multicast is blocked — instead of browsing mDNS. `None` browses mDNS.
 async fn resolve_pin(
     canonical_pin: &str,
     relays: &[String],
     channel: PinChannel,
+    target_ip: Option<std::net::IpAddr>,
 ) -> Result<EndpointAddr> {
     let candidates = crate::pin_record::candidate_keys(canonical_pin).await?;
     // The no-record outcome, phrased for what the user can actually fix.
     let miss = || match channel {
         PinChannel::NostrOnly => anyhow::anyhow!(
             "no peer found for that PIN (it refreshes every 60s — check the current code on the other device)"
+        ),
+        PinChannel::LanOnly if target_ip.is_some() => anyhow::anyhow!(
+            "no device answered for that PIN at that IP — check the address shown on the other device and that the code (it refreshes every 60s) matches"
         ),
         PinChannel::LanOnly => anyhow::anyhow!(
             "no device found for that PIN on this network — both devices must be on the same network, and the code refreshes every 60s"
@@ -1197,11 +1142,22 @@ async fn resolve_pin(
             Ok(None) => Err(miss()),
             Err(e) => Err(e.context("nostr PIN lookup failed")),
         },
-        PinChannel::LanOnly => match crate::lan::dnssd_lookup_pin_record(&candidates).await {
-            Ok(Some(found)) => Ok(found.endpoint_addr()),
-            Ok(None) => Err(miss()),
-            Err(e) => Err(e.context("LAN PIN lookup failed")),
-        },
+        PinChannel::LanOnly => {
+            // A typed IP selects the unicast side channel (works where multicast
+            // is blocked); no IP browses mDNS. Either way the record carries the
+            // host's direct addresses, so the node id rides back dialable.
+            let found = match target_ip {
+                Some(ip) => {
+                    crate::lan::unicast_lookup_pin_record(ip, &candidates).await
+                }
+                None => crate::lan::dnssd_lookup_pin_record(&candidates).await,
+            };
+            match found {
+                Ok(Some(found)) => Ok(found.endpoint_addr()),
+                Ok(None) => Err(miss()),
+                Err(e) => Err(e.context("LAN PIN lookup failed")),
+            }
+        }
         PinChannel::NostrAndLan => {
             // Race both lookups; the first hit wins (the LAN answers in well
             // under a second when the peer is local). A channel that misses or
@@ -1274,6 +1230,11 @@ async fn run_pin_publisher(
 ) {
     let node_id = endpoint.id();
     let mut adverts: VecDeque<crate::lan::PinAdvert> = VecDeque::new();
+    // LAN-only unicast side-channel listeners, kept with the same one-period
+    // look-back as `adverts`: the port is PIN-derived, so it rotates with the
+    // PIN, and a joiner who typed the just-rotated code still reaches the
+    // previous listener.
+    let mut unicast: VecDeque<crate::lan::UnicastListener> = VecDeque::new();
     loop {
         // A peer may already have paired (e.g. a reconnect landed before this
         // loop turn). Publishing a fresh PIN would be pointless and misleading.
@@ -1284,6 +1245,16 @@ async fn run_pin_publisher(
 
         let pin = crate::pin::generate_pin(matches!(channel, PinChannel::LanOnly));
         let bucket = crate::pin::current_bucket();
+        // On the LAN-only channel, surface the host's LAN IPv4 so the UI can
+        // offer it for the joiner's manual-IP side channel. Constant across
+        // rotations, but sent with every PIN so a late-arriving UI still gets it.
+        let host_lan_ip = matches!(channel, PinChannel::LanOnly)
+            .then(|| {
+                let addrs: Vec<_> = endpoint.addr().ip_addrs().copied().collect();
+                crate::lan::preferred_lan_ipv4(&addrs)
+            })
+            .flatten()
+            .map(|ip| ip.to_string());
         // Show the new code right away (before the network publish) and give it a
         // full rotation period from *now*, not from the wall-clock bucket boundary:
         // a PIN minted late in a bucket would otherwise flash for only a few
@@ -1294,6 +1265,7 @@ async fn run_pin_publisher(
         events.send(NetEvent::PinRotated {
             pin_display: crate::pin::format_pin(&pin),
             seconds_left: crate::pin::BUCKET_SECS,
+            host_lan_ip,
         });
 
         // This bucket's PIN auth key (so an inbound dialer holding this PIN can
@@ -1365,6 +1337,23 @@ async fn run_pin_publisher(
                     }
                     Err(e) => log::warn!("Failed to advertise PIN on the local network: {e:#}"),
                 }
+                // LAN-only also serves the record over the unicast side channel
+                // (manual-IP path). It rides alongside mDNS, so a bind failure
+                // (e.g. a rare derived-port collision) only warns — mDNS still
+                // carries the rendezvous for joiners on this network.
+                if matches!(channel, PinChannel::LanOnly) {
+                    match crate::lan::unicast_advertise_pin_record(&keys, &node_id, &addrs).await {
+                        Ok(listener) => {
+                            unicast.push_back(listener);
+                            while unicast.len() > 2 {
+                                unicast.pop_front();
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to start the manual-IP side channel: {e:#}")
+                        }
+                    }
+                }
             }
             if channel.nostr() {
                 match crate::nostr::publish_pin_record(&keys, &node_id, &relays).await {
@@ -1396,6 +1385,7 @@ async fn run_pin_publisher(
                 // auth rejection).
                 recent.clear();
                 adverts.clear();
+                unicast.clear();
                 log::info!("Refreshing the PIN on request; previous PINs revoked");
             }
         }
@@ -1493,12 +1483,25 @@ async fn auth_as_dialer(conn: &iroh::endpoint::Connection, auth_token: &str) -> 
 /// crosses the wire. The whole exchange is bounded by [`AUTH_TIMEOUT`] and any failure is an
 /// [`AuthFailure`] — fatal for this target, exactly like a wrong token. On success the opened
 /// stream is returned (not finished) for the clipboard.
-async fn auth_as_dialer_pin(conn: &iroh::endpoint::Connection, pin: &str) -> Result<Bi> {
+async fn auth_as_dialer_pin(
+    conn: &iroh::endpoint::Connection,
+    pin: &str,
+    own_id: iroh::EndpointId,
+) -> Result<Bi> {
     // One deadline over the whole exchange, including opening the stream — a
     // stalled open_bi must not delay the point where the timeout starts.
     let handshake = async {
         let (mut send, mut recv) = conn.open_bi().await.context("opening session stream")?;
-        crate::pin_auth::dialer_handshake(&mut send, &mut recv, pin).await?;
+        // Bind the PIN proof to both QUIC-authenticated node ids: our own, and
+        // the listener we dialed (`remote_id`, authenticated by QUIC/TLS).
+        crate::pin_auth::dialer_handshake(
+            &mut send,
+            &mut recv,
+            pin,
+            &own_id.to_string(),
+            &conn.remote_id().to_string(),
+        )
+        .await?;
         Ok::<Bi, anyhow::Error>((send, recv))
     };
     match tokio::time::timeout(AUTH_TIMEOUT, handshake).await {
@@ -1529,6 +1532,7 @@ async fn auth_as_listener(
     auth_tokens: &HashSet<String>,
     pin_cache: Option<&RecentPins>,
     claim: &PairClaim,
+    own_id: iroh::EndpointId,
 ) -> Result<Bi> {
     let remote_id = conn.remote_id();
 
@@ -1602,11 +1606,16 @@ async fn auth_as_listener(
                 // The claim is committed inside the handshake, right after the proof verifies
                 // and *before* the acceptance frame is sent — so a race loser is rejected
                 // in-band, not accepted-then-dropped.
+                // Bind the verified proof to both QUIC-authenticated node ids: the dialer's
+                // (`remote_id`, from QUIC/TLS) and our own. A proof only verifies if the dialer
+                // folded in the same ids — so this validates the client's node id in-band.
                 crate::pin_auth::listener_handshake(
                     &mut send,
                     &mut recv,
                     &candidates,
                     &nonce,
+                    &remote_id.to_string(),
+                    &own_id.to_string(),
                     |key| claim.commit(remote_id, Some(key.clone())),
                 )
                 .await?;
@@ -1737,92 +1746,6 @@ mod tests {
         );
     }
 
-    /// End-to-end manual mode within one process: a server session and a client
-    /// session pair over real iroh endpoints (discovery via mDNS/pkarr), then
-    /// exchange one clipboard item in each direction.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn manual_mode_pairs_and_exchanges_items() {
-        let _ = env_logger::builder().is_test(true).try_init();
-
-        // Server side.
-        let (srv_tx, srv_rx) = std::sync::mpsc::channel();
-        let srv_events = EventSender::new(srv_tx, None);
-        let srv_session = start_session(SessionKind::Server(ServerMode::Manual), srv_events, None);
-
-        let code = wait_for_event(&srv_rx, Duration::from_secs(30), |ev| {
-            if let NetEvent::ServerReady {
-                pairing_code: Some(code),
-                ..
-            } = ev
-            {
-                Some(code.clone())
-            } else {
-                None
-            }
-        });
-        let (node_id, secret, addrs) =
-            crate::manual_code::decode(&code).expect("displayed pairing code is valid");
-        assert!(
-            !addrs.is_empty(),
-            "the pairing code should embed the server's direct addresses"
-        );
-
-        // Client side.
-        let (cli_tx, cli_rx) = std::sync::mpsc::channel();
-        let cli_events = EventSender::new(cli_tx, None);
-        let cli_session = start_session(
-            SessionKind::Client(DialSpec::Manual {
-                node_id,
-                secret,
-                addrs,
-            }),
-            cli_events,
-            None,
-        );
-
-        // Both sides report Connected.
-        wait_for_event(&cli_rx, Duration::from_secs(60), |ev| {
-            matches!(ev, NetEvent::Status(ConnStatus::Connected)).then_some(())
-        });
-        wait_for_event(&srv_rx, Duration::from_secs(30), |ev| {
-            matches!(ev, NetEvent::Status(ConnStatus::Connected)).then_some(())
-        });
-
-        // Client -> server.
-        cli_session
-            .clip_tx
-            .send("from the client".to_string())
-            .unwrap();
-        let text = wait_for_event(&srv_rx, Duration::from_secs(15), |ev| {
-            if let NetEvent::ItemReceived { text, .. } = ev {
-                Some(text.clone())
-            } else {
-                None
-            }
-        });
-        assert_eq!(text, "from the client");
-
-        // Server -> client.
-        srv_session
-            .clip_tx
-            .send("from the server".to_string())
-            .unwrap();
-        let text = wait_for_event(&cli_rx, Duration::from_secs(15), |ev| {
-            if let NetEvent::ItemReceived { text, .. } = ev {
-                Some(text.clone())
-            } else {
-                None
-            }
-        });
-        assert_eq!(text, "from the server");
-
-        // Teardown.
-        let mut cli = Some(cli_session);
-        let mut srv = Some(srv_session);
-        stop_session(&mut cli).await;
-        stop_session(&mut srv).await;
-    }
-
     /// End-to-end LAN-only PIN mode within one process: the server advertises
     /// the rotating PIN's rendezvous record over DNS-SD (no nostr at all), the
     /// client resolves it from the displayed PIN alone — including the direct
@@ -1859,6 +1782,7 @@ mod tests {
                 canonical_pin,
                 relays: Vec::new(),
                 channel: PinChannel::LanOnly,
+                target_ip: None,
             }),
             EventSender::new(cli_tx, None),
             None,
@@ -1906,6 +1830,75 @@ mod tests {
         stop_session(&mut srv).await;
     }
 
+    /// End-to-end LAN-only PIN mode via the manual-IP unicast side channel: the
+    /// joiner supplies a `target_ip`, so discovery bypasses mDNS entirely and
+    /// fetches the PIN-encrypted record over TCP from the host's IP (here
+    /// loopback). The record carries the host's direct addresses, which the
+    /// joiner then dials — the whole point being pairing where multicast is
+    /// blocked.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lan_pin_mode_pairs_over_the_unicast_side_channel() {
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        let (srv_tx, srv_rx) = std::sync::mpsc::channel();
+        let srv_session = start_session(
+            SessionKind::Server(ServerMode::Pin {
+                relays: Vec::new(),
+                channel: PinChannel::LanOnly,
+            }),
+            EventSender::new(srv_tx, None),
+            None,
+        );
+        let pin_display = wait_for_event(&srv_rx, Duration::from_secs(30), |ev| {
+            if let NetEvent::PinRotated { pin_display, .. } = ev {
+                Some(pin_display.clone())
+            } else {
+                None
+            }
+        });
+        let canonical_pin =
+            crate::pin::normalize_pin(&pin_display).expect("displayed PIN is valid");
+
+        let (cli_tx, cli_rx) = std::sync::mpsc::channel();
+        let cli_session = start_session(
+            SessionKind::Client(DialSpec::Pin {
+                canonical_pin,
+                relays: Vec::new(),
+                channel: PinChannel::LanOnly,
+                // The host serves the unicast side channel on all interfaces, so
+                // loopback reaches it on the same machine.
+                target_ip: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+            }),
+            EventSender::new(cli_tx, None),
+            None,
+        );
+
+        wait_for_event(&cli_rx, Duration::from_secs(120), |ev| {
+            matches!(ev, NetEvent::Status(ConnStatus::Connected)).then_some(())
+        });
+        wait_for_event(&srv_rx, Duration::from_secs(30), |ev| {
+            matches!(ev, NetEvent::PinCleared).then_some(())
+        });
+
+        cli_session
+            .clip_tx
+            .send("over the side channel".to_string())
+            .unwrap();
+        let text = wait_for_event(&srv_rx, Duration::from_secs(15), |ev| {
+            if let NetEvent::ItemReceived { text, .. } = ev {
+                Some(text.clone())
+            } else {
+                None
+            }
+        });
+        assert_eq!(text, "over the side channel");
+
+        let mut cli = Some(cli_session);
+        let mut srv = Some(srv_session);
+        stop_session(&mut cli).await;
+        stop_session(&mut srv).await;
+    }
+
     /// After an interrupted connection resumes, each side pulls the other's
     /// latest sent item (surfaced with `pulled: true` for UI deduplication).
     #[tokio::test(flavor = "multi_thread")]
@@ -1914,30 +1907,30 @@ mod tests {
 
         let (srv_tx, srv_rx) = std::sync::mpsc::channel();
         let srv_session = start_session(
-            SessionKind::Server(ServerMode::Manual),
+            SessionKind::Server(ServerMode::Pin {
+                relays: Vec::new(),
+                channel: PinChannel::LanOnly,
+            }),
             EventSender::new(srv_tx, None),
             None,
         );
-        let code = wait_for_event(&srv_rx, Duration::from_secs(30), |ev| {
-            if let NetEvent::ServerReady {
-                pairing_code: Some(code),
-                ..
-            } = ev
-            {
-                Some(code.clone())
+        let pin_display = wait_for_event(&srv_rx, Duration::from_secs(30), |ev| {
+            if let NetEvent::PinRotated { pin_display, .. } = ev {
+                Some(pin_display.clone())
             } else {
                 None
             }
         });
-        let (node_id, secret, addrs) =
-            crate::manual_code::decode(&code).expect("displayed pairing code is valid");
+        let canonical_pin =
+            crate::pin::normalize_pin(&pin_display).expect("displayed PIN is valid");
 
         let (cli_tx, cli_rx) = std::sync::mpsc::channel();
         let cli_session = start_session(
-            SessionKind::Client(DialSpec::Manual {
-                node_id,
-                secret,
-                addrs,
+            SessionKind::Client(DialSpec::Pin {
+                canonical_pin,
+                relays: Vec::new(),
+                channel: PinChannel::LanOnly,
+                target_ip: None,
             }),
             EventSender::new(cli_tx, None),
             None,
@@ -1985,58 +1978,14 @@ mod tests {
         stop_session(&mut srv).await;
     }
 
-    /// A client presenting the wrong session secret is rejected with a fatal
-    /// auth error.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn manual_mode_rejects_wrong_secret() {
-        let _ = env_logger::builder().is_test(true).try_init();
-
-        let (srv_tx, srv_rx) = std::sync::mpsc::channel();
-        let srv_session = start_session(
-            SessionKind::Server(ServerMode::Manual),
-            EventSender::new(srv_tx, None),
-            None,
-        );
-        let node_id = wait_for_event(&srv_rx, Duration::from_secs(30), |ev| {
-            if let NetEvent::ServerReady { node_id, .. } = ev {
-                Some(node_id.clone())
-            } else {
-                None
-            }
-        });
-
-        let (cli_tx, cli_rx) = std::sync::mpsc::channel();
-        let cli_session = start_session(
-            SessionKind::Client(DialSpec::Manual {
-                node_id,
-                secret: crate::manual_code::generate_secret(), // not the server's secret
-                addrs: Vec::new(),
-            }),
-            EventSender::new(cli_tx, None),
-            None,
-        );
-
-        let err = wait_for_event(&cli_rx, Duration::from_secs(60), |ev| {
-            if let NetEvent::Error(e) = ev {
-                Some(e.clone())
-            } else {
-                None
-            }
-        });
-        assert!(
-            err.contains("rejected"),
-            "expected an auth rejection, got: {err}"
-        );
-
-        let mut cli = Some(cli_session);
-        let mut srv = Some(srv_session);
-        stop_session(&mut cli).await;
-        stop_session(&mut srv).await;
-    }
-
-    /// A second device dialing a server that is already paired with someone
+    /// A second device dialing a server that is already pairing with someone
     /// else is refused promptly with a fatal "busy" error (a `SERVER_BUSY`
-    /// close), not left hanging in the reconnect loop.
+    /// close), not left hanging in the reconnect loop. Both devices reach the
+    /// server via the LAN-only unicast side channel (loopback), started
+    /// concurrently — discovery is withdrawn once a peer pairs, so both must
+    /// fetch the record before either pairing completes. The server pairs
+    /// whichever authenticates first and refuses the other; the test is
+    /// order-agnostic about which wins.
     #[tokio::test(flavor = "multi_thread")]
     async fn busy_server_refuses_a_third_device() {
         let _ = env_logger::builder().is_test(true).try_init();
@@ -2044,65 +1993,51 @@ mod tests {
         // Server.
         let (srv_tx, srv_rx) = std::sync::mpsc::channel();
         let srv_session = start_session(
-            SessionKind::Server(ServerMode::Manual),
+            SessionKind::Server(ServerMode::Pin {
+                relays: Vec::new(),
+                channel: PinChannel::LanOnly,
+            }),
             EventSender::new(srv_tx, None),
             None,
         );
-        let code = wait_for_event(&srv_rx, Duration::from_secs(30), |ev| {
-            if let NetEvent::ServerReady {
-                pairing_code: Some(code),
-                ..
-            } = ev
-            {
-                Some(code.clone())
+        let pin_display = wait_for_event(&srv_rx, Duration::from_secs(30), |ev| {
+            if let NetEvent::PinRotated { pin_display, .. } = ev {
+                Some(pin_display.clone())
             } else {
                 None
             }
         });
-        let (node_id, secret, addrs) =
-            crate::manual_code::decode(&code).expect("displayed pairing code is valid");
+        let canonical_pin =
+            crate::pin::normalize_pin(&pin_display).expect("displayed PIN is valid");
+        let dial = || DialSpec::Pin {
+            canonical_pin: canonical_pin.clone(),
+            relays: Vec::new(),
+            channel: PinChannel::LanOnly,
+            target_ip: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+        };
 
-        // First device pairs and holds the claim.
+        // Both devices dial concurrently — both fetch the record before either
+        // pairing completes (the pairing handshake far outlasts a loopback fetch).
         let (a_tx, a_rx) = std::sync::mpsc::channel();
-        let a_session = start_session(
-            SessionKind::Client(DialSpec::Manual {
-                node_id: node_id.clone(),
-                secret: secret.clone(),
-                addrs: addrs.clone(),
-            }),
-            EventSender::new(a_tx, None),
-            None,
-        );
-        wait_for_event(&a_rx, Duration::from_secs(60), |ev| {
-            matches!(ev, NetEvent::Status(ConnStatus::Connected)).then_some(())
-        });
-        wait_for_event(&srv_rx, Duration::from_secs(30), |ev| {
-            matches!(ev, NetEvent::Status(ConnStatus::Connected)).then_some(())
-        });
-
-        // Second device dials the same server with the same (valid) secret —
-        // but a different node identity, so it must be turned away as busy.
+        let a_session = start_session(SessionKind::Client(dial()), EventSender::new(a_tx, None), None);
         let (b_tx, b_rx) = std::sync::mpsc::channel();
-        let b_session = start_session(
-            SessionKind::Client(DialSpec::Manual {
-                node_id,
-                secret,
-                addrs,
-            }),
-            EventSender::new(b_tx, None),
-            None,
-        );
-        let err = wait_for_event(&b_rx, Duration::from_secs(60), |ev| {
-            if let NetEvent::Error(e) = ev {
-                Some(e.clone())
-            } else {
-                None
+        let b_session = start_session(SessionKind::Client(dial()), EventSender::new(b_tx, None), None);
+
+        // Exactly one pairs; the other is turned away as busy. Watch both.
+        let start = Instant::now();
+        let (mut connected, mut busy) = (false, false);
+        while start.elapsed() < Duration::from_secs(90) && !(connected && busy) {
+            for rx in [&a_rx, &b_rx] {
+                match rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(NetEvent::Status(ConnStatus::Connected)) => connected = true,
+                    Ok(NetEvent::Error(e)) if e.contains("another device") => busy = true,
+                    Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
             }
-        });
-        assert!(
-            err.contains("another device"),
-            "expected a busy/already-paired rejection, got: {err}"
-        );
+        }
+        assert!(connected, "one device must pair");
+        assert!(busy, "the other device must be refused as busy");
 
         let mut a = Some(a_session);
         let mut b = Some(b_session);

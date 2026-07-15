@@ -69,19 +69,14 @@ pub enum ServerMode {
     NostrToken { identity: TokenIdentity },
     /// Rotating-PIN quick mode: publish the rendezvous record under per-bucket
     /// PIN-derived keys on the selected channel(s); in-band PIN
-    /// challenge-response auth.
+    /// challenge-response auth. On the LAN-only channel the host additionally
+    /// runs a unicast side-channel listener (see `crate::lan::unicast`) serving
+    /// the same PIN-encrypted record, so a joiner who types the host's LAN IP
+    /// can pair where multicast is blocked.
     Pin {
         relays: Vec<String>,
         channel: PinChannel,
     },
-    /// Manual/offline mode: no signaling at all. The server displays a single
-    /// pairing code — its node id, a fresh session secret, and its direct
-    /// socket addresses (see `crate::manual_code`, reported via
-    /// [`NetEvent::ServerReady`]) — which the user carries to the other device
-    /// out of band. Auth is the same in-band PIN challenge-response as the PIN
-    /// mode. The embedded addresses (plus mDNS on desktop) make this work with
-    /// zero internet, even where mDNS is blocked.
-    Manual,
 }
 
 /// What the client dials.
@@ -97,19 +92,17 @@ pub enum DialSpec {
     },
     /// Resolve via the rotating-PIN rendezvous on the selected channel(s) —
     /// racing them when both are enabled — then prove PIN possession in-band.
+    ///
+    /// `target_ip` is only meaningful on the LAN-only channel: `Some(ip)` fetches
+    /// the PIN-encrypted node-id record from the host's unicast side channel at
+    /// that IP (the joiner typed it — works where multicast is blocked); `None`
+    /// resolves via mDNS as before. The side-channel port is derived from the
+    /// PIN's rendezvous key (see `crate::lan`), so no port is ever typed.
     Pin {
         canonical_pin: String,
         relays: Vec<String>,
         channel: PinChannel,
-    },
-    /// Dial the node id carried by a pasted pairing code and prove its session
-    /// secret in-band (the same PIN challenge-response as the PIN mode). The
-    /// code's embedded direct addresses are dialed as-is, so this works with
-    /// no discovery at all — the fallback when mDNS is blocked on the network.
-    Manual {
-        node_id: String,
-        secret: String,
-        addrs: Vec<std::net::SocketAddr>,
+        target_ip: Option<std::net::IpAddr>,
     },
 }
 
@@ -166,13 +159,11 @@ pub enum ConnStatus {
 /// Events from the networking runtime to the UI thread.
 #[derive(Debug)]
 pub enum NetEvent {
-    /// Server endpoint is up. `pairing_code` is set in manual mode (the code
-    /// the user carries to the other device); `token_fingerprint` is set in
-    /// configure mode (the standing secret's).
+    /// Server endpoint is up. `token_fingerprint` is set in configure mode (the
+    /// standing secret's).
     ServerReady {
         node_id: String,
         token_fingerprint: Option<String>,
-        pairing_code: Option<String>,
     },
     /// Client endpoint is online. Token mode includes the fingerprint so the
     /// connector retains the same identity details as the initiator screen.
@@ -181,9 +172,12 @@ pub enum NetEvent {
         token_fingerprint: Option<String>,
     },
     /// PIN quick mode: a fresh PIN was minted (display form, `XXXX-XXXX`).
+    /// `host_lan_ip` is the host's LAN IPv4 on the LAN-only channel (so the UI
+    /// can offer it for the joiner's manual-IP side channel); `None` otherwise.
     PinRotated {
         pin_display: String,
         seconds_left: u64,
+        host_lan_ip: Option<String>,
     },
     /// PIN quick mode: paired (or stopped) — stop showing a PIN.
     PinCleared,

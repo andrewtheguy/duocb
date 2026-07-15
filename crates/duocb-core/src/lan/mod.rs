@@ -38,13 +38,17 @@
 mod dnssd;
 #[cfg(not(target_os = "ios"))]
 mod swarm;
+mod unicast;
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use anyhow::Result;
 use iroh::{EndpointAddr, EndpointId};
 use nostr_sdk::prelude::Keys;
+use sha2::{Digest, Sha256};
+
+pub use unicast::UnicastListener;
 
 /// mDNS service name; swarm records live under `_duocb-pin._udp.local.`.
 #[cfg(not(target_os = "ios"))]
@@ -69,6 +73,31 @@ const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 /// and the payload decrypt is the real verification anyway.
 fn instance_name(keys: &Keys) -> String {
     keys.public_key().to_hex()[..32].to_string()
+}
+
+/// Domain-separating salt for the unicast side-channel port derivation.
+const PORT_SALT: &[u8] = b"duocb:pin-side-channel-port:v1";
+/// First port of the IANA ephemeral/dynamic range (49152–65535).
+const EPHEMERAL_START: u16 = 49152;
+/// Size of the ephemeral range (65535 − 49152 + 1 = 16384).
+const EPHEMERAL_LEN: u16 = u16::MAX - EPHEMERAL_START + 1;
+
+/// The unicast side-channel port for a `(pin, bucket)` keypair, mapped into the ephemeral range
+/// (49152–65535). Derived from the **same Argon2-derived rendezvous public key** the mDNS
+/// [`instance_name`] label uses — not from the PIN string — so, exactly like the mDNS label,
+/// mapping a candidate PIN to its port costs an Argon2 evaluation and the open port leaks no cheap
+/// pre-filter of the PIN. The key already varies per rotation bucket, so the port does too; the
+/// joiner tries each candidate bucket's port (see `unicast::lookup`), mirroring the mDNS
+/// candidate-label match. Different PINs almost always map to different ports, so hosts on one LAN
+/// normally coexist; the range is finite (16384 ports), so a collision is possible and would make
+/// a second host's listener fail to bind on the shared port (the publisher only warns, and mDNS
+/// still carries the rendezvous).
+fn side_channel_port(keys: &Keys) -> u16 {
+    let mut hasher = Sha256::new();
+    hasher.update(PORT_SALT);
+    hasher.update(keys.public_key().to_bytes());
+    let digest = hasher.finalize();
+    EPHEMERAL_START + (u16::from_be_bytes([digest[0], digest[1]]) % EPHEMERAL_LEN)
 }
 
 /// A resolved LAN rendezvous hit: the decrypted node id plus the direct socket
@@ -181,6 +210,47 @@ pub async fn dnssd_advertise_pin_record(
 /// `Ok(None)` when no matching record answered within the browse window.
 pub async fn dnssd_lookup_pin_record(candidates: &[Keys]) -> Result<Option<PinFound>> {
     dnssd::lookup(candidates).await
+}
+
+/// Start the LAN-only channel's unicast side channel: a listener on the port
+/// derived from the record keypair ([`side_channel_port`]) serving the same
+/// PIN-encrypted node-id record, so a joiner who types the host's LAN IP can
+/// pair where multicast is blocked. Dropping the returned [`UnicastListener`]
+/// withdraws it. Runs alongside the DNS-SD advertisement (see `crate::lan::unicast`).
+pub async fn unicast_advertise_pin_record(
+    keys: &Keys,
+    node_id: &EndpointId,
+    addrs: &[SocketAddr],
+) -> Result<UnicastListener> {
+    unicast::advertise(keys, node_id, addrs).await
+}
+
+/// Fetch the LAN-only PIN record from the host's unicast side channel at `ip`,
+/// trying the port each candidate keypair derives to (adjacent buckets, as for
+/// the DNS-SD lookup). Returns the decrypted node id and the host's direct socket
+/// addresses, or `Ok(None)` when nothing reachable answered or the record did not
+/// decrypt (wrong/expired PIN).
+pub async fn unicast_lookup_pin_record(
+    ip: IpAddr,
+    candidates: &[Keys],
+) -> Result<Option<PinFound>> {
+    unicast::lookup(ip, candidates).await
+}
+
+/// Pick the host's display-worthy LAN IPv4 from its direct socket addresses: the
+/// first RFC1918 private address (10/8, 172.16/12, 192.168/16). Link-local
+/// (169.254/16), loopback, and public addresses are skipped by `is_private`.
+/// Used to show the joiner which IP to type for the unicast side channel;
+/// `None` when no private IPv4 is present (e.g. only IPv6, or a loopback-only
+/// endpoint in a same-machine test).
+pub(crate) fn preferred_lan_ipv4(addrs: &[SocketAddr]) -> Option<Ipv4Addr> {
+    addrs
+        .iter()
+        .filter_map(|a| match a.ip() {
+            IpAddr::V4(v4) => Some(v4),
+            IpAddr::V6(_) => None,
+        })
+        .find(Ipv4Addr::is_private)
 }
 
 /// DNS-SD carries a single SRV port per service instance, but iroh binds its
