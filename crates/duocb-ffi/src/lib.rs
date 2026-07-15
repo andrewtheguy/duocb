@@ -32,8 +32,10 @@
 //! key. LAN-only signaling goes through the system mDNSResponder daemon
 //! (Bonjour), so it needs no multicast entitlement — but the app must list
 //! `_duocb-pin._udp` under `NSBonjourServices` and set
-//! `NSLocalNetworkUsageDescription`. The nostr-only preset and manual mode
-//! remain desktop-only. Token/name/suffix persistence is the caller's job
+//! `NSLocalNetworkUsageDescription`. For a LAN-only PIN the joiner may also
+//! supply the host's IP (the `ip` config key) to pair over the unicast side
+//! channel where multicast is blocked. The nostr-only preset remains
+//! desktop-only. Token/name/suffix persistence is the caller's job
 //! (Keychain on iOS); mint the suffix once with [`duocb_generate_suffix`] and
 //! reuse it forever.
 //!
@@ -94,6 +96,12 @@ struct FfiConfig {
     /// user-typed form (dashes/spaces/lowercase ok).
     #[serde(default)]
     pin: Option<String>,
+    /// QuickJoin role only, and only for a LAN-only PIN: the host's LAN IPv4 as
+    /// shown on the hosting device (dotted-quad, no port). Present selects the
+    /// unicast side channel (pairs where multicast is blocked); omitted/blank
+    /// resolves via mDNS. Ignored for a non-LAN-only PIN.
+    #[serde(default)]
+    ip: Option<String>,
     /// QuickHost role only: which channel carries the rotating-PIN rendezvous.
     /// Omitted means `nostr_lan`. Ignored for QuickJoin — the join channel is
     /// read from the PIN's first character (see `duocb_core::pin`).
@@ -263,6 +271,24 @@ pub unsafe extern "C" fn duocb_normalize_pin(
     if write_cstr(out_buf, out_len, &canonical) { 1 } else { -1 }
 }
 
+/// Whether a quick-pair PIN is a LAN-only PIN (its first character encodes the
+/// channel — see `duocb_core::pin`). The Swift UI uses this to reveal the
+/// optional host-IP field on join. `pin` is normalized first, so any user-typed
+/// form is accepted. Returns 1 = LAN-only, 0 = not LAN-only (or the PIN is
+/// invalid/incomplete), -1 = NULL/non-UTF-8 input.
+/// # Safety
+/// `pin` must be NULL or a valid NUL-terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn duocb_pin_is_lan_only(pin: *const c_char) -> c_int {
+    let Some(pin) = (unsafe { cstr_arg(pin) }) else {
+        return -1;
+    };
+    match duocb_core::pin::normalize_pin(pin) {
+        Some(canonical) if duocb_core::pin::pin_is_lan_only(&canonical) => 1,
+        _ => 0,
+    }
+}
+
 /// Start a session (configure or quick mode, per the config's `role`).
 /// Returns a non-NULL handle, or NULL with the error message written to
 /// `err_buf`.
@@ -364,10 +390,20 @@ fn build_initial_commands(cfg: FfiConfig) -> Result<(Option<TokenIdentity>, UiCo
             // The join channel is not configured — it is read from the PIN's
             // first character (a LAN-only PIN uses the DNS-SD path, anything
             // else the nostr+LAN race). The `channel` config key is ignored here.
-            let channel = if duocb_core::pin::pin_is_lan_only(&canonical_pin) {
+            let lan_only = duocb_core::pin::pin_is_lan_only(&canonical_pin);
+            let channel = if lan_only {
                 PinChannel::LanOnly
             } else {
                 PinChannel::NostrAndLan
+            };
+            // An optional host IP selects the unicast side channel — only for a
+            // LAN-only PIN, and only when a well-formed IPv4 is supplied.
+            let target_ip = match cfg.ip.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                Some(ip) if lan_only => Some(std::net::IpAddr::V4(
+                    ip.parse::<std::net::Ipv4Addr>()
+                        .map_err(|_| "invalid host IP (enter the IPv4 address shown on the other device)")?,
+                )),
+                _ => None,
             };
             return Ok((
                 None,
@@ -376,6 +412,7 @@ fn build_initial_commands(cfg: FfiConfig) -> Result<(Option<TokenIdentity>, UiCo
                         canonical_pin,
                         relays,
                         channel,
+                        target_ip,
                     },
                 },
             ));
@@ -589,10 +626,14 @@ fn event_json(event: &NetEvent) -> String {
         NetEvent::PinRotated {
             pin_display,
             seconds_left,
+            host_lan_ip,
         } => json!({
             "type": "pin_rotated",
             "pin_display": pin_display,
             "seconds_left": seconds_left,
+            // The host's LAN IPv4 on the LAN-only channel (for the joiner's
+            // manual-IP side channel); null on other channels.
+            "host_lan_ip": host_lan_ip,
         }),
         // A peer paired (or the host stopped publishing) — hide the PIN.
         NetEvent::PinCleared => json!({ "type": "pin_cleared" }),
@@ -833,8 +874,47 @@ mod tests {
         let (_, cmd) = build_initial_commands(cfg).unwrap();
         match cmd {
             UiCommand::Connect {
-                spec: DialSpec::Pin { channel, .. },
-            } => assert_eq!(channel, PinChannel::LanOnly),
+                spec: DialSpec::Pin { channel, target_ip, .. },
+            } => {
+                assert_eq!(channel, PinChannel::LanOnly);
+                // No `ip` key: resolve via mDNS.
+                assert!(target_ip.is_none());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn quick_join_ip_selects_the_side_channel_only_for_a_lan_only_pin() {
+        let lan_pin = duocb_core::pin::generate_pin(true);
+
+        // A valid IPv4 with a LAN-only PIN selects the unicast side channel.
+        let json = format!(r#"{{"role":"quick_join","pin":"{lan_pin}","ip":"192.168.1.42"}}"#);
+        let cfg: FfiConfig = serde_json::from_str(&json).unwrap();
+        match build_initial_commands(cfg).unwrap().1 {
+            UiCommand::Connect {
+                spec: DialSpec::Pin { target_ip: Some(ip), .. },
+            } => assert_eq!(ip, "192.168.1.42".parse::<std::net::IpAddr>().unwrap()),
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        // A malformed IP is rejected.
+        let json = format!(r#"{{"role":"quick_join","pin":"{lan_pin}","ip":"not-an-ip"}}"#);
+        let cfg: FfiConfig = serde_json::from_str(&json).unwrap();
+        let err = build_initial_commands(cfg).expect_err("bad ip fails");
+        assert!(err.contains("host IP"), "unexpected error: {err}");
+
+        // The IP is ignored for a non-LAN-only PIN (the field is hidden there).
+        let net_pin = duocb_core::pin::generate_pin(false);
+        let json = format!(r#"{{"role":"quick_join","pin":"{net_pin}","ip":"192.168.1.42"}}"#);
+        let cfg: FfiConfig = serde_json::from_str(&json).unwrap();
+        match build_initial_commands(cfg).unwrap().1 {
+            UiCommand::Connect {
+                spec: DialSpec::Pin { channel, target_ip, .. },
+            } => {
+                assert_eq!(channel, PinChannel::NostrAndLan);
+                assert!(target_ip.is_none());
+            }
             other => panic!("unexpected command: {other:?}"),
         }
     }
@@ -866,7 +946,6 @@ mod tests {
         let json = event_json(&NetEvent::ServerReady {
             node_id: "abc".into(),
             token_fingerprint: Some("aaaa-bbbb-cccc-dddd".into()),
-            pairing_code: None,
         });
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["type"], "server_ready");
@@ -898,11 +977,13 @@ mod tests {
         let json = event_json(&NetEvent::PinRotated {
             pin_display: "AAAA-BBBB".into(),
             seconds_left: 10,
+            host_lan_ip: Some("192.168.1.42".into()),
         });
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["type"], "pin_rotated");
         assert_eq!(v["pin_display"], "AAAA-BBBB");
         assert_eq!(v["seconds_left"], 10);
+        assert_eq!(v["host_lan_ip"], "192.168.1.42");
 
         let json = event_json(&NetEvent::PinCleared);
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();

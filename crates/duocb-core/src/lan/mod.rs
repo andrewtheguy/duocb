@@ -38,13 +38,16 @@
 mod dnssd;
 #[cfg(not(target_os = "ios"))]
 mod swarm;
+mod unicast;
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use anyhow::Result;
 use iroh::{EndpointAddr, EndpointId};
 use nostr_sdk::prelude::Keys;
+
+pub use unicast::UnicastListener;
 
 /// mDNS service name; swarm records live under `_duocb-pin._udp.local.`.
 #[cfg(not(target_os = "ios"))]
@@ -181,6 +184,48 @@ pub async fn dnssd_advertise_pin_record(
 /// `Ok(None)` when no matching record answered within the browse window.
 pub async fn dnssd_lookup_pin_record(candidates: &[Keys]) -> Result<Option<PinFound>> {
     dnssd::lookup(candidates).await
+}
+
+/// Start the LAN-only channel's unicast side channel: a listener on the
+/// PIN-derived port ([`crate::pin::side_channel_port`]) serving the same
+/// PIN-encrypted node-id record, so a joiner who types the host's LAN IP can
+/// pair where multicast is blocked. Dropping the returned [`UnicastListener`]
+/// withdraws it. Runs alongside the DNS-SD advertisement (see `crate::lan::unicast`).
+pub async fn unicast_advertise_pin_record(
+    pin: &str,
+    keys: &Keys,
+    node_id: &EndpointId,
+    addrs: &[SocketAddr],
+) -> Result<UnicastListener> {
+    unicast::advertise(pin, keys, node_id, addrs).await
+}
+
+/// Fetch the LAN-only PIN record from the host's unicast side channel at `ip`
+/// (port derived from `pin`). Returns the decrypted node id and the host's direct
+/// socket addresses, or `Ok(None)` when nothing reachable answered or the record
+/// did not decrypt (wrong/expired PIN).
+pub async fn unicast_lookup_pin_record(
+    ip: IpAddr,
+    pin: &str,
+    candidates: &[Keys],
+) -> Result<Option<PinFound>> {
+    unicast::lookup(ip, pin, candidates).await
+}
+
+/// Pick the host's display-worthy LAN IPv4 from its direct socket addresses: the
+/// first RFC1918 private address (10/8, 172.16/12, 192.168/16). Link-local
+/// (169.254/16), loopback, and public addresses are skipped by `is_private`.
+/// Used to show the joiner which IP to type for the unicast side channel;
+/// `None` when no private IPv4 is present (e.g. only IPv6, or a loopback-only
+/// endpoint in a same-machine test).
+pub(crate) fn preferred_lan_ipv4(addrs: &[SocketAddr]) -> Option<Ipv4Addr> {
+    addrs
+        .iter()
+        .filter_map(|a| match a.ip() {
+            IpAddr::V4(v4) => Some(v4),
+            IpAddr::V6(_) => None,
+        })
+        .find(Ipv4Addr::is_private)
 }
 
 /// DNS-SD carries a single SRV port per service instance, but iroh binds its

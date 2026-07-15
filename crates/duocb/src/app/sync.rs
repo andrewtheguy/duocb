@@ -51,7 +51,6 @@ impl App {
         let copied = self.copied_target();
         s.set_copied_secret(copied == Some(CopyTarget::Secret));
         s.set_copied_pin(copied == Some(CopyTarget::Pin));
-        s.set_copied_pairing_code(copied == Some(CopyTarget::PairingCode));
         let name = self.in_my_name.trim();
         match duocb_core::identity::validate_name(name) {
             Ok(()) => {
@@ -152,7 +151,7 @@ impl App {
                 .unwrap_or_default()
                 .into(),
         );
-        s.set_pairing_code(str_or_empty(&self.pairing_code));
+        s.set_host_lan_ip(str_or_empty(&self.host_lan_ip));
         s.set_pin_display(str_or_empty(&self.pin_display));
         s.set_pin_countdown(match (&self.pin_display, self.pin_deadline) {
             (Some(_), Some(deadline)) => {
@@ -181,11 +180,13 @@ impl App {
         s.set_pin_a_full(
             duocb_core::pin::pin_input_len(&self.in_pin_a) == duocb_core::pin::PIN_GROUP_LEN,
         );
-        let code = self.in_manual_code.trim();
-        s.set_manual_code_invalid(
-            !code.is_empty() && duocb_core::manual_code::decode(code).is_none(),
-        );
-        s.set_join_by_code(self.join_by_code);
+        // The optional host-IP entry shows only for a LAN-only PIN (its first
+        // character marks the channel — see `duocb_core::pin`). A non-empty entry
+        // must be a well-formed IPv4; the warning shows otherwise. `dial_ready`
+        // (below) already folds this in via `client_dial_spec`.
+        s.set_pin_is_lan_only(duocb_core::pin::pin_is_lan_only(&combined));
+        let ip = self.in_join_ip.trim();
+        s.set_join_ip_invalid(!ip.is_empty() && ip.parse::<std::net::Ipv4Addr>().is_err());
         s.set_dial_ready(self.client_dial_spec().is_some());
 
         // Session panel.
@@ -245,7 +246,7 @@ impl App {
         s.set_in_import_token(self.in_import_token.clone().into());
         s.set_in_pin_a(self.in_pin_a.clone().into());
         s.set_in_pin_b(self.in_pin_b.clone().into());
-        s.set_in_manual_code(self.in_manual_code.clone().into());
+        s.set_in_join_ip(self.in_join_ip.clone().into());
         s.set_in_compose(self.in_compose.clone().into());
     }
 }

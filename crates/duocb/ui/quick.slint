@@ -1,13 +1,13 @@
 // The quick-options screen: options first — the P/L channel choice, then the
-// testing-only extras (internet-only, manual) collapsed behind Advanced —
-// followed by the selected mode's host and join actions, both acting right
-// here. Selecting an option retargets the two action cards; nothing here is
-// persisted, and the credentials last one session.
+// testing-only extra (internet-only) collapsed behind Advanced — followed by
+// the selected mode's host and join actions, both acting right here. Selecting
+// an option retargets the two action cards; nothing here is persisted, and the
+// credentials last one session.
 
 import { UiState, Actions } from "globals.slint";
 import { PairMode, PinChannel } from "types.slint";
 import { Theme } from "theme.slint";
-import { Card, CardTitle, Weak, Small, Body, BigButton, WideButton, BackHeader, SelectableRow, JoinModeToggle } from "widgets.slint";
+import { Card, CardTitle, Weak, Small, Body, BigButton, WideButton, BackHeader, SelectableRow } from "widgets.slint";
 import { LineEdit, ScrollView } from "std-widgets.slint";
 
 component ModeRow inherits SelectableRow {
@@ -29,11 +29,7 @@ component ModeRow inherits SelectableRow {
 
 export component QuickScreen inherits ScrollView {
     out property <bool> field-focused:
-        pin-a.has-focus || pin-b.has-focus || code-entry.has-focus;
-    /// Whether the testing-only manual mode is the active selection — it
-    /// retitles the host card and swaps the join card's entry to the
-    /// pairing-code paste field.
-    property <bool> manual: UiState.mode == PairMode.manual;
+        pin-a.has-focus || pin-b.has-focus || ip-entry.has-focus;
     viewport-width: root.width;
     viewport-height: max(root.height, content.preferred-height);
     horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
@@ -66,7 +62,7 @@ export component QuickScreen inherits ScrollView {
                 clicked => { Actions.set-pin-channel(PinChannel.lan-only); }
             }
             Small {
-                text: "Private means no third-party server participates: discovery is a Bonjour (DNS-SD) service on the local network only and traffic is always direct between the devices, never relayed. Pairs with the iOS app's \"Local network only\" channel. LAN-only is not a packet-level subnet boundary; reflected mDNS, a VPN/overlay, or globally routed addresses can extend the direct path beyond a conventional LAN. The PIN shown here encodes this choice, so the joiner just types it — no need to pick a channel on both devices.";
+                text: "Private means no third-party server participates: discovery is a Bonjour (DNS-SD) service on the local network only and traffic is always direct between the devices, never relayed. Pairs with the iOS app's \"Local network only\" channel. If multicast is blocked, the joiner can instead type the host's IP (shown on this device when hosting). LAN-only is not a packet-level subnet boundary; reflected mDNS, a VPN/overlay, or globally routed addresses can extend the direct path beyond a conventional LAN. The PIN shown here encodes this choice, so the joiner just types it — no need to pick a channel on both devices.";
             }
         }
 
@@ -96,114 +92,103 @@ export component QuickScreen inherits ScrollView {
             if UiState.quick-advanced-open: Small {
                 text: "Finds the peer through a nostr relay only — its PIN is never advertised on the local network — so pairing needs the internet. The connection itself still uses iroh's default paths, so it can take a direct local route when both devices share a network.";
             }
-            if UiState.quick-advanced-open: ModeRow {
-                demoted: true;
-                text: "M  Manual";
-                selected: UiState.mode == PairMode.manual;
-                clicked => { Actions.select-manual(); }
-            }
-            if UiState.quick-advanced-open: Small {
-                text: "No discovery at all: copy one pairing code between the devices out of band — on the same network or across the internet. Verifies connectivity with zero signaling.";
-            }
         }
 
         Card {
-            CardTitle { text: root.manual ? "Show a pairing code" : "Show a PIN"; }
+            CardTitle { text: "Show a PIN"; }
             BigButton {
-                text: root.manual
-                    ? "📡 Show a pairing code on this device"
-                    : "📡 Show a PIN on this device";
+                text: "📡 Show a PIN on this device";
                 hint: "S";
                 clicked => { Actions.begin-server(); }
             }
             Small {
-                text: root.manual
-                    ? "A pairing code appears on this device. Copy it and send it to the other device over any channel you trust; it stays valid for the whole session."
-                    : "A short PIN appears on this device. Enter it on the other device within a minute — it renews every 60 seconds until a device pairs.";
+                text: "A short PIN appears on this device. Enter it on the other device within a minute — it renews every 60 seconds until a device pairs.";
             }
         }
 
         // Joining is independent of the choices above: type the PIN shown on the
-        // other device, or (via the toggle) paste a manual pairing code. The
-        // channel/mode is read from the entry itself, never picked. PIN is the
-        // default; the toggle picks which entry shows and which the join reads.
+        // other device. The channel is read from the PIN's first character, never
+        // picked. For a LAN-only PIN an optional host-IP field appears — fill it
+        // only when automatic discovery (mDNS) is blocked on the network.
         Card {
-            CardTitle { text: UiState.join-by-code ? "Enter a pairing code" : "Enter a PIN"; }
-            JoinModeToggle { }
-            // Both entries stay instantiated (visibility-toggled) so their fields
-            // can report focus for shortcut gating; only the active one is shown
-            // and sized.
-            forms := Rectangle {
-                height: UiState.join-by-code ? manual-form.preferred-height : pin-form.preferred-height;
+            CardTitle { text: "Enter a PIN"; }
 
-                pin-form := VerticalLayout {
-                    visible: !UiState.join-by-code;
+            pin-form := VerticalLayout {
+                alignment: start;
+                spacing: Theme.pad-xs;
+                // Two four-character groups (dash as a static label,
+                // auto-advance, backspace hop); Enter in either group joins.
+                HorizontalLayout {
                     alignment: start;
                     spacing: Theme.pad-xs;
-                    // Two four-character groups (dash as a static label,
-                    // auto-advance, backspace hop); Enter in either group joins.
-                    HorizontalLayout {
-                        alignment: start;
-                        spacing: Theme.pad-xs;
-                        pin-a := LineEdit {
-                            min-width: 96px;
-                            horizontal-alignment: center;
-                            font-family: UiState.mono-font;
-                            placeholder-text: "XXXX";
-                            text <=> UiState.in-pin-a;
-                            edited => {
-                                Actions.fields-edited();
-                                if UiState.pin-a-full { pin-b.focus(); }
-                            }
-                            accepted => { Actions.join-quick(); }
+                    pin-a := LineEdit {
+                        min-width: 96px;
+                        horizontal-alignment: center;
+                        font-family: UiState.mono-font;
+                        placeholder-text: "XXXX";
+                        text <=> UiState.in-pin-a;
+                        edited => {
+                            Actions.fields-edited();
+                            if UiState.pin-a-full { pin-b.focus(); }
                         }
-                        Text {
-                            text: "-";
-                            vertical-alignment: center;
-                            font-size: Theme.font-pin;
-                        }
-                        pin-b := LineEdit {
-                            min-width: 96px;
-                            horizontal-alignment: center;
-                            font-family: UiState.mono-font;
-                            placeholder-text: "XXXX";
-                            text <=> UiState.in-pin-b;
-                            edited => { Actions.fields-edited(); }
-                            key-pressed(event) => {
-                                if event.text == Key.Backspace && self.text == "" {
-                                    pin-a.focus();
-                                    EventResult.accept
-                                } else {
-                                    EventResult.reject
-                                }
-                            }
-                            accepted => { Actions.join-quick(); }
-                        }
+                        accepted => { Actions.join-quick(); }
                     }
-                    // Neutral progress while typing; a warning only once the
-                    // whole PIN is in but fails its checksum.
-                    if UiState.pin-incomplete != "": Weak {
-                        text: UiState.pin-incomplete;
+                    Text {
+                        text: "-";
+                        vertical-alignment: center;
+                        font-size: Theme.font-pin;
                     }
-                    if UiState.pin-invalid: Text {
-                        text: "Not a valid PIN (check for typos)";
-                        color: Theme.warn;
-                        font-size: Theme.font-body;
+                    pin-b := LineEdit {
+                        min-width: 96px;
+                        horizontal-alignment: center;
+                        font-family: UiState.mono-font;
+                        placeholder-text: "XXXX";
+                        text <=> UiState.in-pin-b;
+                        edited => { Actions.fields-edited(); }
+                        key-pressed(event) => {
+                            if event.text == Key.Backspace && self.text == "" {
+                                pin-a.focus();
+                                EventResult.accept
+                            } else {
+                                EventResult.reject
+                            }
+                        }
+                        accepted => { Actions.join-quick(); }
                     }
                 }
+                // Neutral progress while typing; a warning only once the whole
+                // PIN is in but fails its checksum.
+                if UiState.pin-incomplete != "": Weak {
+                    text: UiState.pin-incomplete;
+                }
+                if UiState.pin-invalid: Text {
+                    text: "Not a valid PIN (check for typos)";
+                    color: Theme.warn;
+                    font-size: Theme.font-body;
+                }
+            }
 
-                manual-form := VerticalLayout {
-                    visible: UiState.join-by-code;
+            // Optional host-IP entry, revealed only for a LAN-only PIN. Kept
+            // instantiated (so `ip-entry` can report focus for shortcut gating)
+            // and collapsed to zero height when hidden.
+            ip-wrap := Rectangle {
+                height: UiState.pin-is-lan-only ? ip-col.preferred-height : 0px;
+                clip: true;
+                ip-col := VerticalLayout {
                     alignment: start;
                     spacing: Theme.pad-xs;
-                    code-entry := LineEdit {
-                        placeholder-text: "Paste a pairing code…";
-                        text <=> UiState.in-manual-code;
+                    Small {
+                        text: "Optional — only if the other device isn't found automatically. Type the IP it shows.";
+                    }
+                    ip-entry := LineEdit {
+                        font-family: UiState.mono-font;
+                        placeholder-text: "192.168.1.42";
+                        text <=> UiState.in-join-ip;
                         edited => { Actions.fields-edited(); }
                         accepted => { Actions.join-quick(); }
                     }
-                    if UiState.manual-code-invalid: Text {
-                        text: "Not a complete pairing code (check for missing characters)";
+                    if UiState.join-ip-invalid: Text {
+                        text: "Not a valid IPv4 address";
                         color: Theme.warn;
                         font-size: Theme.font-body;
                     }
@@ -216,9 +201,7 @@ export component QuickScreen inherits ScrollView {
                 clicked => { Actions.join-quick(); }
             }
             Small {
-                text: UiState.join-by-code
-                    ? "Paste the pairing code copied from the hosting device."
-                    : "Type the PIN shown on the hosting device.";
+                text: "Type the PIN shown on the hosting device.";
             }
         }
     }

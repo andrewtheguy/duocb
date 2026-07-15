@@ -45,7 +45,6 @@ export global UiState {
     // (inbox/outbox rows carry their own `copied` flag in ClipRow).
     in property <bool> copied-secret;
     in property <bool> copied-pin;
-    in property <bool> copied-pairing-code;
     in property <bool> name-valid;
     /// "Broadcast as" preview when the name is valid, "" otherwise.
     in property <string> name-preview;
@@ -76,9 +75,9 @@ export global UiState {
     /// The fingerprint shown in the pairing summary (session token, or the
     /// standing secret's).
     in property <string> session-fingerprint;
-    /// Manual mode's out-of-band credential (node id + session secret in one
-    /// copyable string), "" outside manual hosting.
-    in property <string> pairing-code;
+    /// The host's LAN IPv4 on the LAN-only channel (so the joiner can type it
+    /// for the manual-IP side channel), "" on other channels / before it's known.
+    in property <string> host-lan-ip;
     in property <string> pin-display;
     /// "refreshes in 42s", composed in Rust; "" while no PIN shows.
     in property <string> pin-countdown;
@@ -94,8 +93,11 @@ export global UiState {
     /// True once the first PIN group is full, so the entry auto-advances focus
     /// to the second group (Apple-style code entry).
     in property <bool> pin-a-full;
-    /// True when the pairing-code entry is non-empty but not a valid code.
-    in property <bool> manual-code-invalid;
+    /// True when the typed PIN is LAN-only (its first character), so the join
+    /// card reveals the optional host-IP field.
+    in property <bool> pin-is-lan-only;
+    /// True when the host-IP entry is non-empty but not a well-formed IPv4.
+    in property <bool> join-ip-invalid;
     in property <bool> dial-ready;
 
     // Session panel.
@@ -117,11 +119,9 @@ export global UiState {
     in-out property <string> in-import-token;
     in-out property <string> in-pin-a;
     in-out property <string> in-pin-b;
-    in-out property <string> in-manual-code;
+    /// The joiner's optional host-IP entry (shown only for a LAN-only PIN).
+    in-out property <string> in-join-ip;
     in-out property <string> in-compose;
-    /// Quick join entry: false shows the PIN fields (default), true the
-    /// pairing-code field. Also selects which credential the join reads.
-    in property <bool> join-by-code;
 }
 
 export global Actions {
@@ -153,19 +153,14 @@ export global Actions {
 
     // Quick options / client.
     callback set-pin-channel(channel: PinChannel);
-    /// Select the advanced manual mode (the quick screen's M row).
-    callback select-manual();
     callback toggle-quick-advanced();
-    /// Switch the join entry between the PIN fields and the pairing-code field.
-    callback set-join-by-code(by-code: bool);
-    /// Dial whatever the quick screen's join entry holds (PIN or pairing
-    /// code, per the selected mode), moving to the client screen.
+    /// Dial what the quick screen's join entry holds (the typed PIN, plus an
+    /// optional host IP for a LAN-only PIN), moving to the client screen.
     callback join-quick();
     callback connect-client();
     callback disconnect();
 
     // Server credentials.
-    callback copy-pairing-code();
     callback copy-pin();
     callback refresh-pin();
 

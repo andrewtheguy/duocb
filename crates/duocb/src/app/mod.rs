@@ -79,9 +79,10 @@ pub(crate) struct App {
     // Server presentation state.
     pub(crate) server_running: bool,
     pub(crate) node_id: Option<String>,
-    /// Manual mode's out-of-band credential (node id + session secret in one
-    /// copyable string); stays valid for the whole server session.
-    pub(crate) pairing_code: Option<String>,
+    /// The host's LAN IPv4 on the LAN-only channel, surfaced so the joiner can
+    /// type it for the manual-IP side channel (from [`NetEvent::PinRotated`]);
+    /// `None` on other channels or before an address is known.
+    pub(crate) host_lan_ip: Option<String>,
     pub(crate) token_fingerprint: Option<String>,
     pub(crate) pin_display: Option<String>,
     pub(crate) pin_deadline: Option<Instant>,
@@ -100,11 +101,11 @@ pub(crate) struct App {
     /// each) so grouping never edits a field's text mid-keystroke.
     pub(crate) in_pin_a: String,
     pub(crate) in_pin_b: String,
-    pub(crate) in_manual_code: String,
-    /// Which join entry the quick screen shows: PIN (default) or a pasted
-    /// pairing code. A toggle flips it; it also selects which credential
-    /// [`App::quick_dial_spec`] reads.
-    pub(crate) join_by_code: bool,
+    /// The joiner's optional host-IP entry, shown only for a LAN-only PIN. When
+    /// non-empty it must parse as an IPv4 for the dial to be ready, and selects
+    /// the unicast side channel (see [`App::quick_dial_spec`]); blank resolves
+    /// via mDNS.
+    pub(crate) in_join_ip: String,
     /// Draft of the session panel's compose field (send typed text).
     pub(crate) in_compose: String,
 
@@ -134,7 +135,6 @@ pub(crate) struct App {
 pub(crate) enum CopyTarget {
     Secret,
     Pin,
-    PairingCode,
     Outbox,
     Inbox(usize),
 }
@@ -200,7 +200,7 @@ impl App {
             confirm_clear_secret: false,
             server_running: false,
             node_id: None,
-            pairing_code: None,
+            host_lan_ip: None,
             token_fingerprint: None,
             pin_display: None,
             pin_deadline: None,
@@ -210,8 +210,7 @@ impl App {
             in_import_token: String::new(),
             in_pin_a: String::new(),
             in_pin_b: String::new(),
-            in_manual_code: String::new(),
-            join_by_code: false,
+            in_join_ip: String::new(),
             in_compose: String::new(),
             peer_node_id: None,
             conn_path: None,
@@ -242,11 +241,9 @@ impl App {
             NetEvent::ServerReady {
                 node_id,
                 token_fingerprint,
-                pairing_code,
             } => {
                 self.node_id = Some(node_id);
                 self.token_fingerprint = token_fingerprint;
-                self.pairing_code = pairing_code;
             }
             NetEvent::ClientReady {
                 node_id,
@@ -258,10 +255,12 @@ impl App {
             NetEvent::PinRotated {
                 pin_display,
                 seconds_left,
+                host_lan_ip,
             } => {
                 self.pin_display = Some(pin_display);
                 self.pin_deadline = Some(Instant::now() + Duration::from_secs(seconds_left));
                 self.pin_paired = false;
+                self.host_lan_ip = host_lan_ip;
             }
             NetEvent::PinCleared => {
                 if self.pin_display.take().is_some() {
@@ -278,7 +277,7 @@ impl App {
                     self.server_running = false;
                     self.client_active = false;
                     self.node_id = None;
-                    self.pairing_code = None;
+                    self.host_lan_ip = None;
                     self.token_fingerprint = None;
                     self.joined_peer = None;
                     self.pin_display = None;
@@ -292,11 +291,6 @@ impl App {
             }
             NetEvent::PeerPaired { peer_node_id } => {
                 self.peer_node_id = Some(peer_node_id);
-                // The pairing code stays valid for the whole server session —
-                // the paired peer can reconnect with it — so keep it copyable on
-                // the initiator (it is cleared only when the session ends, in the
-                // Idle branch above). Drop the joiner's pasted copy now it's paired.
-                self.in_manual_code.clear();
             }
             NetEvent::PeerDisconnected => {
                 self.peer_node_id = None;
@@ -710,7 +704,7 @@ impl App {
         self.net.send(UiCommand::SetPresence { identity: None });
     }
 
-    /// Open the quick-options screen (ad-hoc PIN/manual pairing).
+    /// Open the quick-options screen (ad-hoc rotating-PIN pairing).
     pub(crate) fn open_quick(&mut self) {
         self.screen = Screen::Quick;
         // Home implies configure mode; entering the quick screen picks its
@@ -724,17 +718,16 @@ impl App {
     }
 
     /// Select the PIN rendezvous channel (the quick screen's P/L/I rows); it
-    /// applies to both the host and join actions there. Also leaves manual
-    /// mode, so the rows and the M row act as one radio group.
+    /// applies to both the host and join actions there.
     pub(crate) fn set_pin_channel(&mut self, channel: PinChannel) {
         self.mode = PairMode::NostrPin;
         self.pin_channel = channel;
     }
 
-    /// Quick join: dial whatever the quick screen's join entry holds (PIN or
-    /// pairing code, per the selected mode) and move to the client screen. A
-    /// no-op while the entry doesn't validate (the Join action is disabled
-    /// then — see `dial-ready`).
+    /// Quick join: dial what the quick screen's join entry holds (the typed PIN,
+    /// plus an optional host IP for a LAN-only PIN) and move to the client
+    /// screen. A no-op while the entry doesn't validate (the Join action is
+    /// disabled then — see `dial-ready`).
     pub(crate) fn join_quick(&mut self) {
         if self.client_dial_spec().is_some() {
             self.connect_client();
@@ -743,12 +736,11 @@ impl App {
     }
 
     /// Whether the current quick-mode selection is one of the "uncommon"
-    /// (testing-leaning) options — internet-only PIN discovery, or manual mode.
+    /// (testing-leaning) options — currently only internet-only PIN discovery.
     /// Used to keep the quick screen's uncommon section open while such an
     /// option is active, so the live choice is never hidden.
     pub(crate) fn quick_uncommon_selected(&self) -> bool {
-        self.mode == PairMode::Manual
-            || (self.mode == PairMode::NostrPin && self.pin_channel == PinChannel::NostrOnly)
+        self.mode == PairMode::NostrPin && self.pin_channel == PinChannel::NostrOnly
     }
 
     /// Whether the quick screen's uncommon section should render open.
@@ -763,9 +755,7 @@ impl App {
     pub(crate) fn go_back(&mut self) {
         self.stop_session();
         self.screen = match (self.screen, self.mode) {
-            (Screen::Server | Screen::Client, PairMode::NostrPin | PairMode::Manual) => {
-                Screen::Quick
-            }
+            (Screen::Server | Screen::Client, PairMode::NostrPin) => Screen::Quick,
             _ => {
                 self.mode = PairMode::NostrToken;
                 Screen::Home
@@ -804,7 +794,6 @@ impl App {
                 relays: default_relays(),
                 channel: self.core_pin_channel(),
             }),
-            PairMode::Manual => Some(ServerMode::Manual),
         }
     }
 
@@ -819,37 +808,38 @@ impl App {
                 identity: self.token_identity()?,
                 peer_display: self.selected_peer_display()?,
             }),
-            PairMode::NostrPin | PairMode::Manual => self.quick_dial_spec(),
+            PairMode::NostrPin => self.quick_dial_spec(),
         }
     }
 
-    /// The quick-join dial spec, derived purely from the active join entry —
-    /// never from the show-side P/L/I/M choice. The [`App::join_by_code`] toggle
-    /// selects which credential is read: a pasted pairing code, or the typed PIN
-    /// (whose first character selects the channel; see `duocb_core::pin`). `None`
-    /// when that entry is not a valid, complete credential.
+    /// The quick-join dial spec, derived purely from the join entry — never from
+    /// the show-side P/L/I choice. The typed PIN's first character selects the
+    /// channel (see `duocb_core::pin`); for a LAN-only PIN an optional typed host
+    /// IP selects the unicast side channel (blank resolves via mDNS). `None` when
+    /// the PIN is incomplete/invalid, or a typed IP is not a well-formed IPv4 —
+    /// which is what keeps the Join button disabled.
     fn quick_dial_spec(&self) -> Option<duocb_core::net::DialSpec> {
         use duocb_core::net::{DialSpec, PinChannel as Core};
-        if self.join_by_code {
-            return duocb_core::manual_code::decode(&self.in_manual_code).map(
-                |(node_id, secret, addrs)| DialSpec::Manual {
-                    node_id,
-                    secret,
-                    addrs,
-                },
-            );
-        }
         let canonical_pin =
             duocb_core::pin::normalize_pin(&format!("{}{}", self.in_pin_a, self.in_pin_b))?;
-        let channel = if duocb_core::pin::pin_is_lan_only(&canonical_pin) {
-            Core::LanOnly
+        let lan_only = duocb_core::pin::pin_is_lan_only(&canonical_pin);
+        let channel = if lan_only { Core::LanOnly } else { Core::NostrAndLan };
+        // The host-IP field only applies to a LAN-only PIN. When present it must
+        // be a well-formed IPv4 (matching the v4-only side-channel listener), or
+        // the spec is `None` and Join stays disabled.
+        let target_ip = if lan_only {
+            match self.in_join_ip.trim() {
+                "" => None,
+                ip => Some(std::net::IpAddr::V4(ip.parse::<std::net::Ipv4Addr>().ok()?)),
+            }
         } else {
-            Core::NostrAndLan
+            None
         };
         Some(DialSpec::Pin {
             canonical_pin,
             relays: default_relays(),
             channel,
+            target_ip,
         })
     }
 
@@ -1166,7 +1156,7 @@ pub(crate) mod tests {
         assert_eq!(app.configure_step, ConfigureStep::Ready);
 
         app.screen = Screen::Quick;
-        app.mode = PairMode::Manual;
+        app.mode = PairMode::NostrPin;
         app.go_back();
         assert_eq!(app.screen, Screen::Home);
         assert_eq!(app.mode, PairMode::NostrToken);
@@ -1238,25 +1228,49 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn join_entry_toggle_selects_which_credential_is_read() {
+    fn join_ip_selects_the_side_channel_for_a_lan_only_pin() {
+        use duocb_core::net::{DialSpec, PinChannel as Core};
         let g = duocb_core::pin::PIN_GROUP_LEN;
         let mut app = test_app();
         app.mode = PairMode::NostrPin;
-        let canonical = duocb_core::pin::generate_pin(false);
-        app.in_pin_a = canonical[..g].to_string();
-        app.in_pin_b = canonical[g..].to_string();
+        let lan_pin = duocb_core::pin::generate_pin(true);
+        app.in_pin_a = lan_pin[..g].to_string();
+        app.in_pin_b = lan_pin[g..].to_string();
 
-        // Default (PIN) entry: the typed PIN drives the dial.
-        assert!(!app.join_by_code);
-        assert!(matches!(
-            app.client_dial_spec(),
-            Some(duocb_core::net::DialSpec::Pin { .. })
-        ));
+        // No IP typed: a LAN-only PIN resolves via mDNS (target_ip None).
+        match app.client_dial_spec() {
+            Some(DialSpec::Pin { channel, target_ip, .. }) => {
+                assert_eq!(channel, Core::LanOnly);
+                assert!(target_ip.is_none(), "blank IP means mDNS");
+            }
+            other => panic!("unexpected dial spec: {other:?}"),
+        }
 
-        // Switched to the code entry: the PIN is ignored and, with no code
-        // entered, there is nothing to dial.
-        app.join_by_code = true;
+        // A well-formed IPv4 selects the unicast side channel.
+        app.in_join_ip = "192.168.1.42".to_string();
+        match app.client_dial_spec() {
+            Some(DialSpec::Pin { target_ip: Some(ip), .. }) => {
+                assert_eq!(ip, "192.168.1.42".parse::<std::net::IpAddr>().unwrap());
+            }
+            other => panic!("unexpected dial spec: {other:?}"),
+        }
+
+        // A malformed IP disables Join (no valid spec).
+        app.in_join_ip = "not-an-ip".to_string();
         assert!(app.client_dial_spec().is_none());
+
+        // The IP is ignored for a non-LAN-only PIN (the field is hidden then),
+        // so a stale value never blocks the dial.
+        let net_pin = duocb_core::pin::generate_pin(false);
+        app.in_pin_a = net_pin[..g].to_string();
+        app.in_pin_b = net_pin[g..].to_string();
+        match app.client_dial_spec() {
+            Some(DialSpec::Pin { channel, target_ip, .. }) => {
+                assert_eq!(channel, Core::NostrAndLan);
+                assert!(target_ip.is_none());
+            }
+            other => panic!("unexpected dial spec: {other:?}"),
+        }
     }
 
     #[test]

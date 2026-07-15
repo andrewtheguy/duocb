@@ -5,7 +5,7 @@
 import { UiState, Actions } from "globals.slint";
 import { PairMode } from "types.slint";
 import { Theme } from "theme.slint";
-import { Card, Body, Weak, Small, Mono, BackHeader, TokenPairingSummary, LabeledValue } from "widgets.slint";
+import { Card, Body, Weak, Small, BackHeader, TokenPairingSummary, LabeledValue } from "widgets.slint";
 import { SessionPanel } from "session.slint";
 import { Button, LineEdit, ScrollView } from "std-widgets.slint";
 
@@ -59,6 +59,18 @@ export component ServerScreen inherits ScrollView {
                 text: UiState.pin-countdown;
                 horizontal-alignment: center;
             }
+            // LAN-only channel: if the other device can't find this one
+            // automatically (multicast blocked), the joiner can type this IP.
+            if UiState.host-lan-ip != "": Small {
+                text: "Can't find it automatically? Enter this IP on the other device:";
+                horizontal-alignment: center;
+            }
+            if UiState.host-lan-ip != "": Text {
+                text: UiState.host-lan-ip;
+                font-family: UiState.mono-font;
+                font-size: Theme.font-body;
+                horizontal-alignment: center;
+            }
         }
         // Paired: the PIN is spent. Show this device's node id — the same
         // value the other device displays as "Paired with:" — so the user can
@@ -73,34 +85,6 @@ export component ServerScreen inherits ScrollView {
             && UiState.pin-display == "" && UiState.pin-paired
             && UiState.node-id-short != "": Small {
             text: "Confirm this matches “Paired with” on the other device.";
-        }
-
-        // The pairing code bundles the node id and the session secret; it is
-        // shown in the clear like a PIN (its holder can pair anyway, and the
-        // session is claimed by the first peer). It stays valid (and copyable)
-        // for the whole session so the paired peer can be re-sent it and
-        // reconnect after a drop.
-        if UiState.server-running && UiState.mode == PairMode.manual
-            && UiState.pairing-code != "": HorizontalLayout {
-            spacing: Theme.pad-s;
-            alignment: start;
-            Body { text: "Pairing code:"; vertical-alignment: center; }
-            Button {
-                text: UiState.copied-pairing-code ? "✔ Copied" : "Copy (" + UiState.cmd-label + "+T)";
-                clicked => { Actions.copy-pairing-code(); }
-            }
-        }
-        if UiState.server-running && UiState.mode == PairMode.manual
-            && UiState.pairing-code != "": Mono {
-            text: UiState.pairing-code;
-        }
-        if UiState.server-running && UiState.mode == PairMode.manual
-            && UiState.pairing-code != "": Body {
-            text: "Send it to the other device over any channel you trust and paste it there.";
-        }
-        if UiState.server-running && UiState.mode == PairMode.manual
-            && UiState.pairing-code != "": Small {
-            text: "Manual mode uses no signaling service (no nostr) — only iroh. The code embeds this device's direct addresses, which the other device dials straight away — no discovery at all, so it pairs offline even where mDNS is blocked — with iroh's DNS and relay as fallback across networks. The code stays valid for this whole session.";
         }
 
         if UiState.server-running: HorizontalLayout {

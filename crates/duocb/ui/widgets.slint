@@ -193,24 +193,6 @@ export component WideButton inherits CtaButtonBase {
     border-color: root.focused ? Theme.accent : Theme.card-border;
 }
 
-/// The join-entry mode toggle: PIN vs pairing code, sharing the
-/// `UiState.join-by-code` state and driving `Actions.set-join-by-code`.
-/// Title-less so callers place it under their own heading.
-export component JoinModeToggle inherits HorizontalLayout {
-    spacing: Theme.pad-s;
-    Button {
-        text: "PIN";
-        primary: !UiState.join-by-code;
-        clicked => { Actions.set-join-by-code(false); }
-    }
-    Button {
-        text: "Pairing code";
-        primary: UiState.join-by-code;
-        clicked => { Actions.set-join-by-code(true); }
-    }
-    Rectangle { horizontal-stretch: 1; }
-}
-
 /// A selectable list row (device picker, mode picker): hover/selected
 /// background and click handling around caller-supplied content.
 export component SelectableRow inherits Rectangle {

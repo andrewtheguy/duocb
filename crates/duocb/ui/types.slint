@@ -7,7 +7,7 @@
 export enum Screen {
     /// The configure mode's wizard/hub — the primary flow (iOS parity).
     home,
-    /// The quick-options wizard: ad-hoc PIN/manual pairing, nothing saved.
+    /// The quick-options wizard: ad-hoc rotating-PIN pairing, nothing saved.
     quick,
     /// Start a connection: this device hosts and shows credentials.
     server,
@@ -29,13 +29,11 @@ export enum ConfigureStep {
     join,
 }
 
-/// The pairing mode. `nostr-token` is the configure mode (home); the other two
-/// are the quick options — `nostr-pin` is the everyday pick, `manual` is a
-/// demoted testing-only option (connectivity without nostr).
+/// The pairing mode. `nostr-token` is the configure mode (home); `nostr-pin` is
+/// the quick rotating-PIN option (nothing saved).
 export enum PairMode {
     nostr-token,
     nostr-pin,
-    manual,
 }
 
 /// Which rendezvous transport(s) carry the PIN quick mode's record. `both`

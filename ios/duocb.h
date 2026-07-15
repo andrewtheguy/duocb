@@ -22,10 +22,13 @@
  * system daemon, no third-party server, direct addresses dialed as resolved).
  * quick_join takes NO channel — it is read from the PIN's first character (a
  * LAN-only PIN uses the "lan" path, anything else "nostr_lan"), so the two
- * sides can never mismatch. "lan" needs Info.plist keys: NSBonjourServices must
- * list "_duocb-pin._udp" and NSLocalNetworkUsageDescription must be set; joining
+ * sides can never mismatch. For a LAN-only PIN, quick_join may also carry an
+ * optional "ip" (the host's LAN IPv4, shown on the hosting device) to pair over
+ * the unicast side channel where multicast is blocked; omit it to resolve via
+ * mDNS. "lan" needs Info.plist keys: NSBonjourServices must list
+ * "_duocb-pin._udp" and NSLocalNetworkUsageDescription must be set; joining
  * triggers the Local Network permission prompt on first use. The nostr-only
- * preset and manual mode remain desktop-only.
+ * preset remains desktop-only.
  *
  * Lifecycle:
  *   1. duocb_init_logging()                                   (once, optional)
@@ -60,6 +63,15 @@
  *                                              check digit doesn't match). No
  *                                              "channel" key — it is inferred
  *                                              from the PIN's first character.
+ *   {"role":"quick_join","pin":"gh…","ip":"192.168.1.42"}
+ *                                              ip: optional, LAN-only PIN only —
+ *                                              the host's IPv4 (dotted-quad, no
+ *                                              port) shown on the hosting device.
+ *                                              Present pairs over the unicast
+ *                                              side channel (multicast-free);
+ *                                              omitted resolves via mDNS. A
+ *                                              malformed IP is rejected; ignored
+ *                                              for a non-LAN-only PIN.
  *
  * Events (one JSON object per duocb_next_event call), by "type":
  *   server_ready      {node_id, token_fingerprint}
@@ -77,10 +89,15 @@
  *                                               latest item — skip it if the
  *                                               inbox already holds that text)
  *   item_sent         {}
- *   pin_rotated       {pin_display, seconds_left} (quick_host: the current PIN
- *                                               as "XXXX-XXXX" and how long
- *                                               until it rotates; fires again
- *                                               on every rotation)
+ *   pin_rotated       {pin_display, seconds_left, host_lan_ip} (quick_host: the
+ *                                               current PIN as "XXXX-XXXX" and
+ *                                               how long until it rotates; fires
+ *                                               again on every rotation.
+ *                                               host_lan_ip is the host's LAN
+ *                                               IPv4 on the "lan" channel — show
+ *                                               it so the joiner can type it for
+ *                                               the manual-IP side channel — and
+ *                                               null on other channels)
  *   pin_cleared       {}                        (quick_host: a peer paired or
  *                                               publishing stopped — hide the
  *                                               PIN)
@@ -137,6 +154,12 @@ int duocb_token_fingerprint(const char *token, char *out_buf, size_t out_len);
  * join field; duocb_start re-normalizes anyway. 1 = valid (canonical PIN
  * written), 0 = invalid PIN, -1 = NULL argument or buffer < 9 bytes. */
 int duocb_normalize_pin(const char *pin, char *out_buf, size_t out_len);
+
+/* Whether a quick-pair PIN is LAN-only (its first character encodes the
+ * channel). Use to reveal the optional host-IP field on the join screen. The
+ * PIN is normalized first, so any user-typed form is accepted. 1 = LAN-only,
+ * 0 = not LAN-only or the PIN is invalid/incomplete, -1 = NULL argument. */
+int duocb_pin_is_lan_only(const char *pin);
 
 /* Start a session (configure or quick mode, per the config's "role").
  * Returns a non-NULL handle, or NULL with the error message in err_buf. */

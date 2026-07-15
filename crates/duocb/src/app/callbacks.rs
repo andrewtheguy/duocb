@@ -114,7 +114,6 @@ pub(crate) fn wire(app: &Rc<RefCell<App>>, ui: &MainWindow) {
             app.borrow().sync(&ui);
         }
     });
-    act!(on_select_manual, |app| app.mode = crate::PairMode::Manual);
     act!(on_toggle_quick_advanced, |app| {
         app.quick_advanced_expanded = !app.quick_advanced_expanded
     });
@@ -125,11 +124,6 @@ pub(crate) fn wire(app: &Rc<RefCell<App>>, ui: &MainWindow) {
     });
 
     // Server credentials.
-    act!(on_copy_pairing_code, |app| {
-        if let Some(code) = app.pairing_code.clone() {
-            app.copy_with_flash(&code, CopyTarget::PairingCode);
-        }
-    });
     act!(on_copy_pin, |app| {
         if let Some(pin) = app.pin_display.clone() {
             app.copy_with_flash(&pin, CopyTarget::Pin);
@@ -137,14 +131,6 @@ pub(crate) fn wire(app: &Rc<RefCell<App>>, ui: &MainWindow) {
     });
     act!(on_refresh_pin, |app| {
         app.net.send(duocb_core::net::UiCommand::RefreshPin);
-    });
-    actions.on_set_join_by_code({
-        let app = Rc::clone(app);
-        let weak = ui.as_weak();
-        move |by_code| {
-            app.borrow_mut().join_by_code = by_code;
-            app.borrow().sync(&weak.unwrap());
-        }
     });
 
     // Session panel.
@@ -215,7 +201,7 @@ pub(crate) fn wire(app: &Rc<RefCell<App>>, ui: &MainWindow) {
                 );
                 app.in_pin_a = a;
                 app.in_pin_b = b;
-                app.in_manual_code = s.get_in_manual_code().into();
+                app.in_join_ip = s.get_in_join_ip().into();
                 app.in_compose = s.get_in_compose().into();
             }
             app.borrow().sync(&ui);
