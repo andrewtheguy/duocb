@@ -292,14 +292,16 @@ pub unsafe extern "C" fn duocb_pin_is_lan_only(pin: *const c_char) -> c_int {
 /// Describe how the LAN-only join screen should constrain the optional host-IP
 /// entry to *this* device's own subnet. Writes a JSON object to `out_buf`:
 ///
-///   {"prefix":"10.22.33.","hint":"Valid range: …","label":"10.22.33.0/24"}
+///   {"prefix":"10.22.33.","placeholder":"last octet","hint":"","label":"10.22.33.0/24"}
 ///
 /// `prefix` is the locked network part to show, non-editable, ahead of the
 /// field (the user types only the host part; `duocb_resolve_join_ip` also
-/// accepts a whole pasted address). `hint` is a range hint for a partial-octet
-/// subnet (a /20), else "". `label` is the CIDR for the out-of-range message.
-/// All three are "" when no private subnet is detected (free full-IP entry).
-/// Returns 1 = written, 0 = buffer too small, -1 = NULL buffer.
+/// accepts a whole pasted address). `placeholder` describes the editable tail
+/// ("last octet" / "last 2 octets") for the field's placeholder text. `hint` is
+/// a range hint for a partial-octet subnet (a /20), else "". `label` is the CIDR
+/// for the out-of-range message. All four are "" when no private subnet is
+/// detected (free full-IP entry). Returns 1 = written, 0 = buffer too small,
+/// -1 = NULL buffer.
 /// # Safety
 /// `out_buf` must be NULL or point to at least `out_len` writable bytes.
 #[unsafe(no_mangle)]
@@ -307,6 +309,7 @@ pub unsafe extern "C" fn duocb_join_ip_context(out_buf: *mut c_char, out_len: us
     let constraint = duocb_core::subnet::JoinIpConstraint::detect();
     let json = serde_json::json!({
         "prefix": constraint.locked_prefix(),
+        "placeholder": constraint.host_placeholder(),
         "hint": constraint.hint(),
         "label": constraint.label(),
     })
@@ -1084,7 +1087,7 @@ mod tests {
     #[test]
     fn join_ip_context_returns_parseable_json() {
         // The concrete subnet depends on the host's interfaces, so assert only
-        // the shape: a JSON object with the three string keys.
+        // the shape: a JSON object with the four string keys.
         let mut out = [0 as c_char; 256];
         let rc = unsafe { duocb_join_ip_context(out.as_mut_ptr(), out.len()) };
         assert_eq!(rc, 1);
@@ -1092,6 +1095,7 @@ mod tests {
             serde_json::from_str(unsafe { CStr::from_ptr(out.as_ptr()) }.to_str().unwrap())
                 .unwrap();
         assert!(json["prefix"].is_string());
+        assert!(json["placeholder"].is_string());
         assert!(json["hint"].is_string());
         assert!(json["label"].is_string());
         // NULL buffer → -1.

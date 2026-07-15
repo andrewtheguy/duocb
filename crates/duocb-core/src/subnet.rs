@@ -44,6 +44,12 @@ impl Ipv4Subnet {
         prefix
     }
 
+    /// How many trailing octets the user still types after the locked prefix,
+    /// i.e. `4 - floor(prefix/8)` — 1 for a /24, 2 for a /20 or /16, 3 for a /8.
+    pub fn editable_octets(&self) -> usize {
+        4 - usize::from(self.0.prefix_len() / 8)
+    }
+
     /// Whether the prefix splits an octet (its length is not a multiple of 8,
     /// e.g. /20 or /28), so the editable tail spans a partial range worth
     /// hinting. For an octet-aligned prefix (/8, /16, /24) every value the user
@@ -149,6 +155,18 @@ impl JoinIpConstraint {
         self.primary().map(Ipv4Subnet::locked_prefix).unwrap_or_default()
     }
 
+    /// Placeholder for the editable tail field, describing how many octets
+    /// follow the locked prefix (`"last octet"` for a /24, `"last 2 octets"`
+    /// for a /20) so the field reads as a prompt rather than a specific example
+    /// address. Empty when the constraint is inactive (a full IP is typed).
+    pub fn host_placeholder(&self) -> String {
+        match self.primary().map(Ipv4Subnet::editable_octets) {
+            Some(1) => "last octet".to_string(),
+            Some(n) => format!("last {n} octets"),
+            None => String::new(),
+        }
+    }
+
     /// A "valid range" hint for a partial-octet primary subnet (e.g. a /20),
     /// where not every tail value is in range; empty otherwise.
     pub fn hint(&self) -> String {
@@ -224,6 +242,15 @@ mod tests {
         assert!(!subnet("10.0.0.0/8").splits_an_octet());
         assert!(subnet("10.22.32.0/20").splits_an_octet());
         assert!(subnet("10.22.33.0/28").splits_an_octet());
+    }
+
+    #[test]
+    fn host_placeholder_counts_the_editable_octets() {
+        assert_eq!(constraint(&["10.22.33.0/24"]).host_placeholder(), "last octet");
+        assert_eq!(constraint(&["10.22.32.0/20"]).host_placeholder(), "last 2 octets");
+        assert_eq!(constraint(&["192.168.1.0/16"]).host_placeholder(), "last 2 octets");
+        assert_eq!(constraint(&["10.0.0.0/8"]).host_placeholder(), "last 3 octets");
+        assert_eq!(JoinIpConstraint::unconstrained().host_placeholder(), "");
     }
 
     #[test]
