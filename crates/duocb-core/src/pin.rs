@@ -47,7 +47,6 @@
 use anyhow::{Context, Result};
 use argon2::{Algorithm, Argon2, Params, Version};
 use rand::Rng;
-use sha2::{Digest, Sha256};
 
 /// Crockford base32 alphabet: digits + uppercase letters minus the ambiguous `I L O U`.
 const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
@@ -272,36 +271,6 @@ pub fn derive_auth_key_material(canonical_pin: &str) -> Result<[u8; 32]> {
     argon2_key(canonical_pin, AUTH_KDF_SALT)
 }
 
-/// Domain-separating salt for the LAN-only unicast side-channel port derivation.
-const PORT_SALT: &[u8] = b"duocb:pin-side-channel-port:v1";
-/// First port of the IANA ephemeral/dynamic range (49152–65535).
-const EPHEMERAL_START: u16 = 49152;
-/// Size of the ephemeral range (65535 − 49152 + 1 = 16384).
-const EPHEMERAL_LEN: u16 = u16::MAX - EPHEMERAL_START + 1;
-
-/// Derive the LAN-only unicast side-channel port from a canonical PIN, mapped into the
-/// ephemeral range (49152–65535). Both peers share the PIN, so the joiner computes the host's
-/// listener port with nothing extra to type; different PINs land on different ports, so hosts
-/// on one LAN coexist. Keyed on the PIN string alone (bucket-independent, like the auth key),
-/// so a rotation-boundary race never changes the port for a given displayed PIN.
-///
-/// This is not a security boundary, and it deliberately leaks a little: the port is a **fast**
-/// (non-Argon2) projection of the PIN, so an on-LAN attacker who scans for the open port learns
-/// which ~14-bit bucket (one of 16384) the PIN hashes to — a cheap pre-filter that
-/// narrows an offline PIN search by that many bits *before* paying the Argon2 cost per surviving
-/// guess. That is the extent of it: the served record is still PIN-encrypted and the iroh session
-/// is challenge-response authenticated, so the open port alone grants nothing. (A single fixed
-/// listener port would avoid even this projection leak, at the cost of two hosts on one LAN
-/// colliding on the port.)
-pub fn side_channel_port(canonical_pin: &str) -> u16 {
-    let mut hasher = Sha256::new();
-    hasher.update(PORT_SALT);
-    hasher.update(canonical_pin.as_bytes());
-    let digest = hasher.finalize();
-    let n = u16::from_be_bytes([digest[0], digest[1]]);
-    EPHEMERAL_START + (n % EPHEMERAL_LEN)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -512,25 +481,6 @@ mod tests {
                 derive_key_material(&pin, bucket).unwrap(),
                 "auth key collided with the rendezvous key at bucket {bucket}"
             );
-        }
-    }
-
-    #[test]
-    fn side_channel_port_is_deterministic_pin_specific_and_in_range() {
-        let pin = pin_with_checksum("K7P29QX");
-        let p = side_channel_port(&pin);
-        assert_eq!(p, side_channel_port(&pin), "same pin must derive the same port");
-        assert!(
-            (EPHEMERAL_START..=u16::MAX).contains(&p),
-            "port {p} must land in the ephemeral range"
-        );
-        // Different PINs (almost always) land on different ports so hosts coexist.
-        let other = side_channel_port(&pin_with_checksum("9QXMK7P"));
-        assert_ne!(p, other, "a different pin should derive a different port");
-        // Every ephemeral port is reachable and none escapes the range.
-        for _ in 0..500 {
-            let port = side_channel_port(&generate_pin(true));
-            assert!((EPHEMERAL_START..=u16::MAX).contains(&port));
         }
     }
 }

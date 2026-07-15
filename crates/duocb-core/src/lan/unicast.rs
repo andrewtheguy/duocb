@@ -4,12 +4,15 @@
 //! Where DNS-SD needs multicast to *discover* the host, this path has the joiner
 //! type the host's LAN IPv4 directly, then fetch the very same PIN-encrypted
 //! node-id record over a one-shot TCP request/response. The host — when hosting
-//! on the LAN-only channel — runs a small listener on a PIN-derived port
-//! (`crate::pin::side_channel_port`) that serves the record to anyone who
-//! connects; the joiner computes the same port from the PIN, so no port is ever
-//! typed. The served record carries the same NIP-44 ciphertext the DNS-SD `e`
-//! TXT attribute holds, plus the host's direct socket addresses (which DNS-SD
-//! instead conveys via SRV/A/AAAA), so the joiner ends up with the identical
+//! on the LAN-only channel — runs a small listener on a port derived from the
+//! record keypair (`super::side_channel_port`, the same Argon2-derived key the
+//! DNS-SD instance label uses) that serves the record to anyone who connects; the
+//! joiner derives the same port from its PIN-derived candidate keys, so no port is
+//! ever typed. Because the key rotates per bucket, so does the port, and the
+//! joiner probes each candidate bucket's port — mirroring the DNS-SD lookup's
+//! candidate-label match. The served record carries the same NIP-44 ciphertext the
+//! DNS-SD `e` TXT attribute holds, plus the host's direct socket addresses (which
+//! DNS-SD instead conveys via SRV/A/AAAA), so the joiner ends up with the identical
 //! [`PinFound`] and dials iroh exactly as the DNS-SD path does.
 //!
 //! Cross-platform (plain tokio TCP): on iOS the joiner's outbound connect to a
@@ -19,6 +22,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
+use futures::stream::{FuturesUnordered, StreamExt};
 use iroh::EndpointId;
 use nostr_sdk::prelude::Keys;
 use serde::{Deserialize, Serialize};
@@ -27,7 +31,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
 use super::{PinFound, LOOKUP_TIMEOUT};
-use crate::{pin, pin_record};
+use crate::pin_record;
 
 /// Cap on the record a joiner will read (and a host will serve): the JSON is a
 /// short ciphertext plus a handful of socket addresses. Bounds a hostile or
@@ -56,12 +60,11 @@ impl Drop for UnicastListener {
     }
 }
 
-/// Start serving the PIN rendezvous record on the PIN-derived side-channel port.
-/// `keys` is the current bucket's record keypair (as for the DNS-SD advert) and
-/// `addrs` the endpoint's direct socket addresses. Binds IPv4 on all interfaces
-/// (the joiner types an IPv4).
+/// Start serving the PIN rendezvous record on the side-channel port derived from
+/// `keys` (the current bucket's record keypair, as for the DNS-SD advert); `addrs`
+/// is the endpoint's direct socket addresses. Binds IPv4 on all interfaces (the
+/// joiner types an IPv4).
 pub async fn advertise(
-    pin: &str,
     keys: &Keys,
     node_id: &EndpointId,
     addrs: &[SocketAddr],
@@ -80,7 +83,7 @@ pub async fn advertise(
         ));
     }
 
-    let port = pin::side_channel_port(pin);
+    let port = super::side_channel_port(keys);
     let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, port))
         .await
         .with_context(|| format!("binding the unicast side channel on port {port}"))?;
@@ -113,57 +116,77 @@ async fn serve_one(stream: &mut TcpStream, body: &[u8]) -> std::io::Result<()> {
     stream.shutdown().await
 }
 
-/// Fetch and decrypt the PIN record from the host's unicast side channel at
-/// `ip`, deriving the port from `pin`. Returns the decrypted node id plus the
-/// host's direct socket addresses ([`PinFound`]), or `Ok(None)` when no reachable
-/// side channel answered or no candidate bucket decrypted the record (wrong or
-/// expired PIN) — the same "no record" outcome the DNS-SD browse window reports.
-pub async fn lookup(ip: IpAddr, pin: &str, candidates: &[Keys]) -> Result<Option<PinFound>> {
-    let addr = SocketAddr::new(ip, pin::side_channel_port(pin));
-    let fetch = async {
-        let stream = TcpStream::connect(addr).await?;
-        let mut buf = Vec::new();
-        // Read one byte past the cap so an oversize responder is detectable.
-        stream
-            .take(MAX_RECORD_BYTES as u64 + 1)
-            .read_to_end(&mut buf)
-            .await?;
-        Ok::<Vec<u8>, std::io::Error>(buf)
-    };
-    let buf = match tokio::time::timeout(LOOKUP_TIMEOUT, fetch).await {
-        Ok(Ok(buf)) => buf,
-        // Connect refused/reset or a read error: no reachable side channel here.
-        Ok(Err(e)) => {
-            log::debug!("unicast side channel at {addr} unreachable: {e}");
-            return Ok(None);
+/// Fetch and decrypt the PIN record from the host's unicast side channel at `ip`.
+/// Each candidate bucket key derives its own port; the host listens on the one for
+/// the bucket it minted the PIN in, so the ports are probed concurrently and the
+/// first that returns a decryptable record wins. Returns the decrypted node id plus
+/// the host's direct socket addresses ([`PinFound`]), or `Ok(None)` when no reachable
+/// port answered or none decrypted (wrong or expired PIN) — the same "no record"
+/// outcome the DNS-SD browse window reports. Bounded overall by [`LOOKUP_TIMEOUT`].
+pub async fn lookup(ip: IpAddr, candidates: &[Keys]) -> Result<Option<PinFound>> {
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let mut probes: FuturesUnordered<_> = candidates
+        .iter()
+        .map(|keys| fetch_and_decrypt(SocketAddr::new(ip, super::side_channel_port(keys)), candidates))
+        .collect();
+    let race = async {
+        while let Some(found) = probes.next().await {
+            if found.is_some() {
+                return found;
+            }
         }
-        Err(_) => {
-            log::debug!("unicast side channel at {addr} timed out");
-            return Ok(None);
+        None
+    };
+    match tokio::time::timeout(LOOKUP_TIMEOUT, race).await {
+        Ok(found) => Ok(found),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Connect to one candidate port, read the served record, and decrypt it with any
+/// candidate key. `None` on any failure (unreachable/reset, oversize, unparseable,
+/// or no candidate key decrypts) so a probe of a closed port simply drops out of
+/// the race.
+async fn fetch_and_decrypt(addr: SocketAddr, candidates: &[Keys]) -> Option<PinFound> {
+    let buf = match fetch(addr).await {
+        Ok(buf) => buf,
+        Err(e) => {
+            log::debug!("unicast side channel at {addr} unreachable: {e}");
+            return None;
         }
     };
     if buf.len() > MAX_RECORD_BYTES {
         log::debug!("unicast side channel at {addr} returned an oversize record");
-        return Ok(None);
+        return None;
     }
     let record: UnicastRecord = match serde_json::from_slice(&buf) {
         Ok(record) => record,
         // Something on the derived port that isn't our record — treat as a miss.
         Err(e) => {
             log::debug!("unicast side channel at {addr} returned an unparseable record: {e}");
-            return Ok(None);
+            return None;
         }
     };
-    // Try each candidate bucket key, exactly as the DNS-SD lookup does.
-    for keys in candidates {
-        if let Some(node_id) = pin_record::decrypt_pin_payload(keys, &record.e) {
-            return Ok(Some(PinFound {
-                node_id,
-                addrs: record.addrs,
-            }));
-        }
-    }
-    Ok(None)
+    candidates.iter().find_map(|keys| {
+        pin_record::decrypt_pin_payload(keys, &record.e).map(|node_id| PinFound {
+            node_id,
+            addrs: record.addrs.clone(),
+        })
+    })
+}
+
+/// Connect and read the served record (up to one byte past the cap, so an oversize
+/// responder is detectable).
+async fn fetch(addr: SocketAddr) -> std::io::Result<Vec<u8>> {
+    let stream = TcpStream::connect(addr).await?;
+    let mut buf = Vec::new();
+    stream
+        .take(MAX_RECORD_BYTES as u64 + 1)
+        .read_to_end(&mut buf)
+        .await?;
+    Ok(buf)
 }
 
 #[cfg(test)]
@@ -172,18 +195,17 @@ mod tests {
 
     #[tokio::test]
     async fn advertise_then_lookup_round_trips_node_id_and_addrs() {
-        // Distinct per test so parallel runs bind distinct (PIN-derived) ports.
-        let pin = "ROUNDTR1"; // any string — the port derives from it
-        let candidates = pin_record::candidate_keys(pin).await.unwrap();
-        // The host advertises under the current bucket's key (candidates[0]).
-        let keys = &candidates[0];
+        // Distinct per test so parallel runs bind distinct (key-derived) ports.
+        let candidates = pin_record::candidate_keys("ROUNDTR1").await.unwrap();
+        // The host advertises under the current bucket's key (candidates[0]); the
+        // joiner probes every candidate's port and hits that one.
         let node_id = iroh::SecretKey::generate().public();
         let addrs: Vec<SocketAddr> =
             vec!["192.168.1.9:4433".parse().unwrap(), "[2001:db8::7]:4444".parse().unwrap()];
 
-        let _listener = advertise(pin, keys, &node_id, &addrs).await.unwrap();
+        let _listener = advertise(&candidates[0], &node_id, &addrs).await.unwrap();
 
-        let found = lookup(IpAddr::V4(Ipv4Addr::LOCALHOST), pin, &candidates)
+        let found = lookup(IpAddr::V4(Ipv4Addr::LOCALHOST), &candidates)
             .await
             .unwrap()
             .expect("the just-advertised record must resolve");
@@ -193,10 +215,9 @@ mod tests {
 
     #[tokio::test]
     async fn lookup_returns_none_when_nothing_is_listening() {
-        // A PIN whose derived port has no listener: connect is refused.
-        let pin = "NOLISTN2";
-        let candidates = pin_record::candidate_keys(pin).await.unwrap();
-        let found = lookup(IpAddr::V4(Ipv4Addr::LOCALHOST), pin, &candidates)
+        // Candidate keys whose derived ports have no listener: every connect is refused.
+        let candidates = pin_record::candidate_keys("NOLISTN2").await.unwrap();
+        let found = lookup(IpAddr::V4(Ipv4Addr::LOCALHOST), &candidates)
             .await
             .unwrap();
         assert!(found.is_none());
@@ -204,17 +225,13 @@ mod tests {
 
     #[tokio::test]
     async fn lookup_returns_none_for_the_wrong_pin() {
-        let host_pin = "WRONGHS3";
-        let host_candidates = pin_record::candidate_keys(host_pin).await.unwrap();
+        let host_candidates = pin_record::candidate_keys("WRONGHS3").await.unwrap();
         let node_id = iroh::SecretKey::generate().public();
-        let _listener = advertise(host_pin, &host_candidates[0], &node_id, &[])
-            .await
-            .unwrap();
+        let _listener = advertise(&host_candidates[0], &node_id, &[]).await.unwrap();
 
-        // A different PIN derives a different port, so nothing answers there.
-        let other_pin = "WRONGOT4";
-        let other_candidates = pin_record::candidate_keys(other_pin).await.unwrap();
-        let found = lookup(IpAddr::V4(Ipv4Addr::LOCALHOST), other_pin, &other_candidates)
+        // A different PIN derives different keys, hence different ports, so nothing answers.
+        let other_candidates = pin_record::candidate_keys("WRONGOT4").await.unwrap();
+        let found = lookup(IpAddr::V4(Ipv4Addr::LOCALHOST), &other_candidates)
             .await
             .unwrap();
         assert!(found.is_none());

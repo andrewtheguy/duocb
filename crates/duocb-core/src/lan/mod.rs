@@ -46,6 +46,7 @@ use std::time::Duration;
 use anyhow::Result;
 use iroh::{EndpointAddr, EndpointId};
 use nostr_sdk::prelude::Keys;
+use sha2::{Digest, Sha256};
 
 pub use unicast::UnicastListener;
 
@@ -72,6 +73,28 @@ const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 /// and the payload decrypt is the real verification anyway.
 fn instance_name(keys: &Keys) -> String {
     keys.public_key().to_hex()[..32].to_string()
+}
+
+/// Domain-separating salt for the unicast side-channel port derivation.
+const PORT_SALT: &[u8] = b"duocb:pin-side-channel-port:v1";
+/// First port of the IANA ephemeral/dynamic range (49152–65535).
+const EPHEMERAL_START: u16 = 49152;
+/// Size of the ephemeral range (65535 − 49152 + 1 = 16384).
+const EPHEMERAL_LEN: u16 = u16::MAX - EPHEMERAL_START + 1;
+
+/// The unicast side-channel port for a `(pin, bucket)` keypair, mapped into the ephemeral range
+/// (49152–65535). Derived from the **same Argon2-derived rendezvous public key** the mDNS
+/// [`instance_name`] label uses — not from the PIN string — so, exactly like the mDNS label,
+/// mapping a candidate PIN to its port costs an Argon2 evaluation and the open port leaks no cheap
+/// pre-filter of the PIN. The key already varies per rotation bucket, so the port does too; the
+/// joiner tries each candidate bucket's port (see `unicast::lookup`), mirroring the mDNS
+/// candidate-label match. Different PINs land on different ports, so hosts on one LAN coexist.
+fn side_channel_port(keys: &Keys) -> u16 {
+    let mut hasher = Sha256::new();
+    hasher.update(PORT_SALT);
+    hasher.update(keys.public_key().to_bytes());
+    let digest = hasher.finalize();
+    EPHEMERAL_START + (u16::from_be_bytes([digest[0], digest[1]]) % EPHEMERAL_LEN)
 }
 
 /// A resolved LAN rendezvous hit: the decrypted node id plus the direct socket
@@ -186,30 +209,29 @@ pub async fn dnssd_lookup_pin_record(candidates: &[Keys]) -> Result<Option<PinFo
     dnssd::lookup(candidates).await
 }
 
-/// Start the LAN-only channel's unicast side channel: a listener on the
-/// PIN-derived port ([`crate::pin::side_channel_port`]) serving the same
+/// Start the LAN-only channel's unicast side channel: a listener on the port
+/// derived from the record keypair ([`side_channel_port`]) serving the same
 /// PIN-encrypted node-id record, so a joiner who types the host's LAN IP can
 /// pair where multicast is blocked. Dropping the returned [`UnicastListener`]
 /// withdraws it. Runs alongside the DNS-SD advertisement (see `crate::lan::unicast`).
 pub async fn unicast_advertise_pin_record(
-    pin: &str,
     keys: &Keys,
     node_id: &EndpointId,
     addrs: &[SocketAddr],
 ) -> Result<UnicastListener> {
-    unicast::advertise(pin, keys, node_id, addrs).await
+    unicast::advertise(keys, node_id, addrs).await
 }
 
-/// Fetch the LAN-only PIN record from the host's unicast side channel at `ip`
-/// (port derived from `pin`). Returns the decrypted node id and the host's direct
-/// socket addresses, or `Ok(None)` when nothing reachable answered or the record
-/// did not decrypt (wrong/expired PIN).
+/// Fetch the LAN-only PIN record from the host's unicast side channel at `ip`,
+/// trying the port each candidate keypair derives to (adjacent buckets, as for
+/// the DNS-SD lookup). Returns the decrypted node id and the host's direct socket
+/// addresses, or `Ok(None)` when nothing reachable answered or the record did not
+/// decrypt (wrong/expired PIN).
 pub async fn unicast_lookup_pin_record(
     ip: IpAddr,
-    pin: &str,
     candidates: &[Keys],
 ) -> Result<Option<PinFound>> {
-    unicast::lookup(ip, pin, candidates).await
+    unicast::lookup(ip, candidates).await
 }
 
 /// Pick the host's display-worthy LAN IPv4 from its direct socket addresses: the

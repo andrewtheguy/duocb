@@ -1148,7 +1148,7 @@ async fn resolve_pin(
             // host's direct addresses, so the node id rides back dialable.
             let found = match target_ip {
                 Some(ip) => {
-                    crate::lan::unicast_lookup_pin_record(ip, canonical_pin, &candidates).await
+                    crate::lan::unicast_lookup_pin_record(ip, &candidates).await
                 }
                 None => crate::lan::dnssd_lookup_pin_record(&candidates).await,
             };
@@ -1342,9 +1342,7 @@ async fn run_pin_publisher(
                 // (e.g. a rare derived-port collision) only warns — mDNS still
                 // carries the rendezvous for joiners on this network.
                 if matches!(channel, PinChannel::LanOnly) {
-                    match crate::lan::unicast_advertise_pin_record(&pin, &keys, &node_id, &addrs)
-                        .await
-                    {
+                    match crate::lan::unicast_advertise_pin_record(&keys, &node_id, &addrs).await {
                         Ok(listener) => {
                             unicast.push_back(listener);
                             while unicast.len() > 2 {

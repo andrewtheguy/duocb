@@ -96,8 +96,8 @@ pub enum DialSpec {
     /// `target_ip` is only meaningful on the LAN-only channel: `Some(ip)` fetches
     /// the PIN-encrypted node-id record from the host's unicast side channel at
     /// that IP (the joiner typed it — works where multicast is blocked); `None`
-    /// resolves via mDNS as before. The side-channel port is derived from the PIN
-    /// (`pin::side_channel_port`), so no port is ever typed.
+    /// resolves via mDNS as before. The side-channel port is derived from the
+    /// PIN's rendezvous key (see `crate::lan`), so no port is ever typed.
     Pin {
         canonical_pin: String,
         relays: Vec<String>,
