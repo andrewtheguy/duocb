@@ -289,6 +289,68 @@ pub unsafe extern "C" fn duocb_pin_is_lan_only(pin: *const c_char) -> c_int {
     }
 }
 
+/// Describe how the LAN-only join screen should constrain the optional host-IP
+/// entry to *this* device's own subnet. Writes a JSON object to `out_buf`:
+///
+///   {"prefix":"10.22.33.","hint":"Valid range: …","label":"10.22.33.0/24"}
+///
+/// `prefix` is the locked network part to show, non-editable, ahead of the
+/// field (the user types only the host part; `duocb_resolve_join_ip` also
+/// accepts a whole pasted address). `hint` is a range hint for a partial-octet
+/// subnet (a /20), else "". `label` is the CIDR for the out-of-range message.
+/// All three are "" when no private subnet is detected (free full-IP entry).
+/// Returns 1 = written, 0 = buffer too small, -1 = NULL buffer.
+/// # Safety
+/// `out_buf` must be NULL or point to at least `out_len` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn duocb_join_ip_context(out_buf: *mut c_char, out_len: usize) -> c_int {
+    let constraint = duocb_core::subnet::JoinIpConstraint::detect();
+    let json = serde_json::json!({
+        "prefix": constraint.locked_prefix(),
+        "hint": constraint.hint(),
+        "label": constraint.label(),
+    })
+    .to_string();
+    if out_buf.is_null() {
+        return -1;
+    }
+    if write_cstr(out_buf, out_len, &json) { 1 } else { 0 }
+}
+
+/// Validate what the user typed into the host-IP entry against this device's
+/// subnet, resolving the host part after the locked prefix (or a pasted whole
+/// address) into a full IPv4. On success the full dotted-quad is written to
+/// `out_buf` — pass exactly that as the config `ip` to `duocb_start`.
+/// Returns 1 = in range (address written), 0 = out of range, 2 = empty entry
+/// (resolve via mDNS; pass no `ip`), -1 = malformed / NULL input / buffer too
+/// small.
+/// # Safety
+/// `entry` must be NULL or a valid NUL-terminated C string; `out_buf` must be
+/// NULL or point to at least `out_len` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn duocb_resolve_join_ip(
+    entry: *const c_char,
+    out_buf: *mut c_char,
+    out_len: usize,
+) -> c_int {
+    let Some(entry) = (unsafe { cstr_arg(entry) }) else {
+        return -1;
+    };
+    use duocb_core::subnet::JoinIpOutcome;
+    match duocb_core::subnet::JoinIpConstraint::detect().resolve(entry) {
+        JoinIpOutcome::InRange(ip) => {
+            if write_cstr(out_buf, out_len, &ip.to_string()) {
+                1
+            } else {
+                -1
+            }
+        }
+        JoinIpOutcome::OutOfRange => 0,
+        JoinIpOutcome::Empty => 2,
+        JoinIpOutcome::Malformed => -1,
+    }
+}
+
 /// Start a session (configure or quick mode, per the config's `role`).
 /// Returns a non-NULL handle, or NULL with the error message written to
 /// `err_buf`.
@@ -1017,6 +1079,50 @@ mod tests {
             duocb_normalize_pin(typed.as_ptr() as *const c_char, out.as_mut_ptr(), 8)
         };
         assert_eq!(rc, -1);
+    }
+
+    #[test]
+    fn join_ip_context_returns_parseable_json() {
+        // The concrete subnet depends on the host's interfaces, so assert only
+        // the shape: a JSON object with the three string keys.
+        let mut out = [0 as c_char; 256];
+        let rc = unsafe { duocb_join_ip_context(out.as_mut_ptr(), out.len()) };
+        assert_eq!(rc, 1);
+        let json: serde_json::Value =
+            serde_json::from_str(unsafe { CStr::from_ptr(out.as_ptr()) }.to_str().unwrap())
+                .unwrap();
+        assert!(json["prefix"].is_string());
+        assert!(json["hint"].is_string());
+        assert!(json["label"].is_string());
+        // NULL buffer → -1.
+        assert_eq!(unsafe { duocb_join_ip_context(ptr::null_mut(), 0) }, -1);
+    }
+
+    #[test]
+    fn resolve_join_ip_reports_empty_loopback_and_malformed() {
+        let mut out = [0 as c_char; 32];
+        // Empty entry → 2 (resolve via mDNS).
+        assert_eq!(
+            unsafe { duocb_resolve_join_ip(c"".as_ptr(), out.as_mut_ptr(), out.len()) },
+            2
+        );
+        // Loopback is always local, whatever the LAN subnet is → 1, address echoed.
+        let rc =
+            unsafe { duocb_resolve_join_ip(c"127.0.0.1".as_ptr(), out.as_mut_ptr(), out.len()) };
+        assert_eq!(rc, 1);
+        assert_eq!(
+            unsafe { CStr::from_ptr(out.as_ptr()) }.to_str().unwrap(),
+            "127.0.0.1"
+        );
+        // Malformed / NULL → -1.
+        assert_eq!(
+            unsafe { duocb_resolve_join_ip(c"nope".as_ptr(), out.as_mut_ptr(), out.len()) },
+            -1
+        );
+        assert_eq!(
+            unsafe { duocb_resolve_join_ip(ptr::null(), out.as_mut_ptr(), out.len()) },
+            -1
+        );
     }
 
     #[test]

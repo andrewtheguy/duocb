@@ -7,7 +7,7 @@
 import { UiState, Actions } from "globals.slint";
 import { PairMode, PinChannel } from "types.slint";
 import { Theme } from "theme.slint";
-import { Card, CardTitle, Weak, Small, Body, BigButton, WideButton, BackHeader, SelectableRow } from "widgets.slint";
+import { Card, CardTitle, Weak, Small, Body, Mono, BigButton, WideButton, BackHeader, SelectableRow } from "widgets.slint";
 import { LineEdit, ScrollView } from "std-widgets.slint";
 
 component ModeRow inherits SelectableRow {
@@ -180,15 +180,28 @@ export component QuickScreen inherits ScrollView {
                     Small {
                         text: "Optional — only if the other device isn't found automatically. Type the IP it shows.";
                     }
-                    ip-entry := LineEdit {
-                        font-family: UiState.mono-font;
-                        placeholder-text: "192.168.1.42";
-                        text <=> UiState.in-join-ip;
-                        edited => { Actions.fields-edited(); }
-                        accepted => { Actions.join-quick(); }
+                    // The network part of this device's subnet is locked ahead of
+                    // the field, so the user types only the host part (the whole
+                    // address is still accepted if pasted).
+                    HorizontalLayout {
+                        spacing: Theme.pad-xs;
+                        if UiState.join-ip-prefix != "": Mono {
+                            text: UiState.join-ip-prefix;
+                            vertical-alignment: center;
+                        }
+                        ip-entry := LineEdit {
+                            font-family: UiState.mono-font;
+                            placeholder-text: UiState.join-ip-prefix != "" ? "15" : "192.168.1.42";
+                            text <=> UiState.in-join-ip;
+                            edited => { Actions.fields-edited(); }
+                            accepted => { Actions.join-quick(); }
+                        }
                     }
-                    if UiState.join-ip-invalid: Text {
-                        text: "Not a valid IPv4 address";
+                    if UiState.join-ip-hint != "": Small {
+                        text: UiState.join-ip-hint;
+                    }
+                    if UiState.join-ip-error != "": Text {
+                        text: UiState.join-ip-error;
                         color: Theme.warn;
                         font-size: Theme.font-body;
                     }

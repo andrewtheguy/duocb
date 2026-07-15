@@ -101,11 +101,16 @@ pub(crate) struct App {
     /// each) so grouping never edits a field's text mid-keystroke.
     pub(crate) in_pin_a: String,
     pub(crate) in_pin_b: String,
-    /// The joiner's optional host-IP entry, shown only for a LAN-only PIN. When
-    /// non-empty it must parse as an IPv4 for the dial to be ready, and selects
-    /// the unicast side channel (see [`App::quick_dial_spec`]); blank resolves
-    /// via mDNS.
+    /// The joiner's optional host-IP entry, shown only for a LAN-only PIN. Holds
+    /// only the *host part* typed after the locked network prefix (or a full
+    /// address pasted whole); [`App::join_ip_ctx`] resolves and range-checks it.
+    /// When it resolves to an in-range address it selects the unicast side
+    /// channel (see [`App::quick_dial_spec`]); blank resolves via mDNS.
     pub(crate) in_join_ip: String,
+    /// The local-subnet constraint the host-IP entry is held to (this device's
+    /// own private IPv4 subnet). Detected when the quick screen opens; drives
+    /// the locked prefix, the range hint, and out-of-range rejection.
+    pub(crate) join_ip_ctx: duocb_core::subnet::JoinIpConstraint,
     /// Draft of the session panel's compose field (send typed text).
     pub(crate) in_compose: String,
 
@@ -211,6 +216,7 @@ impl App {
             in_pin_a: String::new(),
             in_pin_b: String::new(),
             in_join_ip: String::new(),
+            join_ip_ctx: duocb_core::subnet::JoinIpConstraint::unconstrained(),
             in_compose: String::new(),
             peer_node_id: None,
             conn_path: None,
@@ -715,6 +721,11 @@ impl App {
         // Start with the advanced options collapsed; they still reveal
         // themselves if an advanced option is the active selection.
         self.quick_advanced_expanded = false;
+        // Detect this device's LAN subnet so a LAN-only join can lock the host
+        // IP's network octets to it and reject an out-of-range address. Read
+        // once on entry — a mid-session network change is rare and the field is
+        // optional anyway (blank falls back to mDNS).
+        self.join_ip_ctx = duocb_core::subnet::JoinIpConstraint::detect();
     }
 
     /// Select the PIN rendezvous channel (the quick screen's P/L/I rows); it
@@ -812,25 +823,36 @@ impl App {
         }
     }
 
+    /// The current validation outcome of the host-IP entry against the detected
+    /// subnet constraint — the single source for both the displayed error
+    /// (`sync`) and the dial's `target_ip` (`quick_dial_spec`).
+    pub(crate) fn join_ip_outcome(&self) -> duocb_core::subnet::JoinIpOutcome {
+        self.join_ip_ctx.resolve(&self.in_join_ip)
+    }
+
     /// The quick-join dial spec, derived purely from the join entry — never from
     /// the show-side P/L/I choice. The typed PIN's first character selects the
-    /// channel (see `duocb_core::pin`); for a LAN-only PIN an optional typed host
-    /// IP selects the unicast side channel (blank resolves via mDNS). `None` when
-    /// the PIN is incomplete/invalid, or a typed IP is not a well-formed IPv4 —
-    /// which is what keeps the Join button disabled.
+    /// channel (see `duocb_core::pin`); for a LAN-only PIN the optional host-IP
+    /// entry, resolved and range-checked against this device's own subnet (see
+    /// [`App::join_ip_ctx`]), selects the unicast side channel (blank resolves
+    /// via mDNS). `None` when the PIN is incomplete/invalid, or the typed host IP
+    /// is malformed or out of range — which is what keeps the Join button
+    /// disabled.
     fn quick_dial_spec(&self) -> Option<duocb_core::net::DialSpec> {
         use duocb_core::net::{DialSpec, PinChannel as Core};
+        use duocb_core::subnet::JoinIpOutcome;
         let canonical_pin =
             duocb_core::pin::normalize_pin(&format!("{}{}", self.in_pin_a, self.in_pin_b))?;
         let lan_only = duocb_core::pin::pin_is_lan_only(&canonical_pin);
         let channel = if lan_only { Core::LanOnly } else { Core::NostrAndLan };
-        // The host-IP field only applies to a LAN-only PIN. When present it must
-        // be a well-formed IPv4 (matching the v4-only side-channel listener), or
-        // the spec is `None` and Join stays disabled.
+        // The host-IP field only applies to a LAN-only PIN. Blank means mDNS; an
+        // in-range address selects the side channel; anything malformed or out of
+        // range yields `None` so Join stays disabled.
         let target_ip = if lan_only {
-            match self.in_join_ip.trim() {
-                "" => None,
-                ip => Some(std::net::IpAddr::V4(ip.parse::<std::net::Ipv4Addr>().ok()?)),
+            match self.join_ip_outcome() {
+                JoinIpOutcome::Empty => None,
+                JoinIpOutcome::InRange(ip) => Some(std::net::IpAddr::V4(ip)),
+                JoinIpOutcome::OutOfRange | JoinIpOutcome::Malformed => return None,
             }
         } else {
             None

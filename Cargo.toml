@@ -6,7 +6,7 @@ resolver = "3"
 default-members = ["crates/duocb-core", "crates/duocb"]
 
 [workspace.package]
-version = "0.0.24"
+version = "0.0.25"
 edition = "2024"
 description = "P2P clipboard sharing between two devices over iroh"
 
@@ -37,6 +37,10 @@ swarm-discovery = "0.6.3"
 # Bonjour advertisement an iOS host registers through the system daemon.
 # Desktop-only; iOS talks to mDNSResponder via dns_sd.h instead.
 mdns-sd = "0.20.1"
+# Local network-interface enumeration (address + netmask) for constraining the
+# LAN-only joiner's typed host IP to its own subnet. Already in the tree via
+# iroh, so it builds on every target we ship (desktop and iOS).
+netdev = "0.45"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 futures = "0.3"
 
