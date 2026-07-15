@@ -9,8 +9,8 @@
 //! ```text
 //! D→L: AuthRequest::Pin { nonce_d }          # dialer opens with a random nonce
 //! L→D: PinChallenge     { nonce_l }          # listener's random nonce
-//! D→L: PinResponse      { proof_d }          # proof_d = seal(k, "dialer"   || nonce_d || nonce_l)
-//! L→D: PinConfirm       { accepted, proof_l } # proof_l = seal(k, "listener" || nonce_d || nonce_l)
+//! D→L: PinResponse      { proof_d }          # proof_d = seal(k, "dialer"   || nonce_d || nonce_l || id_d || id_l)
+//! L→D: PinConfirm       { accepted, proof_l } # proof_l = seal(k, "listener" || nonce_d || nonce_l || id_d || id_l)
 //! ```
 //!
 //! `k` is a keypair derived from the **PIN string alone** ([`derive_auth_keys`], bucket-independent),
@@ -19,6 +19,16 @@
 //! impostor cannot forge a proof. The direction strings domain-separate the two proofs (a proof for
 //! one direction can't be replayed as the other) and both nonces bind the exchange to this one
 //! handshake (no cross-handshake replay).
+//!
+//! **Node-id binding.** Each proof also folds in both peers' node ids — `id_d` the dialer's,
+//! `id_l` the listener's. Each side knows both: the listener takes `id_d` from the
+//! QUIC/TLS-authenticated `Connection::remote_id()` and `id_l` from its own endpoint; the dialer
+//! takes `id_l` from `remote_id()` (the id it dialed) and `id_d` from its own endpoint. A proof
+//! therefore verifies only when the PIN-derived key matches *and* both peers agree on the two node
+//! ids — so the listener effectively validates that the dialer's claimed identity is the one QUIC
+//! authenticated (and vice versa). This binds PIN possession to the specific authenticated iroh
+//! connection: a relayed or man-in-the-middle handshake that terminates the QUIC session at a
+//! different node id fails, even against a party that knows the PIN.
 //!
 //! Because the listener mints a fresh PIN every rotation bucket, it verifies `proof_d` against the
 //! last few buckets' keys (its recent-PIN cache) — mirroring the dialer's adjacent-bucket look-back
@@ -85,29 +95,54 @@ pub fn generate_nonce() -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
-/// The exact plaintext a proof authenticates: domain, direction, and both nonces.
-fn proof_plaintext(dir: Direction, nonce_d: &str, nonce_l: &str) -> String {
-    format!("{PROOF_DOMAIN}|{}|{nonce_d}|{nonce_l}", dir.as_str())
+/// The exact plaintext a proof authenticates: domain, direction, both nonces, and both peers' node
+/// ids (dialer then listener). Node ids are fixed-format hex, so `|` never appears inside one and
+/// the fields stay unambiguous.
+fn proof_plaintext(
+    dir: Direction,
+    nonce_d: &str,
+    nonce_l: &str,
+    id_d: &str,
+    id_l: &str,
+) -> String {
+    format!("{PROOF_DOMAIN}|{}|{nonce_d}|{nonce_l}|{id_d}|{id_l}", dir.as_str())
 }
 
-/// Seal a proof for `dir` binding both nonces, under the PIN-derived key (NIP-44 self-encryption).
-fn seal_proof(keys: &Keys, dir: Direction, nonce_d: &str, nonce_l: &str) -> Result<String> {
+/// Seal a proof for `dir` binding both nonces and both node ids, under the PIN-derived key (NIP-44
+/// self-encryption).
+fn seal_proof(
+    keys: &Keys,
+    dir: Direction,
+    nonce_d: &str,
+    nonce_l: &str,
+    id_d: &str,
+    id_l: &str,
+) -> Result<String> {
     nip44::encrypt(
         keys.secret_key(),
         &keys.public_key(),
-        proof_plaintext(dir, nonce_d, nonce_l),
+        proof_plaintext(dir, nonce_d, nonce_l, id_d, id_l),
         nip44::Version::V2,
     )
     .context("sealing PIN auth proof")
 }
 
 /// Verify a proof for `dir`: it must decrypt under `keys` (NIP-44 MAC) *and* the plaintext must
-/// match the expected domain/direction/nonces. Constant-time plaintext compare.
-fn verify_proof(keys: &Keys, dir: Direction, nonce_d: &str, nonce_l: &str, proof: &str) -> bool {
+/// match the expected domain/direction/nonces/node-ids. Constant-time plaintext compare.
+#[allow(clippy::too_many_arguments)]
+fn verify_proof(
+    keys: &Keys,
+    dir: Direction,
+    nonce_d: &str,
+    nonce_l: &str,
+    id_d: &str,
+    id_l: &str,
+    proof: &str,
+) -> bool {
     let Ok(plaintext) = nip44::decrypt(keys.secret_key(), &keys.public_key(), proof) else {
         return false;
     };
-    let expected = proof_plaintext(dir, nonce_d, nonce_l);
+    let expected = proof_plaintext(dir, nonce_d, nonce_l, id_d, id_l);
     plaintext.as_bytes().ct_eq(expected.as_bytes()).into()
 }
 
@@ -116,7 +151,17 @@ fn verify_proof(keys: &Keys, dir: Direction, nonce_d: &str, nonce_l: &str, proof
 /// Writes the initial [`AuthRequest::Pin`], answers the listener's challenge, and verifies the
 /// listener's proof. Returns `Ok(())` only when the listener both accepted our proof and proved it
 /// holds the same PIN. Imposes no timeout — the caller wraps the whole exchange.
-pub async fn dialer_handshake<W, R>(send: &mut W, recv: &mut R, canonical_pin: &str) -> Result<()>
+///
+/// `dialer_id`/`listener_id` are this dialer's own node id and the id it dialed (the listener's,
+/// from `Connection::remote_id()`); both are folded into every proof so the exchange is bound to
+/// the QUIC-authenticated endpoints (see the module docs).
+pub async fn dialer_handshake<W, R>(
+    send: &mut W,
+    recv: &mut R,
+    canonical_pin: &str,
+    dialer_id: &str,
+    listener_id: &str,
+) -> Result<()>
 where
     W: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
@@ -140,8 +185,15 @@ where
             .context("reading PIN challenge")?;
     let nonce_l = challenge.nonce;
 
-    // 3. Prove we hold the PIN.
-    let proof_d = seal_proof(&keys, Direction::Dialer, &nonce_d, &nonce_l)?;
+    // 3. Prove we hold the PIN (bound to both node ids).
+    let proof_d = seal_proof(
+        &keys,
+        Direction::Dialer,
+        &nonce_d,
+        &nonce_l,
+        dialer_id,
+        listener_id,
+    )?;
     write_frame(send, &encode_pin_response(&PinResponse::new(proof_d))?).await?;
 
     // 4. Verdict + the listener's own proof.
@@ -154,7 +206,15 @@ where
     let proof_l = confirm
         .proof
         .context("listener accepted but sent no proof")?;
-    if !verify_proof(&keys, Direction::Listener, &nonce_d, &nonce_l, &proof_l) {
+    if !verify_proof(
+        &keys,
+        Direction::Listener,
+        &nonce_d,
+        &nonce_l,
+        dialer_id,
+        listener_id,
+        &proof_l,
+    ) {
         anyhow::bail!("listener failed to prove PIN possession (wrong peer?)");
     }
     Ok(())
@@ -170,11 +230,19 @@ where
 /// candidate key that verified the proof — when one matches and `commit` accepts it (and our proof
 /// has been sent), so the caller can retain it to re-authenticate a reconnecting peer after the PIN
 /// has rotated out of the recent cache. Otherwise sends a rejection and returns `Err`.
+///
+/// `dialer_id`/`listener_id` are the dialer's node id (the QUIC-authenticated
+/// `Connection::remote_id()`) and this listener's own id; folding them into the verified proof
+/// means the dialer's PIN proof is accepted only if its claimed identity matches the one QUIC
+/// authenticated — the listener validating the client's node id (see the module docs).
+#[allow(clippy::too_many_arguments)]
 pub async fn listener_handshake<W, R, F>(
     send: &mut W,
     recv: &mut R,
     candidates: &[Keys],
     nonce_d: &str,
+    dialer_id: &str,
+    listener_id: &str,
     commit: F,
 ) -> Result<Keys>
 where
@@ -187,20 +255,35 @@ where
     // 2. Send our challenge.
     write_frame(send, &encode_pin_challenge(&PinChallenge::new(&nonce_l))?).await?;
 
-    // 3. Read the dialer's proof and match it against each recent PIN.
+    // 3. Read the dialer's proof and match it against each recent PIN (bound to both node ids).
     let response =
         decode_pin_response(&read_length_prefixed(recv, MAX_CONTROL_MESSAGE_SIZE).await?)
             .context("reading PIN response")?;
-    let matched = candidates
-        .iter()
-        .find(|k| verify_proof(k, Direction::Dialer, nonce_d, &nonce_l, &response.proof));
+    let matched = candidates.iter().find(|k| {
+        verify_proof(
+            k,
+            Direction::Dialer,
+            nonce_d,
+            &nonce_l,
+            dialer_id,
+            listener_id,
+            &response.proof,
+        )
+    });
 
     // 4. Confirm (with our own proof) or reject. Even once the proof verifies, `commit` has the
     //    final say *before* acceptance is written, so a peer that loses the one-pair race is
     //    rejected rather than briefly told it was accepted and then dropped.
     match matched {
         Some(keys) if commit(keys) => {
-            let proof_l = seal_proof(keys, Direction::Listener, nonce_d, &nonce_l)?;
+            let proof_l = seal_proof(
+                keys,
+                Direction::Listener,
+                nonce_d,
+                &nonce_l,
+                dialer_id,
+                listener_id,
+            )?;
             write_frame(send, &encode_pin_confirm(&PinConfirm::accepted(proof_l))?).await?;
             Ok((*keys).clone())
         }
@@ -260,15 +343,21 @@ mod tests {
     fn proof_round_trips_and_rejects_tampering() {
         let keys = derive_auth_keys(&test_pin()).unwrap();
         let (nd, nl) = (generate_nonce(), generate_nonce());
+        let (id_d, id_l) = ("dialer-node-id", "listener-node-id");
 
-        let proof = seal_proof(&keys, Direction::Dialer, &nd, &nl).unwrap();
-        assert!(verify_proof(&keys, Direction::Dialer, &nd, &nl, &proof));
+        let proof = seal_proof(&keys, Direction::Dialer, &nd, &nl, id_d, id_l).unwrap();
+        assert!(verify_proof(&keys, Direction::Dialer, &nd, &nl, id_d, id_l, &proof));
 
         // Wrong direction, swapped nonces, or a different key must all fail.
-        assert!(!verify_proof(&keys, Direction::Listener, &nd, &nl, &proof));
-        assert!(!verify_proof(&keys, Direction::Dialer, &nl, &nd, &proof));
+        assert!(!verify_proof(&keys, Direction::Listener, &nd, &nl, id_d, id_l, &proof));
+        assert!(!verify_proof(&keys, Direction::Dialer, &nl, &nd, id_d, id_l, &proof));
         let other = derive_auth_keys(&test_pin()).unwrap();
-        assert!(!verify_proof(&other, Direction::Dialer, &nd, &nl, &proof));
+        assert!(!verify_proof(&other, Direction::Dialer, &nd, &nl, id_d, id_l, &proof));
+
+        // A different (spoofed) dialer or listener node id must fail — the proof is bound to the
+        // QUIC-authenticated identities.
+        assert!(!verify_proof(&keys, Direction::Dialer, &nd, &nl, "other-dialer", id_l, &proof));
+        assert!(!verify_proof(&keys, Direction::Dialer, &nd, &nl, id_d, "other-listener", &proof));
     }
 
     #[test]
@@ -278,9 +367,20 @@ mod tests {
         assert_ne!(a.public_key(), b.public_key());
     }
 
+    // The node ids used across the handshake tests; both halves agree on them in the happy path.
+    const ID_D: &str = "dialer-node-id";
+    const ID_L: &str = "listener-node-id";
+
     /// Run a full dialer/listener handshake over an in-memory duplex, mirroring how the runtime
-    /// reads the opening request before dispatching to the listener half.
-    async fn run_handshake(dialer_pin: &str, listener_pins: &[&str]) -> (Result<()>, Result<()>) {
+    /// reads the opening request before dispatching to the listener half. `dialer_ids`/`listener_ids`
+    /// are the `(id_d, id_l)` each side folds into its proofs — equal in the happy path, unequal to
+    /// simulate a relayed/mismatched identity.
+    async fn run_handshake_with_ids(
+        dialer_pin: &str,
+        listener_pins: &[&str],
+        dialer_ids: (&str, &str),
+        listener_ids: (&str, &str),
+    ) -> (Result<()>, Result<()>) {
         let (a, b) = tokio::io::duplex(4096);
         let (mut a_read, mut a_write) = tokio::io::split(a);
         let (mut b_read, mut b_write) = tokio::io::split(b);
@@ -291,14 +391,31 @@ mod tests {
             .collect();
 
         let dialer = dialer_pin.to_string();
-        let dialer_task = async move { dialer_handshake(&mut a_write, &mut a_read, &dialer).await };
+        let (d_id_d, d_id_l) = (dialer_ids.0.to_string(), dialer_ids.1.to_string());
+        let dialer_task = async move {
+            dialer_handshake(&mut a_write, &mut a_read, &dialer, &d_id_d, &d_id_l).await
+        };
+        let (l_id_d, l_id_l) = (listener_ids.0.to_string(), listener_ids.1.to_string());
         let listener_task = async move {
             let nonce_d = read_pin_request(&mut b_read).await?;
-            listener_handshake(&mut b_write, &mut b_read, &candidates, &nonce_d, |_| true)
-                .await
-                .map(|_| ())
+            listener_handshake(
+                &mut b_write,
+                &mut b_read,
+                &candidates,
+                &nonce_d,
+                &l_id_d,
+                &l_id_l,
+                |_| true,
+            )
+            .await
+            .map(|_| ())
         };
         tokio::join!(dialer_task, listener_task)
+    }
+
+    /// The happy path: both sides agree on the two node ids.
+    async fn run_handshake(dialer_pin: &str, listener_pins: &[&str]) -> (Result<()>, Result<()>) {
+        run_handshake_with_ids(dialer_pin, listener_pins, (ID_D, ID_L), (ID_D, ID_L)).await
     }
 
     #[tokio::test]
@@ -330,12 +447,22 @@ mod tests {
         let candidates = vec![derive_auth_keys(&pin).unwrap()];
 
         let dialer = pin.clone();
-        let dialer_task = async move { dialer_handshake(&mut a_write, &mut a_read, &dialer).await };
+        let dialer_task = async move {
+            dialer_handshake(&mut a_write, &mut a_read, &dialer, ID_D, ID_L).await
+        };
         let listener_task = async move {
             let nonce_d = read_pin_request(&mut b_read).await?;
-            listener_handshake(&mut b_write, &mut b_read, &candidates, &nonce_d, |_| false)
-                .await
-                .map(|_| ())
+            listener_handshake(
+                &mut b_write,
+                &mut b_read,
+                &candidates,
+                &nonce_d,
+                ID_D,
+                ID_L,
+                |_| false,
+            )
+            .await
+            .map(|_| ())
         };
         let (d, l) = tokio::join!(dialer_task, listener_task);
         // Match the explicit rejection message rather than just `is_err()`, which would also pass
@@ -354,5 +481,36 @@ mod tests {
         let (d, l) = run_handshake(&test_pin(), &[&test_pin()]).await;
         assert!(d.is_err(), "dialer should be rejected");
         assert!(l.is_err(), "listener should reject");
+    }
+
+    #[tokio::test]
+    async fn handshake_fails_when_the_dialer_node_id_disagrees() {
+        // Same PIN, but the listener saw a different dialer node id than the dialer folded in
+        // (e.g. a relay whose QUIC session terminates at another id). The proof must not verify.
+        let pin = test_pin();
+        let (d, l) = run_handshake_with_ids(
+            &pin,
+            &[&pin],
+            (ID_D, ID_L),
+            ("some-other-dialer-id", ID_L),
+        )
+        .await;
+        assert!(d.is_err(), "dialer must be rejected on a node-id mismatch");
+        assert!(l.is_err(), "listener must reject on a node-id mismatch");
+    }
+
+    #[tokio::test]
+    async fn handshake_fails_when_the_listener_node_id_disagrees() {
+        // The dialer believes it reached a different listener than the one answering.
+        let pin = test_pin();
+        let (d, l) = run_handshake_with_ids(
+            &pin,
+            &[&pin],
+            (ID_D, "some-other-listener-id"),
+            (ID_D, ID_L),
+        )
+        .await;
+        assert!(d.is_err(), "dialer must be rejected on a node-id mismatch");
+        assert!(l.is_err(), "listener must reject on a node-id mismatch");
     }
 }

@@ -560,8 +560,8 @@ async fn run_server_session(
 
         // Auth runs on the single session stream; on success the same stream
         // stays open for clipboard frames (no separate data stream / handshake).
-        let (send, recv) = match auth_as_listener(&conn, &tokens, pin_cache.as_ref(), &claim).await
-        {
+        let (send, recv) =
+            match auth_as_listener(&conn, &tokens, pin_cache.as_ref(), &claim, node_id).await {
             Ok(streams) => streams,
             Err(e) => {
                 log::warn!("Auth failed for {remote_id}: {e:#}");
@@ -795,7 +795,7 @@ async fn run_client_session(
                         auth_as_dialer(&conn, &identity.token).await
                     }
                     DialSpec::Pin { canonical_pin, .. } => {
-                        auth_as_dialer_pin(&conn, canonical_pin).await
+                        auth_as_dialer_pin(&conn, canonical_pin, own_id).await
                     }
                 };
                 match auth_result {
@@ -1485,12 +1485,25 @@ async fn auth_as_dialer(conn: &iroh::endpoint::Connection, auth_token: &str) -> 
 /// crosses the wire. The whole exchange is bounded by [`AUTH_TIMEOUT`] and any failure is an
 /// [`AuthFailure`] — fatal for this target, exactly like a wrong token. On success the opened
 /// stream is returned (not finished) for the clipboard.
-async fn auth_as_dialer_pin(conn: &iroh::endpoint::Connection, pin: &str) -> Result<Bi> {
+async fn auth_as_dialer_pin(
+    conn: &iroh::endpoint::Connection,
+    pin: &str,
+    own_id: iroh::EndpointId,
+) -> Result<Bi> {
     // One deadline over the whole exchange, including opening the stream — a
     // stalled open_bi must not delay the point where the timeout starts.
     let handshake = async {
         let (mut send, mut recv) = conn.open_bi().await.context("opening session stream")?;
-        crate::pin_auth::dialer_handshake(&mut send, &mut recv, pin).await?;
+        // Bind the PIN proof to both QUIC-authenticated node ids: our own, and
+        // the listener we dialed (`remote_id`, authenticated by QUIC/TLS).
+        crate::pin_auth::dialer_handshake(
+            &mut send,
+            &mut recv,
+            pin,
+            &own_id.to_string(),
+            &conn.remote_id().to_string(),
+        )
+        .await?;
         Ok::<Bi, anyhow::Error>((send, recv))
     };
     match tokio::time::timeout(AUTH_TIMEOUT, handshake).await {
@@ -1521,6 +1534,7 @@ async fn auth_as_listener(
     auth_tokens: &HashSet<String>,
     pin_cache: Option<&RecentPins>,
     claim: &PairClaim,
+    own_id: iroh::EndpointId,
 ) -> Result<Bi> {
     let remote_id = conn.remote_id();
 
@@ -1594,11 +1608,16 @@ async fn auth_as_listener(
                 // The claim is committed inside the handshake, right after the proof verifies
                 // and *before* the acceptance frame is sent — so a race loser is rejected
                 // in-band, not accepted-then-dropped.
+                // Bind the verified proof to both QUIC-authenticated node ids: the dialer's
+                // (`remote_id`, from QUIC/TLS) and our own. A proof only verifies if the dialer
+                // folded in the same ids — so this validates the client's node id in-band.
                 crate::pin_auth::listener_handshake(
                     &mut send,
                     &mut recv,
                     &candidates,
                     &nonce,
+                    &remote_id.to_string(),
+                    &own_id.to_string(),
                     |key| claim.commit(remote_id, Some(key.clone())),
                 )
                 .await?;
