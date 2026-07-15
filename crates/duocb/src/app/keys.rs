@@ -103,10 +103,6 @@ fn handle_configure_key(
     letter: &dyn Fn(char) -> bool,
     command: &dyn Fn(char) -> bool,
 ) -> bool {
-    if letter('q') {
-        app.open_quick();
-        return true;
-    }
     match app.configure_step {
         ConfigureStep::SetupChoice => {
             if letter('g') {
@@ -135,7 +131,9 @@ fn handle_configure_key(
             }
         }
         ConfigureStep::Ready => {
-            if letter('s') {
+            if letter('q') {
+                app.open_quick();
+            } else if letter('s') {
                 app.begin_server();
             } else if letter('c') {
                 app.enter_join_picker();
