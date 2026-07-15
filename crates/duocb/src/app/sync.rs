@@ -189,6 +189,7 @@ impl App {
         // message. `dial_ready` (below) folds validity in via `client_dial_spec`.
         s.set_pin_is_lan_only(duocb_core::pin::pin_is_lan_only(&combined));
         s.set_join_ip_prefix(self.join_ip_ctx.locked_prefix().into());
+        s.set_join_ip_placeholder(self.join_ip_ctx.host_placeholder().into());
         s.set_join_ip_hint(self.join_ip_ctx.hint().into());
         s.set_join_ip_error(match self.join_ip_outcome() {
             JoinIpOutcome::OutOfRange => {

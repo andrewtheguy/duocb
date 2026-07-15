@@ -170,14 +170,16 @@ int duocb_pin_is_lan_only(const char *pin);
  * host's IP falls inside one of this device's private IPv4 subnets). Writes a
  * JSON object to out_buf:
  *
- *   {"prefix":"10.22.33.","hint":"Valid range: …","label":"10.22.33.0/24"}
+ *   {"prefix":"10.22.33.","placeholder":"last octet","hint":"Valid range: …","label":"10.22.33.0/24"}
  *
  * "prefix" is the locked network part to show non-editable ahead of the field
- * (the user types only the host part). "hint" is a range hint for a
- * partial-octet subnet (e.g. a /20), else "". "label" is the CIDR for the
- * out-of-range message. All three are "" when no private subnet is detected —
- * fall back to a free full-IP entry then. 1 = written, 0 = buffer too small
- * (a 256-byte buffer is ample), -1 = NULL buffer. */
+ * (the user types only the host part). "placeholder" describes the editable
+ * tail ("last octet" / "last 2 octets") for the field's placeholder text.
+ * "hint" is a range hint for a partial-octet subnet (e.g. a /20), else "".
+ * "label" is the CIDR for the out-of-range message. All four are "" when no
+ * private subnet is detected — fall back to a free full-IP entry then.
+ * 1 = written, 0 = buffer too small (a 256-byte buffer is ample), -1 = NULL
+ * buffer. */
 int duocb_join_ip_context(char *out_buf, size_t out_len);
 
 /* Validate what the user typed into the host-IP entry against this device's

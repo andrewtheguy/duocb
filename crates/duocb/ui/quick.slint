@@ -191,7 +191,7 @@ export component QuickScreen inherits ScrollView {
                         }
                         ip-entry := LineEdit {
                             font-family: UiState.mono-font;
-                            placeholder-text: UiState.join-ip-prefix != "" ? "15" : "192.168.1.42";
+                            placeholder-text: UiState.join-ip-prefix != "" ? UiState.join-ip-placeholder : "Host IP (optional)";
                             text <=> UiState.in-join-ip;
                             edited => { Actions.fields-edited(); }
                             accepted => { Actions.join-quick(); }
