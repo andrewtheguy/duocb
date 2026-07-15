@@ -16,3 +16,4 @@ pub mod pin;
 pub mod pin_auth;
 mod pin_record;
 pub mod protocol;
+pub mod subnet;

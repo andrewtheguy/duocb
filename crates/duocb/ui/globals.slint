@@ -96,8 +96,15 @@ export global UiState {
     /// True when the typed PIN is LAN-only (its first character), so the join
     /// card reveals the optional host-IP field.
     in property <bool> pin-is-lan-only;
-    /// True when the host-IP entry is non-empty but not a well-formed IPv4.
-    in property <bool> join-ip-invalid;
+    /// The locked network prefix of this device's subnet (e.g. "10.22.33."),
+    /// shown non-editable ahead of the host-IP field so the user types only the
+    /// host part. "" when no subnet was detected (free full-IP entry).
+    in property <string> join-ip-prefix;
+    /// A "valid range" hint for a partial-octet subnet (e.g. a /20); "" otherwise.
+    in property <string> join-ip-hint;
+    /// The host-IP entry error ("IP out of range for …" / "Not a valid IPv4
+    /// address"); "" when the entry is empty or valid.
+    in property <string> join-ip-error;
     in property <bool> dial-ready;
 
     // Session panel.

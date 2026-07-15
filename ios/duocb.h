@@ -71,7 +71,10 @@
  *                                              side channel (multicast-free);
  *                                              omitted resolves via mDNS. A
  *                                              malformed IP is rejected; ignored
- *                                              for a non-LAN-only PIN.
+ *                                              for a non-LAN-only PIN. Build this
+ *                                              value with duocb_resolve_join_ip
+ *                                              (below), which range-checks the
+ *                                              entry against this device's subnet.
  *
  * Events (one JSON object per duocb_next_event call), by "type":
  *   server_ready      {node_id, token_fingerprint}
@@ -161,6 +164,29 @@ int duocb_normalize_pin(const char *pin, char *out_buf, size_t out_len);
  * 0 = not LAN-only or the PIN is invalid/incomplete, -1 = NULL or non-UTF-8
  * argument. */
 int duocb_pin_is_lan_only(const char *pin);
+
+/* Describe how the LAN-only join screen should constrain the optional host-IP
+ * entry to THIS device's own subnet (both devices must share a LAN, so the
+ * host's IP falls inside one of this device's private IPv4 subnets). Writes a
+ * JSON object to out_buf:
+ *
+ *   {"prefix":"10.22.33.","hint":"Valid range: …","label":"10.22.33.0/24"}
+ *
+ * "prefix" is the locked network part to show non-editable ahead of the field
+ * (the user types only the host part). "hint" is a range hint for a
+ * partial-octet subnet (e.g. a /20), else "". "label" is the CIDR for the
+ * out-of-range message. All three are "" when no private subnet is detected —
+ * fall back to a free full-IP entry then. 1 = written, 0 = buffer too small
+ * (a 256-byte buffer is ample), -1 = NULL buffer. */
+int duocb_join_ip_context(char *out_buf, size_t out_len);
+
+/* Validate what the user typed into the host-IP entry against this device's
+ * subnet, resolving the host part after the locked prefix (or a whole pasted
+ * address) into a full IPv4 written to out_buf — pass exactly that as the
+ * config "ip" to duocb_start. 1 = in range (address written), 0 = out of range
+ * (show "IP out of range" using the "label" above), 2 = empty entry (resolve
+ * via mDNS; pass no "ip"), -1 = malformed / NULL input / buffer too small. */
+int duocb_resolve_join_ip(const char *entry, char *out_buf, size_t out_len);
 
 /* Start a session (configure or quick mode, per the config's "role").
  * Returns a non-NULL handle, or NULL with the error message in err_buf. */

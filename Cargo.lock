@@ -1892,6 +1892,7 @@ dependencies = [
  "libc",
  "log",
  "mdns-sd",
+ "netdev",
  "nostr-sdk",
  "parking_lot",
  "rand 0.9.5",

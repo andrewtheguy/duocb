@@ -12,6 +12,7 @@ use super::{
 use crate::{ClipRow, MainWindow, PathRow, PeerRow, UiState};
 use duocb_core::net::ConnStatus;
 use duocb_core::net::endpoint::ConnPathKind;
+use duocb_core::subnet::JoinIpOutcome;
 
 impl App {
     pub(crate) fn sync(&self, ui: &MainWindow) {
@@ -181,12 +182,21 @@ impl App {
             duocb_core::pin::pin_input_len(&self.in_pin_a) == duocb_core::pin::PIN_GROUP_LEN,
         );
         // The optional host-IP entry shows only for a LAN-only PIN (its first
-        // character marks the channel — see `duocb_core::pin`). A non-empty entry
-        // must be a well-formed IPv4; the warning shows otherwise. `dial_ready`
-        // (below) already folds this in via `client_dial_spec`.
+        // character marks the channel — see `duocb_core::pin`). It is constrained
+        // to this device's own subnet: `join-ip-prefix` is the locked network
+        // part the user types after, `join-ip-hint` a range hint for a
+        // partial-octet subnet, and `join-ip-error` the out-of-range / malformed
+        // message. `dial_ready` (below) folds validity in via `client_dial_spec`.
         s.set_pin_is_lan_only(duocb_core::pin::pin_is_lan_only(&combined));
-        let ip = self.in_join_ip.trim();
-        s.set_join_ip_invalid(!ip.is_empty() && ip.parse::<std::net::Ipv4Addr>().is_err());
+        s.set_join_ip_prefix(self.join_ip_ctx.locked_prefix().into());
+        s.set_join_ip_hint(self.join_ip_ctx.hint().into());
+        s.set_join_ip_error(match self.join_ip_ctx.resolve(&self.in_join_ip) {
+            JoinIpOutcome::OutOfRange => {
+                format!("IP out of range for {}", self.join_ip_ctx.label()).into()
+            }
+            JoinIpOutcome::Malformed => "Not a valid IPv4 address".into(),
+            JoinIpOutcome::Empty | JoinIpOutcome::InRange(_) => SharedString::default(),
+        });
         s.set_dial_ready(self.client_dial_spec().is_some());
 
         // Session panel.
