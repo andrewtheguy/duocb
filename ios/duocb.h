@@ -170,7 +170,7 @@ int duocb_pin_is_lan_only(const char *pin);
  * host's IP falls inside one of this device's private IPv4 subnets). Writes a
  * JSON object to out_buf:
  *
- *   {"prefix":"10.22.33.","placeholder":"last octet","hint":"Valid range: …","label":"10.22.33.0/24"}
+ *   {"prefix":"10.22.33.","placeholder":"last octet","hint":"","label":"10.22.33.0/24"}
  *
  * "prefix" is the locked network part to show non-editable ahead of the field
  * (the user types only the host part). "placeholder" describes the editable
