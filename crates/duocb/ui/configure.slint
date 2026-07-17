@@ -264,18 +264,18 @@ export component HomeScreen inherits ScrollView {
 
         Rectangle { vertical-stretch: 1; }
 
-        // Quick options, its description, and the version render only on the
-        // hub (the configured home), matching mobile.
-        if UiState.configure-step == ConfigureStep.ready: WideButton {
+        // Quick pairing needs no standing identity, so expose it both before
+        // setup and on the configured hub, matching mobile.
+        if UiState.configure-step == ConfigureStep.setup-choice || UiState.configure-step == ConfigureStep.ready: WideButton {
             text: "⚡ Quick options — pair on the spot, nothing saved";
             hint: "Q";
             clicked => { Actions.open-quick(); }
         }
-        if UiState.configure-step == ConfigureStep.ready: Small {
+        if UiState.configure-step == ConfigureStep.setup-choice || UiState.configure-step == ConfigureStep.ready: Small {
             text: "Quick pair connects to any duocb device via a short PIN, even one that doesn't share your secret.";
             horizontal-alignment: center;
         }
-        if UiState.configure-step == ConfigureStep.ready: Small {
+        if UiState.configure-step == ConfigureStep.setup-choice || UiState.configure-step == ConfigureStep.ready: Small {
             text: "duocb v" + UiState.app-version;
             horizontal-alignment: center;
         }
