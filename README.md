@@ -27,7 +27,7 @@ Received content never touches the receiving machine's clipboard (or disk) by it
 
 ## Pairing modes
 
-**Configure** is the primary mode and the home screen itself; the quick options live behind the home's **Quick options** button (`Q`) for ad-hoc pairing.
+**Configure** is the primary mode and the home screen itself; ad-hoc pairing lives behind the **Quick options** button (`Q`), available both before secret setup and on the configured hub.
 
 | Mode | Signaling | What you transfer by hand | Auth | Internet |
 |---|---|---|---|---|
@@ -63,7 +63,7 @@ Run `duocb` on both devices.
 2. **Other device:** press `I`, paste the same secret (confirm the fingerprint matches), and name it.
 3. **Pair:** press `S` (Start) on one device; on the other press `C` (Join) to open the device picker, select it (`R` refreshes the list), and press `Enter`. Joining first and starting shortly afterward also works: the join retries every few seconds for up to 10 attempts. If it gives up first, press Join again after the host starts.
 
-**Quick options:** press `Q` on both devices. The two everyday choices are `P` PIN quick pair (internet + local network — the default) and `L` local network only (private session: Bonjour/DNS-SD discovery and direct device-to-device traffic, with no third-party server; this is also the channel the iOS app's "Local network only" option speaks — see the LAN-boundary caveat above). One advanced, mostly-for-testing option sits behind an "Advanced options" section: `I` internet only (the PIN is found through a nostr relay only, not advertised on the LAN — though the connection can still take a direct local path). **The channel is chosen only on the device showing the PIN**: `P` and `L` advertise the record differently on the LAN (`P` rides the iroh-style swarm responder, `L` a standard Bonjour service), and the PIN's first character encodes which, so the joiner just types the PIN and the app picks the matching discovery automatically — no channel to select on the joining side. Then press `S` on the starting device and `C` on the joining one, and type the displayed PIN. A device hosting on `L` also shows its LAN IP; if the joiner's network blocks multicast so the automatic lookup fails, type that IP into the join form's optional field to fetch the record over a direct unicast connection instead (same PIN either way).
+**Quick options:** press `Q` on both devices; no shared secret or device setup is required. The two everyday choices are `P` PIN quick pair (internet + local network — the default) and `L` local network only (private session: Bonjour/DNS-SD discovery and direct device-to-device traffic, with no third-party server; this is also the channel the iOS app's "Local network only" option speaks — see the LAN-boundary caveat above). One advanced, mostly-for-testing option sits behind an "Advanced options" section: `I` internet only (the PIN is found through a nostr relay only, not advertised on the LAN — though the connection can still take a direct local path). **The channel is chosen only on the device showing the PIN**: `P` and `L` advertise the record differently on the LAN (`P` rides the iroh-style swarm responder, `L` a standard Bonjour service), and the PIN's first character encodes which, so the joiner just types the PIN and the app picks the matching discovery automatically — no channel to select on the joining side. Then press `S` on the starting device and `C` on the joining one, and type the displayed PIN. A device hosting on `L` also shows its LAN IP; if the joiner's network blocks multicast so the automatic lookup fails, type that IP into the join form's optional field to fetch the record over a direct unicast connection instead (same PIN either way).
 
 **Paired:** both sides now show the same session panel — `Ctrl/⌘+S` (or the button) reads your clipboard and sends it, and a compose field sends typed text directly (Enter) without touching the clipboard; received items appear in the inbox where you can **Peek** (view without copying) and **Copy** (the only action that writes that received item to your clipboard). Either device can send at any time; the outbox above the inbox shows the last item you sent (size + CRC) so the other side can confirm it matches what arrived.
 
@@ -107,16 +107,15 @@ On every launch, duocb creates (if needed) and locks `duocb/config.json` under t
 
 The config is **per-machine**: the permanent suffix is this device's identity, so
 copying a config file to another machine is not supported — import the secret
-through the wizard there instead. Configs from versions before the suffix
-existed load with a fresh suffix; there is no other migration (pre-1.0, no
-backward compatibility).
+through the wizard there instead. Existing configs must contain a
+`device_suffix`; there is no migration or backward compatibility.
 
 Only one duocb process may use a config path at a time. The process holds an
-exclusive OS lock on the config file itself for its lifetime, preventing two local
-instances from accidentally claiming the same device identity and guarding the
-file against accidental external edits while duocb runs. For same-machine
-end-to-end testing, give each process its own config (each mints its own suffix;
-keep the secret equal):
+exclusive OS lock on a sibling `<config>.lock` file for its lifetime, preventing
+two local instances from accidentally claiming the same device identity. Config
+saves flush complete JSON to `<config>.tmp` and atomically rename it over the
+configured path. For same-machine end-to-end testing, give each process its own
+config (each mints its own suffix; keep the secret equal):
 
 ```sh
 duocb --config /tmp/duocb-mac1.json
@@ -126,6 +125,9 @@ duocb --config /tmp/duocb-mac2.json
 `-c` is an alias for `--config`; `DUOCB_CONFIG=/path/to/config.json` provides the
 same override for test harnesses. A command-line path takes precedence over the
 environment variable.
+
+If the selected config exists but cannot be read or parsed, duocb prints an
+error and exits during startup instead of silently replacing it with defaults.
 
 Clipboard content and the inbox are never persisted anywhere.
 

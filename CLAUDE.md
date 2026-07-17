@@ -16,7 +16,7 @@
 
 ## Config-based E2E tests on the same device
 
-Only one duocb process may use a config path at a time (it holds an exclusive OS lock on the config file itself for its lifetime). To run both peers of a configure-mode pairing on the same machine, give each process its own config location — otherwise the second fails to acquire the lock. Each config mints its own permanent `device_suffix` on first launch, so short names don't need to differ; keep the shared `auth_token` equal (import the same secret through the setup wizard):
+Only one duocb process may use a config path at a time (it holds an exclusive OS lock on a sibling `<config>.lock` file for its lifetime, allowing JSON saves to use atomic temp-and-rename replacement). To run both peers of a configure-mode pairing on the same machine, give each process its own config location — otherwise the second fails to acquire the lock. Each config mints its own permanent `device_suffix` on first launch, so short names don't need to differ; keep the shared `auth_token` equal (import the same secret through the setup wizard):
 
 ```sh
 cargo run -- --config /tmp/duocb-peer1.json   # or DUOCB_CONFIG=/tmp/duocb-peer1.json

@@ -145,13 +145,16 @@ pub(crate) enum CopyTarget {
 }
 
 impl App {
-    pub(crate) fn new(mut config_lock: crate::config::ConfigLock, net: NetHandle) -> Self {
-        let mut config = config_lock.load();
-
-        // The permanent device suffix is minted on the first launch with this
-        // config file and persisted immediately. A failed save still leaves a
-        // usable in-memory suffix for this session; the next successful save
-        // persists it.
+    pub(crate) fn new(
+        config_lock: crate::config::ConfigLock,
+        mut config: crate::config::Config,
+        net: NetHandle,
+    ) -> Self {
+        // A missing config path reaches here with defaults and mints the
+        // permanent device suffix. Existing configs without the suffix are
+        // rejected by ConfigLock::load instead of silently changing identity.
+        // A failed first save still leaves a usable in-memory suffix for this
+        // session; the next successful save persists it.
         let mut startup_error = None;
         let device_suffix = match config.device_suffix.as_deref() {
             Some(s) if duocb_core::identity::is_valid_suffix(s) => s.to_string(),
@@ -970,7 +973,8 @@ pub(crate) mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let lock = crate::config::acquire_lock(&dir.join("config.json")).unwrap();
-        App::new(lock, spawn_net_runtime(None))
+        let config = lock.load().unwrap();
+        App::new(lock, config, spawn_net_runtime(None))
     }
 
     fn rand_suffix() -> String {
@@ -1074,7 +1078,8 @@ pub(crate) mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let lock = crate::config::acquire_lock(&dir.join("config.json")).unwrap();
-        let mut app = App::new(lock, net);
+        let config = lock.load().unwrap();
+        let mut app = App::new(lock, config, net);
         app.secret = Some(duocb_core::auth::generate_token());
         app.saved_name = Some("mac".into());
         app.configure_step = ConfigureStep::Ready;

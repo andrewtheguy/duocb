@@ -105,7 +105,9 @@ fn handle_configure_key(
 ) -> bool {
     match app.configure_step {
         ConfigureStep::SetupChoice => {
-            if letter('g') {
+            if letter('q') {
+                app.open_quick();
+            } else if letter('g') {
                 app.begin_generate_secret();
             } else if letter('i') {
                 app.configure_step = ConfigureStep::SetupImport;
@@ -264,6 +266,12 @@ mod tests {
     #[test]
     fn wizard_keys_route() {
         let mut app = test_app();
+        assert_eq!(app.configure_step, ConfigureStep::SetupChoice);
+        // Quick mode is identity-free and available before secret setup.
+        assert!(plain(&mut app, "q", false));
+        assert_eq!(app.screen, Screen::Quick);
+        app.go_back();
+        assert_eq!(app.screen, Screen::Home);
         assert_eq!(app.configure_step, ConfigureStep::SetupChoice);
         // Generate persists the secret and jumps straight to naming — no
         // intermediate "save the secret" step.
