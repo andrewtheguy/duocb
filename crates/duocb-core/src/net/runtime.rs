@@ -31,9 +31,9 @@ use crate::protocol::{
     encode_auth_request, encode_auth_response, encode_clip_msg, read_length_prefixed,
 };
 
-/// How many recent buckets' PIN keys the server retains for in-band PIN auth. Mirrors the
-/// client's adjacent-bucket look-back in `nostr::lookup_pin_record`.
-const RECENT_PIN_CACHE: usize = 3;
+/// Retain only the PIN keys from the sender's current and previous rotation buckets for
+/// in-band authentication. The joiner may still probe an additional bucket for clock skew.
+const RECENT_PIN_CACHE: usize = 2;
 
 /// Timeout for the authentication handshake.
 const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -90,9 +90,9 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Recent PIN auth keypairs (newest first), one per rotation bucket the quick-mode server has
-/// published. Written by the PIN publisher, read by the listener auth path to verify a dialer's
-/// proof. Cheap to clone (shared handle).
+/// Current and previous PIN auth keypairs (newest first), one per rotation bucket the quick-mode
+/// server has published. Written by the PIN publisher, read by the listener auth path to verify a
+/// dialer's proof. Cheap to clone (shared handle).
 #[derive(Clone, Default)]
 struct RecentPins(Arc<parking_lot::RwLock<VecDeque<nostr_sdk::Keys>>>);
 
@@ -1645,6 +1645,27 @@ mod tests {
     use super::*;
     use crate::net::NetEvent;
     use std::time::Instant;
+
+    #[test]
+    fn recent_pin_cache_keeps_only_current_and_previous() {
+        let recent = RecentPins::default();
+        let expired = nostr_sdk::Keys::generate();
+        let previous = nostr_sdk::Keys::generate();
+        let current = nostr_sdk::Keys::generate();
+        let previous_pubkey = previous.public_key();
+        let current_pubkey = current.public_key();
+
+        recent.push(expired);
+        recent.push(previous);
+        recent.push(current);
+
+        let retained: Vec<_> = recent
+            .snapshot()
+            .into_iter()
+            .map(|keys| keys.public_key())
+            .collect();
+        assert_eq!(retained, vec![current_pubkey, previous_pubkey]);
+    }
 
     /// Drain events from a std receiver until `pred` matches or the deadline
     /// passes, panicking with the seen events on timeout.

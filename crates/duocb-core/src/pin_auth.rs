@@ -33,8 +33,9 @@
 //! it presents, so the binding does not defeat a relay or intermediary that possesses the PIN.
 //!
 //! Because the listener mints a fresh PIN every rotation bucket, it verifies `proof_d` against the
-//! last few buckets' keys (its recent-PIN cache) — mirroring the dialer's adjacent-bucket look-back
-//! when it fetched the node id. QUIC/TLS hides these proofs from passive network and relay observers
+//! current and previous buckets' keys (its recent-PIN cache). The dialer may additionally probe the
+//! next bucket when fetching the node id to tolerate clock skew. QUIC/TLS hides these proofs from
+//! passive network and relay observers
 //! and binds the connection to the peer's node id (its public key). This construction is not a PAKE:
 //! a party that can observe a decrypted proof transcript can test PIN guesses offline, as can anyone
 //! archiving the public PIN-derived rendezvous event. Argon2id and the short recent-PIN acceptance
