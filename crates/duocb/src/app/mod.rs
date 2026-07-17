@@ -145,9 +145,11 @@ pub(crate) enum CopyTarget {
 }
 
 impl App {
-    pub(crate) fn new(config_lock: crate::config::ConfigLock, net: NetHandle) -> Self {
-        let mut config = config_lock.load();
-
+    pub(crate) fn new(
+        config_lock: crate::config::ConfigLock,
+        mut config: crate::config::Config,
+        net: NetHandle,
+    ) -> Self {
         // The permanent device suffix is minted on the first launch with this
         // config file and persisted immediately. A failed save still leaves a
         // usable in-memory suffix for this session; the next successful save
@@ -970,7 +972,8 @@ pub(crate) mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let lock = crate::config::acquire_lock(&dir.join("config.json")).unwrap();
-        App::new(lock, spawn_net_runtime(None))
+        let config = lock.load().unwrap();
+        App::new(lock, config, spawn_net_runtime(None))
     }
 
     fn rand_suffix() -> String {
@@ -1074,7 +1077,8 @@ pub(crate) mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let lock = crate::config::acquire_lock(&dir.join("config.json")).unwrap();
-        let mut app = App::new(lock, net);
+        let config = lock.load().unwrap();
+        let mut app = App::new(lock, config, net);
         app.secret = Some(duocb_core::auth::generate_token());
         app.saved_name = Some("mac".into());
         app.configure_step = ConfigureStep::Ready;

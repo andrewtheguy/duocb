@@ -127,6 +127,9 @@ duocb --config /tmp/duocb-mac2.json
 same override for test harnesses. A command-line path takes precedence over the
 environment variable.
 
+If the selected config exists but cannot be read or parsed, duocb prints an
+error and exits during startup instead of silently replacing it with defaults.
+
 Clipboard content and the inbox are never persisted anywhere.
 
 ## Security model

@@ -70,6 +70,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // process may run only with another explicit config path, which gives
     // same-machine E2E tests isolated state.
     let config_lock = config::acquire_lock(&config_path)?;
+    // Load before initializing the UI or networking so malformed persisted
+    // state terminates startup without starting any application services.
+    let config = config_lock.load()?;
 
     let ui = MainWindow::new()?;
     set_platform_fonts(&ui);
@@ -84,7 +87,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         move || notify.notify_one()
     })));
 
-    let app = Rc::new(RefCell::new(app::App::new(config_lock, net)));
+    let app = Rc::new(RefCell::new(app::App::new(config_lock, config, net)));
     app::callbacks::wire(&app, &ui);
     app.borrow().sync(&ui);
 

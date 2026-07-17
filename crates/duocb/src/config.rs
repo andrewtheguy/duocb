@@ -121,27 +121,20 @@ impl ConfigLock {
         sibling_path(&self.path, ".tmp")
     }
 
-    /// Read the current config path, returning defaults when the file is absent,
-    /// empty, unreadable, or malformed. A broken config must never block startup.
-    pub fn load(&self) -> Config {
+    /// Read the current config path. A missing file is a first launch; any
+    /// unreadable or malformed file is an error so startup cannot silently
+    /// replace broken persisted state with defaults.
+    pub fn load(&self) -> Result<Config> {
         let content = match std::fs::read_to_string(&self.path) {
             Ok(content) => content,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Config::default(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
             Err(e) => {
-                log::warn!("Ignoring unreadable config {}: {e}", self.path.display());
-                return Config::default();
+                return Err(e)
+                    .with_context(|| format!("reading config {}", self.path.display()));
             }
         };
-        if content.trim().is_empty() {
-            return Config::default();
-        }
-        match serde_json::from_str(&content) {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                log::warn!("Ignoring malformed config {}: {e}", self.path.display());
-                Config::default()
-            }
-        }
+        serde_json::from_str(&content)
+            .with_context(|| format!("parsing config {}", self.path.display()))
     }
 
     /// Persist the config by flushing complete new content to a sibling temp
@@ -245,7 +238,10 @@ mod tests {
         let path = dir.join("config.json");
         let lock = acquire_lock(&path).expect("lock");
 
-        assert!(lock.load().auth_token.is_none(), "fresh config is empty");
+        assert!(
+            lock.load().expect("load fresh config").auth_token.is_none(),
+            "fresh config is empty"
+        );
 
         lock.save(&Config {
             auth_token: Some("token-value".to_string()),
@@ -254,7 +250,7 @@ mod tests {
         })
         .expect("save");
 
-        let loaded = lock.load();
+        let loaded = lock.load().expect("load saved config");
         assert_eq!(loaded.auth_token.as_deref(), Some("token-value"));
         assert_eq!(loaded.my_name.as_deref(), Some("desktop"));
 
@@ -265,7 +261,7 @@ mod tests {
             device_suffix: None,
         })
         .expect("save shorter");
-        let loaded = lock.load();
+        let loaded = lock.load().expect("load shorter config");
         assert_eq!(loaded.auth_token.as_deref(), Some("t"));
         assert_eq!(loaded.my_name, None);
 
@@ -274,23 +270,25 @@ mod tests {
     }
 
     #[test]
-    fn malformed_config_falls_back_to_defaults() {
+    fn malformed_config_is_an_error() {
         let dir = temp_dir();
         let path = dir.join("config.json");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(&path, b"{ not valid json").unwrap();
 
         let lock = acquire_lock(&path).expect("lock");
-        let loaded = lock.load();
-        assert!(loaded.auth_token.is_none());
-        assert!(loaded.my_name.is_none());
+        let error = lock.load().expect_err("malformed config must fail");
+        assert!(
+            error.to_string().contains(&format!("parsing config {}", path.display())),
+            "error should identify the malformed config: {error:#}"
+        );
 
         drop(lock);
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn empty_config_loads_defaults() {
+    fn empty_config_is_an_error() {
         let dir = temp_dir();
         let path = dir.join("config.json");
 
@@ -302,11 +300,13 @@ mod tests {
         })
         .expect("save");
 
-        // An external deliberate reset to an empty file loads defaults.
+        // An empty file is not valid JSON and must not silently reset state.
         std::fs::write(&path, b"").unwrap();
-        let loaded = lock.load();
-        assert!(loaded.auth_token.is_none());
-        assert!(loaded.my_name.is_none());
+        let error = lock.load().expect_err("empty config must fail");
+        assert!(
+            error.to_string().contains(&format!("parsing config {}", path.display())),
+            "error should identify the empty config: {error:#}"
+        );
 
         drop(lock);
         let _ = std::fs::remove_dir_all(dir);
@@ -326,7 +326,7 @@ mod tests {
         .unwrap();
 
         let lock = acquire_lock(&path).expect("lock");
-        let loaded = lock.load();
+        let loaded = lock.load().expect("load config without suffix");
         assert_eq!(loaded.auth_token.as_deref(), Some("tok"));
         assert_eq!(loaded.my_name.as_deref(), Some("desktop"));
         assert_eq!(loaded.device_suffix, None);
@@ -350,11 +350,11 @@ mod tests {
 
         // The clear-secret action drops the token but must keep the permanent
         // suffix (and may keep the name as a prefill).
-        let mut cleared = lock.load();
+        let mut cleared = lock.load().expect("load config to clear");
         cleared.auth_token = None;
         lock.save(&cleared).expect("save cleared");
 
-        let loaded = lock.load();
+        let loaded = lock.load().expect("load cleared config");
         assert_eq!(loaded.auth_token, None);
         assert_eq!(loaded.device_suffix.as_deref(), Some("a7B2c3D4"));
 
@@ -390,7 +390,7 @@ mod tests {
         assert_eq!(old.auth_token.as_deref(), Some("old"));
         assert_eq!(old.my_name.as_deref(), Some("old-name"));
 
-        let current = lock.load();
+        let current = lock.load().expect("load current config");
         assert_eq!(current.auth_token.as_deref(), Some("new"));
         assert_eq!(current.my_name.as_deref(), Some("new-name"));
         assert!(!sibling_path(&path, ".tmp").exists());
