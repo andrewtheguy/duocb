@@ -133,8 +133,15 @@ impl ConfigLock {
                     .with_context(|| format!("reading config {}", self.path.display()));
             }
         };
-        serde_json::from_str(&content)
-            .with_context(|| format!("parsing config {}", self.path.display()))
+        let config: Config = serde_json::from_str(&content)
+            .with_context(|| format!("parsing config {}", self.path.display()))?;
+        if config.device_suffix.is_none() {
+            anyhow::bail!(
+                "config {} is missing required device_suffix",
+                self.path.display()
+            );
+        }
+        Ok(config)
     }
 
     /// Persist the config by flushing complete new content to a sibling temp
@@ -258,7 +265,7 @@ mod tests {
         lock.save(&Config {
             auth_token: Some("t".to_string()),
             my_name: None,
-            device_suffix: None,
+            device_suffix: Some("a7B2c3D4".to_string()),
         })
         .expect("save shorter");
         let loaded = lock.load().expect("load shorter config");
@@ -313,12 +320,10 @@ mod tests {
     }
 
     #[test]
-    fn config_without_suffix_field_loads_with_none() {
+    fn existing_config_without_suffix_is_an_error() {
         let dir = temp_dir();
         let path = dir.join("config.json");
         std::fs::create_dir_all(&dir).unwrap();
-        // A config written before the suffix existed: still parses, suffix None,
-        // so the app treats it as a first launch for the suffix only.
         std::fs::write(
             &path,
             br#"{ "auth_token": "tok", "my_name": "desktop" }"#,
@@ -326,10 +331,16 @@ mod tests {
         .unwrap();
 
         let lock = acquire_lock(&path).expect("lock");
-        let loaded = lock.load().expect("load config without suffix");
-        assert_eq!(loaded.auth_token.as_deref(), Some("tok"));
-        assert_eq!(loaded.my_name.as_deref(), Some("desktop"));
-        assert_eq!(loaded.device_suffix, None);
+        let error = lock
+            .load()
+            .expect_err("an existing config must contain device_suffix");
+        assert!(
+            error.to_string().contains(&format!(
+                "config {} is missing required device_suffix",
+                path.display()
+            )),
+            "error should identify the invalid config: {error:#}"
+        );
 
         drop(lock);
         let _ = std::fs::remove_dir_all(dir);
@@ -371,7 +382,7 @@ mod tests {
         lock.save(&Config {
             auth_token: Some("old".to_string()),
             my_name: Some("old-name".to_string()),
-            device_suffix: None,
+            device_suffix: Some("a7B2c3D4".to_string()),
         })
         .expect("save old config");
         let old_file = File::open(&path).expect("open old config inode");
@@ -379,7 +390,7 @@ mod tests {
         lock.save(&Config {
             auth_token: Some("new".to_string()),
             my_name: Some("new-name".to_string()),
-            device_suffix: None,
+            device_suffix: Some("a7B2c3D4".to_string()),
         })
         .expect("save new config");
 

@@ -150,10 +150,11 @@ impl App {
         mut config: crate::config::Config,
         net: NetHandle,
     ) -> Self {
-        // The permanent device suffix is minted on the first launch with this
-        // config file and persisted immediately. A failed save still leaves a
-        // usable in-memory suffix for this session; the next successful save
-        // persists it.
+        // A missing config path reaches here with defaults and mints the
+        // permanent device suffix. Existing configs without the suffix are
+        // rejected by ConfigLock::load instead of silently changing identity.
+        // A failed first save still leaves a usable in-memory suffix for this
+        // session; the next successful save persists it.
         let mut startup_error = None;
         let device_suffix = match config.device_suffix.as_deref() {
             Some(s) if duocb_core::identity::is_valid_suffix(s) => s.to_string(),

@@ -107,9 +107,8 @@ On every launch, duocb creates (if needed) and locks `duocb/config.json` under t
 
 The config is **per-machine**: the permanent suffix is this device's identity, so
 copying a config file to another machine is not supported — import the secret
-through the wizard there instead. Configs from versions before the suffix
-existed load with a fresh suffix; there is no other migration (pre-1.0, no
-backward compatibility).
+through the wizard there instead. Existing configs must contain a
+`device_suffix`; there is no migration or backward compatibility.
 
 Only one duocb process may use a config path at a time. The process holds an
 exclusive OS lock on a sibling `<config>.lock` file for its lifetime, preventing
