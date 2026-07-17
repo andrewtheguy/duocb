@@ -42,7 +42,8 @@
 //!
 //! The auth key is deliberately bucket-independent: the client types one PIN and must derive
 //! the same auth key regardless of which rotation bucket the server published under, so it
-//! never has to guess the bucket. The server instead remembers the last few buckets' PINs.
+//! never has to guess the bucket. The server instead remembers the current and previous buckets'
+//! PINs.
 
 use anyhow::{Context, Result};
 use argon2::{Algorithm, Argon2, Params, Version};
