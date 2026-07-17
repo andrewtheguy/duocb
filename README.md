@@ -112,11 +112,11 @@ existed load with a fresh suffix; there is no other migration (pre-1.0, no
 backward compatibility).
 
 Only one duocb process may use a config path at a time. The process holds an
-exclusive OS lock on the config file itself for its lifetime, preventing two local
-instances from accidentally claiming the same device identity and guarding the
-file against accidental external edits while duocb runs. For same-machine
-end-to-end testing, give each process its own config (each mints its own suffix;
-keep the secret equal):
+exclusive OS lock on a sibling `<config>.lock` file for its lifetime, preventing
+two local instances from accidentally claiming the same device identity. Config
+saves flush complete JSON to `<config>.tmp` and atomically rename it over the
+configured path. For same-machine end-to-end testing, give each process its own
+config (each mints its own suffix; keep the secret equal):
 
 ```sh
 duocb --config /tmp/duocb-mac1.json

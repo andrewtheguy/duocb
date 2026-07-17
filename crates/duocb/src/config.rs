@@ -7,20 +7,17 @@
 //! content and the inbox are never persisted.
 //!
 //! The config is a machine-managed JSON file, not meant for hand editing. duocb
-//! holds an exclusive OS lock on the file itself for the whole session, which
-//! both stops a second local instance from claiming the same identity and guards
-//! the file against accidental external edits while duocb runs. Because the lock
-//! lives on the file, writes go in place through the held handle rather than via
-//! an atomic temp-and-rename (a rename would swap the inode and drop the lock).
-//! To keep the crash safety a rename would have given, each save first writes the
-//! complete new content to a sibling `<config>.bak`, flushes it, and only then
-//! overwrites the config in place; a crash mid-overwrite leaves the config torn
-//! but the backup intact, and [`ConfigLock::load`] recovers from it.
+//! holds an exclusive OS lock on a sibling `<config>.lock` file for the whole
+//! session, which stops a second local instance from claiming the same identity
+//! without tying the lock to the config inode. Each save writes and flushes the
+//! complete new content to a sibling `<config>.tmp`, then atomically renames it
+//! over the config. A crash during a save therefore leaves either the old or new
+//! complete JSON file at the configured path, never an in-place torn write.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions, TryLockError};
-use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 #[derive(Default, Serialize, Deserialize)]
@@ -66,49 +63,42 @@ pub fn resolve_path(explicit: Option<PathBuf>) -> Result<PathBuf> {
     }
 }
 
-/// What the locked config file held on read (see [`ConfigLock::read_locked`]).
-enum LockedConfig {
-    Valid(Config),
-    /// Empty file: fresh install or deliberate reset — load defaults, do not
-    /// consult the backup.
-    Empty,
-    /// Non-empty malformed or unreadable content (e.g. torn by a crash during
-    /// the in-place overwrite) — the backup may recover it.
-    Damaged,
-}
-
-/// Process-lifetime exclusive lock on the config file, opened once and held open
-/// for the whole session. All config reads and writes go through this handle, so
-/// the lock also serves as the sole gateway to the file. Different explicit
-/// config paths deliberately acquire independent locks.
+/// Process-lifetime exclusive lock on a sibling lock file. Keeping the lock on
+/// a stable sidecar inode lets config saves atomically replace the JSON inode.
+/// Different explicit config paths deliberately acquire independent locks.
 pub struct ConfigLock {
-    file: File,
+    _lock_file: File,
     path: PathBuf,
 }
 
-/// Open `config_path` (creating it and its parent directory if needed) and take
-/// an exclusive OS lock on it for this process. Fails if another duocb instance
-/// already holds the lock on the same file.
+fn sibling_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// Open a sibling `<config>.lock` file (creating it and the parent directory if
+/// needed) and take an exclusive OS lock on it for this process. Fails if
+/// another duocb instance already holds the lock for the same config path.
 pub fn acquire_lock(config_path: &Path) -> Result<ConfigLock> {
     if let Some(dir) = config_path.parent() {
         std::fs::create_dir_all(dir)
             .with_context(|| format!("creating config directory {}", dir.display()))?;
     }
-    let file = OpenOptions::new()
+    let lock_path = sibling_path(config_path, ".lock");
+    let lock_file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(config_path)
-        .with_context(|| format!("opening config {}", config_path.display()))?;
+        .open(&lock_path)
+        .with_context(|| format!("opening config lock {}", lock_path.display()))?;
 
-    // The token is a credential: keep the file owner-only. Safe to apply here
-    // because the file is still empty (or being reused) before any write.
-    restrict_to_owner(&file)?;
+    restrict_to_owner(&lock_file)?;
 
-    match file.try_lock() {
+    match lock_file.try_lock() {
         Ok(()) => Ok(ConfigLock {
-            file,
+            _lock_file: lock_file,
             path: config_path.to_path_buf(),
         }),
         Err(TryLockError::WouldBlock) => anyhow::bail!(
@@ -116,7 +106,7 @@ pub fn acquire_lock(config_path: &Path) -> Result<ConfigLock> {
             config_path.display()
         ),
         Err(TryLockError::Error(e)) => {
-            Err(e).with_context(|| format!("locking config {}", config_path.display()))
+            Err(e).with_context(|| format!("locking config lock {}", lock_path.display()))
         }
     }
 }
@@ -127,109 +117,61 @@ impl ConfigLock {
         &self.path
     }
 
-    fn backup_path(&self) -> PathBuf {
-        let mut name = self.path.as_os_str().to_os_string();
-        name.push(".bak");
-        PathBuf::from(name)
+    fn temp_path(&self) -> PathBuf {
+        sibling_path(&self.path, ".tmp")
     }
 
-    /// Read the config, returning defaults when nothing valid is on disk (a
-    /// broken config must never block startup). Reads the locked file first.
-    /// An **empty** file is a fresh install or a deliberate reset and yields
-    /// defaults immediately — it must never pull stale credentials back from
-    /// the backup. Only **non-empty damaged** content (torn by a crash during
-    /// the in-place overwrite, or unreadable) falls back to the sibling backup
-    /// that [`save`](Self::save) writes before overwriting.
-    pub fn load(&mut self) -> Config {
-        match self.read_locked() {
-            LockedConfig::Valid(cfg) => cfg,
-            LockedConfig::Empty => Config::default(),
-            LockedConfig::Damaged => {
-                let backup = self.backup_path();
-                match std::fs::read_to_string(&backup) {
-                    Ok(content) if !content.trim().is_empty() => {
-                        match serde_json::from_str(&content) {
-                            Ok(cfg) => {
-                                log::warn!("Recovered config from backup {}", backup.display());
-                                cfg
-                            }
-                            Err(e) => {
-                                log::warn!(
-                                    "Ignoring malformed config backup {}: {e}",
-                                    backup.display()
-                                );
-                                Config::default()
-                            }
-                        }
-                    }
-                    _ => Config::default(),
-                }
+    /// Read the current config path, returning defaults when the file is absent,
+    /// empty, unreadable, or malformed. A broken config must never block startup.
+    pub fn load(&self) -> Config {
+        let content = match std::fs::read_to_string(&self.path) {
+            Ok(content) => content,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Config::default(),
+            Err(e) => {
+                log::warn!("Ignoring unreadable config {}: {e}", self.path.display());
+                return Config::default();
             }
-        }
-    }
-
-    /// Parse the locked config file, distinguishing "nothing here" from "torn":
-    /// an empty file must load as defaults, while non-empty malformed or
-    /// unreadable content is a candidate for backup recovery.
-    fn read_locked(&mut self) -> LockedConfig {
-        let mut content = String::new();
-        if let Err(e) = self
-            .file
-            .seek(SeekFrom::Start(0))
-            .and_then(|_| self.file.read_to_string(&mut content))
-        {
-            log::warn!("Ignoring unreadable config {}: {e}", self.path.display());
-            return LockedConfig::Damaged;
-        }
+        };
         if content.trim().is_empty() {
-            return LockedConfig::Empty;
+            return Config::default();
         }
         match serde_json::from_str(&content) {
-            Ok(cfg) => LockedConfig::Valid(cfg),
+            Ok(cfg) => cfg,
             Err(e) => {
                 log::warn!("Ignoring malformed config {}: {e}", self.path.display());
-                LockedConfig::Damaged
+                Config::default()
             }
         }
     }
 
-    /// Persist the config. The lock stays on the config inode, so this cannot use
-    /// an atomic temp-and-rename; instead it writes the complete new content to a
-    /// flushed sibling backup first, then overwrites the config in place through
-    /// the held handle. A crash before the overwrite finishes leaves the config
-    /// torn but the backup whole, and [`load`](Self::load) recovers from it.
-    pub fn save(&mut self, cfg: &Config) -> Result<()> {
+    /// Persist the config by flushing complete new content to a sibling temp
+    /// file and atomically replacing the config path with it. The stable sibling
+    /// lock remains held while the JSON inode changes.
+    pub fn save(&self, cfg: &Config) -> Result<()> {
         let content = serde_json::to_string_pretty(cfg).context("serializing config")?;
 
-        let backup = self.backup_path();
-        write_private_file(&backup, content.as_bytes())
-            .with_context(|| format!("writing config backup {}", backup.display()))?;
-
-        self.file
-            .seek(SeekFrom::Start(0))
-            .context("rewinding config for write")?;
-        self.file
-            .write_all(content.as_bytes())
-            .with_context(|| format!("writing config {}", self.path.display()))?;
-        // Trim any bytes left over from a previously longer config.
-        self.file
-            .set_len(content.len() as u64)
-            .with_context(|| format!("truncating config {}", self.path.display()))?;
-        self.file
-            .sync_all()
-            .with_context(|| format!("flushing config {}", self.path.display()))?;
+        let temp = self.temp_path();
+        write_private_file(&temp, content.as_bytes())
+            .with_context(|| format!("staging config {}", temp.display()))?;
+        std::fs::rename(&temp, &self.path).with_context(|| {
+            format!(
+                "atomically replacing config {} from {}",
+                self.path.display(),
+                temp.display()
+            )
+        })?;
         Ok(())
     }
 }
 
-/// Restrict `file` to owner-only access, since the config holds a credential.
-/// Unix-only; a no-op elsewhere (on Windows, `%APPDATA%` is already per-user, so
-/// no extra ACL is set).
+/// Restrict a config-related file to owner-only access. Unix-only; a no-op
+/// elsewhere (on Windows, `%APPDATA%` is already per-user, so no extra ACL is
+/// set).
 #[cfg(unix)]
 fn restrict_to_owner(file: &File) -> Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
     file.set_permissions(std::fs::Permissions::from_mode(0o600))
-        .context("restricting config file permissions")
+        .context("restricting config-related file permissions")
 }
 
 #[cfg(not(unix))]
@@ -273,19 +215,26 @@ mod tests {
     }
 
     #[test]
-    fn config_lock_is_exclusive_per_path() {
+    fn config_lock_is_exclusive_and_separate_from_config() {
         let dir = temp_dir();
         let first_path = dir.join("mac1.json");
         let second_path = dir.join("mac2.json");
 
         let first = acquire_lock(&first_path).expect("first lock");
+        assert!(!first_path.exists(), "locking must not create the config");
+        assert!(
+            sibling_path(&first_path, ".lock").exists(),
+            "locking must use a sidecar file"
+        );
         assert!(
             acquire_lock(&first_path).is_err(),
             "same config must conflict"
         );
-        let _second = acquire_lock(&second_path).expect("different config locks independently");
+        let second = acquire_lock(&second_path).expect("different config locks independently");
         drop(first);
-        let _again = acquire_lock(&first_path).expect("lock releases on drop");
+        let again = acquire_lock(&first_path).expect("lock releases on drop");
+        drop(again);
+        drop(second);
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -294,7 +243,7 @@ mod tests {
     fn save_then_load_roundtrips() {
         let dir = temp_dir();
         let path = dir.join("config.json");
-        let mut lock = acquire_lock(&path).expect("lock");
+        let lock = acquire_lock(&path).expect("lock");
 
         assert!(lock.load().auth_token.is_none(), "fresh config is empty");
 
@@ -309,7 +258,7 @@ mod tests {
         assert_eq!(loaded.auth_token.as_deref(), Some("token-value"));
         assert_eq!(loaded.my_name.as_deref(), Some("desktop"));
 
-        // A shorter follow-up write must not leave trailing bytes behind.
+        // A shorter replacement must contain exactly the new JSON.
         lock.save(&Config {
             auth_token: Some("t".to_string()),
             my_name: None,
@@ -320,6 +269,7 @@ mod tests {
         assert_eq!(loaded.auth_token.as_deref(), Some("t"));
         assert_eq!(loaded.my_name, None);
 
+        drop(lock);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -330,37 +280,35 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(&path, b"{ not valid json").unwrap();
 
-        let mut lock = acquire_lock(&path).expect("lock");
+        let lock = acquire_lock(&path).expect("lock");
         let loaded = lock.load();
         assert!(loaded.auth_token.is_none());
         assert!(loaded.my_name.is_none());
 
+        drop(lock);
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn emptied_config_loads_defaults_and_ignores_stale_backup() {
+    fn empty_config_loads_defaults() {
         let dir = temp_dir();
         let path = dir.join("config.json");
 
-        // A save leaves a backup with credentials behind.
-        let mut lock = acquire_lock(&path).expect("lock");
+        let lock = acquire_lock(&path).expect("lock");
         lock.save(&Config {
-            auth_token: Some("stale".to_string()),
+            auth_token: Some("secret".to_string()),
             my_name: Some("desktop".to_string()),
             device_suffix: None,
         })
         .expect("save");
-        drop(lock);
 
-        // The user resets/deletes the config (empty file): the stale backup
-        // must NOT be restored.
+        // An external deliberate reset to an empty file loads defaults.
         std::fs::write(&path, b"").unwrap();
-        let mut lock = acquire_lock(&path).expect("relock");
         let loaded = lock.load();
-        assert!(loaded.auth_token.is_none(), "stale token must not return");
+        assert!(loaded.auth_token.is_none());
         assert!(loaded.my_name.is_none());
 
+        drop(lock);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -377,12 +325,13 @@ mod tests {
         )
         .unwrap();
 
-        let mut lock = acquire_lock(&path).expect("lock");
+        let lock = acquire_lock(&path).expect("lock");
         let loaded = lock.load();
         assert_eq!(loaded.auth_token.as_deref(), Some("tok"));
         assert_eq!(loaded.my_name.as_deref(), Some("desktop"));
         assert_eq!(loaded.device_suffix, None);
 
+        drop(lock);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -390,7 +339,7 @@ mod tests {
     fn clearing_the_secret_keeps_the_suffix() {
         let dir = temp_dir();
         let path = dir.join("config.json");
-        let mut lock = acquire_lock(&path).expect("lock");
+        let lock = acquire_lock(&path).expect("lock");
 
         lock.save(&Config {
             auth_token: Some("secret".to_string()),
@@ -409,32 +358,45 @@ mod tests {
         assert_eq!(loaded.auth_token, None);
         assert_eq!(loaded.device_suffix.as_deref(), Some("a7B2c3D4"));
 
+        drop(lock);
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn load_recovers_from_backup_when_config_is_torn() {
+    fn save_atomically_replaces_the_config_inode() {
         let dir = temp_dir();
         let path = dir.join("config.json");
 
-        let mut lock = acquire_lock(&path).expect("lock");
+        let lock = acquire_lock(&path).expect("lock");
         lock.save(&Config {
-            auth_token: Some("good".to_string()),
-            my_name: Some("desktop".to_string()),
+            auth_token: Some("old".to_string()),
+            my_name: Some("old-name".to_string()),
             device_suffix: None,
         })
-        .expect("save");
+        .expect("save old config");
+        let old_file = File::open(&path).expect("open old config inode");
+
+        lock.save(&Config {
+            auth_token: Some("new".to_string()),
+            my_name: Some("new-name".to_string()),
+            device_suffix: None,
+        })
+        .expect("save new config");
+
+        // An open handle still sees the old inode, while the configured path now
+        // resolves to the complete replacement. This distinguishes rename from
+        // an in-place overwrite.
+        let old: Config = serde_json::from_reader(old_file).expect("parse old inode");
+        assert_eq!(old.auth_token.as_deref(), Some("old"));
+        assert_eq!(old.my_name.as_deref(), Some("old-name"));
+
+        let current = lock.load();
+        assert_eq!(current.auth_token.as_deref(), Some("new"));
+        assert_eq!(current.my_name.as_deref(), Some("new-name"));
+        assert!(!sibling_path(&path, ".tmp").exists());
+        assert!(sibling_path(&path, ".lock").exists());
+
         drop(lock);
-
-        // Simulate a crash during the in-place overwrite: the config is torn but
-        // the backup written beforehand is intact.
-        std::fs::write(&path, b"{ torn").unwrap();
-
-        let mut lock = acquire_lock(&path).expect("relock");
-        let loaded = lock.load();
-        assert_eq!(loaded.auth_token.as_deref(), Some("good"));
-        assert_eq!(loaded.my_name.as_deref(), Some("desktop"));
-
         let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -145,7 +145,7 @@ pub(crate) enum CopyTarget {
 }
 
 impl App {
-    pub(crate) fn new(mut config_lock: crate::config::ConfigLock, net: NetHandle) -> Self {
+    pub(crate) fn new(config_lock: crate::config::ConfigLock, net: NetHandle) -> Self {
         let mut config = config_lock.load();
 
         // The permanent device suffix is minted on the first launch with this
