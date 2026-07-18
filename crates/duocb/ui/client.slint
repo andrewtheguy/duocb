@@ -163,6 +163,11 @@ export component ClientScreen inherits ScrollView {
 
         if UiState.client-active && UiState.mode == PairMode.nostr-token: TokenPairingSummary { }
         if UiState.client-active && UiState.mode != PairMode.nostr-token
+            && UiState.node-id-short != "": LabeledValue {
+            label: "This device's id:";
+            value: UiState.node-id-short;
+        }
+        if UiState.client-active && UiState.mode != PairMode.nostr-token
             && UiState.peer-node-id-short != "": LabeledValue {
             label: "Paired with:";
             value: UiState.peer-node-id-short;

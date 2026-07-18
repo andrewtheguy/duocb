@@ -72,9 +72,9 @@ export component ServerScreen inherits ScrollView {
                 horizontal-alignment: center;
             }
         }
-        // Paired: the PIN is spent. Show this device's node id — the same
-        // value the other device displays as "Paired with:" — so the user can
-        // eyeball that the two match.
+        // Paired: the PIN is spent. Show both node ids — this device's own id
+        // and the paired peer's — so the user can eyeball that each side
+        // matches the other's displayed value.
         if UiState.server-running && UiState.mode == PairMode.nostr-pin
             && UiState.pin-display == "" && UiState.pin-paired
             && UiState.node-id-short != "": LabeledValue {
@@ -83,8 +83,14 @@ export component ServerScreen inherits ScrollView {
         }
         if UiState.server-running && UiState.mode == PairMode.nostr-pin
             && UiState.pin-display == "" && UiState.pin-paired
+            && UiState.peer-node-id-short != "": LabeledValue {
+            label: "Paired with:";
+            value: UiState.peer-node-id-short;
+        }
+        if UiState.server-running && UiState.mode == PairMode.nostr-pin
+            && UiState.pin-display == "" && UiState.pin-paired
             && UiState.node-id-short != "": Small {
-            text: "Confirm this matches “Paired with” on the other device.";
+            text: "Confirm these match the other device's shown ids.";
         }
 
         if UiState.server-running: HorizontalLayout {
