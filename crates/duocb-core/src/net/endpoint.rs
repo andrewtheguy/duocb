@@ -1,8 +1,11 @@
 //! iroh endpoint helpers: builders, connect, and the connection path watcher.
 //!
-//! The iroh identity is always ephemeral (a fresh node id every run); node-id
-//! discovery is handled out-of-band (nostr or a node id embedded in a manual
-//! pairing code), so no secret key is ever persisted or wired in here.
+//! The iroh identity is ephemeral but session-scoped: the runtime's command
+//! loop mints a secret key per logical session and passes it in here, so every
+//! endpoint bound for that session — including one bound by a restarted
+//! session task — presents the same node id, and a paired peer's reconnect is
+//! recognized. Node-id discovery is handled out-of-band (nostr or a node id
+//! embedded in a manual pairing code); no secret key is ever persisted.
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
@@ -183,10 +186,15 @@ async fn wait_for_endpoint_ready(endpoint: &Endpoint, readiness: EndpointReadine
     }
 }
 
-/// Create a listening endpoint. The endpoint identity is ephemeral, so the node
-/// id changes every run.
-pub async fn create_server_endpoint(readiness: EndpointReadiness) -> Result<Endpoint> {
-    let builder = create_endpoint_builder(readiness)?.alpns(vec![ALPN.to_vec()]);
+/// Create a listening endpoint with the given session identity (its public key
+/// is the node id peers dial and the pair claim is bound to).
+pub async fn create_server_endpoint(
+    readiness: EndpointReadiness,
+    secret: iroh::SecretKey,
+) -> Result<Endpoint> {
+    let builder = create_endpoint_builder(readiness)?
+        .secret_key(secret)
+        .alpns(vec![ALPN.to_vec()]);
     let endpoint = builder
         .bind()
         .await
@@ -195,9 +203,13 @@ pub async fn create_server_endpoint(readiness: EndpointReadiness) -> Result<Endp
     Ok(endpoint)
 }
 
-/// Create a dialing endpoint. The endpoint identity is ephemeral.
-pub async fn create_client_endpoint(readiness: EndpointReadiness) -> Result<Endpoint> {
-    let builder = create_endpoint_builder(readiness)?;
+/// Create a dialing endpoint with the given session identity (its public key
+/// is the node id the server's pair claim is bound to).
+pub async fn create_client_endpoint(
+    readiness: EndpointReadiness,
+    secret: iroh::SecretKey,
+) -> Result<Endpoint> {
+    let builder = create_endpoint_builder(readiness)?.secret_key(secret);
     let endpoint = builder
         .bind()
         .await
