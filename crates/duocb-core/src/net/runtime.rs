@@ -61,7 +61,11 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(3);
 /// gives up. The counter resets on every successful connection, so this bounds
 /// only an unbroken run of failures (an unreachable peer) — not a flaky link
 /// that keeps recovering. Applied uniformly whether or not a connection has
-/// succeeded before, so a dropped session never retries without end.
+/// succeeded before, so a dropped session never retries without end. Giving up
+/// ends the session task but not the pairing: the endpoint identity and pinned
+/// dial target live on in [`SessionMemory`], so pressing Join again with the
+/// same PIN/peer reconnects as the same node id instead of being refused by
+/// the server's claim.
 const MAX_CONNECT_ATTEMPTS: u32 = 10;
 
 /// Marker error for fatal authentication failures (wrong token/PIN, explicit
@@ -117,13 +121,15 @@ impl RecentPins {
     }
 }
 
-/// The single peer a serve endpoint is paired with, for the lifetime of one server session.
+/// The single peer a serve endpoint is paired with, for the lifetime of one logical session.
 /// duocb links one pair of devices at a time by design: once a client authenticates, its
 /// (QUIC/TLS-authenticated) node id claims the endpoint and any other node id is refused until
 /// the server is stopped. The claim is intentionally *not* released when the paired peer
 /// disconnects, so that peer — and only that peer — can reconnect without re-pairing (in PIN
-/// mode, without re-typing a PIN that may since have rotated). A fresh server session mints a
-/// new endpoint id and a new (empty) claim.
+/// mode, without re-typing a PIN that may since have rotated). The claim lives in
+/// [`SessionMemory`], owned by the command loop, so it survives session-task restarts;
+/// explicitly stopping the server discards it, and a restarted server then holds a new
+/// endpoint id and an empty claim.
 #[derive(Clone, Default)]
 struct PairClaim {
     peer: Arc<parking_lot::Mutex<Option<ClaimedPeer>>>,
@@ -184,6 +190,88 @@ enum SessionKind {
     Client(DialSpec),
 }
 
+/// Client-side dial target pinned at the first successful pairing (PIN mode),
+/// shared between the command loop's [`SessionMemory`] and the session task.
+type PinnedAddr = Arc<parking_lot::Mutex<Option<EndpointAddr>>>;
+
+/// What a session's identity is bound to. Reusing [`SessionMemory`] is only
+/// correct while the session is "the same" from the user's point of view —
+/// same role and same credential/target; anything else mints fresh state.
+#[derive(Clone, PartialEq, Eq)]
+enum SessionKey {
+    ServerPin { channel: PinChannel },
+    ServerToken { token: String },
+    ClientPin { canonical_pin: String },
+    ClientToken { token: String, peer_display: String },
+}
+
+fn session_key(kind: &SessionKind) -> SessionKey {
+    match kind {
+        SessionKind::Server(ServerMode::Pin { channel, .. }) => {
+            SessionKey::ServerPin { channel: *channel }
+        }
+        SessionKind::Server(ServerMode::NostrToken { identity }) => SessionKey::ServerToken {
+            token: identity.token.clone(),
+        },
+        SessionKind::Client(DialSpec::Pin { canonical_pin, .. }) => SessionKey::ClientPin {
+            canonical_pin: canonical_pin.clone(),
+        },
+        SessionKind::Client(DialSpec::NostrToken {
+            identity,
+            peer_display,
+        }) => SessionKey::ClientToken {
+            token: identity.token.clone(),
+            peer_display: peer_display.clone(),
+        },
+    }
+}
+
+/// Identity and pairing state for one logical session, owned by the command
+/// loop and lent to every session task started under the same [`SessionKey`].
+/// A session task can end while the pairing is still good — the client gives
+/// up after [`MAX_CONNECT_ATTEMPTS`], an auth exchange dies mid-handshake, a
+/// host restarts the session — and the endpoint identity is what the peer's
+/// pair claim is bound to. Keeping the secret key (and with it the node id),
+/// the server's claim, and the client's pinned dial target here lets the next
+/// task reconnect as the same peer instead of being refused as a stranger.
+/// Cleared on [`UiCommand::StopServer`]/[`UiCommand::Disconnect`] — the user
+/// ending the session is the one legitimate way to unpair — and replaced when
+/// a session starts under a different key. Never persisted; a fresh process
+/// starts clean.
+struct SessionMemory {
+    key: SessionKey,
+    secret: iroh::SecretKey,
+    /// Server: the one-pair-per-session claim (holds the paired peer's node id
+    /// and, in PIN mode, the key that lets its rotated PIN re-verify).
+    claim: PairClaim,
+    /// Server (PIN mode): the recent rotation buckets' auth keys.
+    recent_pins: RecentPins,
+    /// Client (PIN mode): the dial target pinned at the first pairing.
+    pinned_addr: PinnedAddr,
+}
+
+impl SessionMemory {
+    fn new(key: SessionKey) -> Self {
+        Self {
+            key,
+            secret: iroh::SecretKey::generate(),
+            claim: PairClaim::default(),
+            recent_pins: RecentPins::default(),
+            pinned_addr: PinnedAddr::default(),
+        }
+    }
+}
+
+/// Reuse the held memory when the new session's key matches (the same logical
+/// session continuing under a new task); mint fresh identity and pairing state
+/// otherwise.
+fn remember(memory: &mut Option<SessionMemory>, key: SessionKey) -> &SessionMemory {
+    if memory.as_ref().is_none_or(|m| m.key != key) {
+        *memory = Some(SessionMemory::new(key));
+    }
+    memory.as_ref().expect("memory was just ensured")
+}
+
 /// Shared slot holding a clone of the currently-paired connection (or `None`
 /// when unpaired), so the command loop can snapshot its paths on demand without
 /// interrupting the session task's pump. iroh's `Connection` is a cheap handle.
@@ -216,7 +304,12 @@ struct Session {
     pin_refresh: Option<Arc<tokio::sync::Notify>>,
 }
 
-fn start_session(kind: SessionKind, events: EventSender, hosting: Option<HostingTx>) -> Session {
+fn start_session(
+    kind: SessionKind,
+    events: EventSender,
+    hosting: Option<HostingTx>,
+    memory: &SessionMemory,
+) -> Session {
     let cancel = CancellationToken::new();
     let (clip_tx, clip_rx) = mpsc::unbounded_channel();
     let task_cancel = cancel.clone();
@@ -225,6 +318,10 @@ fn start_session(kind: SessionKind, events: EventSender, hosting: Option<Hosting
     let pin_refresh = matches!(&kind, SessionKind::Server(ServerMode::Pin { .. }))
         .then(|| Arc::new(tokio::sync::Notify::new()));
     let task_pin_refresh = pin_refresh.clone();
+    let secret = memory.secret.clone();
+    let claim = memory.claim.clone();
+    let recent_pins = memory.recent_pins.clone();
+    let pinned_addr = memory.pinned_addr.clone();
     let handle = tokio::spawn(async move {
         let last_sent = LastSent::default();
         match kind {
@@ -238,11 +335,24 @@ fn start_session(kind: SessionKind, events: EventSender, hosting: Option<Hosting
                     last_sent,
                     hosting,
                     task_pin_refresh,
+                    secret,
+                    claim,
+                    recent_pins,
                 )
                 .await
             }
             SessionKind::Client(spec) => {
-                run_client_session(spec, events, task_cancel, clip_rx, task_conn, last_sent).await
+                run_client_session(
+                    spec,
+                    events,
+                    task_cancel,
+                    clip_rx,
+                    task_conn,
+                    last_sent,
+                    secret,
+                    pinned_addr,
+                )
+                .await
             }
         }
     });
@@ -318,6 +428,11 @@ fn spawn_presence(identity: TokenIdentity, hosting: &HostingTx, events: EventSen
 /// carrying the current server node id into its records.
 pub async fn net_main(mut cmd_rx: mpsc::UnboundedReceiver<UiCommand>, events: EventSender) {
     let mut session: Option<Session> = None;
+    // Identity + pairing state for the current logical session, spanning
+    // session-task restarts (see [`SessionMemory`]). Cleared only by the
+    // explicit stop commands, so a temporary disconnection — even one that
+    // outlives a session task — never demotes a pairing to "re-pair".
+    let mut memory: Option<SessionMemory> = None;
     let mut presence: Option<Presence> = None;
     // One in-flight peer-list fetch at a time; a completed handle is replaced.
     let mut peer_fetch: Option<JoinHandle<()>> = None;
@@ -339,18 +454,19 @@ pub async fn net_main(mut cmd_rx: mpsc::UnboundedReceiver<UiCommand>, events: Ev
                 } else {
                     None
                 };
-                session = Some(start_session(
-                    SessionKind::Server(mode),
-                    events.clone(),
-                    session_hosting,
-                ));
+                let kind = SessionKind::Server(mode);
+                let mem = remember(&mut memory, session_key(&kind));
+                session = Some(start_session(kind, events.clone(), session_hosting, mem));
             }
             UiCommand::Connect { spec } => {
                 stop_session(&mut session).await;
-                session = Some(start_session(SessionKind::Client(spec), events.clone(), None));
+                let kind = SessionKind::Client(spec);
+                let mem = remember(&mut memory, session_key(&kind));
+                session = Some(start_session(kind, events.clone(), None, mem));
             }
             UiCommand::StopServer | UiCommand::Disconnect => {
                 stop_session(&mut session).await;
+                memory = None;
                 events.status(ConnStatus::Idle);
             }
             UiCommand::RefreshPin => {
@@ -467,6 +583,9 @@ async fn run_server_session(
     last_sent: LastSent,
     hosting: Option<HostingTx>,
     pin_refresh: Option<Arc<tokio::sync::Notify>>,
+    secret: iroh::SecretKey,
+    claim: PairClaim,
+    recent_pins: RecentPins,
 ) {
     events.status(ConnStatus::Starting);
 
@@ -479,7 +598,7 @@ async fn run_server_session(
         ServerMode::Pin { channel, .. } => pin_channel_readiness(*channel),
         ServerMode::NostrToken { .. } => EndpointReadiness::RelayOnline,
     };
-    let endpoint = match create_server_endpoint(readiness).await {
+    let endpoint = match create_server_endpoint(readiness, secret).await {
         Ok(ep) => ep,
         Err(e) => {
             events.error(format!("Failed to start: {e:#}"));
@@ -489,10 +608,10 @@ async fn run_server_session(
     };
     let node_id = endpoint.id();
 
-    // One pairing per server session (all modes). The claim is empty until the
-    // first client authenticates and lives until the server is stopped.
-    let claim = PairClaim::default();
-    let recent_pins = RecentPins::default();
+    // One pairing per logical session (all modes). The claim (owned by the
+    // command loop, like the endpoint identity) is empty until the first
+    // client authenticates and lives until the server is stopped — surviving
+    // a restarted session task, whose paired peer reconnects seamlessly.
 
     // Tokens accepted from clients — configure mode only. The PIN quick mode
     // authenticates with the in-band PIN challenge-response instead.
@@ -672,6 +791,7 @@ async fn accept_serveable(
 // Client session
 // ============================================================================
 
+#[allow(clippy::too_many_arguments)]
 async fn run_client_session(
     spec: DialSpec,
     events: EventSender,
@@ -679,6 +799,8 @@ async fn run_client_session(
     mut clip_rx: mpsc::UnboundedReceiver<String>,
     conn_slot: ConnSlot,
     last_sent: LastSent,
+    secret: iroh::SecretKey,
+    pinned_addr: PinnedAddr,
 ) {
     events.status(ConnStatus::Starting);
 
@@ -691,7 +813,7 @@ async fn run_client_session(
         DialSpec::Pin { channel, .. } => pin_channel_readiness(*channel),
         DialSpec::NostrToken { .. } => EndpointReadiness::RelayOnline,
     };
-    let endpoint = match create_client_endpoint(readiness).await {
+    let endpoint = match create_client_endpoint(readiness, secret).await {
         Ok(ep) => ep,
         Err(e) => {
             events.error(format!("Failed to start: {e:#}"));
@@ -714,15 +836,17 @@ async fn run_client_session(
     // Consecutive failed attempts, reset to zero on every successful connection
     // (below). Fixed-interval retry, bounded by `MAX_CONNECT_ATTEMPTS`.
     let mut attempts: u32 = 0;
-    // For a PIN target: the dial target resolved on the first successful
-    // pairing (node id plus any direct addresses the rendezvous carried).
-    // Reused on every reconnect thereafter — the typed PIN has since rotated
-    // off the relay (so a fresh lookup would fail), but the server retains our
-    // pairing key, so we reconnect by node id and re-prove the same PIN in-band
-    // without the user re-typing a code.
-    let mut pinned_pin_addr: Option<EndpointAddr> = None;
 
     loop {
+        // For a PIN target: the dial target resolved on the first successful
+        // pairing (node id plus any direct addresses the rendezvous carried).
+        // Reused on every reconnect thereafter — the typed PIN has since
+        // rotated off the relay (so a fresh lookup would fail), but the server
+        // retains our pairing key, so we reconnect by node id and re-prove the
+        // same PIN in-band without the user re-typing a code. It lives in the
+        // command loop's `SessionMemory` so a successor task (a rejoin after
+        // this one gives up) reconnects the same way.
+        let pinned_pin_addr = pinned_addr.lock().clone();
         // Resolve the target each attempt: configure mode re-queries the chosen
         // peer's presence record, so a restarted host's fresh node id is found.
         let resolved: Result<EndpointAddr> = match &spec {
@@ -804,8 +928,11 @@ async fn run_client_session(
                         // (PIN mode) stopped publishing PINs. Pin the dial target NOW so
                         // reconnects dial this id — a fresh rendezvous lookup could
                         // never succeed again.
-                        if matches!(spec, DialSpec::Pin { .. }) && pinned_pin_addr.is_none() {
-                            pinned_pin_addr = attempt_addr;
+                        if matches!(spec, DialSpec::Pin { .. }) {
+                            let mut slot = pinned_addr.lock();
+                            if slot.is_none() {
+                                *slot = attempt_addr;
+                            }
                         }
                         let remote_id = conn.remote_id();
                         events.send(NetEvent::PeerPaired {
@@ -1667,6 +1794,13 @@ mod tests {
         assert_eq!(retained, vec![current_pubkey, previous_pubkey]);
     }
 
+    /// Start a session backed by its own fresh [`SessionMemory`], for tests
+    /// that don't exercise session-task restarts.
+    fn start_test_session(kind: SessionKind, events: EventSender) -> Session {
+        let memory = SessionMemory::new(session_key(&kind));
+        start_session(kind, events, None, &memory)
+    }
+
     /// Drain events from a std receiver until `pred` matches or the deadline
     /// passes, panicking with the seen events on timeout.
     fn wait_for_event<T>(
@@ -1701,13 +1835,12 @@ mod tests {
 
         let (tx, rx) = std::sync::mpsc::channel();
         let events = EventSender::new(tx, None);
-        let session = start_session(
+        let session = start_test_session(
             SessionKind::Server(ServerMode::Pin {
                 relays: Vec::new(),
                 channel: PinChannel::LanOnly,
             }),
             events,
-            None,
         );
 
         let pin_rotated = |ev: &NetEvent| {
@@ -1777,13 +1910,12 @@ mod tests {
         let _ = env_logger::builder().is_test(true).try_init();
 
         let (srv_tx, srv_rx) = std::sync::mpsc::channel();
-        let srv_session = start_session(
+        let srv_session = start_test_session(
             SessionKind::Server(ServerMode::Pin {
                 relays: Vec::new(),
                 channel: PinChannel::LanOnly,
             }),
             EventSender::new(srv_tx, None),
-            None,
         );
 
         // The displayed PIN is all the joining user gets to type.
@@ -1798,7 +1930,7 @@ mod tests {
             crate::pin::normalize_pin(&pin_display).expect("displayed PIN is valid");
 
         let (cli_tx, cli_rx) = std::sync::mpsc::channel();
-        let cli_session = start_session(
+        let cli_session = start_test_session(
             SessionKind::Client(DialSpec::Pin {
                 canonical_pin,
                 relays: Vec::new(),
@@ -1806,7 +1938,6 @@ mod tests {
                 target_ip: None,
             }),
             EventSender::new(cli_tx, None),
-            None,
         );
 
         // Both sides pair; pairing clears the displayed PIN on the server.
@@ -1862,13 +1993,12 @@ mod tests {
         let _ = env_logger::builder().is_test(true).try_init();
 
         let (srv_tx, srv_rx) = std::sync::mpsc::channel();
-        let srv_session = start_session(
+        let srv_session = start_test_session(
             SessionKind::Server(ServerMode::Pin {
                 relays: Vec::new(),
                 channel: PinChannel::LanOnly,
             }),
             EventSender::new(srv_tx, None),
-            None,
         );
         let pin_display = wait_for_event(&srv_rx, Duration::from_secs(30), |ev| {
             if let NetEvent::PinRotated { pin_display, .. } = ev {
@@ -1881,7 +2011,7 @@ mod tests {
             crate::pin::normalize_pin(&pin_display).expect("displayed PIN is valid");
 
         let (cli_tx, cli_rx) = std::sync::mpsc::channel();
-        let cli_session = start_session(
+        let cli_session = start_test_session(
             SessionKind::Client(DialSpec::Pin {
                 canonical_pin,
                 relays: Vec::new(),
@@ -1891,7 +2021,6 @@ mod tests {
                 target_ip: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
             }),
             EventSender::new(cli_tx, None),
-            None,
         );
 
         wait_for_event(&cli_rx, Duration::from_secs(120), |ev| {
@@ -1927,13 +2056,12 @@ mod tests {
         let _ = env_logger::builder().is_test(true).try_init();
 
         let (srv_tx, srv_rx) = std::sync::mpsc::channel();
-        let srv_session = start_session(
+        let srv_session = start_test_session(
             SessionKind::Server(ServerMode::Pin {
                 relays: Vec::new(),
                 channel: PinChannel::LanOnly,
             }),
             EventSender::new(srv_tx, None),
-            None,
         );
         let pin_display = wait_for_event(&srv_rx, Duration::from_secs(30), |ev| {
             if let NetEvent::PinRotated { pin_display, .. } = ev {
@@ -1946,7 +2074,7 @@ mod tests {
             crate::pin::normalize_pin(&pin_display).expect("displayed PIN is valid");
 
         let (cli_tx, cli_rx) = std::sync::mpsc::channel();
-        let cli_session = start_session(
+        let cli_session = start_test_session(
             SessionKind::Client(DialSpec::Pin {
                 canonical_pin,
                 relays: Vec::new(),
@@ -1954,7 +2082,6 @@ mod tests {
                 target_ip: None,
             }),
             EventSender::new(cli_tx, None),
-            None,
         );
         wait_for_event(&cli_rx, Duration::from_secs(60), |ev| {
             matches!(ev, NetEvent::Status(ConnStatus::Connected)).then_some(())
@@ -1999,6 +2126,106 @@ mod tests {
         stop_session(&mut srv).await;
     }
 
+    /// A client session that ends after pairing (the give-up bound, an app
+    /// restarting the session) does not orphan the pairing: a successor session
+    /// under the same [`SessionMemory`] presents the same node id and pinned
+    /// dial target, so it reconnects — even though the PIN rendezvous was
+    /// withdrawn at the first pairing and the server's claim refuses every
+    /// other identity.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn restarted_client_session_reuses_identity_and_reconnects() {
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        let (srv_tx, srv_rx) = std::sync::mpsc::channel();
+        let srv_session = start_test_session(
+            SessionKind::Server(ServerMode::Pin {
+                relays: Vec::new(),
+                channel: PinChannel::LanOnly,
+            }),
+            EventSender::new(srv_tx, None),
+        );
+        let pin_display = wait_for_event(&srv_rx, Duration::from_secs(30), |ev| {
+            if let NetEvent::PinRotated { pin_display, .. } = ev {
+                Some(pin_display.clone())
+            } else {
+                None
+            }
+        });
+        let canonical_pin =
+            crate::pin::normalize_pin(&pin_display).expect("displayed PIN is valid");
+        let dial = SessionKind::Client(DialSpec::Pin {
+            canonical_pin,
+            relays: Vec::new(),
+            channel: PinChannel::LanOnly,
+            target_ip: None,
+        });
+
+        // First pairing, under memory the command loop would hold on to.
+        let memory = SessionMemory::new(session_key(&dial));
+        let (cli_tx, cli_rx) = std::sync::mpsc::channel();
+        let dial_again = match &dial {
+            SessionKind::Client(spec) => SessionKind::Client(spec.clone()),
+            _ => unreachable!(),
+        };
+        let cli_session = start_session(dial, EventSender::new(cli_tx, None), None, &memory);
+        wait_for_event(&cli_rx, Duration::from_secs(120), |ev| {
+            matches!(ev, NetEvent::Status(ConnStatus::Connected)).then_some(())
+        });
+        // Pairing withdrew the PIN rendezvous — a fresh lookup can never
+        // succeed again — and bound the server's claim to this client's id.
+        wait_for_event(&srv_rx, Duration::from_secs(30), |ev| {
+            matches!(ev, NetEvent::PinCleared).then_some(())
+        });
+
+        // The client session ends (as after MAX_CONNECT_ATTEMPTS, or an app
+        // tearing the session down); the server session stays up, claimed.
+        let mut cli = Some(cli_session);
+        stop_session(&mut cli).await;
+        wait_for_event(&srv_rx, Duration::from_secs(30), |ev| {
+            matches!(ev, NetEvent::PeerDisconnected).then_some(())
+        });
+
+        // A successor session under the same memory reconnects: same node id
+        // (the claim's), same pinned target (no rendezvous needed).
+        let (cli2_tx, cli2_rx) = std::sync::mpsc::channel();
+        let cli2_session =
+            start_session(dial_again, EventSender::new(cli2_tx, None), None, &memory);
+        let node_id = wait_for_event(&cli2_rx, Duration::from_secs(30), |ev| {
+            if let NetEvent::ClientReady { node_id, .. } = ev {
+                Some(node_id.clone())
+            } else {
+                None
+            }
+        });
+        assert_eq!(
+            node_id,
+            memory.secret.public().to_string(),
+            "the successor session must present the session identity"
+        );
+        wait_for_event(&cli2_rx, Duration::from_secs(60), |ev| {
+            matches!(ev, NetEvent::Status(ConnStatus::Connected)).then_some(())
+        });
+
+        // The revived link carries items.
+        cli2_session
+            .clip_tx
+            .send("after the restart".to_string())
+            .unwrap();
+        let text = wait_for_event(&srv_rx, Duration::from_secs(15), |ev| {
+            if let NetEvent::ItemReceived { text, .. } = ev {
+                Some(text.clone())
+            } else {
+                None
+            }
+        });
+        assert_eq!(text, "after the restart");
+
+        let mut cli2 = Some(cli2_session);
+        let mut srv = Some(srv_session);
+        stop_session(&mut cli2).await;
+        stop_session(&mut srv).await;
+    }
+
     /// A second device dialing a server that is already pairing with someone
     /// else is refused promptly with a fatal "busy" error (a `SERVER_BUSY`
     /// close), not left hanging in the reconnect loop. Both devices reach the
@@ -2013,13 +2240,12 @@ mod tests {
 
         // Server.
         let (srv_tx, srv_rx) = std::sync::mpsc::channel();
-        let srv_session = start_session(
+        let srv_session = start_test_session(
             SessionKind::Server(ServerMode::Pin {
                 relays: Vec::new(),
                 channel: PinChannel::LanOnly,
             }),
             EventSender::new(srv_tx, None),
-            None,
         );
         let pin_display = wait_for_event(&srv_rx, Duration::from_secs(30), |ev| {
             if let NetEvent::PinRotated { pin_display, .. } = ev {
@@ -2040,9 +2266,9 @@ mod tests {
         // Both devices dial concurrently — both fetch the record before either
         // pairing completes (the pairing handshake far outlasts a loopback fetch).
         let (a_tx, a_rx) = std::sync::mpsc::channel();
-        let a_session = start_session(SessionKind::Client(dial()), EventSender::new(a_tx, None), None);
+        let a_session = start_test_session(SessionKind::Client(dial()), EventSender::new(a_tx, None));
         let (b_tx, b_rx) = std::sync::mpsc::channel();
-        let b_session = start_session(SessionKind::Client(dial()), EventSender::new(b_tx, None), None);
+        let b_session = start_test_session(SessionKind::Client(dial()), EventSender::new(b_tx, None));
 
         // Exactly one pairs; the other is turned away as busy. Watch both.
         let start = Instant::now();

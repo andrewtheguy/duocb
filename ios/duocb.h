@@ -221,6 +221,19 @@ int duocb_query_conn_path(const DuocbHandle *handle);
  * -1 = NULL handle. */
 int duocb_is_running(const DuocbHandle *handle);
 
+/* Re-issue the session command this handle was started with, on its
+ * still-running runtime. The runtime keeps the session identity and pairing
+ * state (node id, the host's pair claim, the joiner's pinned dial target)
+ * until the handle is stopped, so after the session ends on its own — e.g.
+ * the joiner gave up reconnecting ("could not reach the peer…" then
+ * {"state":"idle"}) — this resumes the same pairing: the same node id dials
+ * the same target and the peer recognizes it, with no re-pairing and no fresh
+ * PIN. A fresh duocb_start would mint a new identity, which an already-paired
+ * peer refuses. Progress arrives as the usual status events.
+ * 0 = requested; -1 = NULL handle; -2 = hub role (nothing to reconnect);
+ * -3 = runtime unavailable (it died — duocb_stop and start fresh). */
+int duocb_reconnect(const DuocbHandle *handle);
+
 /* Stop the session and free the handle. NULL is a safe no-op. */
 void duocb_stop(DuocbHandle *handle);
 

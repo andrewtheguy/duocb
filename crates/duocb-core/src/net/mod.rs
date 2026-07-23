@@ -107,7 +107,7 @@ pub enum DialSpec {
 }
 
 /// Commands from the UI thread to the networking runtime.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum UiCommand {
     StartServer { mode: ServerMode },
     StopServer,
