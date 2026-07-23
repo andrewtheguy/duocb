@@ -72,6 +72,10 @@ pub struct DuocbHandle {
     /// An event that didn't fit the caller's buffer, retained for retry.
     pending: Mutex<Option<String>>,
     task: tokio::task::JoinHandle<()>,
+    /// The session command this handle was started with (`None` for the hub
+    /// role), replayed by [`duocb_reconnect`] into the still-running runtime so
+    /// its session identity/pairing memory is reused.
+    session_cmd: Option<UiCommand>,
 }
 
 #[derive(Deserialize)]
@@ -412,6 +416,11 @@ fn start_inner(json: &str) -> Result<DuocbHandle, String> {
             })
             .map_err(|_| "runtime unavailable".to_string())?;
     }
+    let session_cmd = matches!(
+        cmd,
+        UiCommand::StartServer { .. } | UiCommand::Connect { .. }
+    )
+    .then(|| cmd.clone());
     cmd_tx.send(cmd).map_err(|_| "runtime unavailable".to_string())?;
 
     Ok(DuocbHandle {
@@ -420,6 +429,7 @@ fn start_inner(json: &str) -> Result<DuocbHandle, String> {
         events: Mutex::new(event_rx),
         pending: Mutex::new(None),
         task,
+        session_cmd,
     })
 }
 
@@ -643,6 +653,35 @@ pub unsafe extern "C" fn duocb_is_running(handle: *const DuocbHandle) -> c_int {
     }
     let handle = unsafe { &*handle };
     if handle.task.is_finished() { 0 } else { 1 }
+}
+
+/// Re-issue the session command this handle was started with, on the handle's
+/// still-running runtime. The runtime keeps the session identity and pairing
+/// state (node id, the host's pair claim, the joiner's pinned dial target)
+/// until the handle is stopped, so after the session ends on its own — e.g.
+/// the joiner gave up reconnecting ("could not reach the peer…" + `status:
+/// idle`) — this resumes the same pairing: the same node id dials the same
+/// target and the peer recognizes it, no re-pairing and no fresh PIN needed.
+/// A fresh [`duocb_start`] would instead mint a new identity, which an
+/// already-paired peer refuses. Progress arrives as the usual status events.
+/// Returns 0 = requested, -1 = NULL handle, -2 = the handle runs the hub role
+/// (nothing to reconnect), -3 = runtime unavailable (it died — fall back to
+/// [`duocb_stop`] + a fresh [`duocb_start`]).
+/// # Safety
+/// `handle` must be NULL or a live handle from [`duocb_start`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn duocb_reconnect(handle: *const DuocbHandle) -> c_int {
+    if handle.is_null() {
+        return -1;
+    }
+    let handle = unsafe { &*handle };
+    let Some(cmd) = &handle.session_cmd else {
+        return -2;
+    };
+    if handle.task.is_finished() || handle.cmd_tx.send(cmd.clone()).is_err() {
+        return -3;
+    }
+    0
 }
 
 /// Stop the session (graceful shutdown, bounded wait) and free the handle.
