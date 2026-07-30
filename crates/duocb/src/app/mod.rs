@@ -50,8 +50,8 @@ pub(crate) struct App {
     pub(crate) error: Option<String>,
 
     // Configure-mode standing state (the primary mode).
-    /// The standing secret from the config, always checksum-valid when `Some`.
-    pub(crate) secret: Option<String>,
+    /// The standing secret from the config (parsed, so always valid when `Some`).
+    pub(crate) secret: Option<duocb_core::auth::Secret>,
     /// The confirmed short device name from the config.
     pub(crate) saved_name: Option<String>,
     /// This device's permanent random suffix (always present; minted on the
@@ -83,7 +83,7 @@ pub(crate) struct App {
     /// type it for the manual-IP side channel (from [`NetEvent::PinRotated`]);
     /// `None` on other channels or before an address is known.
     pub(crate) host_lan_ip: Option<String>,
-    pub(crate) token_fingerprint: Option<String>,
+    pub(crate) secret_fingerprint: Option<String>,
     pub(crate) pin_display: Option<String>,
     pub(crate) pin_deadline: Option<Instant>,
     /// PIN cleared because a peer paired (vs. never shown).
@@ -96,7 +96,7 @@ pub(crate) struct App {
     // every edit; authoritative — sync writes them back, which is how resets
     // reach the fields).
     pub(crate) in_my_name: String,
-    pub(crate) in_import_token: String,
+    pub(crate) in_import_secret: String,
     /// The joiner's PIN entry, split into its two `XXXX` groups (one text field
     /// each) so grouping never edits a field's text mid-keystroke.
     pub(crate) in_pin_a: String,
@@ -169,8 +169,9 @@ impl App {
         };
 
         let secret = config
-            .auth_token
-            .filter(|t| duocb_core::auth::validate_token(t).is_ok());
+            .secret
+            .as_deref()
+            .and_then(|encoded| duocb_core::auth::Secret::parse(encoded).ok());
         let saved_name = config
             .my_name
             .filter(|n| duocb_core::identity::validate_name(n).is_ok());
@@ -209,13 +210,13 @@ impl App {
             server_running: false,
             node_id: None,
             host_lan_ip: None,
-            token_fingerprint: None,
+            secret_fingerprint: None,
             pin_display: None,
             pin_deadline: None,
             pin_paired: false,
             client_active: false,
             in_my_name: saved_name.unwrap_or_default(),
-            in_import_token: String::new(),
+            in_import_secret: String::new(),
             in_pin_a: String::new(),
             in_pin_b: String::new(),
             in_join_ip: String::new(),
@@ -249,17 +250,17 @@ impl App {
         match event {
             NetEvent::ServerReady {
                 node_id,
-                token_fingerprint,
+                secret_fingerprint,
             } => {
                 self.node_id = Some(node_id);
-                self.token_fingerprint = token_fingerprint;
+                self.secret_fingerprint = secret_fingerprint;
             }
             NetEvent::ClientReady {
                 node_id,
-                token_fingerprint,
+                secret_fingerprint,
             } => {
                 self.node_id = Some(node_id);
-                self.token_fingerprint = token_fingerprint;
+                self.secret_fingerprint = secret_fingerprint;
             }
             NetEvent::PinRotated {
                 pin_display,
@@ -287,7 +288,7 @@ impl App {
                     self.client_active = false;
                     self.node_id = None;
                     self.host_lan_ip = None;
-                    self.token_fingerprint = None;
+                    self.secret_fingerprint = None;
                     self.joined_peer = None;
                     self.pin_display = None;
                     self.pin_deadline = None;
@@ -457,7 +458,7 @@ impl App {
     /// The standing identity, available once secret + name are configured.
     pub(crate) fn token_identity(&self) -> Option<TokenIdentity> {
         Some(TokenIdentity {
-            token: self.secret.clone()?,
+            secret: self.secret.clone()?,
             name: self.saved_name.clone()?,
             suffix: self.device_suffix.clone(),
             relays: default_relays(),
@@ -479,7 +480,7 @@ impl App {
     /// Returns false and surfaces the error when the save fails.
     fn save_configure_config(&mut self) -> bool {
         let cfg = crate::config::Config {
-            auth_token: self.secret.clone(),
+            secret: self.secret.as_ref().map(duocb_core::auth::Secret::encode),
             my_name: self.saved_name.clone(),
             device_suffix: Some(self.device_suffix.clone()),
         };
@@ -523,27 +524,26 @@ impl App {
     /// be copied from the hub at any time (Copy secret), so a confirm-you-saved-
     /// it screen would only add a click without safeguarding anything.
     pub(crate) fn begin_generate_secret(&mut self) {
-        self.set_secret(duocb_core::auth::generate_token());
+        self.set_secret(duocb_core::auth::Secret::generate());
     }
 
-    /// Commit the pasted secret from the import step, if it validates.
+    /// Commit the pasted secret from the import step, if it parses.
     pub(crate) fn use_imported_secret(&mut self) {
-        let token = self.in_import_token.trim().to_string();
-        if duocb_core::auth::validate_token(&token).is_ok() {
-            self.in_import_token.clear();
-            self.set_secret(token);
+        if let Ok(secret) = duocb_core::auth::Secret::parse(&self.in_import_secret) {
+            self.in_import_secret.clear();
+            self.set_secret(secret);
         }
     }
 
     /// Cancel the import step back to the choice.
     pub(crate) fn cancel_setup(&mut self) {
-        self.in_import_token.clear();
+        self.in_import_secret.clear();
         self.configure_step = ConfigureStep::SetupChoice;
     }
 
     /// Commit a generated or imported secret and move on to naming the device.
-    pub(crate) fn set_secret(&mut self, token: String) {
-        self.secret = Some(token);
+    pub(crate) fn set_secret(&mut self, secret: duocb_core::auth::Secret) {
+        self.secret = Some(secret);
         self.save_configure_config();
         self.reset_name_field();
         self.configure_step = ConfigureStep::SetupName;
@@ -594,7 +594,7 @@ impl App {
         self.peers_refreshed_at = None;
         self.peers_requested_at = None;
         self.presence_conflict = None;
-        self.in_import_token.clear();
+        self.in_import_secret.clear();
         self.configure_step = ConfigureStep::SetupChoice;
     }
 
@@ -1080,7 +1080,7 @@ pub(crate) mod tests {
         let lock = crate::config::acquire_lock(&dir.join("config.json")).unwrap();
         let config = lock.load().unwrap();
         let mut app = App::new(lock, config, net);
-        app.secret = Some(duocb_core::auth::generate_token());
+        app.secret = Some(duocb_core::auth::Secret::generate());
         app.saved_name = Some("mac".into());
         app.configure_step = ConfigureStep::Ready;
         app.mode = PairMode::NostrToken;
@@ -1328,6 +1328,16 @@ pub(crate) mod tests {
     fn masked_secret_hint_shows_last_four() {
         assert_eq!(masked_secret_hint("abcdefgh"), "********efgh");
         assert_eq!(masked_secret_hint("abc"), "********abc");
+
+        // On a real secret the tail is the checksum section: enough to tell two
+        // secrets apart in a password manager, and the fingerprint shown beside
+        // it is the actual cross-device check.
+        let secret = duocb_core::auth::Secret::generate();
+        let encoded = secret.encode();
+        let hint = masked_secret_hint(&encoded);
+        assert!(hint.starts_with("********"));
+        assert!(encoded.ends_with(hint.trim_start_matches('*')));
+        assert_eq!(hint.chars().count(), 12);
     }
 
     #[test]

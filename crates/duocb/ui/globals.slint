@@ -55,10 +55,10 @@ export global UiState {
     in property <string> name-error;
     in property <bool> can-cancel-name;
     in property <bool> import-valid;
-    /// Fingerprint of a checksum-valid import entry, "" otherwise.
+    /// Fingerprint of a valid import entry, "" otherwise.
     in property <string> import-fingerprint;
-    /// True when the import entry is non-empty but not a valid token.
-    in property <bool> import-invalid;
+    /// Why a non-empty import entry is not a valid secret, "" otherwise.
+    in property <string> import-error;
     /// The name rules line under the name field (composed in Rust so the max
     /// length constant lives in one place).
     in property <string> name-rules;
@@ -75,8 +75,8 @@ export global UiState {
     in property <string> joined-peer;
     in property <string> node-id-short;
     in property <string> peer-node-id-short;
-    /// The fingerprint shown in the pairing summary (session token, or the
-    /// standing secret's).
+    /// The fingerprint shown in the pairing summary (the session's secret, or
+    /// the standing one's).
     in property <string> session-fingerprint;
     /// The host's LAN IPv4 on the LAN-only channel (so the joiner can type it
     /// for the manual-IP side channel), "" on other channels / before it's known.
@@ -129,7 +129,7 @@ export global UiState {
     // Form inputs, two-way bound to their fields. The Rust side mirrors them
     // on every edit and writes them back on sync (authoritative after resets).
     in-out property <string> in-my-name;
-    in-out property <string> in-import-token;
+    in-out property <string> in-import-secret;
     in-out property <string> in-pin-a;
     in-out property <string> in-pin-b;
     /// The joiner's optional host-IP entry (shown only for a LAN-only PIN).

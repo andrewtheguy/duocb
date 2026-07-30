@@ -4,7 +4,7 @@
 //!
 //! Environment:
 //!   DUOCB_ROLE    start | join                 (default start)
-//!   DUOCB_TOKEN   shared 47-char token         (default: generate + print, start only)
+//!   DUOCB_SECRET  shared 125-char secret       (default: generate + print, start only)
 //!   DUOCB_NAME    this device's short name     (default mac-peer)
 //!   DUOCB_SUFFIX  8-char device suffix         (default: generate + print)
 //!   DUOCB_PEER    peer display identity to dial, e.g. mac_a7B2c3D4 (required for join)
@@ -35,14 +35,15 @@ fn main() {
         }
         _ => duocb_core::identity::generate_suffix(),
     };
-    let token = match std::env::var("DUOCB_TOKEN") {
-        Ok(token) if !token.is_empty() => token,
+    let secret = match std::env::var("DUOCB_SECRET") {
+        Ok(encoded) if !encoded.is_empty() => {
+            duocb_core::auth::Secret::parse(&encoded).expect("invalid DUOCB_SECRET")
+        }
         _ => {
-            assert_eq!(role, "start", "DUOCB_TOKEN is required for the join role");
-            duocb_core::auth::generate_token()
+            assert_eq!(role, "start", "DUOCB_SECRET is required for the join role");
+            duocb_core::auth::Secret::generate()
         }
     };
-    duocb_core::auth::validate_token(&token).expect("invalid DUOCB_TOKEN");
     let send_on_pair = std::env::var("DUOCB_SEND").ok();
     let relays: Vec<String> = duocb_core::nostr::DEFAULT_NOSTR_RELAYS
         .iter()
@@ -50,16 +51,13 @@ fn main() {
         .collect();
 
     let identity = TokenIdentity {
-        token: token.clone(),
+        secret: secret.clone(),
         name,
         suffix,
         relays,
     };
-    println!("token: {token}");
-    println!(
-        "fingerprint: {}",
-        duocb_core::auth::token_fingerprint(&token)
-    );
+    println!("secret: {}", secret.encode());
+    println!("fingerprint: {}", secret.fingerprint());
     println!("identity: {}", identity.display());
 
     let mut net = spawn_net_runtime(None);

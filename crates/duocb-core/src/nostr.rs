@@ -1,18 +1,23 @@
 //! Nostr side channel for the configure mode's device presence and rendezvous.
 //!
-//! All devices sharing one `auth_token` (the standing secret) derive the *same*
-//! nostr keypair from it, so authorship of an event under that key **is** the
-//! proof of secret possession — a presence record is "a message signed by the
-//! secret". Each running device publishes one kind-30078 parameterized-
-//! replaceable **presence record** under a `d` tag of
-//! `duocb:presence:<sha256(auth||identity)>`, where `identity` is the device's
-//! collision-resistant display identity `<name>_<suffix>` (see
-//! `crate::identity`). The hash is salted with the token so identities cannot
+//! Everything here is keyed off the [`Channel`] — the 128-bit rendezvous half of
+//! the standing secret (see [`crate::auth`]). The auth token half is
+//! deliberately *not* reachable from this module: relays see the channel-derived
+//! public key, and no relay-visible value may be a function of the credential
+//! that authorizes a session.
+//!
+//! All devices sharing one channel derive the *same* nostr keypair from it, so
+//! authorship of an event under that key **is** the proof of channel possession
+//! — a presence record is "a message signed by the channel". Each running device
+//! publishes one kind-30078 parameterized-replaceable **presence record** under a
+//! `d` tag of `duocb:presence:<sha256(channel||identity)>`, where `identity` is
+//! the device's collision-resistant display identity `<name>_<suffix>` (see
+//! `crate::identity`). The hash is salted with the channel so identities cannot
 //! be enumerated on relays.
 //!
-//! The record content is NIP-44 **self-encrypted** under the token-derived
+//! The record content is NIP-44 **self-encrypted** under the channel-derived
 //! keypair and carries a JSON [`PresenceRecord`]: the plaintext display name
-//! (readable only by token holders), the permanent per-device suffix, and a
+//! (readable only by secret holders), the permanent per-device suffix, and a
 //! random per-publisher-run id. It is a directory entry only — it says "this
 //! device exists / was last seen at `created_at`" and carries **no** dial target
 //! or hosting/liveness signal. A peer fetches every record under the shared
@@ -21,12 +26,13 @@
 //!
 //! The dial target is negotiated separately, out of the directory: while a
 //! device is hosting a connection it publishes a short-lived **hosting record**
-//! (see [`publish_hosting`]) keyed off the same token+identity, carrying only its
-//! current ephemeral iroh node id and self-expiring via NIP-40 so it leaves no
-//! standing liveness on relays. On join, the client resolves that record for the
-//! selected identity (see [`lookup_hosting`]) to learn the node id to dial; its
-//! absence means the device is not currently hosting. The `auth_token` still
-//! gates the actual connection in-band.
+//! (see [`publish_hosting`]) keyed off the same channel+identity, carrying only
+//! its current ephemeral iroh node id and self-expiring via NIP-40 so it leaves
+//! no standing liveness on relays. On join, the client resolves that record for
+//! the selected identity (see [`lookup_hosting`]) to learn the node id to dial;
+//! its absence means the device is not currently hosting. The **token** half of
+//! the secret still gates the actual connection in-band, so locating a device and
+//! being allowed to talk to it stay separate.
 
 use std::time::Duration;
 
@@ -36,6 +42,7 @@ use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::auth::Channel;
 use crate::pin;
 
 /// Default public relays used when none are configured.
@@ -56,14 +63,15 @@ const PRESENCE_DTAG_BASE: &str = "duocb:presence";
 /// hash is appended (see [`hosting_dtag`]). A separate slot from presence so the
 /// dial target lives outside the directory listing.
 const HOSTING_DTAG_BASE: &str = "duocb:hosting";
-/// Domain separation for deriving the nostr key from the auth token.
-const KEY_DERIVATION_DOMAIN: &[u8] = b"duocb:nostr-rendezvous:v1";
+/// Domain separation for deriving the nostr key from the rendezvous channel.
+/// `v2` is the channel-keyed derivation; `v1` hashed the whole auth token.
+const KEY_DERIVATION_DOMAIN: &[u8] = b"duocb:nostr-rendezvous:v2";
 /// Domain separation for hashing a device's display identity into its presence `d` tag.
-const PRESENCE_DOMAIN: &[u8] = b"duocb:presence-id:v1";
+const PRESENCE_DOMAIN: &[u8] = b"duocb:presence-id:v2";
 /// Domain separation for hashing a device's display identity into its hosting `d`
 /// tag. Distinct from [`PRESENCE_DOMAIN`] so the two records for one device hash
 /// to unrelated tags and cannot be correlated on relays.
-const HOSTING_DOMAIN: &[u8] = b"duocb:hosting-id:v1";
+const HOSTING_DOMAIN: &[u8] = b"duocb:hosting-id:v2";
 
 /// Payload schema version; records with any other value are rejected on decode
 /// (strict no backward compatibility).
@@ -95,13 +103,13 @@ fn presence_kind() -> Kind {
 
 /// Build a `d` tag for a device: the given `base` tag plus a hex SHA-256 of the
 /// (trimmed) display identity, salted with the `domain` and the shared
-/// `auth_token`. The salt means an identity cannot be guessed or enumerated on
-/// relays without the token; all parties share the token, so all derive the same
-/// tag. The `domain` also decouples the presence and hosting tags for one device.
-fn identity_dtag(base: &str, domain: &[u8], auth_token: &str, identity: &str) -> String {
+/// `channel`. The salt means an identity cannot be guessed or enumerated on
+/// relays without the channel; all parties share it, so all derive the same tag.
+/// The `domain` also decouples the presence and hosting tags for one device.
+fn identity_dtag(base: &str, domain: &[u8], channel: Channel, identity: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(domain);
-    hasher.update(auth_token.as_bytes());
+    hasher.update(channel.as_bytes());
     hasher.update(identity.trim().as_bytes());
     let digest = hasher.finalize();
     let mut tag = String::with_capacity(base.len() + 1 + digest.len() * 2);
@@ -115,25 +123,26 @@ fn identity_dtag(base: &str, domain: &[u8], auth_token: &str, identity: &str) ->
 }
 
 /// The `d` tag for a device's presence (directory) record.
-fn presence_dtag(auth_token: &str, identity: &str) -> String {
-    identity_dtag(PRESENCE_DTAG_BASE, PRESENCE_DOMAIN, auth_token, identity)
+fn presence_dtag(channel: Channel, identity: &str) -> String {
+    identity_dtag(PRESENCE_DTAG_BASE, PRESENCE_DOMAIN, channel, identity)
 }
 
 /// The `d` tag for a device's hosting record (the out-of-directory dial target).
-fn hosting_dtag(auth_token: &str, identity: &str) -> String {
-    identity_dtag(HOSTING_DTAG_BASE, HOSTING_DOMAIN, auth_token, identity)
+fn hosting_dtag(channel: Channel, identity: &str) -> String {
+    identity_dtag(HOSTING_DTAG_BASE, HOSTING_DOMAIN, channel, identity)
 }
 
-/// Derive the shared nostr identity from the `auth_token`. Both peers run this on
-/// the same token and get the same keypair, so the server publishes and the
-/// client looks up under one author key with no extra identifier exchanged.
-pub fn derive_keys(auth_token: &str) -> Result<Keys> {
+/// Derive the shared nostr identity from the rendezvous `channel`. Both peers run
+/// this on the same channel and get the same keypair, so the server publishes and
+/// the client looks up under one author key with no extra identifier exchanged.
+/// The auth token is not an input: this key's *public* half goes on relays.
+pub fn derive_keys(channel: Channel) -> Result<Keys> {
     let mut hasher = Sha256::new();
     hasher.update(KEY_DERIVATION_DOMAIN);
-    hasher.update(auth_token.as_bytes());
+    hasher.update(channel.as_bytes());
     let digest = hasher.finalize();
     let secret =
-        SecretKey::from_slice(&digest).context("deriving nostr secret key from auth token")?;
+        SecretKey::from_slice(&digest).context("deriving nostr secret key from the channel")?;
     Ok(Keys::new(secret))
 }
 
@@ -170,9 +179,9 @@ async fn connect_client(relays: &[String]) -> Result<Client> {
 }
 
 /// The NIP-44-encrypted content of a presence (directory) record. Authorship
-/// under the token-derived key proves secret possession; the payload carries the
-/// plaintext display name (readable only by token holders) plus the minimum a
-/// peer needs to *list* this device. It deliberately carries no dial target or
+/// under the channel-derived key proves channel possession; the payload carries
+/// the plaintext display name (readable only by channel holders) plus the minimum
+/// a peer needs to *list* this device. It deliberately carries no dial target or
 /// hosting/liveness signal — that is the hosting record's job (see
 /// [`publish_hosting`]).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -218,17 +227,17 @@ impl PeerInfo {
     }
 }
 
-/// Publish (or replace) this device's presence record under the auth-token-derived
+/// Publish (or replace) this device's presence record under the channel-derived
 /// key, tagged with its display identity so every device stays distinct.
 pub async fn publish_presence(
-    auth_token: &str,
+    channel: Channel,
     record: &PresenceRecord,
     relays: &[String],
 ) -> Result<()> {
-    let keys = derive_keys(auth_token)?;
+    let keys = derive_keys(channel)?;
     let payload = serde_json::to_string(record).context("serializing presence record")?;
-    // Self-encryption under the shared (auth-token-derived) keypair: any peer with
-    // the same token derives the same key to decrypt; relays see only ciphertext.
+    // Self-encryption under the shared (channel-derived) keypair: any peer with
+    // the same channel derives the same key to decrypt; relays see only ciphertext.
     let content = nip44::encrypt(
         keys.secret_key(),
         &keys.public_key(),
@@ -238,7 +247,7 @@ pub async fn publish_presence(
     .context("encrypting presence record for nostr")?;
     let client = connect_client(relays).await?;
     let event = EventBuilder::new(presence_kind(), content)
-        .tags([Tag::identifier(presence_dtag(auth_token, &record.display()))])
+        .tags([Tag::identifier(presence_dtag(channel, &record.display()))])
         .sign_with_keys(&keys)
         .context("signing presence event")?;
     let res = client.send_event(&event).await;
@@ -273,13 +282,13 @@ fn presence_from_events<'a>(
         .collect()
 }
 
-/// Fetch every presence record published under the shared auth-derived author key
-/// (including this device's own — see [`build_peer_list`] for self-exclusion).
+/// Fetch every presence record published under the shared channel-derived author
+/// key (including this device's own — see [`build_peer_list`] for self-exclusion).
 pub async fn fetch_presence_records(
-    auth_token: &str,
+    channel: Channel,
     relays: &[String],
 ) -> Result<Vec<(PresenceRecord, u64)>> {
-    let keys = derive_keys(auth_token)?;
+    let keys = derive_keys(channel)?;
     let client = connect_client(relays).await?;
     let filter = Filter::new()
         .kind(presence_kind())
@@ -295,16 +304,16 @@ pub async fn fetch_presence_records(
 /// stored record is unreadable — indistinguishable from absent, by design). A
 /// relay failure is an `Err`, so callers can tell "no record" from "no answer".
 pub async fn lookup_presence(
-    auth_token: &str,
+    channel: Channel,
     identity: &str,
     relays: &[String],
 ) -> Result<Option<(PresenceRecord, u64)>> {
-    let keys = derive_keys(auth_token)?;
+    let keys = derive_keys(channel)?;
     let client = connect_client(relays).await?;
     let filter = Filter::new()
         .kind(presence_kind())
         .author(keys.public_key())
-        .identifier(presence_dtag(auth_token, identity))
+        .identifier(presence_dtag(channel, identity))
         .limit(1);
     let events = client.fetch_events(filter, LOOKUP_TIMEOUT).await;
     client.disconnect().await;
@@ -314,25 +323,25 @@ pub async fn lookup_presence(
 }
 
 /// Publish (or replace) this device's hosting record: its current ephemeral iroh
-/// node id, NIP-44 self-encrypted under the token-derived key and tagged under
+/// node id, NIP-44 self-encrypted under the channel-derived key and tagged under
 /// this device's hosting `d` tag. A parameterized-replaceable event (same kind as
 /// presence, distinct `d` tag) so a new node id supersedes the previous, with a
 /// NIP-40 expiration so the record self-cleans once the device stops refreshing
 /// it (i.e. stops hosting) — leaving no standing dial target or liveness behind.
 pub async fn publish_hosting(
-    auth_token: &str,
+    channel: Channel,
     identity: &str,
     node_id: &EndpointId,
     relays: &[String],
 ) -> Result<()> {
-    let keys = derive_keys(auth_token)?;
+    let keys = derive_keys(channel)?;
     // Same `{node_id}` self-encrypted payload the PIN rendezvous uses; reused
     // here for the out-of-directory hosting record (see `crate::pin_record`).
     let content = crate::pin_record::encrypt_pin_payload(&keys, node_id)?;
     let expiration = Timestamp::now() + HOSTING_EVENT_TTL_SECS;
     let client = connect_client(relays).await?;
     let event = EventBuilder::new(presence_kind(), content)
-        .tags([Tag::identifier(hosting_dtag(auth_token, identity))])
+        .tags([Tag::identifier(hosting_dtag(channel, identity))])
         .tag(Tag::expiration(expiration))
         .sign_with_keys(&keys)
         .context("signing hosting event")?;
@@ -347,16 +356,16 @@ pub async fn publish_hosting(
 /// — the device is not hosting (or has stopped and the record expired). A relay
 /// failure is an `Err`, so callers can tell "not hosting" from "no answer".
 pub async fn lookup_hosting(
-    auth_token: &str,
+    channel: Channel,
     identity: &str,
     relays: &[String],
 ) -> Result<Option<EndpointId>> {
-    let keys = derive_keys(auth_token)?;
+    let keys = derive_keys(channel)?;
     let client = connect_client(relays).await?;
     let filter = Filter::new()
         .kind(presence_kind())
         .author(keys.public_key())
-        .identifier(hosting_dtag(auth_token, identity))
+        .identifier(hosting_dtag(channel, identity))
         .limit(1);
     let events = client.fetch_events(filter, LOOKUP_TIMEOUT).await;
     client.disconnect().await;
@@ -502,21 +511,60 @@ pub async fn lookup_pin_record(
 mod tests {
     use super::*;
 
+    use crate::auth::Secret;
+
+    /// A deterministic channel for derivation vectors.
+    fn channel(byte: u8) -> Channel {
+        Channel::for_tests([byte; 16])
+    }
+
     #[test]
-    fn derive_keys_is_deterministic_and_token_specific() {
-        let a = derive_keys("token-one").unwrap();
-        let a_again = derive_keys("token-one").unwrap();
-        let b = derive_keys("token-two").unwrap();
+    fn derive_keys_is_deterministic_and_channel_specific() {
+        let a = derive_keys(channel(1)).unwrap();
+        let a_again = derive_keys(channel(1)).unwrap();
+        let b = derive_keys(channel(2)).unwrap();
         assert_eq!(
             a.public_key(),
             a_again.public_key(),
-            "same token must derive the same key"
+            "same channel must derive the same key"
         );
         assert_ne!(
             a.public_key(),
             b.public_key(),
-            "different tokens must derive different keys"
+            "different channels must derive different keys"
         );
+    }
+
+    #[test]
+    fn derive_keys_ignores_the_token_half() {
+        // Two secrets sharing a channel are the same rendezvous, even though
+        // their credentials differ — that decoupling is the whole point.
+        let a = Secret::generate();
+        let encoded = a.encode();
+        let b = Secret::parse(&encoded).unwrap();
+        assert_eq!(
+            derive_keys(a.channel()).unwrap().public_key(),
+            derive_keys(b.channel()).unwrap().public_key()
+        );
+
+        // And a fresh secret (new channel *and* new token) is a different one.
+        let c = Secret::generate();
+        assert_ne!(
+            derive_keys(a.channel()).unwrap().public_key(),
+            derive_keys(c.channel()).unwrap().public_key()
+        );
+    }
+
+    #[test]
+    fn derive_keys_uses_the_v2_channel_domain() {
+        // Guards against reverting to the v1 formula, which hashed the encoded
+        // token string instead of the raw channel bytes.
+        let ch = channel(0);
+        let mut hasher = Sha256::new();
+        hasher.update(b"duocb:nostr-rendezvous:v1");
+        hasher.update(ch.as_bytes());
+        let v1 = Keys::new(SecretKey::from_slice(&hasher.finalize()).unwrap());
+        assert_ne!(derive_keys(ch).unwrap().public_key(), v1.public_key());
     }
 
     fn record(name: &str, suffix: &str, run_id: &str) -> PresenceRecord {
@@ -529,7 +577,7 @@ mod tests {
     }
 
     fn presence_event(
-        token: &str,
+        channel: Channel,
         keys: &Keys,
         record: &PresenceRecord,
         created_at: u64,
@@ -542,39 +590,42 @@ mod tests {
         )
         .unwrap();
         EventBuilder::new(presence_kind(), content)
-            .tags([Tag::identifier(presence_dtag(token, &record.display()))])
+            .tags([Tag::identifier(presence_dtag(channel, &record.display()))])
             .custom_created_at(Timestamp::from_secs(created_at))
             .sign_with_keys(keys)
             .unwrap()
     }
 
     #[test]
-    fn presence_dtag_is_deterministic_identity_and_token_specific() {
-        let token = "the-auth-token";
-        let a = presence_dtag(token, "web1_a7B2c3D4");
-        let a_again = presence_dtag(token, "web1_a7B2c3D4");
-        let b = presence_dtag(token, "web2_x9Y8z7W6");
+    fn presence_dtag_is_deterministic_identity_and_channel_specific() {
+        let ch = channel(7);
+        let a = presence_dtag(ch, "web1_a7B2c3D4");
+        let a_again = presence_dtag(ch, "web1_a7B2c3D4");
+        let b = presence_dtag(ch, "web2_x9Y8z7W6");
         assert_eq!(
             a, a_again,
-            "same token + identity must derive the same d tag"
+            "same channel + identity must derive the same d tag"
         );
         assert_ne!(a, b, "different identities must derive different d tags");
         assert!(a.starts_with(PRESENCE_DTAG_BASE), "d tag was: {a}");
 
         // Trimming: surrounding whitespace must not change the tag.
-        assert_eq!(a, presence_dtag(token, "  web1_a7B2c3D4  "));
+        assert_eq!(a, presence_dtag(ch, "  web1_a7B2c3D4  "));
 
-        // Salt: the same identity under a different token derives a different tag.
-        let other_token = presence_dtag("other-token", "web1_a7B2c3D4");
-        assert_ne!(a, other_token, "the auth token salts the identity hash");
+        // Salt: the same identity under a different channel derives a different tag.
+        let other = presence_dtag(channel(8), "web1_a7B2c3D4");
+        assert_ne!(a, other, "the channel salts the identity hash");
+
+        // The presence and hosting tags for one device stay uncorrelated.
+        assert_ne!(a, hosting_dtag(ch, "web1_a7B2c3D4"));
     }
 
     #[test]
     fn presence_record_round_trips_through_encrypted_event_content() {
-        let token = "round-trip-token";
-        let keys = derive_keys(token).unwrap();
+        let ch = channel(3);
+        let keys = derive_keys(ch).unwrap();
         let rec = record("mac-book", "a7B2c3D4", "run1");
-        let event = presence_event(token, &keys, &rec, 100);
+        let event = presence_event(ch, &keys, &rec, 100);
 
         // The plaintext name must not appear on the relay.
         assert!(!event.content.contains("mac-book"), "name leaked in clear");
@@ -585,18 +636,19 @@ mod tests {
 
     #[test]
     fn presence_decoding_skips_foreign_and_malformed_records() {
-        let token = "shared-token";
-        let keys = derive_keys(token).unwrap();
+        let ch = channel(4);
+        let keys = derive_keys(ch).unwrap();
 
         let good = record("mac1", "a7B2c3D4", "run1");
-        let good_event = presence_event(token, &keys, &good, 300);
+        let good_event = presence_event(ch, &keys, &good, 300);
 
-        // Encrypted under a different token: must be skipped, not error.
-        let foreign_keys = derive_keys("wrong-token").unwrap();
-        let undecryptable = presence_event("wrong-token", &foreign_keys, &good, 400);
+        // Encrypted under a different channel: must be skipped, not error.
+        let foreign = channel(5);
+        let foreign_keys = derive_keys(foreign).unwrap();
+        let undecryptable = presence_event(foreign, &foreign_keys, &good, 400);
         // Re-sign under our author key so only decryption distinguishes it.
         let undecryptable = EventBuilder::new(presence_kind(), undecryptable.content.clone())
-            .tags([Tag::identifier(presence_dtag(token, "x"))])
+            .tags([Tag::identifier(presence_dtag(ch, "x"))])
             .sign_with_keys(&keys)
             .unwrap();
 
@@ -609,14 +661,14 @@ mod tests {
         )
         .unwrap();
         let legacy = EventBuilder::new(presence_kind(), legacy_content)
-            .tags([Tag::identifier(presence_dtag(token, "legacy"))])
+            .tags([Tag::identifier(presence_dtag(ch, "legacy"))])
             .sign_with_keys(&keys)
             .unwrap();
 
         // Wrong payload version: parses but must be rejected.
         let mut future = record("mac9", "q5R6s7T8", "run9");
         future.version = PRESENCE_VERSION + 1;
-        let future_event = presence_event(token, &keys, &future, 500);
+        let future_event = presence_event(ch, &keys, &future, 500);
 
         // Wrong d-tag base (an unrelated 30078 record): filtered before decrypting.
         let unrelated = EventBuilder::new(presence_kind(), "junk")
@@ -664,16 +716,17 @@ mod tests {
     }
 
     #[test]
-    fn wrong_auth_token_cannot_decrypt_presence() {
-        let publisher = derive_keys("the-real-token").unwrap();
+    fn wrong_channel_cannot_decrypt_presence() {
+        let real = channel(9);
+        let publisher = derive_keys(real).unwrap();
         let rec = record("mac1", "a7B2c3D4", "run1");
-        let event = presence_event("the-real-token", &publisher, &rec, 100);
-        // A peer with a different auth token derives a different key and cannot read it.
-        let attacker = derive_keys("a-different-token").unwrap();
+        let event = presence_event(real, &publisher, &rec, 100);
+        // A peer with a different channel derives a different key and cannot read it.
+        let attacker = derive_keys(channel(10)).unwrap();
         assert!(
             nip44::decrypt(attacker.secret_key(), &attacker.public_key(), &event.content)
                 .is_err(),
-            "decryption must fail under a different auth token"
+            "decryption must fail under a different channel"
         );
         assert!(presence_from_events(&attacker, [&event]).is_empty());
     }
@@ -685,14 +738,14 @@ mod tests {
             .iter()
             .map(|relay| relay.to_string())
             .collect();
-        let token = crate::auth::generate_token();
+        let ch = Secret::generate().channel();
         let host = record("relay-host", &crate::identity::generate_suffix(), "run1");
 
-        publish_presence(&token, &host, &relays)
+        publish_presence(ch, &host, &relays)
             .await
             .expect("publish presence record");
 
-        let fetched = fetch_presence_records(&token, &relays)
+        let fetched = fetch_presence_records(ch, &relays)
             .await
             .expect("fetch presence records");
         let now = std::time::SystemTime::now()
@@ -706,7 +759,7 @@ mod tests {
             .expect("published device appears in the peer list");
 
         // The directory record round-trips as-is (no dial target inside it).
-        let (looked_up, _) = lookup_presence(&token, &host.display(), &relays)
+        let (looked_up, _) = lookup_presence(ch, &host.display(), &relays)
             .await
             .expect("lookup presence")
             .expect("record exists");
@@ -715,18 +768,18 @@ mod tests {
         // The dial target is negotiated out-of-directory: before hosting, no
         // hosting record exists; after publishing one, the node id round-trips.
         assert_eq!(
-            lookup_hosting(&token, &host.display(), &relays)
+            lookup_hosting(ch, &host.display(), &relays)
                 .await
                 .expect("lookup hosting"),
             None,
             "no hosting record before the device hosts"
         );
         let node_id = iroh::SecretKey::generate().public();
-        publish_hosting(&token, &host.display(), &node_id, &relays)
+        publish_hosting(ch, &host.display(), &node_id, &relays)
             .await
             .expect("publish hosting record");
         assert_eq!(
-            lookup_hosting(&token, &host.display(), &relays)
+            lookup_hosting(ch, &host.display(), &relays)
                 .await
                 .expect("lookup hosting"),
             Some(node_id),

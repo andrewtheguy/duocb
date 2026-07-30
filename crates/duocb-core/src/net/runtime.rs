@@ -199,10 +199,19 @@ type PinnedAddr = Arc<parking_lot::Mutex<Option<EndpointAddr>>>;
 /// same role and same credential/target; anything else mints fresh state.
 #[derive(Clone, PartialEq, Eq)]
 enum SessionKey {
-    ServerPin { channel: PinChannel },
-    ServerToken { token: String },
-    ClientPin { canonical_pin: String },
-    ClientToken { token: String, peer_display: String },
+    ServerPin {
+        channel: PinChannel,
+    },
+    ServerToken {
+        secret: crate::auth::Secret,
+    },
+    ClientPin {
+        canonical_pin: String,
+    },
+    ClientToken {
+        secret: crate::auth::Secret,
+        peer_display: String,
+    },
 }
 
 fn session_key(kind: &SessionKind) -> SessionKey {
@@ -211,7 +220,7 @@ fn session_key(kind: &SessionKind) -> SessionKey {
             SessionKey::ServerPin { channel: *channel }
         }
         SessionKind::Server(ServerMode::NostrToken { identity }) => SessionKey::ServerToken {
-            token: identity.token.clone(),
+            secret: identity.secret.clone(),
         },
         SessionKind::Client(DialSpec::Pin { canonical_pin, .. }) => SessionKey::ClientPin {
             canonical_pin: canonical_pin.clone(),
@@ -220,7 +229,7 @@ fn session_key(kind: &SessionKind) -> SessionKey {
             identity,
             peer_display,
         }) => SessionKey::ClientToken {
-            token: identity.token.clone(),
+            secret: identity.secret.clone(),
             peer_display: peer_display.clone(),
         },
     }
@@ -507,7 +516,7 @@ pub async fn net_main(mut cmd_rx: mpsc::UnboundedReceiver<UiCommand>, events: Ev
                     // Spawned so a slow relay lookup never blocks this loop.
                     peer_fetch = Some(tokio::spawn(async move {
                         match crate::nostr::fetch_presence_records(
-                            &identity.token,
+                            identity.secret.channel(),
                             &identity.relays,
                         )
                         .await
@@ -613,18 +622,19 @@ async fn run_server_session(
     // client authenticates and lives until the server is stopped — surviving
     // a restarted session task, whose paired peer reconnects seamlessly.
 
-    // Tokens accepted from clients — configure mode only. The PIN quick mode
-    // authenticates with the in-band PIN challenge-response instead.
-    let (tokens, token_fingerprint): (HashSet<String>, Option<String>) = match &mode {
-        ServerMode::NostrToken { identity } => {
-            let fingerprint = crate::auth::token_fingerprint(&identity.token);
-            (HashSet::from([identity.token.clone()]), Some(fingerprint))
-        }
+    // Wire tokens accepted from clients — configure mode only, and the token half
+    // of the secret only. The PIN quick mode authenticates with the in-band PIN
+    // challenge-response instead.
+    let (tokens, secret_fingerprint): (HashSet<String>, Option<String>) = match &mode {
+        ServerMode::NostrToken { identity } => (
+            HashSet::from([identity.secret.wire_token()]),
+            Some(identity.secret.fingerprint()),
+        ),
         ServerMode::Pin { .. } => (HashSet::new(), None),
     };
     events.send(NetEvent::ServerReady {
         node_id: node_id.to_string(),
-        token_fingerprint,
+        secret_fingerprint,
     });
     events.status(ConnStatus::Listening);
 
@@ -822,15 +832,13 @@ async fn run_client_session(
         }
     };
     let own_id = endpoint.id();
-    let token_fingerprint = match &spec {
-        DialSpec::NostrToken { identity, .. } => {
-            Some(crate::auth::token_fingerprint(&identity.token))
-        }
+    let secret_fingerprint = match &spec {
+        DialSpec::NostrToken { identity, .. } => Some(identity.secret.fingerprint()),
         DialSpec::Pin { .. } => None,
     };
     events.send(NetEvent::ClientReady {
         node_id: own_id.to_string(),
-        token_fingerprint,
+        secret_fingerprint,
     });
 
     // Consecutive failed attempts, reset to zero on every successful connection
@@ -861,7 +869,7 @@ async fn run_client_session(
                 // is not currently hosting.
                 tokio::select! {
                     _ = cancel.cancelled() => return,
-                    r = crate::nostr::lookup_hosting(&identity.token, peer_display, &identity.relays) => match r {
+                    r = crate::nostr::lookup_hosting(identity.secret.channel(), peer_display, &identity.relays) => match r {
                         Ok(Some(id)) => Ok(EndpointAddr::new(id)),
                         Ok(None) => Err(anyhow::anyhow!(
                             "'{peer_display}' is not hosting a connection — press Start on that device (and confirm it uses the same secret)"
@@ -916,7 +924,7 @@ async fn run_client_session(
                 // stream stays open for clipboard frames.
                 let auth_result = match &spec {
                     DialSpec::NostrToken { identity, .. } => {
-                        auth_as_dialer(&conn, &identity.token).await
+                        auth_as_dialer(&conn, &identity.secret).await
                     }
                     DialSpec::Pin { canonical_pin, .. } => {
                         auth_as_dialer_pin(&conn, canonical_pin, own_id).await
@@ -1139,7 +1147,11 @@ async fn run_presence_publisher(
         // transition away from the hub) blocks on this task ending.
         let cycle = async {
             if publishes > 0 {
-                match crate::nostr::lookup_presence(&identity.token, &display, &identity.relays)
+                match crate::nostr::lookup_presence(
+                    identity.secret.channel(),
+                    &display,
+                    &identity.relays,
+                )
                     .await
                 {
                     Ok(Some((record, _))) if record.run_id != run_id => {
@@ -1166,7 +1178,12 @@ async fn run_presence_publisher(
                 suffix: identity.suffix.clone(),
                 run_id: run_id.clone(),
             };
-            match crate::nostr::publish_presence(&identity.token, &record, &identity.relays).await
+            match crate::nostr::publish_presence(
+                identity.secret.channel(),
+                &record,
+                &identity.relays,
+            )
+            .await
             {
                 Ok(()) => log::info!("Published presence to nostr"),
                 Err(e) => log::warn!("Failed to publish presence to nostr: {e:#}"),
@@ -1176,7 +1193,7 @@ async fn run_presence_publisher(
             // last record expire (NIP-40) so no standing liveness lingers.
             if let Some(node_id) = hosting {
                 match crate::nostr::publish_hosting(
-                    &identity.token,
+                    identity.secret.channel(),
                     &display,
                     &node_id,
                     &identity.relays,
@@ -1554,17 +1571,22 @@ fn auth_close_reason(conn: &iroh::endpoint::Connection) -> Option<String> {
     }
 }
 
-/// Authenticate as the dialer with a pre-shared token. On success the opened
+/// Authenticate as the dialer with the standing secret. On success the opened
 /// stream is returned (send side *not* finished): the same stream carries the
 /// clipboard afterward.
-async fn auth_as_dialer(conn: &iroh::endpoint::Connection, auth_token: &str) -> Result<Bi> {
+///
+/// Takes the whole [`crate::auth::Secret`] and extracts the wire token here, so
+/// "only the token half ever leaves this device" lives in exactly one place. The
+/// channel half stays behind — it is relay-visible material and has no business
+/// in the handshake.
+async fn auth_as_dialer(conn: &iroh::endpoint::Connection, secret: &crate::auth::Secret) -> Result<Bi> {
     // Opening the stream and sending the request can fail if the listener has
     // already closed the connection (e.g. a BUSY refusal, which the listener
     // sends without ever accepting a stream). Surface that as the fatal reason
     // it is, rather than a generic transport error the client would retry on.
     let opened = async {
         let (mut send, recv) = conn.open_bi().await.context("opening session stream")?;
-        let request = AuthRequest::new(auth_token);
+        let request = AuthRequest::new(secret.wire_token());
         send.write_all(&encode_auth_request(&request)?).await?;
         Ok::<Bi, anyhow::Error>((send, recv))
     };
@@ -1646,8 +1668,9 @@ async fn auth_as_dialer_pin(
     }
 }
 
-/// Authenticate as the listener. Accepts either a pre-shared token or (PIN mode) a PIN proof;
-/// `pin_cache` holds the recent-bucket PIN keys and is `None` outside PIN mode.
+/// Authenticate as the listener. Accepts either the standing secret's token half (see
+/// [`crate::auth::Secret::wire_token`]) or (PIN mode) a PIN proof; `pin_cache` holds the
+/// recent-bucket PIN keys and is `None` outside PIN mode.
 ///
 /// `claim` enforces the one-pair-at-a-time rule across all modes: if another node id already
 /// holds the claim this peer is refused up front; otherwise a successful handshake commits this
@@ -1697,7 +1720,7 @@ async fn auth_as_listener(
                         "Already paired with another device"
                     } else {
                         log::warn!("Invalid auth token from {remote_id}");
-                        "Invalid authentication token"
+                        "That device's secret does not match this one"
                     };
                     let response = AuthResponse::rejected(reason);
                     send.write_all(&encode_auth_response(&response)?).await?;
@@ -1880,7 +1903,7 @@ mod tests {
         let events = EventSender::new(tx, None);
         let hosting: HostingTx = Arc::new(tokio::sync::watch::channel(None).0);
         let identity = TokenIdentity {
-            token: "test-token".to_string(),
+            secret: crate::auth::Secret::generate(),
             name: "test".to_string(),
             suffix: "a7B2c3D4".to_string(),
             // TEST-NET-1: unroutable, so the first publish hangs in its

@@ -41,19 +41,19 @@ component ImportStep inherits VerticalLayout {
         entry := LineEdit {
             input-type: InputType.password;
             placeholder-text: "…";
-            text <=> UiState.in-import-token;
+            text <=> UiState.in-import-secret;
             edited => { Actions.fields-edited(); }
             accepted => { Actions.use-imported(); }
         }
         if UiState.import-fingerprint != "": LabeledValue {
-            label: "Token fingerprint:";
+            label: "Secret fingerprint:";
             value: UiState.import-fingerprint;
         }
         if UiState.import-fingerprint != "": Small {
             text: "Confirm this matches on the other device.";
         }
-        if UiState.import-invalid: Text {
-            text: "That is not a valid token";
+        if UiState.import-error != "": Text {
+            text: UiState.import-error;
             color: Theme.warn;
             font-size: Theme.font-body;
             wrap: word-wrap;

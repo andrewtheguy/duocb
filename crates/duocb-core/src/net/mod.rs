@@ -20,8 +20,9 @@ pub type WakeFn = std::sync::Arc<dyn Fn() + Send + Sync>;
 /// and a joining session need.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TokenIdentity {
-    /// The shared auth token (the standing secret).
-    pub token: String,
+    /// The standing secret: its channel half drives the nostr rendezvous, its
+    /// token half authenticates the connection (see [`crate::auth::Secret`]).
+    pub secret: crate::auth::Secret,
     /// This device's user-chosen short name.
     pub name: String,
     /// This device's permanent random suffix.
@@ -159,17 +160,17 @@ pub enum ConnStatus {
 /// Events from the networking runtime to the UI thread.
 #[derive(Debug)]
 pub enum NetEvent {
-    /// Server endpoint is up. `token_fingerprint` is set in configure mode (the
+    /// Server endpoint is up. `secret_fingerprint` is set in configure mode (the
     /// standing secret's).
     ServerReady {
         node_id: String,
-        token_fingerprint: Option<String>,
+        secret_fingerprint: Option<String>,
     },
-    /// Client endpoint is online. Token mode includes the fingerprint so the
+    /// Client endpoint is online. Configure mode includes the fingerprint so the
     /// connector retains the same identity details as the initiator screen.
     ClientReady {
         node_id: String,
-        token_fingerprint: Option<String>,
+        secret_fingerprint: Option<String>,
     },
     /// PIN quick mode: a fresh PIN was minted (display form, `XXXX-XXXX`).
     /// `host_lan_ip` is the host's LAN IPv4 on the LAN-only channel (so the UI
