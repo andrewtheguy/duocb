@@ -73,8 +73,8 @@ pub(crate) fn wire(app: &Rc<RefCell<App>>, ui: &MainWindow) {
         app.configure_step = crate::ConfigureStep::SetupName;
     });
     act!(on_copy_secret, |app| {
-        if let Some(secret) = app.secret.clone() {
-            app.copy_with_flash(&secret, CopyTarget::Secret);
+        if let Some(encoded) = app.secret.as_ref().map(duocb_core::auth::Secret::encode) {
+            app.copy_with_flash(&encoded, CopyTarget::Secret);
         }
     });
     act!(on_request_clear_secret, |app| {
@@ -189,7 +189,7 @@ pub(crate) fn wire(app: &Rc<RefCell<App>>, ui: &MainWindow) {
                 let s = ui.global::<UiState>();
                 let mut app = app.borrow_mut();
                 app.in_my_name = s.get_in_my_name().into();
-                app.in_import_token = s.get_in_import_token().into();
+                app.in_import_secret = s.get_in_import_secret().into();
                 // Sanitize each PIN group (uppercase, map look-alikes, drop
                 // noise) then cap/spill them into the two fields. No separator is
                 // ever inserted into a field, so the cursor never shifts under

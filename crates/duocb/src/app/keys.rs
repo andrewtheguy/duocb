@@ -139,9 +139,12 @@ fn handle_configure_key(
                 app.begin_server();
             } else if letter('c') {
                 app.enter_join_picker();
-            } else if command('t') && app.secret.is_some() {
-                let secret = app.secret.clone().unwrap();
-                app.copy_with_flash(&secret, CopyTarget::Secret);
+            } else if command('t') {
+                let Some(encoded) = app.secret.as_ref().map(duocb_core::auth::Secret::encode)
+                else {
+                    return false;
+                };
+                app.copy_with_flash(&encoded, CopyTarget::Secret);
             } else {
                 return false;
             }

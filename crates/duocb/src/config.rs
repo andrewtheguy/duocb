@@ -1,6 +1,7 @@
 //! Minimal config persistence for the configure mode: the standing secret (the
-//! 47-char auth token), this device's short name, and its permanent random
-//! suffix. The setup wizard saves the secret and name as soon as they are
+//! 125-char envelope carrying the rendezvous channel and the auth token — see
+//! `duocb_core::auth::Secret`), this device's short name, and its permanent
+//! random suffix. The setup wizard saves the secret and name as soon as they are
 //! entered; the suffix is generated on the first launch with this config file
 //! and never changes (it survives clearing the secret). The config is
 //! per-machine — copying it to another device is not supported. Clipboard
@@ -23,8 +24,9 @@ use std::path::{Path, PathBuf};
 #[derive(Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// The standing secret shared by all of this user's devices (configure mode).
-    pub auth_token: Option<String>,
+    /// The standing secret shared by all of this user's devices (configure mode),
+    /// in its encoded form (`duocb_core::auth::Secret::encode`).
+    pub secret: Option<String>,
     /// This device's user-chosen short name (without the suffix).
     pub my_name: Option<String>,
     /// Permanent per-device random suffix (8 unambiguous chars), generated on
@@ -34,10 +36,10 @@ pub struct Config {
 }
 
 impl std::fmt::Debug for Config {
-    /// Manual impl so the auth token can never leak through debug logging.
+    /// Manual impl so the secret can never leak through debug logging.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Config")
-            .field("auth_token", &self.auth_token.as_ref().map(|_| "***"))
+            .field("secret", &self.secret.as_ref().map(|_| "***"))
             .field("my_name", &self.my_name)
             .field("device_suffix", &self.device_suffix)
             .finish()
@@ -246,30 +248,30 @@ mod tests {
         let lock = acquire_lock(&path).expect("lock");
 
         assert!(
-            lock.load().expect("load fresh config").auth_token.is_none(),
+            lock.load().expect("load fresh config").secret.is_none(),
             "fresh config is empty"
         );
 
         lock.save(&Config {
-            auth_token: Some("token-value".to_string()),
+            secret: Some("token-value".to_string()),
             my_name: Some("desktop".to_string()),
             device_suffix: Some("a7B2c3D4".to_string()),
         })
         .expect("save");
 
         let loaded = lock.load().expect("load saved config");
-        assert_eq!(loaded.auth_token.as_deref(), Some("token-value"));
+        assert_eq!(loaded.secret.as_deref(), Some("token-value"));
         assert_eq!(loaded.my_name.as_deref(), Some("desktop"));
 
         // A shorter replacement must contain exactly the new JSON.
         lock.save(&Config {
-            auth_token: Some("t".to_string()),
+            secret: Some("t".to_string()),
             my_name: None,
             device_suffix: Some("a7B2c3D4".to_string()),
         })
         .expect("save shorter");
         let loaded = lock.load().expect("load shorter config");
-        assert_eq!(loaded.auth_token.as_deref(), Some("t"));
+        assert_eq!(loaded.secret.as_deref(), Some("t"));
         assert_eq!(loaded.my_name, None);
 
         drop(lock);
@@ -301,7 +303,7 @@ mod tests {
 
         let lock = acquire_lock(&path).expect("lock");
         lock.save(&Config {
-            auth_token: Some("secret".to_string()),
+            secret: Some("secret".to_string()),
             my_name: Some("desktop".to_string()),
             device_suffix: None,
         })
@@ -326,7 +328,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             &path,
-            br#"{ "auth_token": "tok", "my_name": "desktop" }"#,
+            br#"{ "secret": "sec", "my_name": "desktop" }"#,
         )
         .unwrap();
 
@@ -353,7 +355,7 @@ mod tests {
         let lock = acquire_lock(&path).expect("lock");
 
         lock.save(&Config {
-            auth_token: Some("secret".to_string()),
+            secret: Some("secret".to_string()),
             my_name: Some("desktop".to_string()),
             device_suffix: Some("a7B2c3D4".to_string()),
         })
@@ -362,11 +364,11 @@ mod tests {
         // The clear-secret action drops the token but must keep the permanent
         // suffix (and may keep the name as a prefill).
         let mut cleared = lock.load().expect("load config to clear");
-        cleared.auth_token = None;
+        cleared.secret = None;
         lock.save(&cleared).expect("save cleared");
 
         let loaded = lock.load().expect("load cleared config");
-        assert_eq!(loaded.auth_token, None);
+        assert_eq!(loaded.secret, None);
         assert_eq!(loaded.device_suffix.as_deref(), Some("a7B2c3D4"));
 
         drop(lock);
@@ -380,7 +382,7 @@ mod tests {
 
         let lock = acquire_lock(&path).expect("lock");
         lock.save(&Config {
-            auth_token: Some("old".to_string()),
+            secret: Some("old".to_string()),
             my_name: Some("old-name".to_string()),
             device_suffix: Some("a7B2c3D4".to_string()),
         })
@@ -388,7 +390,7 @@ mod tests {
         let old_file = File::open(&path).expect("open old config inode");
 
         lock.save(&Config {
-            auth_token: Some("new".to_string()),
+            secret: Some("new".to_string()),
             my_name: Some("new-name".to_string()),
             device_suffix: Some("a7B2c3D4".to_string()),
         })
@@ -398,11 +400,11 @@ mod tests {
         // resolves to the complete replacement. This distinguishes rename from
         // an in-place overwrite.
         let old: Config = serde_json::from_reader(old_file).expect("parse old inode");
-        assert_eq!(old.auth_token.as_deref(), Some("old"));
+        assert_eq!(old.secret.as_deref(), Some("old"));
         assert_eq!(old.my_name.as_deref(), Some("old-name"));
 
         let current = lock.load().expect("load current config");
-        assert_eq!(current.auth_token.as_deref(), Some("new"));
+        assert_eq!(current.secret.as_deref(), Some("new"));
         assert_eq!(current.my_name.as_deref(), Some("new-name"));
         assert!(!sibling_path(&path, ".tmp").exists());
         assert!(sibling_path(&path, ".lock").exists());

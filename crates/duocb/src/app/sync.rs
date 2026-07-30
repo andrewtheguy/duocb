@@ -35,15 +35,15 @@ impl App {
         s.set_has_secret(self.secret.is_some());
         s.set_secret_hint(
             self.secret
-                .as_deref()
-                .map(masked_secret_hint)
+                .as_ref()
+                .map(|secret| masked_secret_hint(&secret.encode()))
                 .unwrap_or_default()
                 .into(),
         );
         s.set_secret_fingerprint(
             self.secret
-                .as_deref()
-                .map(duocb_core::auth::token_fingerprint)
+                .as_ref()
+                .map(duocb_core::auth::Secret::fingerprint)
                 .unwrap_or_default()
                 .into(),
         );
@@ -79,15 +79,21 @@ impl App {
             )
             .into(),
         );
-        let import = self.in_import_token.trim();
-        let import_valid = duocb_core::auth::validate_token(import).is_ok();
+        // The pasted secret is validated on every keystroke: a fingerprint to
+        // compare against the other device once it parses, otherwise the parse
+        // error itself (a 125-char envelope has many more ways to be wrong than
+        // "not a valid secret" conveys). An empty field shows neither.
+        let (import_valid, import_fingerprint, import_error) =
+            match duocb_core::auth::Secret::parse(&self.in_import_secret) {
+                Ok(secret) => (true, secret.fingerprint(), String::new()),
+                Err(_) if self.in_import_secret.trim().is_empty() => {
+                    (false, String::new(), String::new())
+                }
+                Err(e) => (false, String::new(), format!("{e:#}")),
+            };
         s.set_import_valid(import_valid);
-        s.set_import_fingerprint(if import_valid {
-            duocb_core::auth::token_fingerprint(import).into()
-        } else {
-            SharedString::default()
-        });
-        s.set_import_invalid(!import.is_empty() && !import_valid);
+        s.set_import_fingerprint(import_fingerprint.into());
+        s.set_import_error(import_error.into());
 
         // Device picker.
         let rows: Vec<PeerRow> = self
@@ -142,12 +148,12 @@ impl App {
                 .into(),
         );
         s.set_session_fingerprint(
-            self.token_fingerprint
+            self.secret_fingerprint
                 .clone()
                 .or_else(|| {
                     self.secret
-                        .as_deref()
-                        .map(duocb_core::auth::token_fingerprint)
+                        .as_ref()
+                        .map(duocb_core::auth::Secret::fingerprint)
                 })
                 .unwrap_or_default()
                 .into(),
@@ -254,7 +260,7 @@ impl App {
         // edit), so writing them back is a no-op while typing and applies
         // resets (wizard cancels, compose clear) to the actual fields.
         s.set_in_my_name(self.in_my_name.clone().into());
-        s.set_in_import_token(self.in_import_token.clone().into());
+        s.set_in_import_secret(self.in_import_secret.clone().into());
         s.set_in_pin_a(self.in_pin_a.clone().into());
         s.set_in_pin_b(self.in_pin_b.clone().into());
         s.set_in_join_ip(self.in_join_ip.clone().into());

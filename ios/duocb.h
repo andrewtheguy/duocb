@@ -3,8 +3,9 @@
  * Hand-maintained; keep in sync with crates/duocb-ffi/src/lib.rs.
  * Build with ./build-ios.sh (stages dist/ios/libduocb.xcframework + this header).
  *
- * Configure mode: every device shares one standing secret (the token) and
- * broadcasts a presence record under its unique display identity
+ * Configure mode: every device shares one standing secret — a 125-char opaque
+ * string carrying both a rendezvous channel and an auth token, handled as one
+ * piece — and broadcasts a presence record under its unique display identity
  * "<name>_<suffix>" (e.g. "mac-book_a7B2c3D4"). Role "hub" broadcasts presence
  * and browses the peer list without a session (the screen where the user picks
  * what to do); role "start" hosts (its record carries the node id); role
@@ -46,7 +47,11 @@
  *   4. duocb_stop(handle)                      (frees the handle)
  *
  * Config JSON (configure mode):
- *   {"role":"hub"|"start"|"join","token":"d…47 chars","name":"mac1",
+ *   {"role":"hub"|"start"|"join","secret":"eyJ2IjoxfQ.…","name":"mac1",
+ *                                              secret: exactly DUOCB_SECRET_LEN
+ *                                              chars; generate with
+ *                                              duocb_generate_secret or import
+ *                                              from another device
  *    "suffix":"a7B2c3D4",                      permanent 8-char device id; mint
  *                                              once with duocb_generate_suffix
  *                                              and persist forever (Keychain)
@@ -54,7 +59,7 @@
  *                                              device's display identity
  *    "relays":["wss://…"]}                     relays optional (built-in defaults)
  *
- * Config JSON (quick mode — no token/name/suffix/peer):
+ * Config JSON (quick mode — no secret/name/suffix/peer):
  *   {"role":"quick_host"}
  *   {"role":"quick_host","channel":"lan"}      LAN-only preset (see above)
  *   {"role":"quick_join","pin":"abcd-2345"}    pin: as typed by the user
@@ -77,8 +82,8 @@
  *                                              entry against this device's subnet.
  *
  * Events (one JSON object per duocb_next_event call), by "type":
- *   server_ready      {node_id, token_fingerprint}
- *   client_ready      {node_id, token_fingerprint}
+ *   server_ready      {node_id, secret_fingerprint}
+ *   client_ready      {node_id, secret_fingerprint}
  *   status            {state: idle|starting|listening|resolving|connecting|
  *                             authenticating|connected|reconnecting,
  *                      attempt?, max?}          (attempt/max only when reconnecting)
@@ -133,23 +138,31 @@ typedef struct DuocbHandle DuocbHandle;
 /* Route Rust log output to stderr (Xcode console / unified log). Idempotent. */
 void duocb_init_logging(void);
 
-/* Token helpers for the setup UX. Tokens are 47 chars; fingerprints are
- * 19 chars ("xxxx-xxxx-xxxx-xxxx") — a 64-byte buffer is ample for both. */
+/* Secret helpers for the setup UX. Pass the buffer lengths below: a secret is
+ * DUOCB_SECRET_LEN chars and does NOT fit the 64-byte buffer that sufficed for
+ * the old 47-char token format — an undersized buffer returns 0 and writes a
+ * truncated (useless) value. */
+#define DUOCB_SECRET_LEN 125        /* characters, excluding the NUL */
+#define DUOCB_SECRET_BUF_LEN 128    /* pass as out_len for a secret */
+#define DUOCB_FINGERPRINT_BUF_LEN 32 /* fingerprints are 19 chars + NUL */
 
-/* Generate a fresh token. 1 = written, 0 = buffer too small, -1 = NULL buffer. */
-int duocb_generate_token(char *out_buf, size_t out_len);
+/* Generate a fresh secret. 1 = written, 0 = buffer too small, -1 = NULL buffer. */
+int duocb_generate_secret(char *out_buf, size_t out_len);
 
 /* Generate this device's permanent 8-char identity suffix. Call once on first
  * launch and persist the result forever — it must never change, even when the
  * secret is replaced. 1 = written, 0 = buffer too small, -1 = NULL buffer. */
 int duocb_generate_suffix(char *out_buf, size_t out_len);
 
-/* 1 = valid, 0 = invalid (reason written to err_buf), -1 = NULL argument. */
-int duocb_validate_token(const char *token, char *err_buf, size_t err_len);
+/* 1 = valid, 0 = invalid (reason written to err_buf), -1 = NULL argument.
+ * Surrounding/embedded whitespace is ignored, so a line-wrapped paste is fine. */
+int duocb_validate_secret(const char *secret, char *err_buf, size_t err_len);
 
-/* Display fingerprint of a valid token. 1 = written, 0 = buffer too small,
- * -1 = NULL argument or invalid token. */
-int duocb_token_fingerprint(const char *token, char *out_buf, size_t out_len);
+/* Display fingerprint ("XXXX-XXXX-XXXX-XXXX", uppercase hex) of a valid secret;
+ * it covers the whole secret, so matching fingerprints on two devices mean
+ * matching secrets.
+ * 1 = written, 0 = buffer too small, -1 = NULL argument or invalid secret. */
+int duocb_secret_fingerprint(const char *secret, char *out_buf, size_t out_len);
 
 /* Normalize a user-typed quick-pair PIN to canonical form (8 uppercase
  * Crockford characters): strips dashes/spaces, uppercases, maps I/L->1 and

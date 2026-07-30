@@ -42,9 +42,12 @@ fn truncate_reason(reason: String, max_len: usize) -> String {
     }
 }
 
-/// Wrapper type for authentication tokens that redacts the value in Debug output.
+/// Wrapper type for the wire token that redacts the value in Debug output.
 ///
-/// This prevents accidental token exposure in logs or error messages.
+/// Carries the **token half** of the standing secret (the 43-char base64url of
+/// [`crate::auth::Secret::wire_token`]) — never the whole secret, and never the
+/// rendezvous channel. This wrapper prevents accidental exposure in logs or
+/// error messages.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct AuthToken(String);
@@ -84,7 +87,7 @@ impl std::ops::Deref for AuthToken {
 /// Authentication request sent by the client immediately after the iroh connection,
 /// on the first bidirectional stream it opens. The `method` tag selects the auth path
 /// the server runs:
-/// - `Token` — pre-shared auth token (configure mode).
+/// - `Token` — the standing secret's token half (configure mode).
 /// - `Pin` — PIN/session-secret challenge-response used by PIN quick pair and
 ///   manual mode: `nonce` is the dialer's random nonce and the exchange continues
 ///   with [`PinChallenge`] / [`PinResponse`] / [`PinConfirm`] on the same stream
@@ -94,7 +97,7 @@ impl std::ops::Deref for AuthToken {
 pub enum AuthRequest {
     Token {
         version: u16,
-        /// Authentication token for server validation.
+        /// The standing secret's token half, for server validation.
         auth_token: AuthToken,
     },
     Pin {
@@ -105,7 +108,7 @@ pub enum AuthRequest {
 }
 
 impl AuthRequest {
-    /// Token-method request (pre-shared auth token).
+    /// Token-method request (the standing secret's token half).
     pub fn new(auth_token: impl Into<String>) -> Self {
         Self::Token {
             version: DUOCB_PROTO_VERSION,

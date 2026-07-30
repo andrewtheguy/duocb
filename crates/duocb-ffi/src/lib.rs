@@ -6,13 +6,13 @@
 //! 1. [`duocb_start`] — parse the JSON config, spawn the networking runtime
 //!    ([`duocb_core::net::runtime::net_main`]) on an embedded tokio runtime,
 //!    and issue the role's initial command. Configure-mode roles ("hub",
-//!    "start", "join") take the shared `token`, this device's short `name`
+//!    "start", "join") take the shared `secret`, this device's short `name`
 //!    and permanent 8-char `suffix` (plus the `peer` display identity to dial
 //!    for "join") and start the presence broadcast; the "hub" role runs
 //!    presence + peer discovery only (an initial peer fetch is issued, its
 //!    result arriving as a `peer_list` event) so the app can show the device
 //!    list before the user commits to a role. Quick-mode roles ("quick_host",
-//!    "quick_join") are identity-less — no token/name/suffix, no presence:
+//!    "quick_join") are identity-less — no secret/name/suffix, no presence:
 //!    "quick_host" publishes a rotating PIN rendezvous and "quick_join" dials
 //!    the `pin` typed by the user, both on the `channel` selected in the
 //!    config (see [`QuickChannel`]). Returns an opaque handle. At most **one**
@@ -81,10 +81,10 @@ pub struct DuocbHandle {
 #[derive(Deserialize)]
 struct FfiConfig {
     role: Role,
-    /// Configure-mode roles: 47-char duocb auth token (the standing secret)
-    /// shared by all devices.
+    /// Configure-mode roles: the 125-char duocb secret (the standing secret
+    /// shared by all devices — see `duocb_core::auth::Secret`).
     #[serde(default)]
-    token: Option<String>,
+    secret: Option<String>,
     /// Configure-mode roles: this device's short name (`A-Za-z0-9-`, ≤ 24 chars).
     #[serde(default)]
     name: Option<String>,
@@ -106,9 +106,12 @@ struct FfiConfig {
     /// resolves via mDNS. Ignored for a non-LAN-only PIN.
     #[serde(default)]
     ip: Option<String>,
-    /// QuickHost role only: which channel carries the rotating-PIN rendezvous.
-    /// Omitted means `nostr_lan`. Ignored for QuickJoin — the join channel is
+    /// QuickHost role only: which transport carries the rotating-PIN rendezvous.
+    /// Omitted means `nostr_lan`. Ignored for QuickJoin — the join transport is
     /// read from the PIN's first character (see `duocb_core::pin`).
+    ///
+    /// Unrelated to the standing secret's rendezvous *channel*
+    /// (`duocb_core::auth::Channel`), which is never configured by hand.
     #[serde(default)]
     channel: Option<QuickChannel>,
     /// Empty/omitted means the built-in default relays.
@@ -116,7 +119,8 @@ struct FfiConfig {
     relays: Vec<String>,
 }
 
-/// The quick-mode rendezvous channel (JSON `channel` config key).
+/// The quick-mode rendezvous transport (JSON `channel` config key). Not the
+/// standing secret's `Channel` — quick mode has no standing secret at all.
 #[derive(Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum QuickChannel {
@@ -169,16 +173,21 @@ pub extern "C" fn duocb_init_logging() {
     .try_init();
 }
 
-/// Generate a fresh 47-char auth token into `out_buf`.
+/// Generate a fresh 125-char secret into `out_buf` (needs `DUOCB_SECRET_BUF_LEN`
+/// bytes).
 /// Returns 1 on success, 0 if the buffer is too small, -1 on a NULL buffer.
 /// # Safety
 /// `out_buf` must be NULL or point to at least `out_len` writable bytes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn duocb_generate_token(out_buf: *mut c_char, out_len: usize) -> c_int {
+pub unsafe extern "C" fn duocb_generate_secret(out_buf: *mut c_char, out_len: usize) -> c_int {
     if out_buf.is_null() {
         return -1;
     }
-    if write_cstr(out_buf, out_len, &duocb_core::auth::generate_token()) {
+    if write_cstr(
+        out_buf,
+        out_len,
+        &duocb_core::auth::Secret::generate().encode(),
+    ) {
         1
     } else {
         0
@@ -203,22 +212,22 @@ pub unsafe extern "C" fn duocb_generate_suffix(out_buf: *mut c_char, out_len: us
     }
 }
 
-/// Validate a token's format. Returns 1 if valid; 0 if invalid (the reason is
+/// Validate a secret's format. Returns 1 if valid; 0 if invalid (the reason is
 /// written to `err_buf` when provided); -1 on NULL/non-UTF-8 input.
 /// # Safety
-/// `token` must be NULL or a valid NUL-terminated C string; `err_buf` must be
+/// `secret` must be NULL or a valid NUL-terminated C string; `err_buf` must be
 /// NULL or point to at least `err_len` writable bytes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn duocb_validate_token(
-    token: *const c_char,
+pub unsafe extern "C" fn duocb_validate_secret(
+    secret: *const c_char,
     err_buf: *mut c_char,
     err_len: usize,
 ) -> c_int {
-    let Some(token) = (unsafe { cstr_arg(token) }) else {
+    let Some(secret) = (unsafe { cstr_arg(secret) }) else {
         return -1;
     };
-    match duocb_core::auth::validate_token(token) {
-        Ok(()) => 1,
+    match duocb_core::auth::Secret::parse(secret) {
+        Ok(_) => 1,
         Err(err) => {
             write_cstr(err_buf, err_len, &format!("{err:#}"));
             0
@@ -226,25 +235,26 @@ pub unsafe extern "C" fn duocb_validate_token(
     }
 }
 
-/// Write the token's display fingerprint (`xxxx-xxxx-xxxx-xxxx`) to `out_buf`.
+/// Write the secret's display fingerprint (`XXXX-XXXX-XXXX-XXXX`, uppercase hex)
+/// to `out_buf`.
 /// Returns 1 on success, 0 if the buffer is too small, -1 on NULL/non-UTF-8
-/// input or an invalid token.
+/// input or an invalid secret.
 /// # Safety
-/// `token` must be NULL or a valid NUL-terminated C string; `out_buf` must be
+/// `secret` must be NULL or a valid NUL-terminated C string; `out_buf` must be
 /// NULL or point to at least `out_len` writable bytes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn duocb_token_fingerprint(
-    token: *const c_char,
+pub unsafe extern "C" fn duocb_secret_fingerprint(
+    secret: *const c_char,
     out_buf: *mut c_char,
     out_len: usize,
 ) -> c_int {
-    let Some(token) = (unsafe { cstr_arg(token) }) else {
+    let Some(secret) = (unsafe { cstr_arg(secret) }) else {
         return -1;
     };
-    if duocb_core::auth::validate_token(token).is_err() {
+    let Ok(secret) = duocb_core::auth::Secret::parse(secret) else {
         return -1;
-    }
-    if write_cstr(out_buf, out_len, &duocb_core::auth::token_fingerprint(token)) {
+    };
+    if write_cstr(out_buf, out_len, &secret.fingerprint()) {
         1
     } else {
         0
@@ -445,7 +455,7 @@ fn build_initial_commands(cfg: FfiConfig) -> Result<(Option<TokenIdentity>, UiCo
         cfg.relays
     };
 
-    // Quick roles first: identity-less, so none of the token/name/suffix
+    // Quick roles first: identity-less, so none of the secret/name/suffix
     // validation below applies.
     match cfg.role {
         Role::QuickHost => {
@@ -495,8 +505,9 @@ fn build_initial_commands(cfg: FfiConfig) -> Result<(Option<TokenIdentity>, UiCo
         Role::Hub | Role::Start | Role::Join => {}
     }
 
-    let token = cfg.token.ok_or("token is required")?;
-    duocb_core::auth::validate_token(&token).map_err(|e| format!("invalid token: {e:#}"))?;
+    let encoded = cfg.secret.ok_or("secret is required")?;
+    let secret = duocb_core::auth::Secret::parse(&encoded)
+        .map_err(|e| format!("invalid secret: {e:#}"))?;
     let name = cfg.name.ok_or("name is required")?.trim().to_string();
     duocb_core::identity::validate_name(&name).map_err(|e| format!("invalid name: {e:#}"))?;
     let suffix = cfg.suffix.ok_or("suffix is required")?;
@@ -504,7 +515,7 @@ fn build_initial_commands(cfg: FfiConfig) -> Result<(Option<TokenIdentity>, UiCo
         return Err("invalid suffix (mint one with duocb_generate_suffix)".into());
     }
     let identity = TokenIdentity {
-        token,
+        secret,
         name,
         suffix,
         relays,
@@ -712,20 +723,20 @@ fn event_json(event: &NetEvent) -> String {
     let value = match event {
         NetEvent::ServerReady {
             node_id,
-            token_fingerprint,
+            secret_fingerprint,
             ..
         } => json!({
             "type": "server_ready",
             "node_id": node_id,
-            "token_fingerprint": token_fingerprint,
+            "secret_fingerprint": secret_fingerprint,
         }),
         NetEvent::ClientReady {
             node_id,
-            token_fingerprint,
+            secret_fingerprint,
         } => json!({
             "type": "client_ready",
             "node_id": node_id,
-            "token_fingerprint": token_fingerprint,
+            "secret_fingerprint": secret_fingerprint,
         }),
         NetEvent::PinRotated {
             pin_display,
@@ -843,7 +854,7 @@ mod tests {
     #[test]
     fn config_parses_roles_and_defaults_relays() {
         let cfg: FfiConfig = serde_json::from_str(
-            r#"{"role":"start","token":"t","name":"mac","suffix":"a7B2c3D4"}"#,
+            r#"{"role":"start","secret":"s","name":"mac","suffix":"a7B2c3D4"}"#,
         )
         .unwrap();
         assert!(matches!(cfg.role, Role::Start));
@@ -851,7 +862,7 @@ mod tests {
         assert!(cfg.peer.is_none());
 
         let cfg: FfiConfig = serde_json::from_str(
-            r#"{"role":"join","token":"t","name":"phone","suffix":"x9Y8z7W6","peer":"mac_a7B2c3D4","relays":["wss://r.example"]}"#,
+            r#"{"role":"join","secret":"s","name":"phone","suffix":"x9Y8z7W6","peer":"mac_a7B2c3D4","relays":["wss://r.example"]}"#,
         )
         .unwrap();
         assert!(matches!(cfg.role, Role::Join));
@@ -860,7 +871,7 @@ mod tests {
 
         // The hub role browses the peer list before a role is chosen — no peer.
         let cfg: FfiConfig = serde_json::from_str(
-            r#"{"role":"hub","token":"t","name":"phone","suffix":"x9Y8z7W6"}"#,
+            r#"{"role":"hub","secret":"s","name":"phone","suffix":"x9Y8z7W6"}"#,
         )
         .unwrap();
         assert!(matches!(cfg.role, Role::Hub));
@@ -871,7 +882,7 @@ mod tests {
     fn config_rejects_unknown_role() {
         assert!(
             serde_json::from_str::<FfiConfig>(
-                r#"{"role":"quick","token":"t","name":"x","suffix":"a7B2c3D4"}"#
+                r#"{"role":"quick","secret":"s","name":"x","suffix":"a7B2c3D4"}"#
             )
             .is_err()
         );
@@ -881,7 +892,7 @@ mod tests {
     fn config_parses_quick_roles_without_identity_fields() {
         let cfg: FfiConfig = serde_json::from_str(r#"{"role":"quick_host"}"#).unwrap();
         assert!(matches!(cfg.role, Role::QuickHost));
-        assert!(cfg.token.is_none());
+        assert!(cfg.secret.is_none());
 
         let cfg: FfiConfig =
             serde_json::from_str(r#"{"role":"quick_join","pin":"abcd-2345"}"#).unwrap();
@@ -891,9 +902,9 @@ mod tests {
 
     #[test]
     fn join_requires_a_peer_identity() {
-        let token = duocb_core::auth::generate_token();
+        let secret = duocb_core::auth::Secret::generate().encode();
         let json = format!(
-            r#"{{"role":"join","token":"{token}","name":"phone","suffix":"x9Y8z7W6"}}"#
+            r#"{{"role":"join","secret":"{secret}","name":"phone","suffix":"x9Y8z7W6"}}"#
         );
         let cfg: FfiConfig = serde_json::from_str(&json).unwrap();
         let err = build_initial_commands(cfg)
@@ -902,11 +913,20 @@ mod tests {
     }
 
     #[test]
-    fn identity_roles_require_a_token() {
+    fn identity_roles_require_a_valid_secret() {
         let cfg: FfiConfig =
             serde_json::from_str(r#"{"role":"hub","name":"phone","suffix":"x9Y8z7W6"}"#).unwrap();
-        let err = build_initial_commands(cfg).expect_err("hub needs token");
-        assert!(err.contains("token"), "unexpected error: {err}");
+        let err = build_initial_commands(cfg).expect_err("hub needs a secret");
+        assert!(err.contains("secret is required"), "unexpected error: {err}");
+
+        // A malformed secret is rejected with the parse reason, not silently
+        // dropped: the old 47-char token format lands here.
+        let cfg: FfiConfig = serde_json::from_str(
+            r#"{"role":"hub","secret":"dAAAA","name":"phone","suffix":"x9Y8z7W6"}"#,
+        )
+        .unwrap();
+        let err = build_initial_commands(cfg).expect_err("hub needs a valid secret");
+        assert!(err.contains("invalid secret"), "unexpected error: {err}");
     }
 
     #[test]
@@ -1046,15 +1066,15 @@ mod tests {
     }
 
     #[test]
-    fn event_json_maps_token_mode_and_pin_events() {
+    fn event_json_maps_configure_mode_and_pin_events() {
         let json = event_json(&NetEvent::ServerReady {
             node_id: "abc".into(),
-            token_fingerprint: Some("aaaa-bbbb-cccc-dddd".into()),
+            secret_fingerprint: Some("aaaa-bbbb-cccc-dddd".into()),
         });
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["type"], "server_ready");
         assert_eq!(v["node_id"], "abc");
-        assert_eq!(v["token_fingerprint"], "aaaa-bbbb-cccc-dddd");
+        assert_eq!(v["secret_fingerprint"], "aaaa-bbbb-cccc-dddd");
 
         let json = event_json(&NetEvent::Status(ConnStatus::Reconnecting {
             attempt: 4,
