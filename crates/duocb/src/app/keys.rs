@@ -10,7 +10,7 @@
 use slint::platform::Key;
 
 use super::{App, CopyTarget};
-use crate::{ConfigureStep, PinChannel, Screen};
+use crate::{ConfigureStep, Screen};
 use duocb_core::net::ConnStatus;
 
 /// Handle one key event. `plain` = no modifier held at all; `command` =
@@ -46,17 +46,9 @@ pub(crate) fn handle_global_key(
     let handled = match app.screen {
         Screen::Home if focus_free => handle_configure_key(app, esc, enter, up, down, &letter, &command),
         Screen::Quick if focus_free => {
-            // Letters mirror the rows on screen: P and L are the common
-            // choices; I is the uncommon (testing) one, which the UI reveals
-            // when selected. S hosts and C joins with whatever the selection
-            // (and the join entry) holds.
-            if letter('p') {
-                app.set_pin_channel(PinChannel::Both);
-            } else if letter('l') {
-                app.set_pin_channel(PinChannel::LanOnly);
-            } else if letter('i') {
-                app.set_pin_channel(PinChannel::NostrOnly);
-            } else if letter('s') {
+            // Quick pairing is always local-only. S hosts; C joins with the PIN
+            // and optional host IP entered on this screen.
+            if letter('s') {
                 app.begin_server();
             } else if letter('c') {
                 app.join_quick();
@@ -218,20 +210,11 @@ mod tests {
     fn quick_screen_letters_route() {
         let mut app = test_app();
         app.open_quick();
-        assert_eq!(app.mode, PairMode::NostrPin);
-        // P/L/I select the PIN rendezvous channel.
-        assert!(plain(&mut app, "l", false));
-        assert_eq!(app.mode, PairMode::NostrPin);
-        assert_eq!(app.pin_channel, PinChannel::LanOnly);
-        // The uncommon "internet only" channel auto-reveals the section.
-        assert!(plain(&mut app, "i", false));
-        assert_eq!(app.pin_channel, PinChannel::NostrOnly);
-        assert!(app.quick_advanced_open());
-        // Back to the default channel closes the uncommon section again.
-        assert!(plain(&mut app, "p", false));
-        assert_eq!(app.mode, PairMode::NostrPin);
-        assert_eq!(app.pin_channel, PinChannel::Both);
-        assert!(!app.quick_advanced_open());
+        assert_eq!(app.mode, PairMode::Pin);
+        // The former channel-selection keys no longer do anything.
+        assert!(!plain(&mut app, "p", false));
+        assert!(!plain(&mut app, "l", false));
+        assert!(!plain(&mut app, "i", false));
         // C joins with the current entry — empty here, so it stays put.
         assert!(plain(&mut app, "c", false));
         assert_eq!(app.screen, Screen::Quick);
@@ -248,7 +231,7 @@ mod tests {
         assert_eq!(app.screen, Screen::Quick);
         assert!(!app.client_active);
         // A valid PIN dials and moves to the client screen.
-        let pin = duocb_core::pin::generate_pin(false);
+        let pin = duocb_core::pin::generate_pin(true);
         let g = duocb_core::pin::PIN_GROUP_LEN;
         app.in_pin_a = pin[..g].to_string();
         app.in_pin_b = pin[g..].to_string();
@@ -261,9 +244,9 @@ mod tests {
     fn letters_ignored_while_field_focused() {
         let mut app = test_app();
         app.open_quick();
-        // A channel letter that would route while unfocused is ignored here.
-        assert!(!plain(&mut app, "l", true));
-        assert_eq!(app.pin_channel, PinChannel::Both);
+        // A quick-screen shortcut that would route while unfocused is ignored.
+        assert!(!plain(&mut app, "c", true));
+        assert_eq!(app.screen, Screen::Quick);
     }
 
     #[test]

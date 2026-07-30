@@ -105,18 +105,6 @@ pub(crate) fn wire(app: &Rc<RefCell<App>>, ui: &MainWindow) {
     });
 
     // Quick options / client.
-    actions.on_set_pin_channel({
-        let app = Rc::clone(app);
-        let weak = ui.as_weak();
-        move |channel| {
-            let ui = weak.unwrap();
-            app.borrow_mut().set_pin_channel(channel);
-            app.borrow().sync(&ui);
-        }
-    });
-    act!(on_toggle_quick_advanced, |app| {
-        app.quick_advanced_expanded = !app.quick_advanced_expanded
-    });
     nav!(on_join_quick, |app| app.join_quick());
     nav!(on_connect_client, |app| app.connect_client());
     nav!(on_disconnect, |app| {

@@ -28,7 +28,7 @@ export component ServerScreen inherits ScrollView {
             text: "Your other devices see this one as hosting — pick it in their list to join.";
         }
 
-        if UiState.server-running && UiState.mode == PairMode.nostr-pin
+        if UiState.server-running && UiState.mode == PairMode.pin
             && UiState.pin-display != "": VerticalLayout {
             spacing: Theme.pad-xs;
             alignment: start;
@@ -75,19 +75,19 @@ export component ServerScreen inherits ScrollView {
         // Paired: the PIN is spent. Show both node ids — this device's own id
         // and the paired peer's — so the user can eyeball that each side
         // matches the other's displayed value.
-        if UiState.server-running && UiState.mode == PairMode.nostr-pin
+        if UiState.server-running && UiState.mode == PairMode.pin
             && UiState.pin-display == "" && UiState.pin-paired
             && UiState.node-id-short != "": LabeledValue {
             label: "This device's id:";
             value: UiState.node-id-short;
         }
-        if UiState.server-running && UiState.mode == PairMode.nostr-pin
+        if UiState.server-running && UiState.mode == PairMode.pin
             && UiState.pin-display == "" && UiState.pin-paired
             && UiState.peer-node-id-short != "": LabeledValue {
             label: "Paired with:";
             value: UiState.peer-node-id-short;
         }
-        if UiState.server-running && UiState.mode == PairMode.nostr-pin
+        if UiState.server-running && UiState.mode == PairMode.pin
             && UiState.pin-display == "" && UiState.pin-paired
             && UiState.node-id-short != "": Small {
             text: "Confirm these match the other device's shown ids.";
