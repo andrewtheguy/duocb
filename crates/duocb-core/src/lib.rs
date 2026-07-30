@@ -1,4 +1,4 @@
-//! duocb-core: the portable core of duocb — token auth, wire protocol, nostr
+//! duocb-core: the portable core of duocb — key auth, wire protocol, nostr
 //! signaling, and the headless tokio networking runtime. No GUI, no system
 //! clipboard, no config file: those live in the desktop crate (`crates/duocb`)
 //! and, on iOS, on the Swift side of the FFI (`crates/duocb-ffi`).

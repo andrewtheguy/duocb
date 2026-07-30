@@ -3,8 +3,8 @@
 //!
 //! A connection uses a **single** bidirectional stream, opened by the client
 //! (dialer):
-//! 1. Auth runs first on it: an [`AuthRequest`] answered by an [`AuthResponse`]
-//!    (token method), or the PIN challenge-response (see `crate::pin_auth`).
+//! 1. Auth runs first on it: mutual application-key authentication, or the PIN
+//!    challenge-response used by quick mode (see `crate::pin_auth`).
 //! 2. Once auth succeeds the same stream stays open and carries [`ClipMsg`]
 //!    frames in both directions for the life of the connection. (A clipboard
 //!    app has exactly one data stream, so no separate control channel is
@@ -13,10 +13,8 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-/// Protocol version carried in every frame and validated on decode.
-/// v2: [`ClipMsg`] grew a `kind` tag (item / pull_latest / latest) for the
-/// resume-pull exchange; pre-1.0, mixed versions reject each other cleanly.
-pub const DUOCB_PROTO_VERSION: u16 = 2;
+/// v3 replaces configure-mode token auth with mutual application-key proofs.
+pub const DUOCB_PROTO_VERSION: u16 = 3;
 
 /// Cap for control frames (auth/pin). Small request/response messages only.
 pub const MAX_CONTROL_MESSAGE_SIZE: usize = 16 * 1024;
@@ -42,52 +40,10 @@ fn truncate_reason(reason: String, max_len: usize) -> String {
     }
 }
 
-/// Wrapper type for the wire token that redacts the value in Debug output.
-///
-/// Carries the **token half** of the standing secret (the 43-char base64url of
-/// [`crate::auth::Secret::wire_token`]) — never the whole secret, and never the
-/// rendezvous channel. This wrapper prevents accidental exposure in logs or
-/// error messages.
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct AuthToken(String);
-
-impl AuthToken {
-    /// Create a new AuthToken from a string.
-    pub fn new(token: impl Into<String>) -> Self {
-        Self(token.into())
-    }
-
-    /// Get the token value as a string slice.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Debug for AuthToken {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "AuthToken(***)")
-    }
-}
-
-impl AsRef<str> for AuthToken {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::ops::Deref for AuthToken {
-    type Target = str;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
 /// Authentication request sent by the client immediately after the iroh connection,
 /// on the first bidirectional stream it opens. The `method` tag selects the auth path
 /// the server runs:
-/// - `Token` — the standing secret's token half (configure mode).
+/// - `Key` — the persistent application identity (configure mode).
 /// - `Pin` — PIN/session-secret challenge-response used by PIN quick pair and
 ///   manual mode: `nonce` is the dialer's random nonce and the exchange continues
 ///   with [`PinChallenge`] / [`PinResponse`] / [`PinConfirm`] on the same stream
@@ -95,10 +51,12 @@ impl std::ops::Deref for AuthToken {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method")]
 pub enum AuthRequest {
-    Token {
+    Key {
         version: u16,
-        /// The standing secret's token half, for server validation.
-        auth_token: AuthToken,
+        /// Hex-encoded Nostr/application public key.
+        public_key: String,
+        /// Base64url random client nonce.
+        nonce: String,
     },
     Pin {
         version: u16,
@@ -108,11 +66,11 @@ pub enum AuthRequest {
 }
 
 impl AuthRequest {
-    /// Token-method request (the standing secret's token half).
-    pub fn new(auth_token: impl Into<String>) -> Self {
-        Self::Token {
+    pub fn key(public_key: impl Into<String>, nonce: impl Into<String>) -> Self {
+        Self::Key {
             version: DUOCB_PROTO_VERSION,
-            auth_token: AuthToken::new(auth_token),
+            public_key: public_key.into(),
+            nonce: nonce.into(),
         }
     }
 
@@ -126,7 +84,47 @@ impl AuthRequest {
 
     fn version(&self) -> u16 {
         match self {
-            AuthRequest::Token { version, .. } | AuthRequest::Pin { version, .. } => *version,
+            AuthRequest::Key { version, .. } | AuthRequest::Pin { version, .. } => *version,
+        }
+    }
+}
+
+/// Listener's authenticated challenge in configure mode.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyChallenge {
+    pub version: u16,
+    pub public_key: String,
+    pub nonce: String,
+    pub proof: String,
+}
+
+impl KeyChallenge {
+    pub fn new(
+        public_key: impl Into<String>,
+        nonce: impl Into<String>,
+        proof: impl Into<String>,
+    ) -> Self {
+        Self {
+            version: DUOCB_PROTO_VERSION,
+            public_key: public_key.into(),
+            nonce: nonce.into(),
+            proof: proof.into(),
+        }
+    }
+}
+
+/// Dialer's proof after verifying [`KeyChallenge`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyProof {
+    pub version: u16,
+    pub proof: String,
+}
+
+impl KeyProof {
+    pub fn new(proof: impl Into<String>) -> Self {
+        Self {
+            version: DUOCB_PROTO_VERSION,
+            proof: proof.into(),
         }
     }
 }
@@ -200,8 +198,7 @@ impl PinConfirm {
     }
 }
 
-/// Authentication response from server to client.
-/// Sent in response to a token [`AuthRequest`] on the auth stream.
+/// Final configure-mode authentication verdict.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthResponse {
     pub version: u16,
@@ -365,6 +362,32 @@ pub fn decode_auth_request(data: &[u8]) -> Result<AuthRequest> {
     )
 }
 
+pub fn encode_key_challenge(msg: &KeyChallenge) -> Result<Vec<u8>> {
+    encode_length_prefixed(msg, MAX_CONTROL_MESSAGE_SIZE, "KeyChallenge")
+}
+
+pub fn decode_key_challenge(data: &[u8]) -> Result<KeyChallenge> {
+    decode_length_prefixed(
+        data,
+        MAX_CONTROL_MESSAGE_SIZE,
+        |m: &KeyChallenge| m.version,
+        "KeyChallenge",
+    )
+}
+
+pub fn encode_key_proof(msg: &KeyProof) -> Result<Vec<u8>> {
+    encode_length_prefixed(msg, MAX_CONTROL_MESSAGE_SIZE, "KeyProof")
+}
+
+pub fn decode_key_proof(data: &[u8]) -> Result<KeyProof> {
+    decode_length_prefixed(
+        data,
+        MAX_CONTROL_MESSAGE_SIZE,
+        |m: &KeyProof| m.version,
+        "KeyProof",
+    )
+}
+
 /// Encode a PinChallenge as length-prefixed JSON bytes.
 pub fn encode_pin_challenge(msg: &PinChallenge) -> Result<Vec<u8>> {
     encode_length_prefixed(msg, MAX_CONTROL_MESSAGE_SIZE, "PinChallenge")
@@ -470,33 +493,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_auth_token_debug_redacts_value() {
-        let token = AuthToken::new("super_secret_token");
-        let debug_output = format!("{:?}", token);
-        assert_eq!(debug_output, "AuthToken(***)");
-        assert!(!debug_output.contains("super_secret"));
-    }
-
-    #[test]
-    fn test_auth_token_accessors() {
-        let token = AuthToken::new("my_token_value_");
-        assert_eq!(token.as_str(), "my_token_value_");
-        assert_eq!(token.as_ref(), "my_token_value_");
-        assert_eq!(&*token, "my_token_value_"); // Deref
-    }
-
-    #[test]
-    fn test_auth_token_serde_roundtrip() {
-        let token = AuthToken::new("test_token_12345");
-        let json = serde_json::to_string(&token).unwrap();
-        // Should serialize as plain string (transparent)
-        assert_eq!(json, "\"test_token_12345\"");
-
-        let parsed: AuthToken = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.as_str(), "test_token_12345");
-    }
-
-    #[test]
     fn test_truncate_reason_no_truncation() {
         let reason = "short reason".to_string();
         let result = truncate_reason(reason.clone(), 100);
@@ -551,7 +547,7 @@ mod tests {
     fn test_decode_rejects_trailing_bytes() {
         // A valid frame with extra bytes appended must be rejected, not silently
         // truncated to the framed length.
-        let mut buf = encode_auth_request(&AuthRequest::new("tok")).unwrap();
+        let mut buf = encode_auth_request(&AuthRequest::key("abc", "nonce")).unwrap();
         assert!(decode_auth_request(&buf).is_ok());
         buf.extend_from_slice(b"trailing");
         let err = decode_auth_request(&buf).unwrap_err();
@@ -572,20 +568,36 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_auth_request_token_roundtrip() {
-        let req = AuthRequest::new("my_secret_token");
+    fn test_auth_request_key_roundtrip() {
+        let req = AuthRequest::key("public-key", "client-nonce");
         let encoded = encode_auth_request(&req).unwrap();
         let decoded = decode_auth_request(&encoded).unwrap();
         match decoded {
-            AuthRequest::Token {
+            AuthRequest::Key {
                 version,
-                auth_token,
+                public_key,
+                nonce,
             } => {
                 assert_eq!(version, DUOCB_PROTO_VERSION);
-                assert_eq!(auth_token.as_str(), "my_secret_token");
+                assert_eq!(public_key, "public-key");
+                assert_eq!(nonce, "client-nonce");
             }
-            other => panic!("expected Token, got {other:?}"),
+            other => panic!("expected Key, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_key_challenge_and_proof_roundtrip() {
+        let challenge = KeyChallenge::new("server-key", "server-nonce", "server-proof");
+        let decoded =
+            decode_key_challenge(&encode_key_challenge(&challenge).unwrap()).unwrap();
+        assert_eq!(decoded.public_key, "server-key");
+        assert_eq!(decoded.nonce, "server-nonce");
+        assert_eq!(decoded.proof, "server-proof");
+
+        let proof = KeyProof::new("client-proof");
+        let decoded = decode_key_proof(&encode_key_proof(&proof).unwrap()).unwrap();
+        assert_eq!(decoded.proof, "client-proof");
     }
 
     #[test]
@@ -652,12 +664,12 @@ mod tests {
 
     #[test]
     fn test_auth_response_rejected_roundtrip() {
-        let resp = AuthResponse::rejected("bad token");
+        let resp = AuthResponse::rejected("untrusted key");
         let encoded = encode_auth_response(&resp).unwrap();
         let decoded = decode_auth_response(&encoded).unwrap();
         assert_eq!(decoded.version, DUOCB_PROTO_VERSION);
         assert!(!decoded.accepted);
-        assert_eq!(decoded.reason.as_deref(), Some("bad token"));
+        assert_eq!(decoded.reason.as_deref(), Some("untrusted key"));
     }
 
     // ========================================================================

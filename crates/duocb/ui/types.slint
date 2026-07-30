@@ -19,7 +19,7 @@ export enum Screen {
 export enum ConfigureStep {
     /// No secret: choose between generating a new one and importing one.
     setup-choice,
-    /// Paste an existing secret (masked, fingerprint-confirmed).
+    /// Restore an existing application private key.
     setup-import,
     /// Enter/confirm this device's short name.
     setup-name,
@@ -29,17 +29,17 @@ export enum ConfigureStep {
     join,
 }
 
-/// The pairing mode. `nostr-token` is the configure mode (home); `pin` is the
+/// The pairing mode. `nostr-key` is the configure mode (home); `pin` is the
 /// local-only quick rotating-PIN option (nothing saved).
 export enum PairMode {
-    nostr-token,
+    nostr-key,
     pin,
 }
 
-/// One row of the device picker. `line` is fully composed in Rust
-/// ("name_sfx  · seen 3m ago"); `suffix` is the stable selection key.
+/// One row of a device list. `line` is fully composed in Rust and
+/// `public-key` is the stable selection key.
 export struct PeerRow {
-    suffix: string,
+    public-key: string,
     line: string,
     selected: bool,
 }

@@ -31,17 +31,19 @@ export global UiState {
     /// Error banner text; "" hides the banner.
     in property <string> error;
 
-    // Configure identity / wizard. Secrets are never pushed here in full —
-    // only masked hints and fingerprints.
+    // Configure identity / wizard. The private key is only present in the
+    // explicitly masked restore field; normal projection exposes public data.
     in property <string> display-identity;
-    in property <bool> has-secret;
-    in property <string> secret-hint;
-    in property <string> secret-fingerprint;
+    in property <bool> has-identity;
+    in property <string> public-key-short;
+    in property <string> public-key;
     in property <string> config-path;
     in property <string> presence-conflict;
     // Per-button "✔ Copied" feedback: exactly one is true while a copy is fresh
     // (inbox/outbox rows carry their own `copied` flag in ClipRow).
-    in property <bool> copied-secret;
+    in property <bool> copied-card;
+    in property <bool> copied-private-key;
+    in property <bool> copied-channel;
     in property <bool> copied-pin;
     in property <bool> name-valid;
     /// "Broadcast as" preview when the name is valid, "" otherwise.
@@ -51,12 +53,24 @@ export global UiState {
     in property <bool> can-cancel-name;
     in property <bool> import-valid;
     /// Fingerprint of a valid import entry, "" otherwise.
-    in property <string> import-fingerprint;
+    in property <string> import-public-key;
     /// Why a non-empty import entry is not a valid secret, "" otherwise.
     in property <string> import-error;
     /// The name rules line under the name field (composed in Rust so the max
     /// length constant lives in one place).
     in property <string> name-rules;
+    in property <bool> peer-card-valid;
+    in property <string> peer-card-error;
+    in property <bool> channel-valid;
+    in property <string> channel-error;
+    in property <bool> has-channel;
+    in property <string> channel-display;
+    in property <string> backup-status;
+    in property <bool> backup-found;
+    in property <string> backup-summary;
+    in property <int> backup-selected-count;
+    in property <[PeerRow]> backup-peers;
+    in property <[PeerRow]> directory-candidates;
 
     // Device picker.
     in property <[PeerRow]> peers;
@@ -70,9 +84,8 @@ export global UiState {
     in property <string> joined-peer;
     in property <string> node-id-short;
     in property <string> peer-node-id-short;
-    /// The fingerprint shown in the pairing summary (the session's secret, or
-    /// the standing one's).
-    in property <string> session-fingerprint;
+    /// The persistent application public key shown in the pairing summary.
+    in property <string> session-public-key;
     /// The host's LAN IPv4 on the LAN-only channel (so the joiner can type it
     /// for the manual-IP side channel), "" on other channels / before it's known.
     in property <string> host-lan-ip;
@@ -120,14 +133,16 @@ export global UiState {
     in property <string> inbox-title;
 
     // Modals.
-    in property <bool> show-clear-secret;
+    in property <bool> show-reset-identity;
     in property <bool> show-conn-path;
     in property <[PathRow]> conn-paths;
 
     // Form inputs, two-way bound to their fields. The Rust side mirrors them
     // on every edit and writes them back on sync (authoritative after resets).
     in-out property <string> in-my-name;
-    in-out property <string> in-import-secret;
+    in-out property <string> in-private-key;
+    in-out property <string> in-peer-card;
+    in-out property <string> in-directory-channel;
     in-out property <string> in-pin-a;
     in-out property <string> in-pin-b;
     /// The joiner's optional host-IP entry (shown only for a LAN-only PIN).
@@ -149,17 +164,28 @@ export global Actions {
     callback save-name();
     callback cancel-name();
     callback rename();
-    callback copy-secret();
-    callback request-clear-secret();
-    callback confirm-clear-secret();
-    callback cancel-clear-secret();
+    callback copy-card();
+    callback copy-private-key();
+    callback copy-channel();
+    callback request-reset-identity();
+    callback confirm-reset-identity();
+    callback cancel-reset-identity();
 
     // Hub / device picker.
     callback begin-server();
     callback enter-join-picker();
     callback leave-join-picker();
     callback refresh-peers();
-    callback toggle-peer(suffix: string);
+    callback toggle-peer(public-key: string);
+    callback remove-peer(public-key: string);
+    callback import-peer-card();
+    callback trust-directory-card(public-key: string);
+    callback generate-channel();
+    callback set-channel();
+    callback check-backup();
+    callback restore-backup();
+    callback skip-backup();
+    callback toggle-backup-peer(public-key: string);
     callback join-selected();
 
     // Quick options / client.

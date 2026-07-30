@@ -5,7 +5,7 @@
 import { UiState, Actions } from "globals.slint";
 import { PairMode } from "types.slint";
 import { Theme } from "theme.slint";
-import { Card, Body, Weak, Small, BackHeader, TokenPairingSummary, LabeledValue } from "widgets.slint";
+import { Card, Body, Weak, Small, BackHeader, IdentityPairingSummary, LabeledValue } from "widgets.slint";
 import { SessionPanel } from "session.slint";
 import { Button, LineEdit, ScrollView } from "std-widgets.slint";
 
@@ -23,8 +23,8 @@ export component ServerScreen inherits ScrollView {
         BackHeader { title: "Start a connection"; }
         Body { text: "Status: " + UiState.status-text; }
 
-        if UiState.server-running && UiState.mode == PairMode.nostr-token: TokenPairingSummary { }
-        if UiState.server-running && UiState.mode == PairMode.nostr-token: Small {
+        if UiState.server-running && UiState.mode == PairMode.nostr-key: IdentityPairingSummary { }
+        if UiState.server-running && UiState.mode == PairMode.nostr-key: Small {
             text: "Your other devices see this one as hosting — pick it in their list to join.";
         }
 

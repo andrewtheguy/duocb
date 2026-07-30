@@ -1,11 +1,4 @@
-//! Minimal config persistence for the configure mode: the standing secret (the
-//! 125-char envelope carrying the rendezvous channel and the auth token — see
-//! `duocb_core::auth::Secret`), this device's short name, and its permanent
-//! random suffix. The setup wizard saves the secret and name as soon as they are
-//! entered; the suffix is generated on the first launch with this config file
-//! and never changes (it survives clearing the secret). The config is
-//! per-machine — copying it to another device is not supported. Clipboard
-//! content and the inbox are never persisted.
+//! Strict, local-first configure-mode persistence.
 //!
 //! The config is a machine-managed JSON file, not meant for hand editing. duocb
 //! holds an exclusive OS lock on a sibling `<config>.lock` file for the whole
@@ -21,27 +14,52 @@ use std::fs::{File, OpenOptions, TryLockError};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-#[derive(Default, Serialize, Deserialize)]
+pub const CONFIG_VERSION: u32 = 1;
+
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// The standing secret shared by all of this user's devices (configure mode),
-    /// in its encoded form (`duocb_core::auth::Secret::encode`).
-    pub secret: Option<String>,
-    /// This device's user-chosen short name (without the suffix).
+    pub version: u32,
+    /// Persistent application identity, encoded as NIP-19 `nsec`.
+    pub identity_secret: String,
     pub my_name: Option<String>,
-    /// Permanent per-device random suffix (8 unambiguous chars), generated on
-    /// the first launch with this config file and never regenerated — it
-    /// survives clearing the secret, so the device keeps its identity.
-    pub device_suffix: Option<String>,
+    pub self_card: Option<String>,
+    pub directory_channel: Option<String>,
+    #[serde(default)]
+    pub peers: Vec<String>,
+    #[serde(default)]
+    pub backup_generation: u64,
+    #[serde(default)]
+    pub backup_dirty: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            version: CONFIG_VERSION,
+            identity_secret: duocb_core::auth::Identity::generate().to_nsec(),
+            my_name: None,
+            self_card: None,
+            directory_channel: None,
+            peers: Vec::new(),
+            backup_generation: 0,
+            backup_dirty: false,
+        }
+    }
 }
 
 impl std::fmt::Debug for Config {
     /// Manual impl so the secret can never leak through debug logging.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Config")
-            .field("secret", &self.secret.as_ref().map(|_| "***"))
+            .field("version", &self.version)
+            .field("identity_secret", &"***")
             .field("my_name", &self.my_name)
-            .field("device_suffix", &self.device_suffix)
+            .field("self_card", &self.self_card.as_ref().map(|_| "<signed card>"))
+            .field("directory_channel", &self.directory_channel)
+            .field("peers", &self.peers.len())
+            .field("backup_generation", &self.backup_generation)
+            .field("backup_dirty", &self.backup_dirty)
             .finish()
     }
 }
@@ -137,11 +155,65 @@ impl ConfigLock {
         };
         let config: Config = serde_json::from_str(&content)
             .with_context(|| format!("parsing config {}", self.path.display()))?;
-        if config.device_suffix.is_none() {
+        if config.version != CONFIG_VERSION {
             anyhow::bail!(
-                "config {} is missing required device_suffix",
-                self.path.display()
+                "config {} has unsupported version {} (this release does not migrate shared-secret configs)",
+                self.path.display(),
+                config.version
             );
+        }
+        let identity = duocb_core::auth::Identity::parse_nsec(&config.identity_secret)
+            .with_context(|| format!("config {} has an invalid identity key", self.path.display()))?;
+        match (&config.my_name, &config.self_card) {
+            (None, None) => {}
+            (Some(name), Some(encoded)) => {
+                duocb_core::identity::validate_name(name).with_context(|| {
+                    format!("config {} has an invalid device name", self.path.display())
+                })?;
+                let card = duocb_core::auth::IdentityCard::parse(encoded).with_context(|| {
+                    format!("config {} has an invalid self card", self.path.display())
+                })?;
+                if card.public_key() != identity.public_key() || card.name() != name {
+                    anyhow::bail!(
+                        "config {} self card does not match its identity and name",
+                        self.path.display()
+                    );
+                }
+            }
+            _ => anyhow::bail!(
+                "config {} must contain both my_name and self_card, or neither",
+                self.path.display()
+            ),
+        }
+        if let Some(channel) = &config.directory_channel {
+            duocb_core::auth::DirectoryChannel::parse(channel).with_context(|| {
+                format!(
+                    "config {} has an invalid directory channel",
+                    self.path.display()
+                )
+            })?;
+        }
+        if config.peers.len() > duocb_core::auth::MAX_TRUSTED_PEERS {
+            anyhow::bail!(
+                "config {} has more than {} trusted peers",
+                self.path.display(),
+                duocb_core::auth::MAX_TRUSTED_PEERS
+            );
+        }
+        let mut seen = std::collections::HashSet::new();
+        for encoded in &config.peers {
+            let card = duocb_core::auth::IdentityCard::parse(encoded).with_context(|| {
+                format!("config {} has an invalid peer card", self.path.display())
+            })?;
+            if card.public_key() == identity.public_key() {
+                anyhow::bail!("config {} peer list contains itself", self.path.display());
+            }
+            if !seen.insert(card.public_key()) {
+                anyhow::bail!(
+                    "config {} peer list contains a duplicate public key",
+                    self.path.display()
+                );
+            }
         }
         Ok(config)
     }
@@ -216,6 +288,22 @@ mod tests {
         ))
     }
 
+    fn configured(name: &str) -> Config {
+        let identity = duocb_core::auth::Identity::generate();
+        let card = identity.card(name).unwrap();
+        let channel = duocb_core::auth::DirectoryChannel::generate();
+        Config {
+            version: CONFIG_VERSION,
+            identity_secret: identity.to_nsec(),
+            my_name: Some(name.to_string()),
+            self_card: Some(card.encode()),
+            directory_channel: Some(channel.encode()),
+            peers: Vec::new(),
+            backup_generation: 7,
+            backup_dirty: false,
+        }
+    }
+
     #[test]
     fn config_lock_is_exclusive_and_separate_from_config() {
         let dir = temp_dir();
@@ -247,32 +335,25 @@ mod tests {
         let path = dir.join("config.json");
         let lock = acquire_lock(&path).expect("lock");
 
-        assert!(
-            lock.load().expect("load fresh config").secret.is_none(),
-            "fresh config is empty"
-        );
+        let fresh = lock.load().expect("load fresh config");
+        assert!(duocb_core::auth::Identity::parse_nsec(&fresh.identity_secret).is_ok());
+        assert!(fresh.self_card.is_none());
 
-        lock.save(&Config {
-            secret: Some("token-value".to_string()),
-            my_name: Some("desktop".to_string()),
-            device_suffix: Some("a7B2c3D4".to_string()),
-        })
-        .expect("save");
+        let saved = configured("desktop");
+        let public_key = duocb_core::auth::Identity::parse_nsec(&saved.identity_secret)
+            .unwrap()
+            .public_key();
+        lock.save(&saved).expect("save");
 
         let loaded = lock.load().expect("load saved config");
-        assert_eq!(loaded.secret.as_deref(), Some("token-value"));
         assert_eq!(loaded.my_name.as_deref(), Some("desktop"));
-
-        // A shorter replacement must contain exactly the new JSON.
-        lock.save(&Config {
-            secret: Some("t".to_string()),
-            my_name: None,
-            device_suffix: Some("a7B2c3D4".to_string()),
-        })
-        .expect("save shorter");
-        let loaded = lock.load().expect("load shorter config");
-        assert_eq!(loaded.secret.as_deref(), Some("t"));
-        assert_eq!(loaded.my_name, None);
+        assert_eq!(
+            duocb_core::auth::Identity::parse_nsec(&loaded.identity_secret)
+                .unwrap()
+                .public_key(),
+            public_key
+        );
+        assert_eq!(loaded.backup_generation, 7);
 
         drop(lock);
         let _ = std::fs::remove_dir_all(dir);
@@ -302,12 +383,7 @@ mod tests {
         let path = dir.join("config.json");
 
         let lock = acquire_lock(&path).expect("lock");
-        lock.save(&Config {
-            secret: Some("secret".to_string()),
-            my_name: Some("desktop".to_string()),
-            device_suffix: None,
-        })
-        .expect("save");
+        lock.save(&configured("desktop")).expect("save");
 
         // An empty file is not valid JSON and must not silently reset state.
         std::fs::write(&path, b"").unwrap();
@@ -322,54 +398,20 @@ mod tests {
     }
 
     #[test]
-    fn existing_config_without_suffix_is_an_error() {
+    fn shared_secret_config_is_not_migrated() {
         let dir = temp_dir();
         let path = dir.join("config.json");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            &path,
-            br#"{ "secret": "sec", "my_name": "desktop" }"#,
-        )
-        .unwrap();
+        std::fs::write(&path, br#"{ "secret": "sec", "my_name": "desktop" }"#).unwrap();
 
         let lock = acquire_lock(&path).expect("lock");
-        let error = lock
-            .load()
-            .expect_err("an existing config must contain device_suffix");
+        let error = lock.load().expect_err("legacy configs must be rejected");
         assert!(
-            error.to_string().contains(&format!(
-                "config {} is missing required device_suffix",
-                path.display()
-            )),
+            error
+                .to_string()
+                .contains(&format!("parsing config {}", path.display())),
             "error should identify the invalid config: {error:#}"
         );
-
-        drop(lock);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn clearing_the_secret_keeps_the_suffix() {
-        let dir = temp_dir();
-        let path = dir.join("config.json");
-        let lock = acquire_lock(&path).expect("lock");
-
-        lock.save(&Config {
-            secret: Some("secret".to_string()),
-            my_name: Some("desktop".to_string()),
-            device_suffix: Some("a7B2c3D4".to_string()),
-        })
-        .expect("save");
-
-        // The clear-secret action drops the token but must keep the permanent
-        // suffix (and may keep the name as a prefill).
-        let mut cleared = lock.load().expect("load config to clear");
-        cleared.secret = None;
-        lock.save(&cleared).expect("save cleared");
-
-        let loaded = lock.load().expect("load cleared config");
-        assert_eq!(loaded.secret, None);
-        assert_eq!(loaded.device_suffix.as_deref(), Some("a7B2c3D4"));
 
         drop(lock);
         let _ = std::fs::remove_dir_all(dir);
@@ -381,30 +423,18 @@ mod tests {
         let path = dir.join("config.json");
 
         let lock = acquire_lock(&path).expect("lock");
-        lock.save(&Config {
-            secret: Some("old".to_string()),
-            my_name: Some("old-name".to_string()),
-            device_suffix: Some("a7B2c3D4".to_string()),
-        })
-        .expect("save old config");
+        lock.save(&configured("old-name")).expect("save old config");
         let old_file = File::open(&path).expect("open old config inode");
 
-        lock.save(&Config {
-            secret: Some("new".to_string()),
-            my_name: Some("new-name".to_string()),
-            device_suffix: Some("a7B2c3D4".to_string()),
-        })
-        .expect("save new config");
+        lock.save(&configured("new-name")).expect("save new config");
 
         // An open handle still sees the old inode, while the configured path now
         // resolves to the complete replacement. This distinguishes rename from
         // an in-place overwrite.
         let old: Config = serde_json::from_reader(old_file).expect("parse old inode");
-        assert_eq!(old.secret.as_deref(), Some("old"));
         assert_eq!(old.my_name.as_deref(), Some("old-name"));
 
         let current = lock.load().expect("load current config");
-        assert_eq!(current.secret.as_deref(), Some("new"));
         assert_eq!(current.my_name.as_deref(), Some("new-name"));
         assert!(!sibling_path(&path, ".tmp").exists());
         assert!(sibling_path(&path, ".lock").exists());

@@ -1,15 +1,14 @@
 //! The single push-style projection of [`App`] state into the `UiState`
 //! global. Called after every mutation (action callback, event drain, timer
-//! tick); idempotent, so nothing tracks *what* changed. Secrets are never
-//! pushed in full — only masked hints and fingerprints.
+//! tick); idempotent, so nothing tracks *what* changed. The application private
+//! key is only mirrored while the user explicitly restores it.
 
 use slint::{Color, ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use std::time::Instant;
 
-use super::{
-    App, CopyTarget, ago, item::ClipItem, item::PEEK_LIMIT, masked_secret_hint, now_unix, short_id,
-};
+use super::{App, CopyTarget, item::ClipItem, item::PEEK_LIMIT, short_id};
 use crate::{ClipRow, MainWindow, PathRow, PeerRow, UiState};
+use duocb_core::auth::{DirectoryChannel, IdentityCard};
 use duocb_core::net::ConnStatus;
 use duocb_core::net::endpoint::ConnPathKind;
 use duocb_core::subnet::JoinIpOutcome;
@@ -30,33 +29,24 @@ impl App {
 
         // Configure identity / wizard.
         s.set_display_identity(self.display_identity().into());
-        s.set_has_secret(self.secret.is_some());
-        s.set_secret_hint(
-            self.secret
-                .as_ref()
-                .map(|secret| masked_secret_hint(&secret.encode()))
-                .unwrap_or_default()
+        s.set_has_identity(self.self_card.is_some());
+        s.set_public_key_short(
+            short_id(&self.identity.to_npub())
                 .into(),
         );
-        s.set_secret_fingerprint(
-            self.secret
-                .as_ref()
-                .map(duocb_core::auth::Secret::fingerprint)
-                .unwrap_or_default()
-                .into(),
-        );
+        s.set_public_key(self.identity.to_npub().into());
         s.set_config_path(self.config_lock.path().display().to_string().into());
-        s.set_presence_conflict(str_or_empty(&self.presence_conflict));
+        s.set_presence_conflict(SharedString::default());
         let copied = self.copied_target();
-        s.set_copied_secret(copied == Some(CopyTarget::Secret));
+        s.set_copied_card(copied == Some(CopyTarget::Card));
+        s.set_copied_private_key(copied == Some(CopyTarget::PrivateKey));
+        s.set_copied_channel(copied == Some(CopyTarget::Channel));
         s.set_copied_pin(copied == Some(CopyTarget::Pin));
         let name = self.in_my_name.trim();
         match duocb_core::identity::validate_name(name) {
             Ok(()) => {
                 s.set_name_valid(true);
-                s.set_name_preview(
-                    duocb_core::identity::display_identity(name, &self.device_suffix).into(),
-                );
+                s.set_name_preview(name.into());
                 s.set_name_error(SharedString::default());
             }
             Err(e) => {
@@ -72,62 +62,145 @@ impl App {
         s.set_can_cancel_name(self.has_saved_identity());
         s.set_name_rules(
             format!(
-                "A short name plus this device's permanent id — other devices will see it in their list. Letters, digits, and '-' only (max {} characters).",
+                "The name signed into this device's identity card. Letters, digits, and '-' only (max {} characters).",
                 duocb_core::identity::NAME_MAX_LEN
             )
             .into(),
         );
-        // The pasted secret is validated on every keystroke: a fingerprint to
-        // compare against the other device once it parses, otherwise the parse
-        // error itself (a 125-char envelope has many more ways to be wrong than
-        // "not a valid secret" conveys). An empty field shows neither.
         let (import_valid, import_fingerprint, import_error) =
-            match duocb_core::auth::Secret::parse(&self.in_import_secret) {
-                Ok(secret) => (true, secret.fingerprint(), String::new()),
-                Err(_) if self.in_import_secret.trim().is_empty() => {
+            match duocb_core::auth::Identity::parse_nsec(&self.in_private_key) {
+                Ok(identity) => (true, identity.to_npub(), String::new()),
+                Err(_) if self.in_private_key.trim().is_empty() => {
                     (false, String::new(), String::new())
                 }
                 Err(e) => (false, String::new(), format!("{e:#}")),
             };
         s.set_import_valid(import_valid);
-        s.set_import_fingerprint(import_fingerprint.into());
+        s.set_import_public_key(import_fingerprint.into());
         s.set_import_error(import_error.into());
+        let (peer_card_valid, peer_card_error) = match IdentityCard::parse(&self.in_peer_card) {
+            Ok(card) if card.public_key() == self.identity.public_key() => {
+                (false, "That is this device's own identity card".to_string())
+            }
+            Ok(_) => (true, String::new()),
+            Err(_) if self.in_peer_card.trim().is_empty() => (false, String::new()),
+            Err(error) => (false, format!("{error:#}")),
+        };
+        s.set_peer_card_valid(peer_card_valid);
+        s.set_peer_card_error(peer_card_error.into());
+        let (channel_valid, channel_error) =
+            match DirectoryChannel::parse(&self.in_directory_channel) {
+                Ok(_) => (true, String::new()),
+                Err(_) if self.in_directory_channel.trim().is_empty() => {
+                    (false, String::new())
+                }
+                Err(error) => (false, format!("{error:#}")),
+            };
+        s.set_channel_valid(channel_valid);
+        s.set_channel_error(channel_error.into());
+        s.set_has_channel(self.directory_channel.is_some());
+        s.set_channel_display(
+            self.directory_channel
+                .map(|channel| channel.encode())
+                .unwrap_or_default()
+                .into(),
+        );
+        s.set_backup_status(if self.directory_channel.is_none() {
+            "No Nostr backup channel configured".into()
+        } else if self.backup_check_pending {
+            "Checking for an encrypted peer-list backup…".into()
+        } else if self.backup_publish_blocked {
+            "Backup publication is paused until recovery is resolved or a check succeeds".into()
+        } else if self.backup_dirty {
+            "Peer-list backup pending".into()
+        } else {
+            "Peer-list backup is current".into()
+        });
+        s.set_backup_found(self.recovery_snapshot.is_some());
+        s.set_backup_summary(
+            self.recovery_snapshot
+                .as_ref()
+                .map(|snapshot| {
+                    format!(
+                        "Backup generation {} for “{}” contains {} peer(s). Choose which peers to restore.",
+                        snapshot.generation,
+                        snapshot.self_card.name(),
+                        snapshot.peers.len()
+                    )
+                })
+                .unwrap_or_default()
+                .into(),
+        );
+        s.set_backup_selected_count(self.recovery_selected.len() as i32);
+        let backup_rows: Vec<PeerRow> = self
+            .recovery_snapshot
+            .as_ref()
+            .map(|snapshot| {
+                snapshot
+                    .peers
+                    .iter()
+                    .map(|peer| {
+                        let key = peer.public_key().to_hex();
+                        PeerRow {
+                            public_key: key.clone().into(),
+                            line: format!("{}  · {}", peer.name(), short_id(&peer.npub())).into(),
+                            selected: self.recovery_selected.contains(&key),
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(model) = diffed_model(&s.get_backup_peers(), backup_rows) {
+            s.set_backup_peers(model);
+        }
+        let candidate_rows: Vec<PeerRow> = self
+            .directory_candidates
+            .iter()
+            .filter(|candidate| {
+                !self
+                    .peers
+                    .iter()
+                    .any(|peer| peer.public_key() == candidate.public_key())
+            })
+            .map(|candidate| PeerRow {
+                public_key: candidate.public_key().to_hex().into(),
+                line: format!(
+                    "{}  · {}",
+                    candidate.name(),
+                    short_id(&candidate.npub())
+                )
+                .into(),
+                selected: false,
+            })
+            .collect();
+        if let Some(model) = diffed_model(&s.get_directory_candidates(), candidate_rows) {
+            s.set_directory_candidates(model);
+        }
 
         // Device picker.
         let rows: Vec<PeerRow> = self
             .peers
             .iter()
             .map(|p| {
-                let mut line = p.display();
-                // The record's age, not an online/offline verdict — relay
-                // timing is too unreliable for one, and joining never
-                // requires it.
-                let age = now_unix().saturating_sub(p.last_seen_unix);
-                line.push_str(&format!("  · seen {}", ago(age)));
+                let line = format!("{}  · {}", p.name(), short_id(&p.npub()));
+                let key = p.public_key().to_hex();
                 PeerRow {
-                    suffix: p.suffix.clone().into(),
+                    public_key: key.clone().into(),
                     line: line.into(),
-                    selected: self.selected_peer.as_deref() == Some(p.suffix.as_str()),
+                    selected: self.selected_peer.as_deref() == Some(key.as_str()),
                 }
             })
             .collect();
         if let Some(model) = diffed_model(&s.get_peers(), rows) {
             s.set_peers(model);
         }
-        s.set_peers_updated(
-            self.peers_refreshed_at
-                .map(|at| format!("updated {}", ago(at.elapsed().as_secs())))
-                .unwrap_or_default()
-                .into(),
-        );
+        s.set_peers_updated(format!("{} trusted peer(s)", self.peers.len()).into());
         s.set_peers_empty_text(if !self.peers.is_empty() {
             SharedString::default()
-        } else if self.peers_refreshed_at.is_some() {
-            "No other devices found yet. Import the same secret on your other device and it will appear here.".into()
         } else {
-            "Looking for your other devices…".into()
+            "No trusted peers yet. Paste the other device's signed card on the hub.".into()
         });
-        s.set_join_ready(self.selected_peer_display().is_some());
+        s.set_join_ready(self.selected_peer_card().is_some());
 
         // Server / running-session identity.
         s.set_joined_peer(str_or_empty(&self.joined_peer));
@@ -145,14 +218,10 @@ impl App {
                 .unwrap_or_default()
                 .into(),
         );
-        s.set_session_fingerprint(
-            self.secret_fingerprint
+        s.set_session_public_key(
+            self.identity_public_key
                 .clone()
-                .or_else(|| {
-                    self.secret
-                        .as_ref()
-                        .map(duocb_core::auth::Secret::fingerprint)
-                })
+                .or_else(|| Some(self.identity.to_npub()))
                 .unwrap_or_default()
                 .into(),
         );
@@ -239,7 +308,7 @@ impl App {
         }
 
         // Modals.
-        s.set_show_clear_secret(self.confirm_clear_secret);
+        s.set_show_reset_identity(self.confirm_reset_identity);
         s.set_show_conn_path(self.conn_path.is_some());
         let paths: Vec<PathRow> = self
             .conn_path
@@ -264,7 +333,9 @@ impl App {
         // edit), so writing them back is a no-op while typing and applies
         // resets (wizard cancels, compose clear) to the actual fields.
         s.set_in_my_name(self.in_my_name.clone().into());
-        s.set_in_import_secret(self.in_import_secret.clone().into());
+        s.set_in_private_key(self.in_private_key.clone().into());
+        s.set_in_peer_card(self.in_peer_card.clone().into());
+        s.set_in_directory_channel(self.in_directory_channel.clone().into());
         s.set_in_pin_a(self.in_pin_a.clone().into());
         s.set_in_pin_b(self.in_pin_b.clone().into());
         s.set_in_join_ip(self.in_join_ip.clone().into());

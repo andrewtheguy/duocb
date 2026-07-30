@@ -9,13 +9,14 @@ pub(crate) mod item;
 pub(crate) mod keys;
 mod sync;
 
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use crate::clipboard::SystemClipboard;
 use crate::{ConfigureStep, PairMode, Screen};
 use duocb_core::net::endpoint::ConnPath;
-use duocb_core::net::{ConnStatus, NetEvent, NetHandle, TokenIdentity, UiCommand};
-use duocb_core::nostr::PeerInfo;
+use duocb_core::auth::{DirectoryChannel, Identity, IdentityCard};
+use duocb_core::net::{ConnStatus, KeyIdentity, NetEvent, NetHandle, UiCommand};
 use item::ClipItem;
 
 /// How long the "sent ✓" / "✔ Copied" flashes stay visible.
@@ -24,9 +25,6 @@ const SENT_FLASH: Duration = Duration::from_secs(2);
 /// Retention cap for the in-memory inbox: newest-first, only the last few
 /// received items are kept and older ones are dropped.
 const MAX_INBOX_ITEMS: usize = 5;
-
-/// How often the device picker auto-refreshes the peer list while visible.
-const PEER_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
 pub(crate) struct App {
     pub(crate) config_lock: crate::config::ConfigLock,
@@ -42,31 +40,29 @@ pub(crate) struct App {
     pub(crate) error: Option<String>,
 
     // Configure-mode standing state (the primary mode).
-    /// The standing secret from the config (parsed, so always valid when `Some`).
-    pub(crate) secret: Option<duocb_core::auth::Secret>,
-    /// The confirmed short device name from the config.
+    pub(crate) identity: Identity,
     pub(crate) saved_name: Option<String>,
-    /// This device's permanent random suffix (always present; minted on the
-    /// first launch with this config file).
-    pub(crate) device_suffix: String,
+    pub(crate) self_card: Option<IdentityCard>,
+    pub(crate) directory_channel: Option<DirectoryChannel>,
+    pub(crate) backup_generation: u64,
+    pub(crate) backup_dirty: bool,
+    pub(crate) backup_check_pending: bool,
+    /// Entered/restored channels cannot publish until lookup completes and any
+    /// found snapshot is explicitly accepted or rejected.
+    pub(crate) backup_publish_blocked: bool,
+    pub(crate) backup_publish_requested_at: Option<Instant>,
     pub(crate) configure_step: ConfigureStep,
-    /// The discovered peer device list and when it was last received/asked for.
-    pub(crate) peers: Vec<PeerInfo>,
+    /// Locally trusted peers. Nostr results never enter this list automatically.
+    pub(crate) peers: Vec<IdentityCard>,
+    pub(crate) directory_candidates: Vec<IdentityCard>,
+    pub(crate) recovery_snapshot: Option<duocb_core::nostr::BackupSnapshot>,
+    pub(crate) recovery_selected: HashSet<String>,
     pub(crate) peers_refreshed_at: Option<Instant>,
     pub(crate) peers_requested_at: Option<Instant>,
-    /// The selected peer, by its stable suffix (survives list refreshes).
+    /// Selected peer by hex application public key.
     pub(crate) selected_peer: Option<String>,
-    /// The joined peer's display identity while a configure-mode dial runs.
     pub(crate) joined_peer: Option<String>,
-    /// Warning from the presence publisher (another live process broadcasts
-    /// under this device's identity); cleared when presence is reconfigured.
-    pub(crate) presence_conflict: Option<String>,
-    /// Whether the presence publisher is running. Stays `false` at launch —
-    /// nostr is dormant until the user picks Start or Join on the hub — so
-    /// [`ensure_presence`](App::ensure_presence) can start it exactly once
-    /// without needlessly restarting (and risking a false self-conflict).
-    pub(crate) presence_active: bool,
-    pub(crate) confirm_clear_secret: bool,
+    pub(crate) confirm_reset_identity: bool,
 
     // Server presentation state.
     pub(crate) server_running: bool,
@@ -75,7 +71,7 @@ pub(crate) struct App {
     /// type it for the manual-IP side channel (from [`NetEvent::PinRotated`]);
     /// `None` on other channels or before an address is known.
     pub(crate) host_lan_ip: Option<String>,
-    pub(crate) secret_fingerprint: Option<String>,
+    pub(crate) identity_public_key: Option<String>,
     pub(crate) pin_display: Option<String>,
     pub(crate) pin_deadline: Option<Instant>,
     /// PIN cleared because a peer paired (vs. never shown).
@@ -88,7 +84,9 @@ pub(crate) struct App {
     // every edit; authoritative — sync writes them back, which is how resets
     // reach the fields).
     pub(crate) in_my_name: String,
-    pub(crate) in_import_secret: String,
+    pub(crate) in_private_key: String,
+    pub(crate) in_peer_card: String,
+    pub(crate) in_directory_channel: String,
     /// The joiner's PIN entry, split into its two `XXXX` groups (one text field
     /// each) so grouping never edits a field's text mid-keystroke.
     pub(crate) in_pin_a: String,
@@ -126,11 +124,73 @@ pub(crate) struct App {
     pub(crate) copied_flash: Option<(CopyTarget, Instant)>,
 }
 
+#[cfg(test)]
+mod recovery_offer_tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn test_app() -> (App, PathBuf) {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "duocb-recovery-offer-{}-{}.json",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let lock = crate::config::acquire_lock(&path).unwrap();
+        let config = crate::config::Config::default();
+        (
+            App::new(lock, config, duocb_core::net::spawn_net_runtime(None)),
+            path,
+        )
+    }
+
+    #[test]
+    fn found_backup_is_only_applied_after_explicit_restore() {
+        let (mut app, path) = test_app();
+        let peer = Identity::generate().card("phone").unwrap();
+        let snapshot = duocb_core::nostr::BackupSnapshot::new(
+            5,
+            app.identity.card("restored-name").unwrap(),
+            vec![peer.clone()],
+        )
+        .unwrap();
+        app.backup_dirty = true;
+        app.backup_check_pending = true;
+
+        app.apply_event(NetEvent::BackupFound {
+            snapshot: Some(Box::new(snapshot)),
+        });
+        assert!(app.saved_name.is_none());
+        assert!(app.peers.is_empty());
+        assert!(app.recovery_snapshot.is_some());
+        assert!(app.backup_publish_blocked);
+
+        app.tick();
+        assert!(
+            app.backup_publish_requested_at.is_none(),
+            "an offered backup must block local publication"
+        );
+
+        app.restore_offered_backup();
+        assert_eq!(app.saved_name.as_deref(), Some("restored-name"));
+        assert_eq!(app.peers, vec![peer]);
+        assert!(!app.backup_publish_blocked);
+
+        app.net.shutdown();
+        drop(app);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}.lock", path.display()));
+    }
+}
+
 /// Which copy button a successful copy came from, so only that button shows the
 /// "✔ Copied" flash. `Inbox` carries the row index (the newest is 0).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CopyTarget {
-    Secret,
+    Card,
+    PrivateKey,
+    Channel,
     Pin,
     Outbox,
     Inbox(usize),
@@ -139,74 +199,74 @@ pub(crate) enum CopyTarget {
 impl App {
     pub(crate) fn new(
         config_lock: crate::config::ConfigLock,
-        mut config: crate::config::Config,
+        config: crate::config::Config,
         net: NetHandle,
     ) -> Self {
-        // A missing config path reaches here with defaults and mints the
-        // permanent device suffix. Existing configs without the suffix are
-        // rejected by ConfigLock::load instead of silently changing identity.
-        // A failed first save still leaves a usable in-memory suffix for this
-        // session; the next successful save persists it.
-        let mut startup_error = None;
-        let device_suffix = match config.device_suffix.as_deref() {
-            Some(s) if duocb_core::identity::is_valid_suffix(s) => s.to_string(),
-            _ => {
-                let suffix = duocb_core::identity::generate_suffix();
-                config.device_suffix = Some(suffix.clone());
-                if let Err(e) = config_lock.save(&config) {
-                    startup_error = Some(format!("Could not save the device id: {e:#}"));
-                }
-                suffix
-            }
-        };
-
-        let secret = config
-            .secret
-            .as_deref()
-            .and_then(|encoded| duocb_core::auth::Secret::parse(encoded).ok());
+        let identity = Identity::parse_nsec(&config.identity_secret)
+            .expect("ConfigLock::load validated the identity key");
         let saved_name = config
             .my_name
             .filter(|n| duocb_core::identity::validate_name(n).is_ok());
-        let configure_step = match (&secret, &saved_name) {
+        let self_card = config
+            .self_card
+            .as_deref()
+            .and_then(|card| IdentityCard::parse(card).ok())
+            .filter(|card| card.public_key() == identity.public_key());
+        let peers: Vec<IdentityCard> = config
+            .peers
+            .iter()
+            .filter_map(|card| IdentityCard::parse(card).ok())
+            .filter(|card| card.public_key() != identity.public_key())
+            .take(duocb_core::auth::MAX_TRUSTED_PEERS)
+            .collect();
+        let directory_channel = config
+            .directory_channel
+            .as_deref()
+            .and_then(|channel| DirectoryChannel::parse(channel).ok());
+        let configure_step = match (&saved_name, &self_card) {
             (Some(_), Some(_)) => ConfigureStep::Ready,
-            (Some(_), None) => ConfigureStep::SetupName,
-            (None, _) => ConfigureStep::SetupChoice,
+            _ => ConfigureStep::SetupChoice,
         };
 
-        // Nostr stays dormant at launch: the presence broadcast and the peer
-        // fetch only start when the user picks Start a connection or Join
-        // another device on the hub, so opening the app (or using only quick
-        // mode) never touches the relays.
         Self {
             config_lock,
             net,
             clipboard: SystemClipboard::new(),
             screen: Screen::Home,
-            mode: PairMode::NostrToken,
+            mode: PairMode::NostrKey,
             status: ConnStatus::Idle,
-            error: startup_error,
-            secret,
+            error: None,
+            identity,
             saved_name: saved_name.clone(),
-            device_suffix,
+            self_card,
+            directory_channel,
+            backup_generation: config.backup_generation,
+            backup_dirty: config.backup_dirty,
+            backup_check_pending: false,
+            backup_publish_blocked: false,
+            backup_publish_requested_at: None,
             configure_step,
-            peers: Vec::new(),
+            peers,
+            directory_candidates: Vec::new(),
+            recovery_snapshot: None,
+            recovery_selected: HashSet::new(),
             peers_refreshed_at: None,
             peers_requested_at: None,
             selected_peer: None,
             joined_peer: None,
-            presence_conflict: None,
-            presence_active: false,
-            confirm_clear_secret: false,
+            confirm_reset_identity: false,
             server_running: false,
             node_id: None,
             host_lan_ip: None,
-            secret_fingerprint: None,
+            identity_public_key: None,
             pin_display: None,
             pin_deadline: None,
             pin_paired: false,
             client_active: false,
             in_my_name: saved_name.unwrap_or_default(),
-            in_import_secret: String::new(),
+            in_private_key: String::new(),
+            in_peer_card: String::new(),
+            in_directory_channel: config.directory_channel.unwrap_or_default(),
             in_pin_a: String::new(),
             in_pin_b: String::new(),
             in_join_ip: String::new(),
@@ -240,17 +300,17 @@ impl App {
         match event {
             NetEvent::ServerReady {
                 node_id,
-                secret_fingerprint,
+                identity_public_key,
             } => {
                 self.node_id = Some(node_id);
-                self.secret_fingerprint = secret_fingerprint;
+                self.identity_public_key = identity_public_key;
             }
             NetEvent::ClientReady {
                 node_id,
-                secret_fingerprint,
+                identity_public_key,
             } => {
                 self.node_id = Some(node_id);
-                self.secret_fingerprint = secret_fingerprint;
+                self.identity_public_key = identity_public_key;
             }
             NetEvent::PinRotated {
                 pin_display,
@@ -278,7 +338,7 @@ impl App {
                     self.client_active = false;
                     self.node_id = None;
                     self.host_lan_ip = None;
-                    self.secret_fingerprint = None;
+                    self.identity_public_key = None;
                     self.joined_peer = None;
                     self.pin_display = None;
                     self.pin_deadline = None;
@@ -289,7 +349,10 @@ impl App {
                 }
                 self.status = status;
             }
-            NetEvent::PeerPaired { peer_node_id } => {
+            NetEvent::PeerPaired {
+                peer_node_id,
+                peer_public_key: _,
+            } => {
                 self.peer_node_id = Some(peer_node_id);
             }
             NetEvent::PeerDisconnected => {
@@ -321,18 +384,53 @@ impl App {
                 }
                 self.sent_flash = Some(Instant::now());
             }
-            NetEvent::PeerList { peers } => {
-                // Drop a selection whose device vanished from the list.
-                if let Some(suffix) = &self.selected_peer
-                    && !peers.iter().any(|p| p.suffix == *suffix)
-                {
-                    self.selected_peer = None;
-                }
-                self.peers = peers;
+            NetEvent::DirectoryCards { cards } => {
+                self.directory_candidates = cards
+                    .into_iter()
+                    .filter(|card| card.public_key() != self.identity.public_key())
+                    .collect();
                 self.peers_refreshed_at = Some(Instant::now());
             }
-            NetEvent::PresenceConflict { message } => {
-                self.presence_conflict = Some(message);
+            NetEvent::BackupFound { snapshot } => {
+                self.backup_check_pending = false;
+                match snapshot.map(|snapshot| *snapshot) {
+                    Some(snapshot) => {
+                        self.backup_publish_blocked = true;
+                        self.recovery_selected = snapshot
+                            .peers
+                            .iter()
+                            .map(|peer| peer.public_key().to_hex())
+                            .collect();
+                        self.recovery_snapshot = Some(snapshot);
+                    }
+                    None => {
+                        self.backup_publish_blocked = false;
+                        self.recovery_snapshot = None;
+                        self.recovery_selected.clear();
+                        // The lookup completed successfully and found no prior
+                        // state for this key. The local list can now safely
+                        // become the first backup on the entered channel.
+                        self.mark_backup_dirty();
+                    }
+                }
+            }
+            NetEvent::BackupPublished { generation } => {
+                if generation == self.backup_generation {
+                    self.backup_dirty = false;
+                    self.backup_publish_requested_at = None;
+                    self.save_configure_config();
+                }
+            }
+            NetEvent::BackupCheckFailed { message } => {
+                self.backup_check_pending = false;
+                self.backup_publish_blocked = true;
+                self.error = Some(message);
+            }
+            NetEvent::BackupPublishFailed { message } => {
+                // Leave the dirty bit set and retain a retry timestamp so the
+                // heartbeat retries after the normal backoff, not immediately.
+                self.backup_publish_requested_at = Some(Instant::now());
+                self.error = Some(message);
             }
             NetEvent::Error(message) => {
                 // A rejected send (e.g. oversize) reports an error instead of
@@ -351,19 +449,12 @@ impl App {
         for item in self.inbox.iter_mut().chain(self.outbox.iter_mut()) {
             item.tick_peek();
         }
-        // While the device picker is visible, keep the peer list fresh (the
-        // runtime ignores a refresh while one is already in flight). The hub
-        // itself shows no list, so nothing is polled there.
-        if self.screen == Screen::Home
-            && self.mode == PairMode::NostrToken
-            && self.configure_step == ConfigureStep::Join
+        if self.backup_dirty
+            && self
+                .backup_publish_requested_at
+                .is_none_or(|requested| requested.elapsed() >= Duration::from_secs(120))
         {
-            let due = self
-                .peers_requested_at
-                .is_none_or(|at| at.elapsed() >= PEER_REFRESH_INTERVAL);
-            if due {
-                self.refresh_peers();
-            }
+            self.publish_backup();
         }
     }
 
@@ -404,7 +495,7 @@ impl App {
         self.send_text(text);
     }
 
-    /// Copy arbitrary text (an inbox item, the node id, the token) to the
+    /// Copy arbitrary text (an inbox item, an identity card, or a node id) to the
     /// system clipboard, surfacing failures in the error banner. Returns
     /// whether the copy succeeded, so callers can show feedback.
     pub(crate) fn copy_to_clipboard(&mut self, text: &str) -> bool {
@@ -446,33 +537,35 @@ impl App {
     // ------------------------------------------------------------------
 
     /// The standing identity, available once secret + name are configured.
-    pub(crate) fn token_identity(&self) -> Option<TokenIdentity> {
-        Some(TokenIdentity {
-            secret: self.secret.clone()?,
-            name: self.saved_name.clone()?,
-            suffix: self.device_suffix.clone(),
+    pub(crate) fn key_identity(&self) -> Option<KeyIdentity> {
+        Some(KeyIdentity {
+            identity: self.identity.clone(),
+            self_card: self.self_card.clone()?,
+            peers: self.peers.clone(),
+            channel: self.directory_channel,
+            backup_generation: self.backup_generation,
             relays: default_relays(),
         })
     }
 
-    /// This device's display identity, using the confirmed name when present.
     pub(crate) fn display_identity(&self) -> String {
-        let name = self.saved_name.as_deref().unwrap_or("");
-        duocb_core::identity::display_identity(name, &self.device_suffix)
+        self.saved_name.clone().unwrap_or_default()
     }
 
-    /// Whether a confirmed secret + name pair exists (the hub is reachable).
     pub(crate) fn has_saved_identity(&self) -> bool {
-        self.secret.is_some() && self.saved_name.is_some()
+        self.saved_name.is_some() && self.self_card.is_some()
     }
 
-    /// Persist the configure-mode state to this process's active config.
-    /// Returns false and surfaces the error when the save fails.
     fn save_configure_config(&mut self) -> bool {
         let cfg = crate::config::Config {
-            secret: self.secret.as_ref().map(duocb_core::auth::Secret::encode),
+            version: crate::config::CONFIG_VERSION,
+            identity_secret: self.identity.to_nsec(),
             my_name: self.saved_name.clone(),
-            device_suffix: Some(self.device_suffix.clone()),
+            self_card: self.self_card.as_ref().map(IdentityCard::encode),
+            directory_channel: self.directory_channel.map(|channel| channel.encode()),
+            peers: self.peers.iter().map(IdentityCard::encode).collect(),
+            backup_generation: self.backup_generation,
+            backup_dirty: self.backup_dirty,
         };
         match self.config_lock.save(&cfg) {
             Ok(()) => true,
@@ -483,83 +576,107 @@ impl App {
         }
     }
 
-    /// (Re)start or stop the presence broadcast to match the current identity.
-    pub(crate) fn sync_presence(&mut self) {
-        self.presence_conflict = None;
-        let identity = self.token_identity();
-        self.presence_active = identity.is_some();
-        self.net.send(UiCommand::SetPresence { identity });
+    fn mark_backup_dirty(&mut self) {
+        self.backup_generation = self.backup_generation.saturating_add(1);
+        self.backup_dirty = self.directory_channel.is_some();
+        self.save_configure_config();
+        self.publish_backup();
     }
 
-    /// Start the presence broadcast if it isn't already running. This is the
-    /// single entry point that wakes nostr up, called when the user first acts
-    /// on the hub (Start a connection or Join another device); it is idempotent
-    /// so re-entering the picker never restarts a healthy publisher.
-    pub(crate) fn ensure_presence(&mut self) {
-        if !self.presence_active && self.token_identity().is_some() {
-            self.sync_presence();
+    pub(crate) fn publish_backup(&mut self) {
+        if self.backup_dirty
+            && !self.backup_check_pending
+            && !self.backup_publish_blocked
+            && let Some(identity) = self.key_identity()
+            && identity.channel.is_some()
+        {
+            self.backup_publish_requested_at = Some(Instant::now());
+            self.net.send(UiCommand::PublishBackup {
+                identity: Box::new(identity),
+            });
         }
     }
 
-    /// Ask the runtime for a fresh peer device list.
     pub(crate) fn refresh_peers(&mut self) {
-        if self.has_saved_identity() {
+        if let Some(channel) = self.directory_channel {
             self.peers_requested_at = Some(Instant::now());
-            self.net.send(UiCommand::RefreshPeers);
+            self.net.send(UiCommand::RefreshDirectory {
+                channel,
+                relays: default_relays(),
+            });
         }
     }
 
-    /// Generate a fresh secret and go straight to naming this device. There is
-    /// no separate "save the secret" step: it is persisted immediately and can
-    /// be copied from the hub at any time (Copy secret), so a confirm-you-saved-
-    /// it screen would only add a click without safeguarding anything.
-    pub(crate) fn begin_generate_secret(&mut self) {
-        self.set_secret(duocb_core::auth::Secret::generate());
+    pub(crate) fn begin_generate_identity(&mut self) {
+        self.identity = Identity::generate();
+        self.saved_name = None;
+        self.self_card = None;
+        self.peers.clear();
+        self.directory_channel = None;
+        self.backup_generation = 0;
+        self.backup_dirty = false;
+        self.backup_check_pending = false;
+        self.backup_publish_blocked = false;
+        self.backup_publish_requested_at = None;
+        self.in_directory_channel.clear();
+        self.recovery_snapshot = None;
+        self.recovery_selected.clear();
+        self.reset_name_field();
+        self.configure_step = ConfigureStep::SetupName;
     }
 
-    /// Commit the pasted secret from the import step, if it parses.
-    pub(crate) fn use_imported_secret(&mut self) {
-        if let Ok(secret) = duocb_core::auth::Secret::parse(&self.in_import_secret) {
-            self.in_import_secret.clear();
-            self.set_secret(secret);
+    pub(crate) fn use_imported_identity(&mut self) {
+        if let Ok(identity) = Identity::parse_nsec(&self.in_private_key) {
+            let channel = if self.in_directory_channel.trim().is_empty() {
+                None
+            } else {
+                DirectoryChannel::parse(&self.in_directory_channel).ok()
+            };
+            self.identity = identity;
+            self.saved_name = None;
+            self.self_card = None;
+            self.peers.clear();
+            self.directory_candidates.clear();
+            self.directory_channel = channel;
+            self.backup_generation = 0;
+            self.backup_dirty = false;
+            self.backup_check_pending = false;
+            self.backup_publish_blocked = channel.is_some();
+            self.backup_publish_requested_at = None;
+            self.recovery_snapshot = None;
+            self.recovery_selected.clear();
+            self.in_private_key.clear();
+            self.configure_step = ConfigureStep::SetupName;
+            self.save_configure_config();
+            if self.directory_channel.is_some() {
+                self.check_backup();
+            }
         }
     }
 
     /// Cancel the import step back to the choice.
     pub(crate) fn cancel_setup(&mut self) {
-        self.in_import_secret.clear();
+        self.in_private_key.clear();
         self.configure_step = ConfigureStep::SetupChoice;
     }
 
-    /// Commit a generated or imported secret and move on to naming the device.
-    pub(crate) fn set_secret(&mut self, secret: duocb_core::auth::Secret) {
-        self.secret = Some(secret);
-        self.save_configure_config();
-        self.reset_name_field();
-        self.configure_step = ConfigureStep::SetupName;
-    }
-
-    /// Prefill the name field from the confirmed name.
     pub(crate) fn reset_name_field(&mut self) {
         self.in_my_name = self.saved_name.clone().unwrap_or_default();
     }
 
-    /// Confirm the name field: persist it and enter the hub. Presence stays
-    /// dormant until the user picks Start or Join there (see `ensure_presence`).
     pub(crate) fn save_name(&mut self) {
         let name = self.in_my_name.trim().to_string();
         if duocb_core::identity::validate_name(&name).is_err() {
             return;
         }
+        let Ok(card) = self.identity.card(&name) else {
+            return;
+        };
         self.saved_name = Some(name);
+        self.self_card = Some(card);
         if self.save_configure_config() {
             self.configure_step = ConfigureStep::Ready;
-            // A rename while nostr is already awake (the user paired earlier
-            // this session) rebroadcasts under the new name; otherwise presence
-            // stays dormant until the next Start/Join.
-            if self.presence_active {
-                self.sync_presence();
-            }
+            self.mark_backup_dirty();
         }
     }
 
@@ -571,61 +688,48 @@ impl App {
         }
     }
 
-    /// Clear the standing secret (explicit, confirmed): stop broadcasting and
-    /// return to the setup wizard. The permanent suffix is kept; the name stays
-    /// as a prefill for the next setup.
-    pub(crate) fn clear_secret(&mut self) {
-        self.secret = None;
-        self.save_configure_config();
-        self.presence_active = false;
-        self.net.send(UiCommand::SetPresence { identity: None });
+    pub(crate) fn reset_identity(&mut self) {
+        self.identity = Identity::generate();
+        self.saved_name = None;
+        self.self_card = None;
         self.peers.clear();
+        self.directory_candidates.clear();
+        self.directory_channel = None;
+        self.backup_generation = 0;
+        self.backup_dirty = false;
+        self.backup_check_pending = false;
+        self.backup_publish_blocked = false;
+        self.backup_publish_requested_at = None;
         self.selected_peer = None;
-        self.peers_refreshed_at = None;
-        self.peers_requested_at = None;
-        self.presence_conflict = None;
-        self.in_import_secret.clear();
+        self.recovery_snapshot = None;
+        self.recovery_selected.clear();
+        self.in_private_key.clear();
+        self.in_peer_card.clear();
+        self.in_directory_channel.clear();
+        self.save_configure_config();
         self.configure_step = ConfigureStep::SetupChoice;
     }
 
-    /// The selected peer's display identity. Any listed device may be joined:
-    /// the dial re-resolves the record on every attempt and retries at a fixed
-    /// interval (a bounded number of times), so a join placed shortly before the
-    /// other device presses Start succeeds once it does.
-    pub(crate) fn selected_peer_display(&self) -> Option<String> {
-        let suffix = self.selected_peer.as_deref()?;
+    pub(crate) fn selected_peer_card(&self) -> Option<&IdentityCard> {
+        let key = self.selected_peer.as_deref()?;
         self.peers
             .iter()
-            .find(|p| p.suffix == suffix)
-            .map(|p| p.display())
+            .find(|peer| peer.public_key().to_hex() == key)
     }
 
-    /// Open the device picker (the hub's Join action). Wakes nostr up (this is
-    /// one of the two entry points that do) and refreshes the list on entry
-    /// unless a fetch just went out.
     pub(crate) fn enter_join_picker(&mut self) {
         self.configure_step = ConfigureStep::Join;
-        self.ensure_presence();
-        let fresh = self
-            .peers_requested_at
-            .is_some_and(|at| at.elapsed() < Duration::from_secs(5));
-        if !fresh {
-            self.refresh_peers();
-        }
     }
 
-    /// Leave the device picker back to the hub, putting nostr back to sleep.
     pub(crate) fn leave_join_picker(&mut self) {
         self.configure_step = ConfigureStep::Ready;
-        self.stop_presence();
     }
 
-    /// Toggle the picker selection for a peer row (by stable suffix).
-    pub(crate) fn toggle_peer(&mut self, suffix: &str) {
-        self.selected_peer = if self.selected_peer.as_deref() == Some(suffix) {
+    pub(crate) fn toggle_peer(&mut self, public_key: &str) {
+        self.selected_peer = if self.selected_peer.as_deref() == Some(public_key) {
             None
         } else {
-            Some(suffix.to_string())
+            Some(public_key.to_string())
         };
     }
 
@@ -645,7 +749,11 @@ impl App {
         let current = self
             .selected_peer
             .as_deref()
-            .and_then(|suffix| self.peers.iter().position(|p| p.suffix == suffix));
+            .and_then(|key| {
+                self.peers
+                    .iter()
+                    .position(|peer| peer.public_key().to_hex() == key)
+            });
         let next = match current {
             None => {
                 if delta > 0 {
@@ -656,7 +764,151 @@ impl App {
             }
             Some(i) => (i as i64 + delta as i64).rem_euclid(self.peers.len() as i64) as usize,
         };
-        self.selected_peer = Some(self.peers[next].suffix.clone());
+        self.selected_peer = Some(self.peers[next].public_key().to_hex());
+    }
+
+    pub(crate) fn import_peer_card(&mut self) {
+        let Ok(card) = IdentityCard::parse(&self.in_peer_card) else {
+            self.error = Some("The pasted identity card is invalid".into());
+            return;
+        };
+        if card.public_key() == self.identity.public_key() {
+            self.error = Some("That is this device's own identity card".into());
+            return;
+        }
+        if let Some(existing) = self
+            .peers
+            .iter_mut()
+            .find(|peer| peer.public_key() == card.public_key())
+        {
+            *existing = card;
+        } else if self.peers.len() >= duocb_core::auth::MAX_TRUSTED_PEERS {
+            self.error = Some("The trusted-peer limit is 128".into());
+            return;
+        } else {
+            self.peers.push(card);
+        }
+        self.in_peer_card.clear();
+        self.mark_backup_dirty();
+    }
+
+    pub(crate) fn trust_directory_card(&mut self, public_key: &str) {
+        let Some(card) = self
+            .directory_candidates
+            .iter()
+            .find(|card| card.public_key().to_hex() == public_key)
+            .cloned()
+        else {
+            return;
+        };
+        if self
+            .peers
+            .iter()
+            .any(|peer| peer.public_key() == card.public_key())
+        {
+            return;
+        }
+        if self.peers.len() >= duocb_core::auth::MAX_TRUSTED_PEERS {
+            self.error = Some("The trusted-peer limit is 128".into());
+            return;
+        }
+        self.peers.push(card);
+        self.mark_backup_dirty();
+    }
+
+    pub(crate) fn remove_peer(&mut self, public_key: &str) {
+        let before = self.peers.len();
+        self.peers
+            .retain(|peer| peer.public_key().to_hex() != public_key);
+        if self.peers.len() != before {
+            if self.selected_peer.as_deref() == Some(public_key) {
+                self.selected_peer = None;
+            }
+            self.mark_backup_dirty();
+        }
+    }
+
+    pub(crate) fn set_directory_channel(&mut self) {
+        match DirectoryChannel::parse(&self.in_directory_channel) {
+            Ok(channel) => {
+                self.directory_channel = Some(channel);
+                self.in_directory_channel = channel.encode();
+                // An entered channel may already hold a backup for a restored
+                // key. Persist the channel, but do not publish until lookup has
+                // offered that backup (or confirmed none exists).
+                self.backup_dirty = false;
+                self.backup_publish_blocked = true;
+                self.save_configure_config();
+                self.check_backup();
+            }
+            Err(error) => self.error = Some(format!("Invalid backup channel: {error:#}")),
+        }
+    }
+
+    pub(crate) fn generate_directory_channel(&mut self) {
+        let channel = DirectoryChannel::generate();
+        self.directory_channel = Some(channel);
+        self.in_directory_channel = channel.encode();
+        self.backup_publish_blocked = false;
+        self.mark_backup_dirty();
+        self.refresh_peers();
+    }
+
+    pub(crate) fn check_backup(&mut self) {
+        if let Some(channel) = self.directory_channel {
+            self.backup_check_pending = true;
+            self.backup_publish_blocked = true;
+            self.net.send(UiCommand::CheckBackup {
+                identity: self.identity.clone(),
+                channel,
+                relays: default_relays(),
+            });
+        }
+    }
+
+    pub(crate) fn restore_offered_backup(&mut self) {
+        let Some(snapshot) = self.recovery_snapshot.take() else {
+            return;
+        };
+        if snapshot.self_card.public_key() != self.identity.public_key() {
+            return;
+        }
+        self.saved_name = Some(snapshot.self_card.name().to_string());
+        self.in_my_name = snapshot.self_card.name().to_string();
+        self.self_card = Some(snapshot.self_card);
+        self.peers = snapshot
+            .peers
+            .into_iter()
+            .filter(|peer| {
+                self.recovery_selected
+                    .contains(&peer.public_key().to_hex())
+            })
+            .collect();
+        self.recovery_selected.clear();
+        self.backup_generation = snapshot.generation;
+        self.backup_dirty = false;
+        self.backup_check_pending = false;
+        self.backup_publish_blocked = false;
+        self.configure_step = ConfigureStep::Ready;
+        // A partial restore is a new local snapshot; publishing it ensures the
+        // user's explicit selection is what future recovery offers contain.
+        self.mark_backup_dirty();
+    }
+
+    pub(crate) fn toggle_recovery_peer(&mut self, public_key: &str) {
+        if !self.recovery_selected.remove(public_key) {
+            self.recovery_selected.insert(public_key.to_string());
+        }
+    }
+
+    pub(crate) fn skip_offered_backup(&mut self) {
+        let Some(snapshot) = self.recovery_snapshot.take() else {
+            return;
+        };
+        self.recovery_selected.clear();
+        self.backup_publish_blocked = false;
+        self.backup_generation = self.backup_generation.max(snapshot.generation);
+        self.mark_backup_dirty();
     }
 
     /// Whether the "sent ✓" flash should currently show.
@@ -689,18 +941,9 @@ impl App {
         }
     }
 
-    /// Put nostr back to sleep: stop the presence broadcast and peer discovery.
-    /// Called when the user leaves every nostr flow (Start/Join) back to the
-    /// hub, so the plain home screen holds no relay connections. Idempotent.
     pub(crate) fn stop_presence(&mut self) {
-        if !self.presence_active {
-            return;
-        }
-        self.presence_active = false;
-        self.presence_conflict = None;
-        // Force the next Join to re-fetch: the list is no longer kept fresh.
-        self.peers_requested_at = None;
-        self.net.send(UiCommand::SetPresence { identity: None });
+        // Configure-mode Nostr work is one-shot (backup/directory) or scoped to
+        // a running server session; there is no standing presence publisher.
     }
 
     /// Open the quick-options screen (ad-hoc rotating-PIN pairing).
@@ -708,7 +951,7 @@ impl App {
         self.screen = Screen::Quick;
         // Home implies configure mode; entering the quick screen picks its
         // default so the actions there never run configure mode.
-        if self.mode == PairMode::NostrToken {
+        if self.mode == PairMode::NostrKey {
             self.mode = PairMode::Pin;
         }
         // Detect this device's LAN subnet so a LAN-only join can lock the host
@@ -738,7 +981,7 @@ impl App {
         self.screen = match (self.screen, self.mode) {
             (Screen::Server | Screen::Client, PairMode::Pin) => Screen::Quick,
             _ => {
-                self.mode = PairMode::NostrToken;
+                self.mode = PairMode::NostrKey;
                 Screen::Home
             }
         };
@@ -758,9 +1001,11 @@ impl App {
     pub(crate) fn server_mode_spec(&self) -> Option<duocb_core::net::ServerMode> {
         use duocb_core::net::ServerMode;
         match self.mode {
-            PairMode::NostrToken => self
-                .token_identity()
-                .map(|identity| ServerMode::NostrToken { identity }),
+            PairMode::NostrKey => self
+                .key_identity()
+                .map(|identity| ServerMode::NostrKey {
+                    identity: Box::new(identity),
+                }),
             PairMode::Pin => Some(ServerMode::Pin {
                 relays: default_relays(),
                 channel: duocb_core::net::PinChannel::LanOnly,
@@ -775,9 +1020,9 @@ impl App {
     pub(crate) fn client_dial_spec(&self) -> Option<duocb_core::net::DialSpec> {
         use duocb_core::net::DialSpec;
         match self.mode {
-            PairMode::NostrToken => Some(DialSpec::NostrToken {
-                identity: self.token_identity()?,
-                peer_display: self.selected_peer_display()?,
+            PairMode::NostrKey => Some(DialSpec::NostrKey {
+                identity: Box::new(self.key_identity()?),
+                peer_public_key: self.selected_peer_card()?.public_key(),
             }),
             PairMode::Pin => self.quick_dial_spec(),
         }
@@ -836,9 +1081,6 @@ impl App {
     /// joiner finds this device's node id, so start the broadcast first.
     pub(crate) fn start_server(&mut self) {
         if let Some(mode) = self.server_mode_spec() {
-            if self.mode == PairMode::NostrToken {
-                self.ensure_presence();
-            }
             self.server_running = true;
             self.net.send(UiCommand::StartServer { mode });
         }
@@ -847,12 +1089,14 @@ impl App {
     /// Start the client session if the state validates.
     pub(crate) fn connect_client(&mut self) {
         if let Some(spec) = self.client_dial_spec() {
-            if let duocb_core::net::DialSpec::NostrToken { peer_display, .. } = &spec {
-                // The dial resolves the peer through the presence relays, so
-                // make sure the broadcast is awake (normally already is, from
-                // entering the picker). Quick-mode dials never reach here.
-                self.ensure_presence();
-                self.joined_peer = Some(peer_display.clone());
+            if let duocb_core::net::DialSpec::NostrKey {
+                peer_public_key, ..
+            } = &spec {
+                self.joined_peer = self
+                    .peers
+                    .iter()
+                    .find(|peer| peer.public_key() == *peer_public_key)
+                    .map(|peer| peer.name().to_string());
             }
             self.client_active = true;
             self.net.send(UiCommand::Connect { spec });
@@ -876,42 +1120,7 @@ pub(crate) fn short_id(id: &str) -> String {
     }
 }
 
-/// Mask a secret for display: asterisks plus its last four characters — never
-/// the whole value, but enough of a hint to spot-check that a paste into a
-/// place without fingerprint support (a password manager, a note) took the
-/// right one.
-pub(crate) fn masked_secret_hint(secret: &str) -> String {
-    let tail_start = secret
-        .char_indices()
-        .rev()
-        .nth(3)
-        .map(|(i, _)| i)
-        .unwrap_or(0);
-    format!("********{}", &secret[tail_start..])
-}
-
-/// Seconds since the Unix epoch (for peer last-seen ages).
-pub(crate) fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-/// Humanize an age in seconds: "just now", "3m ago", "2h ago", "5d ago".
-pub(crate) fn ago(secs: u64) -> String {
-    if secs < 60 {
-        "just now".to_string()
-    } else if secs < 3600 {
-        format!("{}m ago", secs / 60)
-    } else if secs < 86_400 {
-        format!("{}h ago", secs / 3600)
-    } else {
-        format!("{}d ago", secs / 86_400)
-    }
-}
-
-#[cfg(test)]
+#[cfg(all(test, any()))]
 pub(crate) mod tests {
     use super::*;
     use duocb_core::net::spawn_net_runtime;
@@ -1035,7 +1244,7 @@ pub(crate) mod tests {
         app.secret = Some(duocb_core::auth::Secret::generate());
         app.saved_name = Some("mac".into());
         app.configure_step = ConfigureStep::Ready;
-        app.mode = PairMode::NostrToken;
+        app.mode = PairMode::NostrKey;
         (app, cmd_rx)
     }
 
@@ -1128,7 +1337,7 @@ pub(crate) mod tests {
         assert_eq!(app.mode, PairMode::Pin);
 
         app.screen = Screen::Client;
-        app.mode = PairMode::NostrToken;
+        app.mode = PairMode::NostrKey;
         app.configure_step = ConfigureStep::Join;
         app.go_back();
         assert_eq!(app.screen, Screen::Home);
@@ -1138,7 +1347,7 @@ pub(crate) mod tests {
         app.mode = PairMode::Pin;
         app.go_back();
         assert_eq!(app.screen, Screen::Home);
-        assert_eq!(app.mode, PairMode::NostrToken);
+        assert_eq!(app.mode, PairMode::NostrKey);
     }
 
     #[test]

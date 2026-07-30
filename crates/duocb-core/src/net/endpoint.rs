@@ -24,7 +24,8 @@ use tokio::task::JoinHandle;
 /// Fixed ALPN protocol identifier for duocb connections.
 ///
 /// Both peers advertise this; a mismatch fails at the QUIC handshake. Access
-/// control is handled by the in-band auth (token or PIN), not the ALPN.
+/// control is handled by the in-band auth (application key or PIN), not the
+/// ALPN.
 pub const ALPN: &[u8] = b"duocb/1";
 
 /// Timeout for the endpoint to come online and for a connect attempt.

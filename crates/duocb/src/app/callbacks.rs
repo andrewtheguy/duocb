@@ -60,32 +60,41 @@ pub(crate) fn wire(app: &Rc<RefCell<App>>, ui: &MainWindow) {
     act!(on_dismiss_error, |app| app.error = None);
 
     // Configure wizard.
-    nav!(on_begin_generate, |app| app.begin_generate_secret());
+    nav!(on_begin_generate, |app| app.begin_generate_identity());
     nav!(on_open_import, |app| {
         app.configure_step = crate::ConfigureStep::SetupImport;
     });
     nav!(on_cancel_setup, |app| app.cancel_setup());
-    nav!(on_use_imported, |app| app.use_imported_secret());
+    nav!(on_use_imported, |app| app.use_imported_identity());
     nav!(on_save_name, |app| app.save_name());
     nav!(on_cancel_name, |app| app.cancel_name());
     nav!(on_rename, |app| {
         app.reset_name_field();
         app.configure_step = crate::ConfigureStep::SetupName;
     });
-    act!(on_copy_secret, |app| {
-        if let Some(encoded) = app.secret.as_ref().map(duocb_core::auth::Secret::encode) {
-            app.copy_with_flash(&encoded, CopyTarget::Secret);
+    act!(on_copy_card, |app| {
+        if let Some(encoded) = app.self_card.as_ref().map(duocb_core::auth::IdentityCard::encode) {
+            app.copy_with_flash(&encoded, CopyTarget::Card);
         }
     });
-    act!(on_request_clear_secret, |app| {
-        app.confirm_clear_secret = true;
+    act!(on_copy_private_key, |app| {
+        let private_key = app.identity.to_nsec();
+        app.copy_with_flash(&private_key, CopyTarget::PrivateKey);
     });
-    nav!(on_confirm_clear_secret, |app| {
-        app.clear_secret();
-        app.confirm_clear_secret = false;
+    act!(on_copy_channel, |app| {
+        if let Some(channel) = app.directory_channel {
+            app.copy_with_flash(&channel.encode(), CopyTarget::Channel);
+        }
     });
-    act!(on_cancel_clear_secret, |app| {
-        app.confirm_clear_secret = false;
+    act!(on_request_reset_identity, |app| {
+        app.confirm_reset_identity = true;
+    });
+    nav!(on_confirm_reset_identity, |app| {
+        app.reset_identity();
+        app.confirm_reset_identity = false;
+    });
+    act!(on_cancel_reset_identity, |app| {
+        app.confirm_reset_identity = false;
     });
 
     // Hub / device picker.
@@ -93,13 +102,46 @@ pub(crate) fn wire(app: &Rc<RefCell<App>>, ui: &MainWindow) {
     nav!(on_enter_join_picker, |app| app.enter_join_picker());
     nav!(on_leave_join_picker, |app| app.leave_join_picker());
     act!(on_refresh_peers, |app| app.refresh_peers());
+    act!(on_import_peer_card, |app| app.import_peer_card());
+    act!(on_generate_channel, |app| app.generate_directory_channel());
+    act!(on_set_channel, |app| app.set_directory_channel());
+    act!(on_check_backup, |app| app.check_backup());
+    nav!(on_restore_backup, |app| app.restore_offered_backup());
+    act!(on_skip_backup, |app| app.skip_offered_backup());
     nav!(on_join_selected, |app| app.join_selected_peer());
     actions.on_toggle_peer({
         let app = Rc::clone(app);
         let weak = ui.as_weak();
-        move |suffix| {
+        move |public_key| {
             let ui = weak.unwrap();
-            app.borrow_mut().toggle_peer(&suffix);
+            app.borrow_mut().toggle_peer(&public_key);
+            app.borrow().sync(&ui);
+        }
+    });
+    actions.on_remove_peer({
+        let app = Rc::clone(app);
+        let weak = ui.as_weak();
+        move |public_key| {
+            let ui = weak.unwrap();
+            app.borrow_mut().remove_peer(&public_key);
+            app.borrow().sync(&ui);
+        }
+    });
+    actions.on_trust_directory_card({
+        let app = Rc::clone(app);
+        let weak = ui.as_weak();
+        move |public_key| {
+            let ui = weak.unwrap();
+            app.borrow_mut().trust_directory_card(&public_key);
+            app.borrow().sync(&ui);
+        }
+    });
+    actions.on_toggle_backup_peer({
+        let app = Rc::clone(app);
+        let weak = ui.as_weak();
+        move |public_key| {
+            let ui = weak.unwrap();
+            app.borrow_mut().toggle_recovery_peer(&public_key);
             app.borrow().sync(&ui);
         }
     });
@@ -177,7 +219,9 @@ pub(crate) fn wire(app: &Rc<RefCell<App>>, ui: &MainWindow) {
                 let s = ui.global::<UiState>();
                 let mut app = app.borrow_mut();
                 app.in_my_name = s.get_in_my_name().into();
-                app.in_import_secret = s.get_in_import_secret().into();
+                app.in_private_key = s.get_in_private_key().into();
+                app.in_peer_card = s.get_in_peer_card().into();
+                app.in_directory_channel = s.get_in_directory_channel().into();
                 // Sanitize each PIN group (uppercase, map look-alikes, drop
                 // noise) then cap/spill them into the two fields. No separator is
                 // ever inserted into a field, so the cursor never shifts under
