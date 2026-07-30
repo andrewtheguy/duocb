@@ -23,7 +23,10 @@ key is separate from iroh's ephemeral transport key:
 
 - The application private key signs the device's portable identity card and
   authenticates the duocb wire handshake.
-- The signed identity card contains the device name and application public key.
+- The signed identity card contains the final device name and application
+  public key. The final name is `<short-name>_<permanent-random-suffix>`; the
+  suffix is minted once per installation and stays stable across renames and
+  identity resets.
 - The iroh key creates the current QUIC endpoint and node id. It is used for
   signaling and transport establishment, never as the saved duocb identity.
 
@@ -81,10 +84,12 @@ installation:
 5. Select the peers to recover and explicitly choose **Restore selected**, or
    choose **Keep local state**.
 
-Restore is never automatic. Entering an existing channel queries before
-publishing, so a fresh empty install cannot overwrite the backup it is trying
-to recover. The private key alone cannot recover the list because the channel
-is intentionally separate and is required to locate/decrypt the backup.
+Accepting the restore also recovers the signed short name and its permanent
+suffix. Restore is never automatic. Entering an existing channel queries
+before publishing, so a fresh empty install cannot overwrite the backup it is
+trying to recover. The private key alone cannot recover the list because the
+channel is intentionally separate and is required to locate/decrypt the
+backup.
 
 ### Quick mode
 

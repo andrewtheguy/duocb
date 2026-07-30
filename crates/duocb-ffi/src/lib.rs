@@ -31,9 +31,9 @@
 //! `NSLocalNetworkUsageDescription`. For a LAN-only PIN the joiner may also
 //! supply the host's IP (the `ip` config key) to pair over the unicast side
 //! channel where multicast is blocked. The nostr-only preset remains
-//! desktop-only. Application private-key and signed-card persistence is the
-//! caller's job (Keychain on iOS). These keys are deliberately separate from
-//! iroh's ephemeral transport identity.
+//! desktop-only. Application private-key, permanent name-suffix, and
+//! signed-card persistence is the caller's job (Keychain on iOS). These keys
+//! are deliberately separate from iroh's ephemeral transport identity.
 //!
 //! The intended app flow mirrors the desktop hub: run a "hub" instance while
 //! the device list is on screen, and when the user picks an action stop it
@@ -193,6 +193,26 @@ pub unsafe extern "C" fn duocb_generate_identity(
     }
 }
 
+/// Generate this installation's permanent 8-character device-name suffix.
+/// Persist it alongside the identity and reuse it when creating replacement
+/// identity cards.
+/// # Safety
+/// `out_buf` must be NULL or point to at least `out_len` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn duocb_generate_suffix(
+    out_buf: *mut c_char,
+    out_len: usize,
+) -> c_int {
+    if out_buf.is_null() {
+        return -1;
+    }
+    if write_cstr(out_buf, out_len, &duocb_core::identity::generate_suffix()) {
+        1
+    } else {
+        0
+    }
+}
+
 /// Validate an identity private key. Returns 1 if valid; 0 if invalid (the reason is
 /// written to `err_buf` when provided); -1 on NULL/non-UTF-8 input.
 /// # Safety
@@ -248,18 +268,22 @@ pub unsafe extern "C" fn duocb_identity_public_key(
 pub unsafe extern "C" fn duocb_create_identity_card(
     private_key: *const c_char,
     name: *const c_char,
+    suffix: *const c_char,
     out_buf: *mut c_char,
     out_len: usize,
 ) -> c_int {
-    let (Some(private_key), Some(name)) =
-        (unsafe { cstr_arg(private_key) }, unsafe { cstr_arg(name) })
+    let (Some(private_key), Some(name), Some(suffix)) = (
+        unsafe { cstr_arg(private_key) },
+        unsafe { cstr_arg(name) },
+        unsafe { cstr_arg(suffix) },
+    )
     else {
         return -1;
     };
     let Ok(identity) = duocb_core::auth::Identity::parse_nsec(private_key) else {
         return -1;
     };
-    let Ok(card) = identity.card(name.trim()) else {
+    let Ok(card) = identity.card(name.trim(), suffix) else {
         return -1;
     };
     if write_cstr(out_buf, out_len, &card.encode()) {
@@ -291,7 +315,7 @@ pub unsafe extern "C" fn duocb_validate_identity_card(
     }
 }
 
-/// Write `{name,public_key,npub}` for a verified identity card.
+/// Write `{name,short_name,suffix,public_key,npub}` for a verified identity card.
 /// # Safety
 /// `card` must be NUL-terminated UTF-8; `out_buf` must be NULL or point
 /// NULL or point to at least `out_len` writable bytes.
@@ -309,6 +333,8 @@ pub unsafe extern "C" fn duocb_identity_card_info(
     };
     let json = serde_json::json!({
         "name": card.name(),
+        "short_name": card.short_name(),
+        "suffix": card.suffix(),
         "public_key": card.public_key().to_hex(),
         "npub": card.npub(),
     })
@@ -1061,6 +1087,8 @@ fn event_json(event: &NetEvent) -> String {
 fn identity_card_json(card: &duocb_core::auth::IdentityCard) -> serde_json::Value {
     serde_json::json!({
         "name": card.name(),
+        "short_name": card.short_name(),
+        "suffix": card.suffix(),
         "public_key": card.public_key().to_hex(),
         "npub": card.npub(),
         "card": card.encode(),
@@ -1466,16 +1494,53 @@ mod tests {
 mod identity_tests {
     use super::*;
 
+    #[test]
+    fn ffi_generates_suffix_and_appends_it_to_card_name() {
+        let mut suffix_buf = [0 as c_char; 16];
+        assert_eq!(
+            unsafe { duocb_generate_suffix(suffix_buf.as_mut_ptr(), suffix_buf.len()) },
+            1
+        );
+        let suffix = unsafe { CStr::from_ptr(suffix_buf.as_ptr()) }
+            .to_str()
+            .unwrap();
+        assert!(duocb_core::identity::is_valid_suffix(suffix));
+
+        let identity = duocb_core::auth::Identity::generate();
+        let private_key = std::ffi::CString::new(identity.to_nsec()).unwrap();
+        let name = std::ffi::CString::new("phone").unwrap();
+        let suffix = std::ffi::CString::new(suffix).unwrap();
+        let mut card_buf = [0 as c_char; 4096];
+        assert_eq!(
+            unsafe {
+                duocb_create_identity_card(
+                    private_key.as_ptr(),
+                    name.as_ptr(),
+                    suffix.as_ptr(),
+                    card_buf.as_mut_ptr(),
+                    card_buf.len(),
+                )
+            },
+            1
+        );
+        let encoded = unsafe { CStr::from_ptr(card_buf.as_ptr()) }
+            .to_str()
+            .unwrap();
+        let card = duocb_core::auth::IdentityCard::parse(encoded).unwrap();
+        assert_eq!(card.short_name(), "phone");
+        assert_eq!(card.suffix(), suffix.to_str().unwrap());
+    }
+
     fn configured_value(role: &str) -> serde_json::Value {
         let identity = duocb_core::auth::Identity::generate();
         let peer = duocb_core::auth::Identity::generate()
-            .card("phone")
+            .card("phone", "x9Y8z7W6")
             .unwrap();
         let peer_public_key = peer.public_key().to_hex();
         let mut value = serde_json::json!({
             "role": role,
             "identity_secret": identity.to_nsec(),
-            "self_card": identity.card("desktop").unwrap().encode(),
+            "self_card": identity.card("desktop", "a7B2c3D4").unwrap().encode(),
             "peers": [peer.encode()],
             "directory_channel": duocb_core::auth::DirectoryChannel::generate().encode(),
             "backup_generation": 9,
@@ -1529,7 +1594,7 @@ mod identity_tests {
         let mut value = configured_value("hub");
         value["self_card"] = serde_json::Value::String(
             duocb_core::auth::Identity::generate()
-                .card("intruder")
+                .card("intruder", "p3Q4r5S6")
                 .unwrap()
                 .encode(),
         );
@@ -1544,11 +1609,11 @@ mod identity_tests {
     fn backup_event_is_a_preview_with_portable_cards() {
         let owner = duocb_core::auth::Identity::generate();
         let peer = duocb_core::auth::Identity::generate()
-            .card("phone")
+            .card("phone", "x9Y8z7W6")
             .unwrap();
         let snapshot = duocb_core::nostr::BackupSnapshot::new(
             3,
-            owner.card("desktop").unwrap(),
+            owner.card("desktop", "a7B2c3D4").unwrap(),
             vec![peer.clone()],
         )
         .unwrap();
@@ -1559,7 +1624,12 @@ mod identity_tests {
             .unwrap();
         assert_eq!(value["type"], "backup_found");
         assert_eq!(value["backup"]["generation"], 3);
-        assert_eq!(value["backup"]["peers"][0]["name"], "phone");
+        assert_eq!(
+            value["backup"]["peers"][0]["name"],
+            "phone_x9Y8z7W6"
+        );
+        assert_eq!(value["backup"]["peers"][0]["short_name"], "phone");
+        assert_eq!(value["backup"]["peers"][0]["suffix"], "x9Y8z7W6");
         assert_eq!(
             value["backup"]["peers"][0]["public_key"],
             peer.public_key().to_hex()

@@ -14,7 +14,7 @@ use std::fs::{File, OpenOptions, TryLockError};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-pub const CONFIG_VERSION: u32 = 1;
+pub const CONFIG_VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -22,6 +22,8 @@ pub struct Config {
     pub version: u32,
     /// Persistent application identity, encoded as NIP-19 `nsec`.
     pub identity_secret: String,
+    /// Permanent random suffix appended to the user-chosen short name.
+    pub device_suffix: String,
     pub my_name: Option<String>,
     pub self_card: Option<String>,
     pub directory_channel: Option<String>,
@@ -38,6 +40,7 @@ impl Default for Config {
         Self {
             version: CONFIG_VERSION,
             identity_secret: duocb_core::auth::Identity::generate().to_nsec(),
+            device_suffix: duocb_core::identity::generate_suffix(),
             my_name: None,
             self_card: None,
             directory_channel: None,
@@ -54,6 +57,7 @@ impl std::fmt::Debug for Config {
         f.debug_struct("Config")
             .field("version", &self.version)
             .field("identity_secret", &"***")
+            .field("device_suffix", &self.device_suffix)
             .field("my_name", &self.my_name)
             .field("self_card", &self.self_card.as_ref().map(|_| "<signed card>"))
             .field("directory_channel", &self.directory_channel)
@@ -157,13 +161,19 @@ impl ConfigLock {
             .with_context(|| format!("parsing config {}", self.path.display()))?;
         if config.version != CONFIG_VERSION {
             anyhow::bail!(
-                "config {} has unsupported version {} (this release does not migrate shared-secret configs)",
+                "config {} has unsupported version {} (this release does not migrate older configs)",
                 self.path.display(),
                 config.version
             );
         }
         let identity = duocb_core::auth::Identity::parse_nsec(&config.identity_secret)
             .with_context(|| format!("config {} has an invalid identity key", self.path.display()))?;
+        if !duocb_core::identity::is_valid_suffix(&config.device_suffix) {
+            anyhow::bail!(
+                "config {} has an invalid device suffix",
+                self.path.display()
+            );
+        }
         match (&config.my_name, &config.self_card) {
             (None, None) => {}
             (Some(name), Some(encoded)) => {
@@ -173,7 +183,9 @@ impl ConfigLock {
                 let card = duocb_core::auth::IdentityCard::parse(encoded).with_context(|| {
                     format!("config {} has an invalid self card", self.path.display())
                 })?;
-                if card.public_key() != identity.public_key() || card.name() != name {
+                let display_name =
+                    duocb_core::identity::display_identity(name, &config.device_suffix);
+                if card.public_key() != identity.public_key() || card.name() != display_name {
                     anyhow::bail!(
                         "config {} self card does not match its identity and name",
                         self.path.display()
@@ -290,11 +302,13 @@ mod tests {
 
     fn configured(name: &str) -> Config {
         let identity = duocb_core::auth::Identity::generate();
-        let card = identity.card(name).unwrap();
+        let suffix = "a7B2c3D4";
+        let card = identity.card(name, suffix).unwrap();
         let channel = duocb_core::auth::DirectoryChannel::generate();
         Config {
             version: CONFIG_VERSION,
             identity_secret: identity.to_nsec(),
+            device_suffix: suffix.to_string(),
             my_name: Some(name.to_string()),
             self_card: Some(card.encode()),
             directory_channel: Some(channel.encode()),
@@ -337,6 +351,9 @@ mod tests {
 
         let fresh = lock.load().expect("load fresh config");
         assert!(duocb_core::auth::Identity::parse_nsec(&fresh.identity_secret).is_ok());
+        assert!(duocb_core::identity::is_valid_suffix(
+            &fresh.device_suffix
+        ));
         assert!(fresh.self_card.is_none());
 
         let saved = configured("desktop");
@@ -411,6 +428,35 @@ mod tests {
                 .to_string()
                 .contains(&format!("parsing config {}", path.display())),
             "error should identify the invalid config: {error:#}"
+        );
+
+        drop(lock);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn key_config_without_suffix_is_not_migrated() {
+        let dir = temp_dir();
+        let path = dir.join("config.json");
+        let identity = duocb_core::auth::Identity::generate();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"version":1,"identity_secret":"{}","my_name":null,"self_card":null,"directory_channel":null,"peers":[],"backup_generation":0,"backup_dirty":false}}"#,
+                identity.to_nsec()
+            ),
+        )
+        .unwrap();
+
+        let lock = acquire_lock(&path).expect("lock");
+        let error = lock
+            .load()
+            .expect_err("key configs without device_suffix must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("parsing config {}", path.display()))
         );
 
         drop(lock);

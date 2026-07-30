@@ -1797,8 +1797,8 @@ mod tests {
         let client_identity = Identity::generate();
         let server_key_identity = KeyIdentity {
             identity: server_identity.clone(),
-            self_card: server_identity.card("server").unwrap(),
-            peers: vec![client_identity.card("client").unwrap()],
+            self_card: server_identity.card("server", "a7B2c3D4").unwrap(),
+            peers: vec![client_identity.card("client", "x9Y8z7W6").unwrap()],
             channel: None,
             backup_generation: 0,
             relays: Vec::new(),

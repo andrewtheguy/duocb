@@ -4,6 +4,7 @@
 //! - `DUOCB_ROLE=start|join`
 //! - `DUOCB_NSEC` persistent identity private key (generated when omitted)
 //! - `DUOCB_NAME` local name (default `headless`)
+//! - `DUOCB_SUFFIX` persistent device suffix
 //! - `DUOCB_PEER_CARD` the other side's signed card (required)
 //! - `DUOCB_SEND` clipboard text sent after pairing (optional)
 
@@ -20,7 +21,10 @@ fn main() {
         .map(|value| Identity::parse_nsec(&value).expect("invalid DUOCB_NSEC"))
         .unwrap_or_else(Identity::generate);
     let name = std::env::var("DUOCB_NAME").unwrap_or_else(|_| "headless".into());
-    let self_card = identity.card(&name).expect("invalid DUOCB_NAME");
+    let suffix = std::env::var("DUOCB_SUFFIX").expect("DUOCB_SUFFIX is required");
+    let self_card = identity
+        .card(&name, &suffix)
+        .expect("invalid DUOCB_NAME or DUOCB_SUFFIX");
     let peer = IdentityCard::parse(
         &std::env::var("DUOCB_PEER_CARD").expect("DUOCB_PEER_CARD is required"),
     )

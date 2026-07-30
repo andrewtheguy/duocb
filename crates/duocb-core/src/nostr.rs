@@ -625,36 +625,43 @@ mod tests {
         let peer = Identity::generate();
         let snapshot = BackupSnapshot::new(
             7,
-            owner.card("owner").unwrap(),
-            vec![peer.card("peer").unwrap()],
+            owner.card("owner", "a7B2c3D4").unwrap(),
+            vec![peer.card("peer", "x9Y8z7W6").unwrap()],
         )
         .unwrap();
         let decoded = BackupSnapshot::decode(&snapshot.encoded_body().unwrap(), owner.public_key())
             .unwrap();
         assert_eq!(decoded.generation, 7);
-        assert_eq!(decoded.self_card.name(), "owner");
+        assert_eq!(decoded.self_card.name(), "owner_a7B2c3D4");
         assert_eq!(decoded.peers[0].public_key(), peer.public_key());
 
         let too_many = (0..=MAX_TRUSTED_PEERS)
             .map(|index| {
                 Identity::generate()
-                    .card(&format!("peer-{index}"))
+                    .card(&format!("peer-{index}"), "x9Y8z7W6")
                     .unwrap()
             })
             .collect();
         assert!(
-            BackupSnapshot::new(8, owner.card("owner").unwrap(), too_many).is_err()
+            BackupSnapshot::new(
+                8,
+                owner.card("owner", "a7B2c3D4").unwrap(),
+                too_many
+            )
+            .is_err()
         );
     }
 
     #[test]
     fn backup_rejects_duplicates_and_wrong_owner() {
         let owner = Identity::generate();
-        let peer = Identity::generate().card("peer").unwrap();
+        let peer = Identity::generate()
+            .card("peer", "x9Y8z7W6")
+            .unwrap();
         assert!(
             BackupSnapshot::new(
                 1,
-                owner.card("owner").unwrap(),
+                owner.card("owner", "a7B2c3D4").unwrap(),
                 vec![peer.clone(), peer]
             )
             .is_err()
@@ -681,10 +688,10 @@ mod tests {
         let channel = DirectoryChannel::generate();
         let snapshot = BackupSnapshot::new(
             12,
-            owner.card("owner").unwrap(),
+            owner.card("owner", "a7B2c3D4").unwrap(),
             vec![
-                Identity::generate().card("phone").unwrap(),
-                Identity::generate().card("laptop").unwrap(),
+                Identity::generate().card("phone", "x9Y8z7W6").unwrap(),
+                Identity::generate().card("laptop", "p3Q4r5S6").unwrap(),
             ],
         )
         .unwrap();

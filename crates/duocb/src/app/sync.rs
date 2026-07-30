@@ -46,7 +46,9 @@ impl App {
         match duocb_core::identity::validate_name(name) {
             Ok(()) => {
                 s.set_name_valid(true);
-                s.set_name_preview(name.into());
+                s.set_name_preview(
+                    duocb_core::identity::display_identity(name, &self.device_suffix).into(),
+                );
                 s.set_name_error(SharedString::default());
             }
             Err(e) => {
@@ -62,7 +64,7 @@ impl App {
         s.set_can_cancel_name(self.has_saved_identity());
         s.set_name_rules(
             format!(
-                "The name signed into this device's identity card. Letters, digits, and '-' only (max {} characters).",
+                "Choose the short name; the permanent random suffix shown below is appended automatically. Letters, digits, and '-' only (max {} characters).",
                 duocb_core::identity::NAME_MAX_LEN
             )
             .into(),

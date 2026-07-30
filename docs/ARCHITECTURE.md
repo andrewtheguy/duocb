@@ -31,8 +31,12 @@ The Slint event loop and tokio runtime communicate only with `UiCommand` and
 - wire/trust key: the 32-byte public key.
 
 An identity card is a signed kind `30382` Nostr event with a fixed identifier
-and a versioned JSON body containing the validated device name. Parsing checks
-the event signature, kind, identifier, schema, name rules, and 2 KiB size cap.
+and a versioned JSON body containing the validated final device name,
+`<short-name>_<permanent-random-suffix>`. The suffix is persisted separately
+from the application key so it remains stable across renames and identity
+resets; accepting a recovered self-card restores its suffix. Parsing checks the
+event signature, kind, identifier, schema, name and suffix rules, and 2 KiB
+size cap.
 
 Each local peer entry is the full verified card, so the saved name is bound to
 the public key. Trust is local and capped at 128 unique public keys. Neither a
@@ -187,7 +191,7 @@ trust a directory card or restore a snapshot.
 ## Persistence and bounds
 
 Desktop config stores the application private key, optional signed self-card
-and name, optional channel, signed peer cards, backup generation, and dirty
+short name and permanent suffix, optional channel, signed peer cards, backup generation, and dirty
 flag. Loading is strict: invalid or legacy data is an error, not a migration or
 silent drop. Files are owner-only, protected by a sibling process-lifetime
 lock, and atomically replaced through a flushed temporary file.

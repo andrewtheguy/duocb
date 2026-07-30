@@ -4,9 +4,12 @@
  *
  * Configure mode uses one persistent application keypair per installation.
  * The private key authenticates duocb's wire protocol and signs a portable
- * identity card containing the device name. It is unrelated to iroh's
- * ephemeral transport key. Pairing is mutual: each installation persists the
- * other installation's verified signed card in its local "peers" list.
+ * identity card containing `<short-name>_<permanent-suffix>`. It is unrelated
+ * to iroh's ephemeral transport key. Pairing is mutual: each installation
+ * persists the other installation's verified signed card in its local "peers"
+ * list.
+ * Generate the suffix once, persist it with the private key, and reuse it for
+ * every renamed/replacement self-card.
  *
  * An optional directory_channel is a standalone 128-bit channel used only for
  * encrypted Nostr peer-list backups and signed-card discovery. The channel is
@@ -52,7 +55,7 @@
  *   item_sent         {}
  *   pin_rotated       {pin_display,seconds_left,host_lan_ip}
  *   pin_cleared       {}
- *   directory_cards   {cards:[{name,public_key,npub,card}]}
+ *   directory_cards   {cards:[{name,short_name,suffix,public_key,npub,card}]}
  *   backup_found      {backup:null|{generation,self_card,peers:[...]}}
  *   backup_published  {generation}
  *   backup_check_failed   {message}
@@ -73,6 +76,7 @@ extern "C" {
 typedef struct DuocbHandle DuocbHandle;
 
 #define DUOCB_IDENTITY_BUF_LEN 128
+#define DUOCB_SUFFIX_BUF_LEN 16
 #define DUOCB_PUBLIC_KEY_BUF_LEN 128
 #define DUOCB_IDENTITY_CARD_BUF_LEN 4096
 #define DUOCB_IDENTITY_CARD_INFO_BUF_LEN 512
@@ -85,6 +89,8 @@ void duocb_init_logging(void);
  * -1 = NULL or invalid input. Validation: 1 = valid, 0 = invalid with a
  * message written to err_buf when supplied, -1 = NULL/non-UTF-8 input. */
 int duocb_generate_identity(char *out_buf, size_t out_len);
+/* Generate once and persist the permanent suffix appended to the short name. */
+int duocb_generate_suffix(char *out_buf, size_t out_len);
 int duocb_validate_identity(const char *private_key,
                             char *err_buf,
                             size_t err_len);
@@ -93,12 +99,13 @@ int duocb_identity_public_key(const char *private_key,
                               size_t out_len);
 int duocb_create_identity_card(const char *private_key,
                                const char *name,
+                               const char *suffix,
                                char *out_buf,
                                size_t out_len);
 int duocb_validate_identity_card(const char *card,
                                  char *err_buf,
                                  size_t err_len);
-/* Writes JSON: {"name":"…","public_key":"hex","npub":"npub1…"}. */
+/* Writes JSON with name, short_name, suffix, public_key, and npub. */
 int duocb_identity_card_info(const char *card,
                              char *out_buf,
                              size_t out_len);

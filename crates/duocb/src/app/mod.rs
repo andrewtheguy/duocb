@@ -42,6 +42,7 @@ pub(crate) struct App {
     // Configure-mode standing state (the primary mode).
     pub(crate) identity: Identity,
     pub(crate) saved_name: Option<String>,
+    pub(crate) device_suffix: String,
     pub(crate) self_card: Option<IdentityCard>,
     pub(crate) directory_channel: Option<DirectoryChannel>,
     pub(crate) backup_generation: u64,
@@ -148,10 +149,10 @@ mod recovery_offer_tests {
     #[test]
     fn found_backup_is_only_applied_after_explicit_restore() {
         let (mut app, path) = test_app();
-        let peer = Identity::generate().card("phone").unwrap();
+        let peer = Identity::generate().card("phone", "x9Y8z7W6").unwrap();
         let snapshot = duocb_core::nostr::BackupSnapshot::new(
             5,
-            app.identity.card("restored-name").unwrap(),
+            app.identity.card("restored-name", "a7B2c3D4").unwrap(),
             vec![peer.clone()],
         )
         .unwrap();
@@ -174,8 +175,38 @@ mod recovery_offer_tests {
 
         app.restore_offered_backup();
         assert_eq!(app.saved_name.as_deref(), Some("restored-name"));
+        assert_eq!(app.device_suffix, "a7B2c3D4");
+        assert_eq!(
+            app.self_card.as_ref().unwrap().name(),
+            "restored-name_a7B2c3D4"
+        );
         assert_eq!(app.peers, vec![peer]);
         assert!(!app.backup_publish_blocked);
+
+        app.net.shutdown();
+        drop(app);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}.lock", path.display()));
+    }
+
+    #[test]
+    fn signed_name_uses_permanent_suffix_and_identity_reset_keeps_it() {
+        let (mut app, path) = test_app();
+        let suffix = app.device_suffix.clone();
+        app.in_my_name = "desktop".into();
+
+        app.save_name();
+
+        assert_eq!(
+            app.self_card.as_ref().unwrap().name(),
+            duocb_core::identity::display_identity("desktop", &suffix)
+        );
+        let saved = app.config_lock.load().unwrap();
+        assert_eq!(saved.device_suffix, suffix);
+
+        app.reset_identity();
+        assert_eq!(app.device_suffix, suffix);
+        assert_eq!(app.config_lock.load().unwrap().device_suffix, suffix);
 
         app.net.shutdown();
         drop(app);
@@ -204,14 +235,21 @@ impl App {
     ) -> Self {
         let identity = Identity::parse_nsec(&config.identity_secret)
             .expect("ConfigLock::load validated the identity key");
+        let device_suffix = config.device_suffix.clone();
         let saved_name = config
             .my_name
             .filter(|n| duocb_core::identity::validate_name(n).is_ok());
+        let expected_card_name = saved_name
+            .as_deref()
+            .map(|name| duocb_core::identity::display_identity(name, &device_suffix));
         let self_card = config
             .self_card
             .as_deref()
             .and_then(|card| IdentityCard::parse(card).ok())
-            .filter(|card| card.public_key() == identity.public_key());
+            .filter(|card| {
+                card.public_key() == identity.public_key()
+                    && expected_card_name.as_deref() == Some(card.name())
+            });
         let peers: Vec<IdentityCard> = config
             .peers
             .iter()
@@ -238,6 +276,7 @@ impl App {
             error: None,
             identity,
             saved_name: saved_name.clone(),
+            device_suffix,
             self_card,
             directory_channel,
             backup_generation: config.backup_generation,
@@ -549,7 +588,10 @@ impl App {
     }
 
     pub(crate) fn display_identity(&self) -> String {
-        self.saved_name.clone().unwrap_or_default()
+        self.saved_name
+            .as_deref()
+            .map(|name| duocb_core::identity::display_identity(name, &self.device_suffix))
+            .unwrap_or_default()
     }
 
     pub(crate) fn has_saved_identity(&self) -> bool {
@@ -560,6 +602,7 @@ impl App {
         let cfg = crate::config::Config {
             version: crate::config::CONFIG_VERSION,
             identity_secret: self.identity.to_nsec(),
+            device_suffix: self.device_suffix.clone(),
             my_name: self.saved_name.clone(),
             self_card: self.self_card.as_ref().map(IdentityCard::encode),
             directory_channel: self.directory_channel.map(|channel| channel.encode()),
@@ -669,7 +712,7 @@ impl App {
         if duocb_core::identity::validate_name(&name).is_err() {
             return;
         }
-        let Ok(card) = self.identity.card(&name) else {
+        let Ok(card) = self.identity.card(&name, &self.device_suffix) else {
             return;
         };
         self.saved_name = Some(name);
@@ -873,8 +916,9 @@ impl App {
         if snapshot.self_card.public_key() != self.identity.public_key() {
             return;
         }
-        self.saved_name = Some(snapshot.self_card.name().to_string());
-        self.in_my_name = snapshot.self_card.name().to_string();
+        self.saved_name = Some(snapshot.self_card.short_name().to_string());
+        self.in_my_name = snapshot.self_card.short_name().to_string();
+        self.device_suffix = snapshot.self_card.suffix().to_string();
         self.self_card = Some(snapshot.self_card);
         self.peers = snapshot
             .peers

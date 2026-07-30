@@ -13,13 +13,13 @@ use nostr_sdk::prelude::secp256k1::Message;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::identity::validate_name;
+use crate::identity::{display_identity, split_display_identity, validate_name};
 
 pub const MAX_TRUSTED_PEERS: usize = 128;
 pub const MAX_CARD_SIZE: usize = 2 * 1024;
 pub const IDENTITY_CARD_KIND: u16 = 30382;
-const IDENTITY_CARD_DTAG: &str = "duocb:identity-card:v1";
-const IDENTITY_CARD_VERSION: u32 = 1;
+const IDENTITY_CARD_DTAG: &str = "duocb:identity-card:v2";
+const IDENTITY_CARD_VERSION: u32 = 2;
 const AUTH_SIGNATURE_DOMAIN: &[u8] = b"duocb:key-auth:v3\0";
 
 /// Persisted, application-level identity. Debug output never exposes the secret.
@@ -81,11 +81,13 @@ impl Identity {
         &self.keys
     }
 
-    pub fn card(&self, name: &str) -> Result<IdentityCard> {
+    pub fn card(&self, name: &str, suffix: &str) -> Result<IdentityCard> {
         validate_name(name)?;
+        let name = display_identity(name, suffix);
+        split_display_identity(&name)?;
         let content = serde_json::to_string(&CardContent {
             version: IDENTITY_CARD_VERSION,
-            name: name.to_string(),
+            name,
         })
         .context("serializing identity card")?;
         let event = EventBuilder::new(Kind::from_u16(IDENTITY_CARD_KIND), content)
@@ -156,7 +158,7 @@ impl IdentityCard {
                 content.version
             );
         }
-        validate_name(&content.name)?;
+        split_display_identity(&content.name)?;
         let card = Self {
             event,
             name: content.name,
@@ -182,6 +184,18 @@ impl IdentityCard {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub fn short_name(&self) -> &str {
+        split_display_identity(&self.name)
+            .expect("verified identity-card name remains valid")
+            .0
+    }
+
+    pub fn suffix(&self) -> &str {
+        split_display_identity(&self.name)
+            .expect("verified identity-card name remains valid")
+            .1
     }
 
     pub fn public_key(&self) -> PublicKey {
@@ -285,15 +299,20 @@ mod tests {
         assert_eq!(identity.public_key(), restored.public_key());
         assert_eq!(identity.to_npub(), restored.to_npub());
 
-        let card = identity.card("mac-book").unwrap();
+        let card = identity.card("mac-book", "a7B2c3D4").unwrap();
         let parsed = IdentityCard::parse(&card.encode()).unwrap();
-        assert_eq!(parsed.name(), "mac-book");
+        assert_eq!(parsed.name(), "mac-book_a7B2c3D4");
+        assert_eq!(parsed.short_name(), "mac-book");
+        assert_eq!(parsed.suffix(), "a7B2c3D4");
         assert_eq!(parsed.public_key(), identity.public_key());
     }
 
     #[test]
     fn card_tampering_is_rejected() {
-        let card = Identity::generate().card("desktop").unwrap().encode();
+        let card = Identity::generate()
+            .card("desktop", "a7B2c3D4")
+            .unwrap()
+            .encode();
         assert!(IdentityCard::parse(&card.replace("desktop", "laptop")).is_err());
     }
 
