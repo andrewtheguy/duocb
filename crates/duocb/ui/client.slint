@@ -91,6 +91,11 @@ component PreConnect inherits VerticalLayout {
                 color: Theme.warn;
                 font-size: Theme.font-body;
             }
+            if UiState.pin-not-local: Text {
+                text: "That PIN is not for local-only quick pairing";
+                color: Theme.warn;
+                font-size: Theme.font-body;
+            }
 
             // Optional host-IP entry, revealed only for a LAN-only PIN (kept
             // instantiated and collapsed to zero height otherwise).

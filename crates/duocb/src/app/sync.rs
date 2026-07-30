@@ -22,8 +22,6 @@ impl App {
         s.set_screen(self.screen);
         s.set_configure_step(self.configure_step);
         s.set_mode(self.mode);
-        s.set_pin_channel(self.pin_channel);
-        s.set_quick_advanced_open(self.quick_advanced_open());
         s.set_status_text(self.status_text().into());
         s.set_connected(self.status == ConnStatus::Connected);
         s.set_server_running(self.server_running);
@@ -182,7 +180,13 @@ impl App {
         } else {
             SharedString::default()
         });
-        s.set_pin_invalid(pin_full && duocb_core::pin::normalize_pin(&combined).is_none());
+        let canonical_pin = duocb_core::pin::normalize_pin(&combined);
+        s.set_pin_invalid(pin_full && canonical_pin.is_none());
+        s.set_pin_not_local(
+            canonical_pin
+                .as_deref()
+                .is_some_and(|pin| !duocb_core::pin::pin_is_lan_only(pin)),
+        );
         // Drives the joiner's auto-advance from the first group to the second.
         s.set_pin_a_full(
             duocb_core::pin::pin_input_len(&self.in_pin_a) == duocb_core::pin::PIN_GROUP_LEN,

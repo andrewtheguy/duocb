@@ -12,7 +12,7 @@ mod sync;
 use std::time::{Duration, Instant};
 
 use crate::clipboard::SystemClipboard;
-use crate::{ConfigureStep, PairMode, PinChannel, Screen};
+use crate::{ConfigureStep, PairMode, Screen};
 use duocb_core::net::endpoint::ConnPath;
 use duocb_core::net::{ConnStatus, NetEvent, NetHandle, TokenIdentity, UiCommand};
 use duocb_core::nostr::PeerInfo;
@@ -36,14 +36,6 @@ pub(crate) struct App {
     // Navigation.
     pub(crate) screen: Screen,
     pub(crate) mode: PairMode,
-    /// Which rendezvous transport(s) the PIN quick mode uses (both sides must
-    /// have overlapping channels; the default covers everything).
-    pub(crate) pin_channel: PinChannel,
-    /// Whether the user has expanded the quick screen's "Advanced options"
-    /// section. The section also shows whenever an advanced option is the
-    /// active selection (see `quick_advanced_open`), so a live choice is never
-    /// hidden regardless of this flag.
-    pub(crate) quick_advanced_expanded: bool,
 
     // Shared status.
     pub(crate) status: ConnStatus,
@@ -191,8 +183,6 @@ impl App {
             clipboard: SystemClipboard::new(),
             screen: Screen::Home,
             mode: PairMode::NostrToken,
-            pin_channel: PinChannel::Both,
-            quick_advanced_expanded: false,
             status: ConnStatus::Idle,
             error: startup_error,
             secret,
@@ -719,11 +709,8 @@ impl App {
         // Home implies configure mode; entering the quick screen picks its
         // default so the actions there never run configure mode.
         if self.mode == PairMode::NostrToken {
-            self.mode = PairMode::NostrPin;
+            self.mode = PairMode::Pin;
         }
-        // Start with the advanced options collapsed; they still reveal
-        // themselves if an advanced option is the active selection.
-        self.quick_advanced_expanded = false;
         // Detect this device's LAN subnet so a LAN-only join can lock the host
         // IP's network octets to it and reject an out-of-range address. Read
         // once on entry — a mid-session network change is rare and the field is
@@ -731,17 +718,10 @@ impl App {
         self.join_ip_ctx = duocb_core::subnet::JoinIpConstraint::detect();
     }
 
-    /// Select the PIN rendezvous channel (the quick screen's P/L/I rows); it
-    /// applies to both the host and join actions there.
-    pub(crate) fn set_pin_channel(&mut self, channel: PinChannel) {
-        self.mode = PairMode::NostrPin;
-        self.pin_channel = channel;
-    }
-
     /// Quick join: dial what the quick screen's join entry holds (the typed PIN,
-    /// plus an optional host IP for a LAN-only PIN) and move to the client
-    /// screen. A no-op while the entry doesn't validate (the Join action is
-    /// disabled then — see `dial-ready`).
+    /// plus an optional host IP) and move to the client screen. A no-op while
+    /// the entry isn't a valid local-only PIN (the Join action is disabled then
+    /// — see `dial-ready`).
     pub(crate) fn join_quick(&mut self) {
         if self.client_dial_spec().is_some() {
             self.connect_client();
@@ -749,27 +729,14 @@ impl App {
         }
     }
 
-    /// Whether the current quick-mode selection is one of the "uncommon"
-    /// (testing-leaning) options — currently only internet-only PIN discovery.
-    /// Used to keep the quick screen's uncommon section open while such an
-    /// option is active, so the live choice is never hidden.
-    pub(crate) fn quick_uncommon_selected(&self) -> bool {
-        self.mode == PairMode::NostrPin && self.pin_channel == PinChannel::NostrOnly
-    }
-
-    /// Whether the quick screen's uncommon section should render open.
-    pub(crate) fn quick_advanced_open(&self) -> bool {
-        self.quick_advanced_expanded || self.quick_uncommon_selected()
-    }
-
     /// Navigate back one screen, stopping any running session. Role screens
     /// return to where they launched from (the quick-options screen for the
-    /// quick modes, the home hub for configure mode); leaving the quick
+    /// quick mode, the home hub for configure mode); leaving the quick
     /// screen restores the home invariant (mode = configure).
     pub(crate) fn go_back(&mut self) {
         self.stop_session();
         self.screen = match (self.screen, self.mode) {
-            (Screen::Server | Screen::Client, PairMode::NostrPin) => Screen::Quick,
+            (Screen::Server | Screen::Client, PairMode::Pin) => Screen::Quick,
             _ => {
                 self.mode = PairMode::NostrToken;
                 Screen::Home
@@ -787,16 +754,6 @@ impl App {
         }
     }
 
-    /// The selected PIN channel as the core's enum.
-    fn core_pin_channel(&self) -> duocb_core::net::PinChannel {
-        use duocb_core::net::PinChannel as Core;
-        match self.pin_channel {
-            PinChannel::Both => Core::NostrAndLan,
-            PinChannel::NostrOnly => Core::NostrOnly,
-            PinChannel::LanOnly => Core::LanOnly,
-        }
-    }
-
     /// Build the server mode from the current state, if it validates.
     pub(crate) fn server_mode_spec(&self) -> Option<duocb_core::net::ServerMode> {
         use duocb_core::net::ServerMode;
@@ -804,17 +761,17 @@ impl App {
             PairMode::NostrToken => self
                 .token_identity()
                 .map(|identity| ServerMode::NostrToken { identity }),
-            PairMode::NostrPin => Some(ServerMode::Pin {
+            PairMode::Pin => Some(ServerMode::Pin {
                 relays: default_relays(),
-                channel: self.core_pin_channel(),
+                channel: duocb_core::net::PinChannel::LanOnly,
             }),
         }
     }
 
     /// Build the dial spec from the current state, if it validates. Configure
     /// mode dials exactly the peer selected in the device picker; the quick
-    /// modes join from what was *entered*, independent of the show-side channel
-    /// choice (see [`App::quick_dial_spec`]).
+    /// mode joins from the local-only PIN and optional host IP that were entered
+    /// (see [`App::quick_dial_spec`]).
     pub(crate) fn client_dial_spec(&self) -> Option<duocb_core::net::DialSpec> {
         use duocb_core::net::DialSpec;
         match self.mode {
@@ -822,7 +779,7 @@ impl App {
                 identity: self.token_identity()?,
                 peer_display: self.selected_peer_display()?,
             }),
-            PairMode::NostrPin => self.quick_dial_spec(),
+            PairMode::Pin => self.quick_dial_spec(),
         }
     }
 
@@ -833,43 +790,38 @@ impl App {
         self.join_ip_ctx.resolve(&self.in_join_ip)
     }
 
-    /// The quick-join dial spec, derived purely from the join entry — never from
-    /// the show-side P/L/I choice. The typed PIN's first character selects the
-    /// channel (see `duocb_core::pin`); for a LAN-only PIN the optional host-IP
-    /// entry, resolved and range-checked against this device's own subnet (see
-    /// [`App::join_ip_ctx`]), selects the unicast side channel (blank resolves
-    /// via mDNS). `None` when the PIN is incomplete/invalid, or the typed host IP
-    /// is malformed or out of range — which is what keeps the Join button
-    /// disabled.
+    /// The local-only quick-join dial spec, derived from the join entry. The
+    /// PIN's first character must mark the LAN-only channel; internet-capable
+    /// quick PINs are rejected. The optional host-IP entry, resolved and
+    /// range-checked against this device's own subnet (see [`App::join_ip_ctx`]),
+    /// selects the unicast side channel (blank resolves via mDNS). `None` when
+    /// the PIN is incomplete, invalid, or non-local, or when the typed host IP
+    /// is malformed or out of range — which keeps the Join button disabled.
     fn quick_dial_spec(&self) -> Option<duocb_core::net::DialSpec> {
-        use duocb_core::net::{DialSpec, PinChannel as Core};
+        use duocb_core::net::{DialSpec, PinChannel};
         use duocb_core::subnet::JoinIpOutcome;
         let canonical_pin =
             duocb_core::pin::normalize_pin(&format!("{}{}", self.in_pin_a, self.in_pin_b))?;
-        let lan_only = duocb_core::pin::pin_is_lan_only(&canonical_pin);
-        let channel = if lan_only { Core::LanOnly } else { Core::NostrAndLan };
-        // The host-IP field only applies to a LAN-only PIN. Blank means mDNS; an
-        // in-range address selects the side channel; anything malformed or out of
-        // range yields `None` so Join stays disabled.
-        let target_ip = if lan_only {
-            match self.join_ip_outcome() {
-                JoinIpOutcome::Empty => None,
-                JoinIpOutcome::InRange(ip) => Some(std::net::IpAddr::V4(ip)),
-                JoinIpOutcome::OutOfRange | JoinIpOutcome::Malformed => return None,
-            }
-        } else {
-            None
+        if !duocb_core::pin::pin_is_lan_only(&canonical_pin) {
+            return None;
+        }
+        // Blank means mDNS; an in-range address selects the side channel;
+        // anything malformed or out of range yields `None`.
+        let target_ip = match self.join_ip_outcome() {
+            JoinIpOutcome::Empty => None,
+            JoinIpOutcome::InRange(ip) => Some(std::net::IpAddr::V4(ip)),
+            JoinIpOutcome::OutOfRange | JoinIpOutcome::Malformed => return None,
         };
         Some(DialSpec::Pin {
             canonical_pin,
             relays: default_relays(),
-            channel,
+            channel: PinChannel::LanOnly,
             target_ip,
         })
     }
 
     /// Go to the start screen and launch. Every mode starts immediately: the
-    /// configure mode's identity lives on the home hub, and the quick modes
+    /// configure mode's identity lives on the home hub, and the quick mode
     /// never had a pre-start form.
     pub(crate) fn begin_server(&mut self) {
         if self.server_mode_spec().is_none() {
@@ -1155,7 +1107,7 @@ pub(crate) mod tests {
     #[test]
     fn quick_mode_never_wakes_presence() {
         let (mut app, mut cmd_rx) = app_with_cmd_spy();
-        app.open_quick(); // mode → NostrPin
+        app.open_quick(); // mode → Pin
         app.begin_server(); // quick host under a PIN
         assert!(!app.presence_active);
         assert!(
@@ -1170,10 +1122,10 @@ pub(crate) mod tests {
     fn go_back_routes_by_mode_and_stops_picker() {
         let mut app = test_app();
         app.screen = Screen::Server;
-        app.mode = PairMode::NostrPin;
+        app.mode = PairMode::Pin;
         app.go_back();
         assert_eq!(app.screen, Screen::Quick);
-        assert_eq!(app.mode, PairMode::NostrPin);
+        assert_eq!(app.mode, PairMode::Pin);
 
         app.screen = Screen::Client;
         app.mode = PairMode::NostrToken;
@@ -1183,7 +1135,7 @@ pub(crate) mod tests {
         assert_eq!(app.configure_step, ConfigureStep::Ready);
 
         app.screen = Screen::Quick;
-        app.mode = PairMode::NostrPin;
+        app.mode = PairMode::Pin;
         app.go_back();
         assert_eq!(app.screen, Screen::Home);
         assert_eq!(app.mode, PairMode::NostrToken);
@@ -1211,10 +1163,9 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn host_spec_uses_the_selected_channel() {
+    fn quick_host_is_always_lan_only() {
         let mut app = test_app();
-        app.mode = PairMode::NostrPin;
-        app.pin_channel = PinChannel::LanOnly;
+        app.mode = PairMode::Pin;
         match app.server_mode_spec() {
             Some(duocb_core::net::ServerMode::Pin { channel, .. }) => {
                 assert_eq!(channel, duocb_core::net::PinChannel::LanOnly);
@@ -1224,34 +1175,34 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn join_spec_infers_the_channel_from_the_pin() {
-        use duocb_core::net::PinChannel as Core;
+    fn quick_join_accepts_only_lan_only_pins() {
+        use duocb_core::net::{DialSpec, PinChannel};
         let g = duocb_core::pin::PIN_GROUP_LEN;
-        // The typed PIN — not the on-screen channel selection — decides the join
-        // channel. A LAN-only PIN dials LAN-only even when a nostr channel is
-        // selected, and vice versa.
-        for (lan_only, selected, expected) in [
-            (true, PinChannel::NostrOnly, Core::LanOnly),
-            (false, PinChannel::LanOnly, Core::NostrAndLan),
-        ] {
-            let mut app = test_app();
-            app.mode = PairMode::NostrPin;
-            app.pin_channel = selected;
-            let canonical = duocb_core::pin::generate_pin(lan_only);
-            app.in_pin_a = canonical[..g].to_string();
-            app.in_pin_b = canonical[g..].to_string();
-            match app.client_dial_spec() {
-                Some(duocb_core::net::DialSpec::Pin {
-                    channel,
-                    canonical_pin,
-                    ..
-                }) => {
-                    assert_eq!(channel, expected);
-                    assert_eq!(canonical_pin, canonical);
-                }
-                other => panic!("unexpected dial spec: {other:?}"),
+        let mut app = test_app();
+        app.mode = PairMode::Pin;
+
+        let local_pin = duocb_core::pin::generate_pin(true);
+        app.in_pin_a = local_pin[..g].to_string();
+        app.in_pin_b = local_pin[g..].to_string();
+        match app.client_dial_spec() {
+            Some(DialSpec::Pin {
+                channel,
+                canonical_pin,
+                ..
+            }) => {
+                assert_eq!(channel, PinChannel::LanOnly);
+                assert_eq!(canonical_pin, local_pin);
             }
+            other => panic!("unexpected dial spec: {other:?}"),
         }
+
+        let internet_pin = duocb_core::pin::generate_pin(false);
+        app.in_pin_a = internet_pin[..g].to_string();
+        app.in_pin_b = internet_pin[g..].to_string();
+        assert!(
+            app.client_dial_spec().is_none(),
+            "internet-capable PINs are not accepted by local-only quick pairing"
+        );
     }
 
     #[test]
@@ -1259,7 +1210,7 @@ pub(crate) mod tests {
         use duocb_core::net::{DialSpec, PinChannel as Core};
         let g = duocb_core::pin::PIN_GROUP_LEN;
         let mut app = test_app();
-        app.mode = PairMode::NostrPin;
+        app.mode = PairMode::Pin;
         let lan_pin = duocb_core::pin::generate_pin(true);
         app.in_pin_a = lan_pin[..g].to_string();
         app.in_pin_b = lan_pin[g..].to_string();
@@ -1286,18 +1237,12 @@ pub(crate) mod tests {
         app.in_join_ip = "not-an-ip".to_string();
         assert!(app.client_dial_spec().is_none());
 
-        // The IP is ignored for a non-LAN-only PIN (the field is hidden then),
-        // so a stale value never blocks the dial.
+        // An internet-capable PIN is rejected even if a valid local-only PIN
+        // was entered before it.
         let net_pin = duocb_core::pin::generate_pin(false);
         app.in_pin_a = net_pin[..g].to_string();
         app.in_pin_b = net_pin[g..].to_string();
-        match app.client_dial_spec() {
-            Some(DialSpec::Pin { channel, target_ip, .. }) => {
-                assert_eq!(channel, Core::NostrAndLan);
-                assert!(target_ip.is_none());
-            }
-            other => panic!("unexpected dial spec: {other:?}"),
-        }
+        assert!(app.client_dial_spec().is_none());
     }
 
     #[test]

@@ -1,31 +1,11 @@
-// The quick-options screen: options first — the P/L channel choice, then the
-// testing-only extra (internet-only) collapsed behind Advanced — followed by
-// the selected mode's host and join actions, both acting right here. Selecting
-// an option retargets the two action cards; nothing here is persisted, and the
+// The local-only quick-pair screen. Hosting advertises over Bonjour/DNS-SD and
+// joining accepts only a LAN-only PIN. Nothing here is persisted, and the
 // credentials last one session.
 
 import { UiState, Actions } from "globals.slint";
-import { PairMode, PinChannel } from "types.slint";
 import { Theme } from "theme.slint";
-import { Card, CardTitle, Weak, Small, Body, Mono, BigButton, WideButton, BackHeader, SelectableRow } from "widgets.slint";
+import { Card, CardTitle, Weak, Small, Mono, BigButton, WideButton, BackHeader } from "widgets.slint";
 import { LineEdit, ScrollView } from "std-widgets.slint";
-
-component ModeRow inherits SelectableRow {
-    in property <string> text;
-    /// Renders the row de-emphasized (the testing-only options).
-    in property <bool> demoted;
-    opacity: root.demoted && !root.selected ? Theme.weak-opacity : 1.0;
-    Text {
-        text: root.selected ? "●" : "○";
-        font-size: Theme.font-body;
-        vertical-alignment: center;
-    }
-    Body {
-        text: root.text;
-        horizontal-stretch: 1;
-        vertical-alignment: center;
-    }
-}
 
 export component QuickScreen inherits ScrollView {
     out property <bool> field-focused:
@@ -41,56 +21,13 @@ export component QuickScreen inherits ScrollView {
 
         BackHeader { title: "Quick options"; }
         Weak {
-            text: "Pair on the spot — nothing is saved, and the credentials last one session.";
+            text: "Pair on the local network — nothing is saved, and the credentials last one session.";
         }
 
-        // The P/L channel choice for the PIN you show. The joiner doesn't pick a
-        // channel — it reads it from the PIN's first character.
         Card {
-            CardTitle { text: "How the devices find each other (when showing a PIN)"; }
-            ModeRow {
-                text: "P  Internet + local network (default)";
-                selected: UiState.mode == PairMode.nostr-pin && UiState.pin-channel == PinChannel.both;
-                clicked => { Actions.set-pin-channel(PinChannel.both); }
-            }
+            CardTitle { text: "Local network only"; }
             Small {
-                text: "Finds the other device over the internet (a nostr relay) and your local network at the same time, so it pairs whether or not you share a network — the everyday choice.";
-            }
-            ModeRow {
-                text: "L  Local network only — private";
-                selected: UiState.mode == PairMode.nostr-pin && UiState.pin-channel == PinChannel.lan-only;
-                clicked => { Actions.set-pin-channel(PinChannel.lan-only); }
-            }
-            Small {
-                text: "Private means no third-party server participates: discovery is a Bonjour (DNS-SD) service on the local network only and traffic is always direct between the devices, never relayed. Pairs with the iOS app's \"Local network only\" channel. If multicast is blocked, the joiner can instead type the host's IP (shown on this device when hosting). LAN-only is not a packet-level subnet boundary; reflected mDNS, a VPN/overlay, or globally routed addresses can extend the direct path beyond a conventional LAN. The PIN shown here encodes this choice, so the joiner just types it — no need to pick a channel on both devices.";
-            }
-        }
-
-        // Advanced options, mostly for testing — collapsed behind a disclosure
-        // until expanded (or until one of them is the active selection).
-        Card {
-            SelectableRow {
-                clicked => { Actions.toggle-quick-advanced(); }
-                Text {
-                    text: UiState.quick-advanced-open ? "▾" : "▸";
-                    width: Theme.font-heading;
-                    font-size: Theme.font-heading;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
-                }
-                CardTitle { text: "Advanced options"; vertical-alignment: center; }
-            }
-            if UiState.quick-advanced-open: Small {
-                text: "Mostly for testing — the options above cover everyday pairing.";
-            }
-            if UiState.quick-advanced-open: ModeRow {
-                demoted: true;
-                text: "I  Internet only";
-                selected: UiState.mode == PairMode.nostr-pin && UiState.pin-channel == PinChannel.nostr-only;
-                clicked => { Actions.set-pin-channel(PinChannel.nostr-only); }
-            }
-            if UiState.quick-advanced-open: Small {
-                text: "Finds the peer through a nostr relay only — its PIN is never advertised on the local network — so pairing needs the internet. The connection itself still uses iroh's default paths, so it can take a direct local route when both devices share a network.";
+                text: "No third-party server participates: discovery uses Bonjour (DNS-SD) and traffic stays direct between the devices. If multicast is blocked, the joiner can type the host's IP shown while hosting. This is a discovery policy, not a packet-level subnet boundary; reflected mDNS, a VPN/overlay, or globally routed addresses can extend the direct path beyond a conventional LAN.";
             }
         }
 
@@ -106,10 +43,9 @@ export component QuickScreen inherits ScrollView {
             }
         }
 
-        // Joining is independent of the choices above: type the PIN shown on the
-        // other device. The channel is read from the PIN's first character, never
-        // picked. For a LAN-only PIN an optional host-IP field appears — fill it
-        // only when automatic discovery (mDNS) is blocked on the network.
+        // Type the local-only PIN shown on the other device. An optional host-IP
+        // field appears once the PIN is valid — fill it only when automatic
+        // discovery (mDNS) is blocked on the network.
         Card {
             CardTitle { text: "Enter a PIN"; }
 
@@ -166,9 +102,14 @@ export component QuickScreen inherits ScrollView {
                     color: Theme.warn;
                     font-size: Theme.font-body;
                 }
+                if UiState.pin-not-local: Text {
+                    text: "That PIN is not for local-only quick pairing";
+                    color: Theme.warn;
+                    font-size: Theme.font-body;
+                }
             }
 
-            // Optional host-IP entry, revealed only for a LAN-only PIN. Kept
+            // Optional host-IP entry, revealed for a valid local-only PIN. Kept
             // instantiated (so `ip-entry` can report focus for shortcut gating)
             // and collapsed to zero height when hidden.
             ip-wrap := Rectangle {
