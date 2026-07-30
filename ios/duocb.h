@@ -158,8 +158,9 @@ int duocb_generate_suffix(char *out_buf, size_t out_len);
  * Surrounding/embedded whitespace is ignored, so a line-wrapped paste is fine. */
 int duocb_validate_secret(const char *secret, char *err_buf, size_t err_len);
 
-/* Display fingerprint ("xxxx-xxxx-xxxx-xxxx") of a valid secret; it covers the
- * whole secret, so matching fingerprints on two devices mean matching secrets.
+/* Display fingerprint ("XXXX-XXXX-XXXX-XXXX", uppercase hex) of a valid secret;
+ * it covers the whole secret, so matching fingerprints on two devices mean
+ * matching secrets.
  * 1 = written, 0 = buffer too small, -1 = NULL argument or invalid secret. */
 int duocb_secret_fingerprint(const char *secret, char *out_buf, size_t out_len);
 

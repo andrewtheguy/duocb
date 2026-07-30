@@ -235,7 +235,8 @@ pub unsafe extern "C" fn duocb_validate_secret(
     }
 }
 
-/// Write the secret's display fingerprint (`xxxx-xxxx-xxxx-xxxx`) to `out_buf`.
+/// Write the secret's display fingerprint (`XXXX-XXXX-XXXX-XXXX`, uppercase hex)
+/// to `out_buf`.
 /// Returns 1 on success, 0 if the buffer is too small, -1 on NULL/non-UTF-8
 /// input or an invalid secret.
 /// # Safety
