@@ -1,9 +1,6 @@
 [workspace]
 members = ["crates/*"]
 resolver = "3"
-# Bare `cargo build` skips the iOS staticlib (built via build-ios.sh with
-# `-p duocb-ffi`); `--workspace` still covers all crates for clippy/test.
-default-members = ["crates/duocb-core", "crates/duocb"]
 
 [workspace.package]
 version = "0.0.31"
@@ -30,16 +27,13 @@ arboard = "3.6.1"
 iroh = "1.0.2"
 iroh-mdns-address-lookup = "0.4.0"
 # Also the engine under iroh-mdns-address-lookup; kept on the same version so
-# the two mDNS responders share one stack. Desktop-only (in-process multicast
-# needs the restricted entitlement on iOS).
+# the two mDNS responders share one stack.
 swarm-discovery = "0.6.3"
-# Spec-compliant DNS-SD for the LAN-only PIN channel: interoperates with the
-# Bonjour advertisement an iOS host registers through the system daemon.
-# Desktop-only; iOS talks to mDNSResponder via dns_sd.h instead.
+# Spec-compliant DNS-SD for the LAN-only PIN channel: interoperates with other
+# Bonjour implementations on the network.
 mdns-sd = "0.20.1"
 # Local network-interface enumeration (address + netmask) for constraining the
-# LAN-only joiner's typed host IP to its own subnet. Already in the tree via
-# iroh, so it builds on every target we ship (desktop and iOS).
+# LAN-only joiner's typed host IP to its own subnet.
 netdev = "0.45"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 futures = "0.3"
@@ -71,5 +65,5 @@ jiff = "0.2"
 strip = true
 lto = "thin"
 codegen-units = 1
-# The FFI staticlib must never unwind into Swift; applies workspace-wide.
+# Drops the unwinding tables and landing pads: smaller binary, less codegen.
 panic = "abort"

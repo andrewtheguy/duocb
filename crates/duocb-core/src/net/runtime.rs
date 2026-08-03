@@ -405,8 +405,7 @@ async fn stop_session(session: &mut Option<Session>) {
         // A graceful teardown (closing the endpoint, notifying the peer)
         // normally finishes in well under a second. Bound the wait so a
         // stalled close can never wedge this command loop — every queued UI
-        // command (and the iOS FFI's stop, which blocks on shutdown) sits
-        // behind this await.
+        // command sits behind this await.
         let mut handle = s.handle;
         if tokio::time::timeout(Duration::from_secs(3), &mut handle)
             .await
@@ -1168,10 +1167,8 @@ fn pin_channel_readiness(channel: PinChannel) -> EndpointReadiness {
 /// hit wins.
 ///
 /// The result is a full dial target: on the LAN-only channel both the DNS-SD
-/// and unicast records carry the host's direct addresses and they ride along
-/// (the only dialable path against an iOS host, which runs no iroh mDNS
-/// responder); the other channels return a bare node id for iroh's discovery to
-/// resolve.
+/// and unicast records carry the host's direct addresses and they ride along;
+/// the other channels return a bare node id for iroh's discovery to resolve.
 ///
 /// `target_ip` (LAN-only only): `Some(ip)` fetches the record from the host's
 /// unicast side channel at that IP — the manual-IP path that works where
@@ -1389,9 +1386,8 @@ async fn run_pin_publisher(
                     }
                     // On the LAN-only channel the advertisement IS the
                     // rendezvous — a shown PIN nobody can resolve must fail
-                    // loudly (e.g. iOS denying the registration until Local
-                    // Network permission is granted). The default channel
-                    // still has nostr carrying the record, so a warn will do.
+                    // loudly. The default channel still has nostr carrying the
+                    // record, so a warn will do.
                     Err(e) if matches!(channel, PinChannel::LanOnly) => {
                         events.error(format!(
                             "Could not publish the PIN on the local network: {e:#}"

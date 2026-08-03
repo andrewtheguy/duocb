@@ -11,22 +11,13 @@
 //!   half of the default nostr+LAN channel. swarm-discovery, the same engine
 //!   iroh's mDNS address lookup runs on (same version, socket options with
 //!   SO_REUSEADDR/SO_REUSEPORT), so this responder coexists with the one every
-//!   desktop endpoint already runs. Its packets are mDNS-*like* but not DNS-SD
-//!   conformant (no PTR records), so only swarm peers see each other. Desktop
-//!   only: in-process multicast on iOS needs the restricted multicast
-//!   entitlement, so there these calls are inert and the channel's nostr half
-//!   carries the rendezvous.
+//!   endpoint already runs. Its packets are mDNS-*like* but not DNS-SD
+//!   conformant (no PTR records), so only swarm peers see each other.
 //! - **dnssd** ([`dnssd_advertise_pin_record`] / [`dnssd_lookup_pin_record`])
-//!   — the LAN-only channel. Spec-compliant DNS-SD (RFC 6762/6763): the
-//!   mdns-sd responder on desktop, and on iOS the system mDNSResponder daemon
-//!   via `dns_sd.h` (`DNSServiceRegister`/`DNSServiceResolve`), which is
-//!   exempt from the multicast entitlement — the daemon performs the multicast;
-//!   the app only needs the `NSBonjourServices` (`_duocb-pin._udp`) and
-//!   `NSLocalNetworkUsageDescription` Info.plist keys and the user accepting
-//!   the Local Network prompt. DNS-SD records carry real SRV/A/AAAA data, so
-//!   the lookup returns the host's direct socket addresses ([`PinFound`]) and
-//!   the joiner dials them explicitly — required because an iOS host runs no
-//!   iroh mDNS responder for a bare node id to resolve against.
+//!   — the LAN-only channel. Spec-compliant DNS-SD (RFC 6762/6763) via the
+//!   mdns-sd responder, so it interoperates with Bonjour. DNS-SD records carry
+//!   real SRV/A/AAAA data, so the lookup returns the host's direct socket
+//!   addresses ([`PinFound`]) and the joiner dials them explicitly.
 //!
 //! The two backends do not see each other on the wire: a LAN-only host is
 //! found by a LAN-only joiner, and the default channel's LAN race only finds
@@ -36,7 +27,6 @@
 //! packet-level on-link subnet filter.
 
 mod dnssd;
-#[cfg(not(target_os = "ios"))]
 mod swarm;
 mod unicast;
 
@@ -51,11 +41,8 @@ use sha2::{Digest, Sha256};
 pub use unicast::UnicastListener;
 
 /// mDNS service name; swarm records live under `_duocb-pin._udp.local.`.
-#[cfg(not(target_os = "ios"))]
 const PIN_SERVICE_NAME: &str = "duocb-pin";
-/// The same service as a full DNS-SD type domain (desktop dnssd backend; the
-/// iOS backend passes the regtype and domain separately — see `dnssd::ios`).
-#[cfg(not(target_os = "ios"))]
+/// The same service as a full DNS-SD type domain (dnssd backend).
 const DNSSD_SERVICE_TYPE: &str = "_duocb-pin._udp.local.";
 /// TXT attribute key carrying the encrypted record content.
 const TXT_KEY: &str = "e";
@@ -127,14 +114,10 @@ pub struct PinAdvert(#[expect(dead_code, reason = "held for Drop")] AdvertKind);
 
 #[expect(dead_code, reason = "variants held for Drop")]
 enum AdvertKind {
-    /// swarm-discovery responder guard (default channel, desktop).
-    #[cfg(not(target_os = "ios"))]
+    /// swarm-discovery responder guard (default channel).
     Swarm(swarm_discovery::DropGuard),
-    /// DNS-SD registration (LAN-only channel, both platforms).
+    /// DNS-SD registration (LAN-only channel).
     Dnssd(dnssd::Advert),
-    /// iOS default channel: the LAN half is skipped (see module docs).
-    #[cfg(target_os = "ios")]
-    Inert,
 }
 
 /// Advertise the PIN rendezvous record on the default channel's swarm backend:
@@ -142,25 +125,12 @@ enum AdvertKind {
 /// `(pin, bucket)`-derived keypair). `addrs` should be the endpoint's direct
 /// socket addresses (advisory on this backend — the dial resolves the node id
 /// via iroh's own mDNS lookup). Must be called within a tokio runtime.
-///
-/// On iOS this is a no-op returning an inert guard: the in-process responder
-/// would need the restricted multicast entitlement, and the default channel's
-/// nostr half carries the rendezvous there.
 pub fn advertise_pin_record(
     keys: &Keys,
     node_id: &EndpointId,
     addrs: &[SocketAddr],
 ) -> Result<PinAdvert> {
-    #[cfg(not(target_os = "ios"))]
-    {
-        swarm::advertise(keys, node_id, addrs).map(|g| PinAdvert(AdvertKind::Swarm(g)))
-    }
-    #[cfg(target_os = "ios")]
-    {
-        let _ = (keys, node_id, addrs);
-        log::debug!("iOS: skipping swarm mDNS PIN advertisement (nostr carries the rendezvous)");
-        Ok(PinAdvert(AdvertKind::Inert))
-    }
+    swarm::advertise(keys, node_id, addrs).map(|g| PinAdvert(AdvertKind::Swarm(g)))
 }
 
 /// Look up the PIN rendezvous record on the default channel's swarm backend,
@@ -170,31 +140,14 @@ pub fn advertise_pin_record(
 /// (wrong/expired PIN, or the two devices are not on the same network). The
 /// connection is then authenticated in-band with the same PIN
 /// (`crate::pin_auth`).
-///
-/// On iOS this resolves to `Ok(None)` immediately (see module docs); the
-/// racing nostr lookup decides the outcome there.
 pub async fn lookup_pin_record(candidates: &[Keys]) -> Result<Option<EndpointId>> {
-    #[cfg(not(target_os = "ios"))]
-    {
-        swarm::lookup(candidates).await
-    }
-    #[cfg(target_os = "ios")]
-    {
-        let _ = candidates;
-        Ok(None)
-    }
+    swarm::lookup(candidates).await
 }
 
 /// Advertise the PIN rendezvous record for the LAN-only channel as a
 /// spec-compliant DNS-SD service instance. Unlike the swarm backend the
 /// advertised SRV/A/AAAA data is load-bearing: the joiner dials the resolved
 /// addresses directly. `addrs` must hold at least one direct socket address.
-///
-/// On iOS this waits for the system daemon's registration verdict: iOS gates
-/// advertising behind the Local Network permission and only reports a denial
-/// asynchronously. A denial fails the advertisement (after nudging the system
-/// permission prompt, which registrations alone never trigger) — the caller
-/// should surface the error, and the next PIN rotation retries.
 pub async fn dnssd_advertise_pin_record(
     keys: &Keys,
     node_id: &EndpointId,

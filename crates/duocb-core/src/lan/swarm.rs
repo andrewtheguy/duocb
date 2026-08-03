@@ -1,7 +1,6 @@
 //! swarm-discovery backend for the default (nostr+LAN) channel's PIN
 //! rendezvous — see the module docs in `super` for how it relates to the
-//! DNS-SD backend. Desktop-only: this responder opens its own multicast
-//! sockets, which iOS gates behind the restricted multicast entitlement.
+//! DNS-SD backend. This responder opens its own multicast sockets.
 //!
 //! The record appears as `<instance>._duocb-pin._udp.local.` with the
 //! ciphertext in a TXT attribute. The advertised port/addresses are advisory:

@@ -1889,7 +1889,6 @@ dependencies = [
  "futures",
  "iroh",
  "iroh-mdns-address-lookup",
- "libc",
  "log",
  "mdns-sd",
  "netdev",
@@ -1904,18 +1903,6 @@ dependencies = [
  "swarm-discovery",
  "tokio",
  "tokio-util",
-]
-
-[[package]]
-name = "duocb-ffi"
-version = "0.0.31"
-dependencies = [
- "duocb-core",
- "env_logger",
- "log",
- "serde",
- "serde_json",
- "tokio",
 ]
 
 [[package]]

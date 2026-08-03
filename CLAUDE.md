@@ -7,12 +7,8 @@
 
 - `crates/duocb-core` — portable core (persistent per-installation application identity and signed cards in `auth.rs`, mutual key wire authentication, pairwise Nostr signaling, encrypted directory backups, quick PIN support, and the headless tokio net runtime). Application identities, optional directory channels, and ephemeral iroh transport keys are separate. No GUI/clipboard/config-file deps.
 - `crates/duocb` — desktop Slint app (binary `duocb`); owns config.rs, clipboard.rs, src/app/ (state + logic), and ui/*.slint (markup, compiled by build.rs; fluent style, Skia renderer, per-platform fonts set in main.rs).
-- `crates/duocb-ffi` — iOS staticlib (`libduocb.a`, application-key configure mode + PIN quick pair with a selectable `channel`: `nostr_lan` default or `lan`; this quick transport field is unrelated to `directory_channel`). LAN is served on iOS by the system Bonjour daemon via dns_sd.h, with no multicast entitlement. The hand-written C header at `ios/duocb.h` must stay in sync.
 - Version bumps: edit the single `[workspace.package] version` in the root Cargo.toml.
-
-## iOS
-
-`./build-ios.sh [debug]` builds device + simulator slices of `duocb-ffi` and stages `dist/ios/libduocb.xcframework` + `duocb.h`. The sibling app repo `../duocb-ios` consumes the pinned GitHub release zip (`libduocb-ios.xcframework.zip`, produced by the release workflow) by default; for local FFI dev set `DUOCB_LOCAL_XCFRAMEWORK=1` there (both for `xcodegen generate` and `xcodebuild`) to use this repo's `dist/ios` build through a committed symlink.
+- Desktop-only. iOS support (the `duocb-ffi` staticlib, `ios/duocb.h`, `build-ios.sh`, and the release workflow's xcframework job) was removed while the core is being refactored; do not re-add it or reintroduce `target_os = "ios"` branches.
 
 ## Config-based E2E tests on the same device
 

@@ -158,5 +158,4 @@ persisted.
 - A server links one peer at a time. Configure mode pins the stable application
   identity while allowing its later iroh transport id to change.
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for protocol details and
-[ios/duocb.h](ios/duocb.h) for the strict iOS FFI.
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for protocol details.

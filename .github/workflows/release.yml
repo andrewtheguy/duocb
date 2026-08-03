@@ -189,30 +189,9 @@ jobs:
           name: release-windows-amd64
           path: target/release/duocb-windows-amd64.msi
 
-  build-ios:
-    needs: setup
-    runs-on: macos-latest
-
-    steps:
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Build iOS xcframework + header
-        run: ./build-ios.sh release
-
-      - name: Package xcframework + header
-        run: |
-          cd dist/ios
-          zip -r libduocb-ios.xcframework.zip libduocb.xcframework duocb.h
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: release-ios
-          path: dist/ios/libduocb-ios.xcframework.zip
-
   publish-release:
-    needs: [setup, build-linux, build-macos, build-ios, build-windows]
-    if: always() && needs.setup.result == 'success' && needs.build-linux.result == 'success' && needs.build-macos.result == 'success' && needs.build-ios.result == 'success' && (needs.build-windows.result == 'success' || needs.build-windows.result == 'skipped')
+    needs: [setup, build-linux, build-macos, build-windows]
+    if: always() && needs.setup.result == 'success' && needs.build-linux.result == 'success' && needs.build-macos.result == 'success' && (needs.build-windows.result == 'success' || needs.build-windows.result == 'skipped')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
