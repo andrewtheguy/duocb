@@ -31,7 +31,8 @@
 //! Because the PIN is short (~35 bits) and the encrypted record sits on public relays,
 //! the key derivation is deliberately slow and memory-hard (**Argon2id**): a captured
 //! record resists offline brute-force, and the 60-second rotation plus a short record TTL
-//! bound the exposure window.
+//! bound the exposure window. Test builds stretch with the Argon2id minimum instead — see
+//! [`WORK_FACTORS`].
 //!
 //! Two independent keys are derived from a PIN, both with the same Argon2id work factor but
 //! **domain-separated** salts (see [`derive_key_material`] and [`derive_auth_key_material`]):
@@ -78,6 +79,21 @@ const ARGON2_MEM_KIB: u32 = 64 * 1024;
 const ARGON2_TIME: u32 = 3;
 /// Argon2id parallelism.
 const ARGON2_LANES: u32 = 1;
+
+/// The `(memory KiB, passes, lanes)` [`argon2_key`] actually runs with: the
+/// hardened constants above in every shipped build.
+#[cfg(not(test))]
+const WORK_FACTORS: (u32, u32, u32) = (ARGON2_MEM_KIB, ARGON2_TIME, ARGON2_LANES);
+/// Under `cargo test` the stretch is deliberately reduced to the Argon2id
+/// minimum (8 KiB, 1 pass). No test asserts the *cost* of the KDF — they assert
+/// that two peers derive the same key from the same `(pin, bucket)` and
+/// different keys otherwise, which holds at any work factor. At the real cost
+/// every `pin_record::candidate_keys` call is three ~2.5s derivations in an
+/// unoptimized test binary, which dominated the suite's runtime.
+/// [`tests::shipped_work_factors_stay_hardened`] keeps the real numbers under
+/// test so this override cannot quietly weaken them.
+#[cfg(test)]
+const WORK_FACTORS: (u32, u32, u32) = (Params::MIN_M_COST, Params::MIN_T_COST, ARGON2_LANES);
 
 /// Domain-separating salt prefix for the PIN *rendezvous* key derivation; the time bucket
 /// is appended so each rotation derives an independent nostr key (see [`derive_key_material`]).
@@ -239,9 +255,11 @@ pub fn current_bucket() -> u64 {
 }
 
 /// Run the shared Argon2id KDF over `canonical_pin` with the given `salt`, producing 32 bytes.
-/// Both key derivations below use identical work factors and differ only in their salt.
+/// Both key derivations below use identical work factors ([`WORK_FACTORS`]) and differ only in
+/// their salt.
 fn argon2_key(canonical_pin: &str, salt: &[u8]) -> Result<[u8; 32]> {
-    let params = Params::new(ARGON2_MEM_KIB, ARGON2_TIME, ARGON2_LANES, Some(32))
+    let (mem_kib, time, lanes) = WORK_FACTORS;
+    let params = Params::new(mem_kib, time, lanes, Some(32))
         .map_err(|e| anyhow::anyhow!("invalid argon2 params: {e}"))?;
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
 
@@ -275,6 +293,18 @@ pub fn derive_auth_key_material(canonical_pin: &str) -> Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shipped work factors are compiled out of this binary (see
+    /// [`WORK_FACTORS`]), so pin them here: a weakening of the real KDF must
+    /// not be able to hide behind the test-only override.
+    #[test]
+    fn shipped_work_factors_stay_hardened() {
+        assert_eq!(ARGON2_MEM_KIB, 64 * 1024, "64 MiB of memory hardness");
+        assert_eq!(ARGON2_TIME, 3, "3 Argon2id passes");
+        assert_eq!(ARGON2_LANES, 1);
+        // And this binary really is running the cheap ones.
+        assert_eq!(WORK_FACTORS, (Params::MIN_M_COST, Params::MIN_T_COST, 1));
+    }
 
     #[test]
     fn generated_pin_is_canonical_and_unambiguous() {
