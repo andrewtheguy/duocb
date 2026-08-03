@@ -14,7 +14,10 @@ use std::fs::{File, OpenOptions, TryLockError};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-pub const CONFIG_VERSION: u32 = 2;
+/// Bumped to 3 with the expiring identity-card format: a version-2 config holds
+/// cards that no longer parse, and failing the version check up front beats
+/// failing deep inside the peer loop with a confusing card error.
+pub const CONFIG_VERSION: u32 = 3;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -371,6 +374,40 @@ mod tests {
             public_key
         );
         assert_eq!(loaded.backup_generation, 7);
+
+        drop(lock);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Trust that has aged out must still load. Card parsing is deliberately
+    /// clock-free so an expired peer stays visible and removable instead of
+    /// making the whole config unloadable on the day it lapses.
+    #[test]
+    fn an_expired_peer_card_still_loads() {
+        let dir = temp_dir();
+        let path = dir.join("config.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = acquire_lock(&path).expect("lock");
+
+        let stale = duocb_core::auth::Identity::generate()
+            .card_issued_at(
+                "laptop",
+                "x9Y8z7W6",
+                duocb_core::auth::unix_now() - duocb_core::auth::CARD_TTL_SECS - 1,
+            )
+            .unwrap();
+        assert!(stale.is_expired());
+        let mut saved = configured("desktop");
+        saved.peers = vec![stale.encode()];
+        lock.save(&saved).expect("save");
+
+        let loaded = lock.load().expect("an expired peer must not break the load");
+        assert_eq!(loaded.peers.len(), 1);
+        assert!(
+            duocb_core::auth::IdentityCard::parse(&loaded.peers[0])
+                .unwrap()
+                .is_expired()
+        );
 
         drop(lock);
         let _ = std::fs::remove_dir_all(dir);

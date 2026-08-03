@@ -448,6 +448,11 @@ pub async fn fetch_directory_cards(
         let Ok(card) = IdentityCard::parse(&header.self_card) else {
             continue;
         };
+        // A backup can outlive the card it carries. Offering an expired one as
+        // a trust candidate would only produce a peer that cannot pair.
+        if card.is_expired() {
+            continue;
+        }
         match newest.entry(card.public_key()) {
             std::collections::hash_map::Entry::Vacant(slot) => {
                 slot.insert((header.generation, card));

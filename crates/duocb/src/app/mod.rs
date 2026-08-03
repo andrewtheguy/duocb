@@ -266,7 +266,7 @@ impl App {
             _ => ConfigureStep::SetupChoice,
         };
 
-        Self {
+        let mut app = Self {
             config_lock,
             net,
             clipboard: SystemClipboard::new(),
@@ -318,6 +318,34 @@ impl App {
             pending_outbox: None,
             sent_flash: None,
             copied_flash: None,
+        };
+        app.renew_self_card_if_stale();
+        app
+    }
+
+    /// Re-mint this device's own card once it is close to expiry.
+    ///
+    /// Cards last [`duocb_core::auth::CARD_TTL_SECS`] and are never refreshed
+    /// over the wire, so the copy a user hands out must have plenty of life
+    /// left. Signing costs nothing — the key is local — so this runs at startup
+    /// and again before the card is copied, which is enough to keep a handed-out
+    /// card from being nearly dead on arrival. It does not affect peers: their
+    /// stored copy only refreshes when its owner re-imports.
+    pub(crate) fn renew_self_card_if_stale(&mut self) {
+        let (Some(card), Some(name)) = (&self.self_card, self.saved_name.clone()) else {
+            return;
+        };
+        if card.remaining_secs_at(duocb_core::auth::unix_now())
+            > duocb_core::auth::CARD_RENEW_BEFORE_SECS
+        {
+            return;
+        }
+        let Ok(fresh) = self.identity.card(&name, &self.device_suffix) else {
+            return;
+        };
+        self.self_card = Some(fresh);
+        if self.save_configure_config() {
+            self.mark_backup_dirty();
         }
     }
 
@@ -819,6 +847,14 @@ impl App {
             self.error = Some("That is this device's own identity card".into());
             return;
         }
+        // Importing a lapsed card would store trust that can never pair, so
+        // refuse it here rather than at the first Join.
+        if card.is_expired() {
+            self.error = Some(
+                "That identity card has expired — copy a fresh one from the other device".into(),
+            );
+            return;
+        }
         if let Some(existing) = self
             .peers
             .iter_mut()
@@ -849,6 +885,14 @@ impl App {
             .iter()
             .any(|peer| peer.public_key() == card.public_key())
         {
+            return;
+        }
+        // The directory listing filters these out, but a candidate can age out
+        // between the refresh and the click.
+        if card.is_expired() {
+            self.error = Some(
+                "That identity card has expired — copy a fresh one from the other device".into(),
+            );
             return;
         }
         if self.peers.len() >= duocb_core::auth::MAX_TRUSTED_PEERS {
@@ -1136,11 +1180,20 @@ impl App {
             if let duocb_core::net::DialSpec::NostrKey {
                 peer_public_key, ..
             } = &spec {
-                self.joined_peer = self
+                let peer = self
                     .peers
                     .iter()
-                    .find(|peer| peer.public_key() == *peer_public_key)
-                    .map(|peer| peer.name().to_string());
+                    .find(|peer| peer.public_key() == *peer_public_key);
+                // The runtime refuses an expired peer too; catching it here
+                // answers immediately instead of after an endpoint spins up.
+                if let Some(peer) = peer.filter(|peer| peer.is_expired()) {
+                    self.error = Some(format!(
+                        "The identity card for {} has expired — import a fresh card from that device",
+                        peer.name()
+                    ));
+                    return;
+                }
+                self.joined_peer = peer.map(|peer| peer.name().to_string());
             }
             self.client_active = true;
             self.net.send(UiCommand::Connect { spec });
@@ -1153,6 +1206,27 @@ pub(crate) fn default_relays() -> Vec<String> {
         .iter()
         .map(|s| s.to_string())
         .collect()
+}
+
+/// The expiry warning for a peer row, or `None` while the card is comfortably
+/// current. Healthy cards say nothing — a countdown on every row would be noise
+/// for the 23 days of a card's life when there is nothing to do about it.
+pub(crate) fn card_expiry_note(card: &IdentityCard) -> Option<String> {
+    const DAY: u64 = 24 * 60 * 60;
+    let remaining = card.remaining_secs_at(duocb_core::auth::unix_now());
+    // Kept short: this is appended to a list row, and the trust card's own text
+    // already explains that the fix is to import a fresh card.
+    if remaining == 0 {
+        return Some("EXPIRED".to_string());
+    }
+    if remaining > duocb_core::auth::CARD_RENEW_BEFORE_SECS {
+        return None;
+    }
+    Some(match remaining / DAY {
+        0 => "expires today".to_string(),
+        1 => "expires in 1 day".to_string(),
+        days => format!("expires in {days} days"),
+    })
 }
 
 /// Shorten a node id for display.

@@ -28,13 +28,42 @@ The Slint event loop and tokio runtime communicate only with `UiCommand` and
 - public display encoding: NIP-19 `npub`;
 - wire/trust key: the 32-byte public key.
 
-An identity card is a signed kind `30382` Nostr event with a fixed identifier
-and a versioned JSON body containing the validated final device name,
-`<short-name>_<permanent-random-suffix>`. The suffix is persisted separately
-from the application key so it remains stable across renames and identity
-resets; accepting a recovered self-card restores its suffix. Parsing checks the
-event signature, kind, identifier, schema, name and suffix rules, and 2 KiB
-size cap.
+An identity card is a signed kind `30382` Nostr event with the identifier
+`duocb:identity-card:v3` and a versioned JSON body containing the validated
+final device name, `<short-name>_<permanent-random-suffix>`, and a mandatory
+absolute `expires_at`. The suffix is persisted separately from the application
+key so it remains stable across renames and identity resets; accepting a
+recovered self-card restores its suffix. Parsing checks the event signature,
+kind, identifier, schema, name and suffix rules, and 2 KiB size cap.
+
+### Card expiry
+
+Cards last 30 days. Three of the parse checks concern expiry, and all three
+compare only signed fields, so parsing stays clock-free and deterministic:
+
+- `expires_at` is after the event's `created_at`;
+- the claimed lifetime does not exceed 30 days, so an issuer cannot self-assert
+  unbounded trust;
+- the NIP-40 `expiration` tag equals the body's `expires_at`.
+
+Whether a card is *current* is a separate decision, made against the local
+clock only where trust is acted on. A card issued implausibly far in the future
+(beyond a five-minute skew grace) is never current, which bounds how far a fast
+clock can stretch a real lifetime.
+
+Cards never travel over the wire — the handshake carries raw application public
+keys — so each side enforces expiry against **its own stored copy** and there
+is no renewal protocol. The listener refuses a dialer whose stored card has
+lapsed before signing anything, and closes with a dedicated code so the dialer
+can say precisely what is wrong; the dialer refuses symmetrically before
+dialing. A host also stops publishing hosting records to peers whose cards have
+lapsed. Recovery is manual and identical to first-time pairing: the owner hands
+over a fresh card. A device re-signs its own card once it is within seven days
+of expiry.
+
+Expired cards still parse. Config load, backup decode, and directory listing
+all run through the same parser, and none of them may fail because trust aged
+out — an expired peer stays listed and marked expired rather than vanishing.
 
 Each local peer entry is the full verified card, so the saved name is bound to
 the public key. Trust is local and capped at 128 unique public keys. Neither a
@@ -73,7 +102,7 @@ S → C  AuthResponse {accepted}
 ```
 
 Before signing or accepting, both sides require the presented application key
-to match a locally trusted card. Both signatures cover a domain-separated
+to match a locally trusted card that has not expired. Both signatures cover a domain-separated
 transcript containing:
 
 ```text
@@ -201,6 +230,9 @@ wire clipboard frames are capped at 1 MiB.
 
 - Identity cards and backup channels are transferred over a path the owner
   trusts.
+- Card expiry bounds how long a leaked or abandoned card stays useful, but only
+  against a peer whose clock is roughly correct: expiry is enforced locally, so
+  a device whose clock is set far back keeps honouring a lapsed card.
 - Possession of a directory channel permits backup decryption but not wire
   authentication.
 - Possession of an application private key permits impersonating that

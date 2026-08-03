@@ -73,6 +73,9 @@ pub(crate) fn wire(app: &Rc<RefCell<App>>, ui: &MainWindow) {
         app.configure_step = crate::ConfigureStep::SetupName;
     });
     act!(on_copy_card, |app| {
+        // Hand out a card with most of its life ahead of it, not one about to
+        // lapse in the peer's config.
+        app.renew_self_card_if_stale();
         if let Some(encoded) = app.self_card.as_ref().map(duocb_core::auth::IdentityCard::encode) {
             app.copy_with_flash(&encoded, CopyTarget::Card);
         }

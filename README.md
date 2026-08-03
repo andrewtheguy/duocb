@@ -23,10 +23,10 @@ key is separate from iroh's ephemeral transport key:
 
 - The application private key signs the device's portable identity card and
   authenticates the duocb wire handshake.
-- The signed identity card contains the final device name and application
-  public key. The final name is `<short-name>_<permanent-random-suffix>`; the
-  suffix is minted once per installation and stays stable across renames and
-  identity resets.
+- The signed identity card contains the final device name, application public
+  key, and a mandatory expiry. The final name is
+  `<short-name>_<permanent-random-suffix>`; the suffix is minted once per
+  installation and stays stable across renames and identity resets.
 - The iroh key creates the current QUIC endpoint and node id. It is used for
   signaling and transport establishment, never as the saved duocb identity.
 
@@ -38,6 +38,13 @@ Pairing is mutual. On each device:
 Import verifies the signature before saving `{name, public key, signed card}`.
 A device only accepts application keys in its own local trusted list. The list
 is capped at 128 entries.
+
+Cards are valid for 30 days. There is no renewal over the wire: once a card
+expires, both devices refuse to pair on it, and the pairing is restored by
+copying a fresh card and importing it again — the same two steps as the first
+time. An expired peer stays in the trusted list, marked expired, so it can be
+renewed or removed deliberately. A device re-signs its own card automatically
+as it nears expiry, so the card it offers always has most of its life left.
 
 When a trusted device starts a connection, it publishes a separate NIP-44
 encrypted hosting record for each trusted peer. The record carries only the
@@ -128,8 +135,9 @@ shape is:
 
 ```json
 {
-  "version": 1,
+  "version": 3,
   "identity_secret": "nsec1…",
+  "device_suffix": "a7B2c3D4",
   "my_name": "mac-book",
   "self_card": "{ signed Nostr event JSON }",
   "directory_channel": "dc1.…",
@@ -140,7 +148,9 @@ shape is:
 ```
 
 Malformed keys, cards, channels, duplicates, mismatched self-cards, legacy
-fields, and oversized peer lists are startup errors. Saves use an owner-only
+fields, and oversized peer lists are startup errors. An *expired* card is not:
+it loads and is shown as expired, so lapsed trust is visible rather than
+silently dropped. Saves use an owner-only
 temporary file and atomic rename. Clipboard text, inbox, and outbox are never
 persisted.
 

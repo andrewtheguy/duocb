@@ -6,7 +6,7 @@
 use slint::{Color, ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use std::time::Instant;
 
-use super::{App, CopyTarget, item::ClipItem, item::PEEK_LIMIT, short_id};
+use super::{App, CopyTarget, card_expiry_note, item::ClipItem, item::PEEK_LIMIT, short_id};
 use crate::{ClipRow, MainWindow, PathRow, PeerRow, UiState};
 use duocb_core::auth::{DirectoryChannel, IdentityCard};
 use duocb_core::net::ConnStatus;
@@ -84,6 +84,11 @@ impl App {
             Ok(card) if card.public_key() == self.identity.public_key() => {
                 (false, "That is this device's own identity card".to_string())
             }
+            Ok(card) if card.is_expired() => (
+                false,
+                "That identity card has expired — copy a fresh one from the other device"
+                    .to_string(),
+            ),
             Ok(_) => (true, String::new()),
             Err(_) if self.in_peer_card.trim().is_empty() => (false, String::new()),
             Err(error) => (false, format!("{error:#}")),
@@ -184,7 +189,11 @@ impl App {
             .peers
             .iter()
             .map(|p| {
-                let line = format!("{}  · {}", p.name(), short_id(&p.npub()));
+                let mut line = format!("{}  · {}", p.name(), short_id(&p.npub()));
+                if let Some(note) = card_expiry_note(p) {
+                    line.push_str("  · ");
+                    line.push_str(&note);
+                }
                 let key = p.public_key().to_hex();
                 PeerRow {
                     public_key: key.clone().into(),

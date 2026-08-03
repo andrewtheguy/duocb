@@ -12,7 +12,7 @@
 
 ## Config-based E2E tests on the same device
 
-Only one duocb process may use a config path at a time (it holds an exclusive OS lock on a sibling `<config>.lock` file for its lifetime, allowing JSON saves to use atomic temp-and-rename replacement). To run both peers of a configure-mode pairing on the same machine, give each process its own config location — otherwise the second fails to acquire the lock. Each config mints its own application identity and permanent device-name suffix. Pair the instances by copying each signed identity card into the other instance's trusted-peer list:
+Only one duocb process may use a config path at a time (it holds an exclusive OS lock on a sibling `<config>.lock` file for its lifetime, allowing JSON saves to use atomic temp-and-rename replacement). To run both peers of a configure-mode pairing on the same machine, give each process its own config location — otherwise the second fails to acquire the lock. Each config mints its own application identity and permanent device-name suffix. Pair the instances by copying each signed identity card into the other instance's trusted-peer list. Cards expire 30 days after they are minted and both sides refuse to pair on a lapsed one, so a long-lived test config needs its cards re-copied:
 
 ```sh
 cargo run -- --config /tmp/duocb-peer1.json   # or DUOCB_CONFIG=/tmp/duocb-peer1.json

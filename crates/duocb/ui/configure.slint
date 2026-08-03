@@ -167,7 +167,7 @@ component HubStep inherits VerticalLayout {
             value: UiState.public-key;
         }
         if UiState.has-identity: Small {
-            text: "Paste this device's signed card into each device that should trust it.";
+            text: "Paste this device's signed card into each device that should trust it. Cards expire after 30 days — copy this one again to renew a pairing.";
         }
         if UiState.has-identity: HorizontalLayout {
             spacing: Theme.pad-s;
@@ -189,7 +189,7 @@ component HubStep inherits VerticalLayout {
     Card {
         CardTitle { text: "Trust another device"; }
         Body {
-            text: "Paste the other device's signed identity card. Pairing is mutual, so import this device's card there too.";
+            text: "Paste the other device's signed identity card. Pairing is mutual, so import this device's card there too. A card is good for 30 days; once it expires neither device will pair until a fresh card is imported.";
         }
         peer-card-entry := LineEdit {
             placeholder-text: "{ signed identity card JSON }";

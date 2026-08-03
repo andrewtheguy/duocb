@@ -19,7 +19,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::auth::{Identity, verify_auth_signature};
+use crate::auth::{Identity, IdentityCard, unix_now, verify_auth_signature};
 use crate::net::endpoint::{
     EndpointReadiness, connect_to_server, connection_paths, create_client_endpoint,
     create_server_endpoint, watch_connection_paths,
@@ -58,6 +58,12 @@ const SHUTDOWN_CODE: u32 = 0;
 /// retrying against a server that will never take it.
 const SERVER_BUSY_CODE: u32 = 3;
 
+/// Connection close code the listener uses when the dialer's key is trusted but
+/// the card carrying that trust has expired. Distinct from [`AUTH_FAILED_CODE`]
+/// because the remedy is specific and the user cannot guess it: cards are never
+/// refreshed over the wire, so the dialer's owner has to hand over a new one.
+const CARD_EXPIRED_CODE: u32 = 4;
+
 /// Fixed delay between reconnect attempts on the dialing peer.
 const RECONNECT_DELAY: Duration = Duration::from_secs(3);
 
@@ -88,6 +94,29 @@ impl std::error::Error for AuthFailure {}
 
 fn auth_failure(msg: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(AuthFailure(msg.into()))
+}
+
+/// Marker error for a refusal caused by an expired identity card, so the
+/// listener can pick [`CARD_EXPIRED_CODE`] out of the shared failure path.
+#[derive(Debug)]
+struct ExpiredCard;
+
+impl std::fmt::Display for ExpiredCard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the identity card for this device has expired")
+    }
+}
+
+impl std::error::Error for ExpiredCard {}
+
+/// The refusal both roles use when their stored card for the other side has
+/// lapsed. Cards are local trust records, never exchanged during the handshake,
+/// so each side judges its own copy.
+fn expired_card_error(card: &IdentityCard) -> anyhow::Error {
+    anyhow::Error::new(ExpiredCard).context(format!(
+        "the trusted identity card for {} expired — ask that device for a fresh card and import it again",
+        card.name()
+    ))
 }
 
 /// Milliseconds since the Unix epoch (sender timestamp on clipboard items).
@@ -632,9 +661,18 @@ async fn run_server_session(
             let cancel = cancel.clone();
             Some(PublisherGuard(tokio::spawn(async move {
                 loop {
+                    // Re-filtered every round, so a peer whose card lapses
+                    // mid-session stops being signalled to without a restart.
+                    let now = unix_now();
+                    let live: Vec<IdentityCard> = identity
+                        .peers
+                        .iter()
+                        .filter(|card| card.is_valid_at(now))
+                        .cloned()
+                        .collect();
                     if let Err(error) = crate::nostr::publish_hosting(
                         &identity.identity,
-                        &identity.peers,
+                        &live,
                         &node_id,
                         &identity.relays,
                     )
@@ -824,6 +862,25 @@ async fn run_client_session(
     pinned_addr: PinnedAddr,
 ) {
     events.status(ConnStatus::Starting);
+
+    // Refuse before spending an endpoint and a relay round trip on a peer whose
+    // card has lapsed. The listener enforces the same rule against its own copy;
+    // this side checks its own so the failure is immediate and self-explanatory
+    // rather than surfacing as a remote rejection.
+    if let DialSpec::NostrKey {
+        identity,
+        peer_public_key,
+    } = &spec
+        && let Some(card) = identity.peer(*peer_public_key)
+        && !card.is_valid_at(unix_now())
+    {
+        events.error(format!(
+            "The identity card for {} expired — ask that device for a fresh card and import it again",
+            card.name()
+        ));
+        events.status(ConnStatus::Idle);
+        return;
+    }
 
     // Same policy as the server side: only the internet-requiring mode gates on
     // the relay; the PIN quick mode starts resolving and dialing right away (the
@@ -1469,6 +1526,12 @@ fn auth_close_reason(conn: &iroh::endpoint::Connection) -> Option<String> {
                      paired with a previous session (Stop and Start the server to re-pair)"
                         .to_string(),
                 )
+            } else if code == u64::from(CARD_EXPIRED_CODE) {
+                Some(
+                    "The other device's copy of this device's identity card has expired — copy \
+                     this device's card again and import it there"
+                        .to_string(),
+                )
             } else if code == u64::from(AUTH_TIMEOUT_CODE) {
                 Some("Authentication timed out on the peer".to_string())
             } else if code == u64::from(SERVER_BUSY_CODE) {
@@ -1665,8 +1728,13 @@ async fn auth_as_listener(
                     .ok_or_else(|| anyhow::anyhow!("listener is not in key-auth mode"))?;
                 let client_key = nostr_sdk::PublicKey::parse(&public_key)
                     .context("dialer application key is invalid")?;
-                if identity.peer(client_key).is_none() {
+                // Both trust checks run before this side signs anything: an
+                // untrusted or lapsed dialer never gets a proof of our identity.
+                let Some(card) = identity.peer(client_key) else {
                     anyhow::bail!("dialer application key is not locally trusted");
+                };
+                if !card.is_valid_at(unix_now()) {
+                    return Err(expired_card_error(card));
                 }
                 if existing.as_ref().is_some_and(|claimed| {
                     claimed.application_key != Some(client_key)
@@ -1749,7 +1817,11 @@ async fn auth_as_listener(
     match auth_result {
         Ok(Ok(streams)) => Ok(streams),
         Ok(Err(e)) => {
-            conn.close(AUTH_FAILED_CODE.into(), b"auth_failed");
+            if e.downcast_ref::<ExpiredCard>().is_some() {
+                conn.close(CARD_EXPIRED_CODE.into(), b"card_expired");
+            } else {
+                conn.close(AUTH_FAILED_CODE.into(), b"auth_failed");
+            }
             Err(e.context("auth failed"))
         }
         Err(_) => {
@@ -1857,6 +1929,77 @@ mod tests {
         server.close().await;
     }
 
+    /// The listener refuses a dialer whose key it trusts but whose stored card
+    /// has lapsed, and refuses it before signing anything — so an expired peer
+    /// cannot even harvest a proof of this device's identity. The dialer learns
+    /// why from the dedicated close code.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_expired_peer_card_is_refused_by_the_listener() {
+        let server_identity = Identity::generate();
+        let client_identity = Identity::generate();
+        let stale = client_identity
+            .card_issued_at(
+                "client",
+                "x9Y8z7W6",
+                unix_now() - crate::auth::CARD_TTL_SECS - 1,
+            )
+            .unwrap();
+        assert!(stale.is_expired());
+        let server_key_identity = KeyIdentity {
+            identity: server_identity.clone(),
+            self_card: server_identity.card("server", "a7B2c3D4").unwrap(),
+            peers: vec![stale],
+            channel: None,
+            backup_generation: 0,
+            relays: Vec::new(),
+        };
+
+        let server =
+            create_server_endpoint(EndpointReadiness::LanDirect, iroh::SecretKey::generate())
+                .await
+                .unwrap();
+        let client =
+            create_client_endpoint(EndpointReadiness::LanDirect, iroh::SecretKey::generate())
+                .await
+                .unwrap();
+
+        let server_id = server.id();
+        let server_addr = server.addr();
+        let claim = PairClaim::default();
+        let listener = {
+            let server = server.clone();
+            let claim = claim.clone();
+            tokio::spawn(async move {
+                let conn = server.accept().await.unwrap().await.unwrap();
+                auth_as_listener(&conn, Some(&server_key_identity), None, &claim, server_id).await
+            })
+        };
+
+        let conn = connect_to_server(&client, server_addr).await.unwrap();
+        let dialer = auth_as_dialer_key(
+            &conn,
+            &client_identity,
+            server_identity.public_key(),
+            client.id(),
+        )
+        .await;
+
+        let error = dialer.expect_err("an expired card must not authenticate");
+        assert!(
+            format!("{error:#}").contains("expired"),
+            "dialer should be told the card expired, got: {error:#}"
+        );
+        let listener = listener.await.unwrap();
+        assert!(listener.is_err(), "listener must refuse the expired card");
+        assert!(
+            claim.peek().is_none(),
+            "a refused dialer must not claim the pairing"
+        );
+
+        client.close().await;
+        server.close().await;
+    }
+
     /// Start a session backed by its own fresh [`SessionMemory`], for tests
     /// that don't exercise session-task restarts.
     fn start_test_session(kind: SessionKind, events: EventSender) -> Session {
@@ -1888,6 +2031,60 @@ mod tests {
             }
         }
         panic!("timed out waiting for event; seen: {seen:?}");
+    }
+
+    /// The dialer refuses its own lapsed card for the selected peer before it
+    /// touches the network — no endpoint, no relay lookup, and an error that
+    /// names the fix rather than a remote rejection.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn joining_a_peer_with_an_expired_card_fails_before_dialing() {
+        let identity = Identity::generate();
+        let peer_identity = Identity::generate();
+        let stale = peer_identity
+            .card_issued_at(
+                "server",
+                "a7B2c3D4",
+                unix_now() - crate::auth::CARD_TTL_SECS - 1,
+            )
+            .unwrap();
+        let key_identity = KeyIdentity {
+            identity: identity.clone(),
+            self_card: identity.card("client", "x9Y8z7W6").unwrap(),
+            peers: vec![stale],
+            channel: None,
+            backup_generation: 0,
+            // Empty relay list: reaching the lookup at all would fail this test
+            // for the wrong reason, so the refusal must come first.
+            relays: Vec::new(),
+        };
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let events = EventSender::new(tx, None);
+        let session = start_test_session(
+            SessionKind::Client(DialSpec::NostrKey {
+                identity: Box::new(key_identity),
+                peer_public_key: peer_identity.public_key(),
+            }),
+            events,
+        );
+
+        let message = wait_for_event(&rx, Duration::from_secs(5), |event| match event {
+            NetEvent::Error(message) => Some(message.clone()),
+            _ => None,
+        });
+        assert!(
+            message.contains("expired") && message.contains("server_a7B2c3D4"),
+            "the error should name the expired peer: {message}"
+        );
+        wait_for_event(&rx, Duration::from_secs(5), |event| {
+            matches!(event, NetEvent::Status(ConnStatus::Idle)).then_some(())
+        });
+        assert!(
+            !rx.try_iter().any(|event| matches!(event, NetEvent::ClientReady { .. })),
+            "no endpoint should be created for an expired peer"
+        );
+
+        stop_session(&mut Some(session)).await;
     }
 
     /// A refresh request rotates the PIN immediately instead of waiting out
