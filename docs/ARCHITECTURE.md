@@ -16,8 +16,6 @@ never used as an iroh secret key. The iroh key never determines local trust.
 - `duocb-core`: portable identity/card types, protocol framing, Nostr
   signaling/backups, PIN support, and the headless tokio runtime.
 - `duocb`: Slint desktop app, local config, clipboard access, recovery UI.
-- `duocb-ffi`: strict C surface for iOS; the hand-written header is
-  `ios/duocb.h`.
 
 The Slint event loop and tokio runtime communicate only with `UiCommand` and
 `NetEvent` channels.
@@ -185,7 +183,7 @@ Recovery events are data-only:
 - `BackupFound { snapshot: Option<BackupSnapshot> }`
 - `BackupPublished { generation }`
 
-The runtime never mutates caller-owned trust. Desktop and iOS decide whether to
+The runtime never mutates caller-owned trust. The host app decides whether to
 trust a directory card or restore a snapshot.
 
 ## Persistence and bounds

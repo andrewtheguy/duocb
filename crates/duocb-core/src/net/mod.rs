@@ -10,8 +10,7 @@ pub mod endpoint;
 pub mod runtime;
 
 /// Callback invoked after every event so the host UI can wake its render loop
-/// (wakes the Slint event loop's event drain on desktop; unused on iOS, where
-/// Swift polls on a timer, and in headless tests).
+/// (wakes the Slint event loop's event drain; unused in headless tests).
 pub type WakeFn = std::sync::Arc<dyn Fn() + Send + Sync>;
 
 /// Persistent configure-mode identity plus its local trust store.
@@ -203,7 +202,7 @@ pub enum NetEvent {
 
 /// Cloneable sender for [`NetEvent`]s that wakes the host UI after each send.
 /// The wake callback is optional so the runtime can run in headless tests and
-/// under polling hosts (the iOS FFI).
+/// under polling hosts.
 #[derive(Clone)]
 pub struct EventSender {
     tx: std::sync::mpsc::Sender<NetEvent>,

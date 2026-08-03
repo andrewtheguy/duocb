@@ -15,8 +15,7 @@
 //! DNS-SD instead conveys via SRV/A/AAAA), so the joiner ends up with the identical
 //! [`PinFound`] and dials iroh exactly as the DNS-SD path does.
 //!
-//! Cross-platform (plain tokio TCP): on iOS the joiner's outbound connect to a
-//! LAN IP is what raises the Local Network permission prompt.
+//! Cross-platform (plain tokio TCP).
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;

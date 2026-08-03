@@ -15,7 +15,7 @@
 //! The **first character partitions the alphabet by channel**: a first char in the lower
 //! half (`0123456789ABCDEF`) marks a nostr-carrying PIN (the default nostr+LAN or the
 //! internet-only channel), while the upper half (`GHJKMNPQRSTVWXYZ`) marks a
-//! **LAN-only** PIN. The LAN-only channel speaks a DNS-SD/Bonjour dialect that is not
+//! **LAN-only** PIN. The LAN-only channel speaks spec-compliant DNS-SD, which is not
 //! wire-compatible with the default channel's LAN responder (see `crate::lan`), so a joiner
 //! must know which discovery to run *before* it resolves. Encoding that one bit in the PIN
 //! lets the joiner infer the channel from the typed code alone — it never has to pick one.
