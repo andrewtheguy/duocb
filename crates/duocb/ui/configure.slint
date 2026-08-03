@@ -167,7 +167,7 @@ component HubStep inherits VerticalLayout {
             value: UiState.public-key;
         }
         if UiState.has-identity: Small {
-            text: "Paste this device's signed card into each device that should trust it. Cards expire after 30 days — copy this one again to renew a pairing.";
+            text: "Paste this device's signed card into each device that should trust it. Cards expire after 30 days — to renew, copy this card again and import it on every device that should keep trusting this one.";
         }
         if UiState.has-identity: HorizontalLayout {
             spacing: Theme.pad-s;

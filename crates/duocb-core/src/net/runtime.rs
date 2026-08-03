@@ -109,14 +109,19 @@ impl std::fmt::Display for ExpiredCard {
 
 impl std::error::Error for ExpiredCard {}
 
-/// The refusal both roles use when their stored card for the other side has
+/// The wording both roles use when their stored card for the other side has
 /// lapsed. Cards are local trust records, never exchanged during the handshake,
-/// so each side judges its own copy.
-fn expired_card_error(card: &IdentityCard) -> anyhow::Error {
-    anyhow::Error::new(ExpiredCard).context(format!(
-        "the trusted identity card for {} expired — ask that device for a fresh card and import it again",
+/// so each side judges its own copy — and both should say the same thing about
+/// it, whether it surfaces as a listener refusal or a dialer's own pre-check.
+fn expired_card_message(card: &IdentityCard) -> String {
+    format!(
+        "The identity card for {} expired — ask that device for a fresh card and import it again",
         card.name()
-    ))
+    )
+}
+
+fn expired_card_error(card: &IdentityCard) -> anyhow::Error {
+    anyhow::Error::new(ExpiredCard).context(expired_card_message(card))
 }
 
 /// Milliseconds since the Unix epoch (sender timestamp on clipboard items).
@@ -874,10 +879,7 @@ async fn run_client_session(
         && let Some(card) = identity.peer(*peer_public_key)
         && !card.is_valid_at(unix_now())
     {
-        events.error(format!(
-            "The identity card for {} expired — ask that device for a fresh card and import it again",
-            card.name()
-        ));
+        events.error(expired_card_message(card));
         events.status(ConnStatus::Idle);
         return;
     }

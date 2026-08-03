@@ -189,6 +189,47 @@ mod recovery_offer_tests {
         let _ = std::fs::remove_file(format!("{}.lock", path.display()));
     }
 
+    /// A backup can be older than the 30-day card lifetime. Restoring one must
+    /// not reinstate a dead self-card: the restored state is persisted and
+    /// published immediately, so a stale card would be handed out and backed up
+    /// in a form no peer accepts.
+    #[test]
+    fn restoring_an_expired_self_card_re_mints_it() {
+        let (mut app, path) = test_app();
+        let stale = app
+            .identity
+            .card_issued_at(
+                "restored-name",
+                "a7B2c3D4",
+                duocb_core::auth::unix_now() - duocb_core::auth::CARD_TTL_SECS - 1,
+            )
+            .unwrap();
+        assert!(stale.is_expired());
+        let snapshot = duocb_core::nostr::BackupSnapshot::new(5, stale, Vec::new()).unwrap();
+
+        app.apply_event(NetEvent::BackupFound {
+            snapshot: Some(Box::new(snapshot)),
+        });
+        app.restore_offered_backup();
+
+        let restored = app.self_card.as_ref().expect("a self card is restored");
+        assert!(!restored.is_expired(), "the restored card must be current");
+        assert_eq!(restored.name(), "restored-name_a7B2c3D4");
+        assert_eq!(app.device_suffix, "a7B2c3D4");
+
+        let persisted = IdentityCard::parse(&app.config_lock.load().unwrap().self_card.unwrap())
+            .expect("the persisted card parses");
+        assert!(
+            !persisted.is_expired(),
+            "the card written to disk must be the current one"
+        );
+
+        app.net.shutdown();
+        drop(app);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}.lock", path.display()));
+    }
+
     #[test]
     fn signed_name_uses_permanent_suffix_and_identity_reset_keeps_it() {
         let (mut app, path) = test_app();
@@ -332,21 +373,29 @@ impl App {
     /// card from being nearly dead on arrival. It does not affect peers: their
     /// stored copy only refreshes when its owner re-imports.
     pub(crate) fn renew_self_card_if_stale(&mut self) {
-        let (Some(card), Some(name)) = (&self.self_card, self.saved_name.clone()) else {
-            return;
-        };
-        if card.remaining_secs_at(duocb_core::auth::unix_now())
-            > duocb_core::auth::CARD_RENEW_BEFORE_SECS
-        {
-            return;
-        }
-        let Ok(fresh) = self.identity.card(&name, &self.device_suffix) else {
+        let Some(fresh) = self.freshly_minted_self_card() else {
             return;
         };
         self.self_card = Some(fresh);
         if self.save_configure_config() {
             self.mark_backup_dirty();
         }
+    }
+
+    /// A replacement for the current self-card when it is close to expiry, or
+    /// `None` when it is still current (or there is nothing to re-mint).
+    /// Separate from [`App::renew_self_card_if_stale`] so a caller that is about
+    /// to persist and publish anyway can swap the card in without triggering a
+    /// second save and backup generation.
+    fn freshly_minted_self_card(&self) -> Option<IdentityCard> {
+        let card = self.self_card.as_ref()?;
+        let name = self.saved_name.as_deref()?;
+        if card.remaining_secs_at(duocb_core::auth::unix_now())
+            > duocb_core::auth::CARD_RENEW_BEFORE_SECS
+        {
+            return None;
+        }
+        self.identity.card(name, &self.device_suffix).ok()
     }
 
     /// Drain every event the runtime has queued. Returns whether any arrived
@@ -964,6 +1013,13 @@ impl App {
         self.in_my_name = snapshot.self_card.short_name().to_string();
         self.device_suffix = snapshot.self_card.suffix().to_string();
         self.self_card = Some(snapshot.self_card);
+        // A backup outlives the card inside it, so a restored self-card can
+        // already be stale. Re-mint before the state below is persisted and
+        // published, or this device would hand out — and back up — a card that
+        // no peer will accept.
+        if let Some(fresh) = self.freshly_minted_self_card() {
+            self.self_card = Some(fresh);
+        }
         self.peers = snapshot
             .peers
             .into_iter()
