@@ -899,9 +899,10 @@ impl App {
         // Importing a lapsed card would store trust that can never pair, so
         // refuse it here rather than at the first Join.
         if card.is_expired() {
-            self.error = Some(
-                "That identity card has expired — copy a fresh one from the other device".into(),
-            );
+            self.error = Some(format!(
+                "That identity card expired on {} — copy a fresh one from the other device",
+                card_expiry_date(&card)
+            ));
             return;
         }
         if let Some(existing) = self
@@ -939,9 +940,10 @@ impl App {
         // The directory listing filters these out, but a candidate can age out
         // between the refresh and the click.
         if card.is_expired() {
-            self.error = Some(
-                "That identity card has expired — copy a fresh one from the other device".into(),
-            );
+            self.error = Some(format!(
+                "That identity card expired on {} — copy a fresh one from the other device",
+                card_expiry_date(&card)
+            ));
             return;
         }
         if self.peers.len() >= duocb_core::auth::MAX_TRUSTED_PEERS {
@@ -1244,8 +1246,9 @@ impl App {
                 // answers immediately instead of after an endpoint spins up.
                 if let Some(peer) = peer.filter(|peer| peer.is_expired()) {
                     self.error = Some(format!(
-                        "The identity card for {} has expired — import a fresh card from that device",
-                        peer.name()
+                        "The identity card for {} expired on {} — import a fresh card from that device",
+                        peer.name(),
+                        card_expiry_date(peer)
                     ));
                     return;
                 }
@@ -1264,25 +1267,99 @@ pub(crate) fn default_relays() -> Vec<String> {
         .collect()
 }
 
-/// The expiry warning for a peer row, or `None` while the card is comfortably
-/// current. Healthy cards say nothing — a countdown on every row would be noise
-/// for the 23 days of a card's life when there is nothing to do about it.
-pub(crate) fn card_expiry_note(card: &IdentityCard) -> Option<String> {
+/// The expiry state for a peer row. The date is always shown — it is signed
+/// into the card itself, so a trusted device can be read at a glance without
+/// re-parsing anything — and a countdown is appended only once the card is
+/// close enough to expiry that the user should go copy a fresh one.
+pub(crate) fn card_expiry_note(card: &IdentityCard) -> String {
     const DAY: u64 = 24 * 60 * 60;
+    let date = card_expiry_date(card);
     let remaining = card.remaining_secs_at(duocb_core::auth::unix_now());
     // Kept short: this is appended to a list row, and the trust card's own text
     // already explains that the fix is to import a fresh card.
     if remaining == 0 {
-        return Some("EXPIRED".to_string());
+        return format!("EXPIRED {date}");
     }
     if remaining > duocb_core::auth::CARD_RENEW_BEFORE_SECS {
-        return None;
+        return format!("expires {date}");
     }
-    Some(match remaining / DAY {
-        0 => "expires today".to_string(),
-        1 => "expires in 1 day".to_string(),
-        days => format!("expires in {days} days"),
-    })
+    match remaining / DAY {
+        0 => format!("expires {date} (today)"),
+        1 => format!("expires {date} (1 day)"),
+        days => format!("expires {date} ({days} days)"),
+    }
+}
+
+/// The card's signed expiry as a local-time calendar date.
+pub(crate) fn card_expiry_date(card: &IdentityCard) -> String {
+    i64::try_from(card.expires_at())
+        .ok()
+        .and_then(|secs| jiff::Timestamp::from_second(secs).ok())
+        .map(|ts| {
+            ts.to_zoned(jiff::tz::TimeZone::system())
+                .strftime("%Y-%m-%d")
+                .to_string()
+        })
+        .unwrap_or_else(|| "an unreadable date".to_string())
+}
+
+#[cfg(test)]
+mod expiry_note_tests {
+    use super::*;
+
+    const DAY: u64 = 24 * 60 * 60;
+
+    /// Derived independently of `card_expiry_date` so the assertions below
+    /// cannot pass by agreeing with a broken formatter.
+    fn local_date(secs: u64) -> String {
+        jiff::Timestamp::from_second(i64::try_from(secs).unwrap())
+            .unwrap()
+            .to_zoned(jiff::tz::TimeZone::system())
+            .strftime("%Y-%m-%d")
+            .to_string()
+    }
+
+    #[test]
+    fn a_healthy_card_still_shows_its_expiry_date() {
+        let card = Identity::generate().card("phone", "x9Y8z7W6").unwrap();
+        assert_eq!(
+            card_expiry_note(&card),
+            format!("expires {}", local_date(card.expires_at()))
+        );
+    }
+
+    #[test]
+    fn a_card_near_expiry_shows_the_date_and_a_countdown() {
+        let now = duocb_core::auth::unix_now();
+        let card = Identity::generate()
+            .card_issued_at(
+                "phone",
+                "x9Y8z7W6",
+                now - duocb_core::auth::CARD_TTL_SECS + 2 * DAY + 60,
+            )
+            .unwrap();
+        assert_eq!(
+            card_expiry_note(&card),
+            format!("expires {} (2 days)", local_date(card.expires_at()))
+        );
+    }
+
+    #[test]
+    fn an_expired_card_shows_the_date_it_lapsed() {
+        let now = duocb_core::auth::unix_now();
+        let card = Identity::generate()
+            .card_issued_at(
+                "phone",
+                "x9Y8z7W6",
+                now - duocb_core::auth::CARD_TTL_SECS - DAY,
+            )
+            .unwrap();
+        assert!(card.is_expired());
+        assert_eq!(
+            card_expiry_note(&card),
+            format!("EXPIRED {}", local_date(card.expires_at()))
+        );
+    }
 }
 
 /// Shorten a node id for display.

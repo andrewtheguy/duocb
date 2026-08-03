@@ -6,7 +6,9 @@
 use slint::{Color, ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use std::time::Instant;
 
-use super::{App, CopyTarget, card_expiry_note, item::ClipItem, item::PEEK_LIMIT, short_id};
+use super::{
+    App, CopyTarget, card_expiry_date, card_expiry_note, item::ClipItem, item::PEEK_LIMIT, short_id,
+};
 use crate::{ClipRow, MainWindow, PathRow, PeerRow, UiState};
 use duocb_core::auth::{DirectoryChannel, IdentityCard};
 use duocb_core::net::ConnStatus;
@@ -86,8 +88,10 @@ impl App {
             }
             Ok(card) if card.is_expired() => (
                 false,
-                "That identity card has expired — copy a fresh one from the other device"
-                    .to_string(),
+                format!(
+                    "That identity card expired on {} — copy a fresh one from the other device",
+                    card_expiry_date(&card)
+                ),
             ),
             Ok(_) => (true, String::new()),
             Err(_) if self.in_peer_card.trim().is_empty() => (false, String::new()),
@@ -151,6 +155,7 @@ impl App {
                         PeerRow {
                             public_key: key.clone().into(),
                             line: format!("{}  · {}", peer.name(), short_id(&peer.npub())).into(),
+                            note: SharedString::default(),
                             selected: self.recovery_selected.contains(&key),
                         }
                     })
@@ -171,12 +176,8 @@ impl App {
             })
             .map(|candidate| PeerRow {
                 public_key: candidate.public_key().to_hex().into(),
-                line: format!(
-                    "{}  · {}",
-                    candidate.name(),
-                    short_id(&candidate.npub())
-                )
-                .into(),
+                line: format!("{}  · {}", candidate.name(), short_id(&candidate.npub())).into(),
+                note: card_expiry_note(candidate).into(),
                 selected: false,
             })
             .collect();
@@ -189,15 +190,11 @@ impl App {
             .peers
             .iter()
             .map(|p| {
-                let mut line = format!("{}  · {}", p.name(), short_id(&p.npub()));
-                if let Some(note) = card_expiry_note(p) {
-                    line.push_str("  · ");
-                    line.push_str(&note);
-                }
                 let key = p.public_key().to_hex();
                 PeerRow {
                     public_key: key.clone().into(),
-                    line: line.into(),
+                    line: format!("{}  · {}", p.name(), short_id(&p.npub())).into(),
+                    note: card_expiry_note(p).into(),
                     selected: self.selected_peer.as_deref() == Some(key.as_str()),
                 }
             })

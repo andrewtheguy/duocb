@@ -220,6 +220,11 @@ component HubStep inherits VerticalLayout {
                 horizontal-stretch: 1;
                 vertical-alignment: center;
             }
+            Mono {
+                text: row.note;
+                wrap: no-wrap;
+                vertical-alignment: center;
+            }
             Button { text: "Remove"; clicked => { Actions.remove-peer(row.public-key); } }
         }
     }
@@ -271,6 +276,11 @@ component HubStep inherits VerticalLayout {
                 horizontal-stretch: 1;
                 vertical-alignment: center;
             }
+            Mono {
+                text: row.note;
+                wrap: no-wrap;
+                vertical-alignment: center;
+            }
             Button {
                 text: "Trust";
                 clicked => { Actions.trust-directory-card(row.public-key); }
@@ -316,6 +326,11 @@ component JoinStep inherits VerticalLayout {
             Mono {
                 text: row.line;
                 horizontal-stretch: 1;
+                vertical-alignment: center;
+            }
+            Mono {
+                text: row.note;
+                wrap: no-wrap;
                 vertical-alignment: center;
             }
         }

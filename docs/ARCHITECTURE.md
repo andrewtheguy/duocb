@@ -64,6 +64,9 @@ of expiry.
 Expired cards still parse. Config load, backup decode, and directory listing
 all run through the same parser, and none of them may fail because trust aged
 out — an expired peer stays listed and marked expired rather than vanishing.
+Every trusted-device row carries the expiry date read straight off the card, so
+the deadline is visible before it bites; a countdown is added inside the last
+seven days and the date is reported again in every refusal message.
 
 Each local peer entry is the full verified card, so the saved name is bound to
 the public key. Trust is local and capped at 128 unique public keys. Neither a
