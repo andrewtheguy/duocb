@@ -14,26 +14,22 @@ pub mod runtime;
 /// Swift polls on a timer, and in headless tests).
 pub type WakeFn = std::sync::Arc<dyn Fn() + Send + Sync>;
 
-/// The standing configure-mode identity: the shared secret plus this device's
-/// collision-resistant display identity (`<name>_<suffix>`, see
-/// `crate::identity`). Everything the presence publisher, a hosting session,
-/// and a joining session need.
+/// Persistent configure-mode identity plus its local trust store.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TokenIdentity {
-    /// The standing secret: its channel half drives the nostr rendezvous, its
-    /// token half authenticates the connection (see [`crate::auth::Secret`]).
-    pub secret: crate::auth::Secret,
-    /// This device's user-chosen short name.
-    pub name: String,
-    /// This device's permanent random suffix.
-    pub suffix: String,
+pub struct KeyIdentity {
+    pub identity: crate::auth::Identity,
+    pub self_card: crate::auth::IdentityCard,
+    pub peers: Vec<crate::auth::IdentityCard>,
+    pub channel: Option<crate::auth::DirectoryChannel>,
+    pub backup_generation: u64,
     pub relays: Vec<String>,
 }
 
-impl TokenIdentity {
-    /// The full display identity `<name>_<suffix>` broadcast to peers.
-    pub fn display(&self) -> String {
-        crate::identity::display_identity(&self.name, &self.suffix)
+impl KeyIdentity {
+    pub fn peer(&self, public_key: nostr_sdk::PublicKey) -> Option<&crate::auth::IdentityCard> {
+        self.peers
+            .iter()
+            .find(|card| card.public_key() == public_key)
     }
 }
 
@@ -64,10 +60,9 @@ impl PinChannel {
 /// How the server signals its ephemeral node id to the client.
 #[derive(Debug, Clone)]
 pub enum ServerMode {
-    /// Configure mode: host under the standing secret. The presence publisher
-    /// (kept running by the runtime) carries the node id to peers; in-band
-    /// token auth gates the connection.
-    NostrToken { identity: TokenIdentity },
+    /// Configure mode: publish pairwise hosting records and authenticate with
+    /// the persistent application key.
+    NostrKey { identity: Box<KeyIdentity> },
     /// Rotating-PIN quick mode: publish the rendezvous record under per-bucket
     /// PIN-derived keys on the selected channel(s); in-band PIN
     /// challenge-response auth. On the LAN-only channel the host additionally
@@ -83,13 +78,10 @@ pub enum ServerMode {
 /// What the client dials.
 #[derive(Debug, Clone)]
 pub enum DialSpec {
-    /// Dial exactly the chosen peer: resolve `peer_display`'s presence record
-    /// under the shared token-derived nostr author (re-resolved on every attempt,
-    /// so a restarted host self-heals), then authenticate with the token.
-    NostrToken {
-        identity: TokenIdentity,
-        /// The selected peer's full display identity, e.g. `mac-book_a7B2c3D4`.
-        peer_display: String,
+    /// Resolve and authenticate exactly one locally trusted application key.
+    NostrKey {
+        identity: Box<KeyIdentity>,
+        peer_public_key: nostr_sdk::PublicKey,
     },
     /// Resolve via the rotating-PIN rendezvous on the selected channel(s) —
     /// racing them when both are enabled — then prove PIN possession in-band.
@@ -124,14 +116,19 @@ pub enum UiCommand {
     /// Request a point-in-time snapshot of the live connection's paths, answered
     /// with [`NetEvent::ConnPath`]. Empty if no connection is up.
     QueryConnPath,
-    /// `Some`: start (or replace) the standing presence publisher for this
-    /// identity. `None`: stop it (the secret was cleared). Independent of any
-    /// session; [`UiCommand::StartServer`] in configure mode ensures it runs.
-    SetPresence { identity: Option<TokenIdentity> },
-    /// One-shot fetch of the peer device list under the configured presence
-    /// identity, answered with [`NetEvent::PeerList`]. Ignored while a previous
-    /// fetch is still in flight; an error event if no identity is configured.
-    RefreshPeers,
+    /// Publish a local-first encrypted peer-list snapshot.
+    PublishBackup { identity: Box<KeyIdentity> },
+    /// Find recovery material without applying it.
+    CheckBackup {
+        identity: crate::auth::Identity,
+        channel: crate::auth::DirectoryChannel,
+        relays: Vec<String>,
+    },
+    /// Fetch signed-card candidates from a backup channel.
+    RefreshDirectory {
+        channel: crate::auth::DirectoryChannel,
+        relays: Vec<String>,
+    },
     Shutdown,
 }
 
@@ -160,17 +157,13 @@ pub enum ConnStatus {
 /// Events from the networking runtime to the UI thread.
 #[derive(Debug)]
 pub enum NetEvent {
-    /// Server endpoint is up. `secret_fingerprint` is set in configure mode (the
-    /// standing secret's).
     ServerReady {
         node_id: String,
-        secret_fingerprint: Option<String>,
+        identity_public_key: Option<String>,
     },
-    /// Client endpoint is online. Configure mode includes the fingerprint so the
-    /// connector retains the same identity details as the initiator screen.
     ClientReady {
         node_id: String,
-        secret_fingerprint: Option<String>,
+        identity_public_key: Option<String>,
     },
     /// PIN quick mode: a fresh PIN was minted (display form, `XXXX-XXXX`).
     /// `host_lan_ip` is the host's LAN IPv4 on the LAN-only channel (so the UI
@@ -183,7 +176,10 @@ pub enum NetEvent {
     /// PIN quick mode: paired (or stopped) — stop showing a PIN.
     PinCleared,
     Status(ConnStatus),
-    PeerPaired { peer_node_id: String },
+    PeerPaired {
+        peer_node_id: String,
+        peer_public_key: Option<String>,
+    },
     PeerDisconnected,
     /// Answer to [`UiCommand::QueryConnPath`]: a point-in-time snapshot of the
     /// connection's paths (empty if no connection is currently up).
@@ -193,13 +189,15 @@ pub enum NetEvent {
     /// back — which the UI should drop if it already holds that content.
     ItemReceived { text: String, pulled: bool },
     ItemSent,
-    /// Answer to [`UiCommand::RefreshPeers`]: the decoded peer device list
-    /// (this device's own record already excluded).
-    PeerList { peers: Vec<crate::nostr::PeerInfo> },
-    /// The presence publisher found a record under this device's own identity
-    /// written by another live publisher and stopped. Another process is using
-    /// this device's identity (e.g. a second instance on a cloned config).
-    PresenceConflict { message: String },
+    DirectoryCards {
+        cards: Vec<crate::auth::IdentityCard>,
+    },
+    BackupFound {
+        snapshot: Option<Box<crate::nostr::BackupSnapshot>>,
+    },
+    BackupPublished { generation: u64 },
+    BackupCheckFailed { message: String },
+    BackupPublishFailed { message: String },
     Error(String),
 }
 

@@ -5,7 +5,7 @@
 import { UiState, Actions } from "globals.slint";
 import { PairMode } from "types.slint";
 import { Theme } from "theme.slint";
-import { Card, Body, Weak, Mono, BackHeader, TokenPairingSummary, LabeledValue } from "widgets.slint";
+import { Card, Body, Weak, Mono, BackHeader, IdentityPairingSummary, LabeledValue } from "widgets.slint";
 import { SessionPanel } from "session.slint";
 import { Button, LineEdit, ScrollView } from "std-widgets.slint";
 
@@ -14,12 +14,12 @@ component PreConnect inherits VerticalLayout {
     alignment: start;
     spacing: Theme.pad-m;
 
-    // Configure mode joins from the home hub (token-hint only). The quick mode
+    // Configure mode joins from the home hub. The quick mode
     // enters here: type the PIN shown on the other device — the same
     // choice-free entry as the quick screen.
-    property <bool> quick: UiState.mode != PairMode.nostr-token;
+    property <bool> quick: UiState.mode != PairMode.nostr-key;
 
-    token-hint := Weak {
+    identity-hint := Weak {
         visible: !root.quick;
         // A configure-mode join launches from the home hub with the
         // selected peer; this state is a brief transient.
@@ -136,7 +136,7 @@ component PreConnect inherits VerticalLayout {
         }
     }
 
-    if UiState.mode != PairMode.nostr-token: HorizontalLayout {
+    if UiState.mode != PairMode.nostr-key: HorizontalLayout {
         alignment: start;
         Button {
             text: "▶ Connect (" + UiState.cmd-label + "+Enter)";
@@ -166,13 +166,13 @@ export component ClientScreen inherits ScrollView {
             pre := PreConnect { visible: !UiState.client-active; }
         }
 
-        if UiState.client-active && UiState.mode == PairMode.nostr-token: TokenPairingSummary { }
-        if UiState.client-active && UiState.mode != PairMode.nostr-token
+        if UiState.client-active && UiState.mode == PairMode.nostr-key: IdentityPairingSummary { }
+        if UiState.client-active && UiState.mode != PairMode.nostr-key
             && UiState.node-id-short != "": LabeledValue {
             label: "This device's id:";
             value: UiState.node-id-short;
         }
-        if UiState.client-active && UiState.mode != PairMode.nostr-token
+        if UiState.client-active && UiState.mode != PairMode.nostr-key
             && UiState.peer-node-id-short != "": LabeledValue {
             label: "Paired with:";
             value: UiState.peer-node-id-short;

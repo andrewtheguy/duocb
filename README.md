@@ -1,159 +1,162 @@
 # duocb
 
-**P2P clipboard sharing between two devices you own end-to-end encrypted..**
-
-duocb links **two devices belonging to the same person** (desktop ↔ laptop, workstation ↔ homelab box) so they can share clipboard text directly, without accounts, servers that see your data, public IPs, or port forwarding. The two roles are only about setup: one device **starts a connection** (displays pairing credentials), the other **joins** it (enters them). Once paired, **both** sides can send and receive — either can push its clipboard to the other over a single encrypted QUIC connection.
-
-Received content never touches the receiving machine's clipboard (or disk) by itself: it lands in an **in-memory inbox** where you can **peek** at a truncated preview of the text first, and only an explicit **Copy** click puts the full content into the system clipboard.
-
-> [!IMPORTANT]
-> **Project goal:** let a **single user link two of their own devices** for ad-hoc clipboard sharing. Both ends are expected to be machines you own (or fully trust) — it is not a public service, not multi-tenant, and one connection pairs with exactly **one** peer.
+End-to-end encrypted, peer-to-peer clipboard sharing between two devices you
+own. Both sides can send and receive after one device starts a connection and
+the other joins it. Received text stays in an in-memory inbox until you
+explicitly copy it.
 
 > [!WARNING]
-> **No backward compatibility (pre-1.0):** during initial development no compatibility or migration path is provided between versions. Expect to regenerate secrets and update both devices together.
-
-**Features:**
-
-- **No account or registration** — download and run
-- **No public IPs or port forwarding** — configure mode uses automatic NAT hole punching with relay fallback; quick pairing connects directly on the local network
-- **End-to-end encryption** via QUIC/TLS 1.3; the connection is bound to the peer's node id (its public key)
-- **Every connection authenticates in-band** — the shared secret's token half or a PIN challenge-response; knowing a node id is never enough to pair
-- **Peek before copy** — received items show size, a CRC-32 fingerprint, and arrival time; the content is only revealed on an explicit **Peek** (which auto-hides after a few seconds), and only **Copy** ever writes your clipboard
-- **Compare what you sent** — the last item you sent is shown in an outbox with its size/CRC so the other device can confirm it matches what arrived
-- **Memory only** — clipboard content, the inbox, and the outbox are never written to disk
-- **Works offline on a LAN** — LAN-only PIN pairing uses Bonjour-compatible DNS-SD (mDNS) discovery and direct device-to-device transport, so no third-party server participates in the session; "LAN-only" is a discovery policy, not a packet-level subnet boundary
-- **Fully keyboard-operable** — every flow has a shortcut
-- **Cross-platform** — Linux, macOS, Windows; no root required
+> duocb is pre-1.0 and intentionally has no backward compatibility. This
+> release rejects the former shared-secret config and wire protocol.
 
 ## Pairing modes
 
-**Configure** is the primary mode and the home screen itself; ad-hoc pairing lives behind the **Quick options** button (`Q`), available both before secret setup and on the configured hub.
+| Mode | Discovery/signaling | Authentication | Saved state |
+|---|---|---|---|
+| Configure | Pairwise encrypted Nostr hosting records | Mutual application-key signatures | One identity key and a local trusted-peer list per installation |
+| Quick | Local Bonjour/DNS-SD or a typed LAN IP | Rotating PIN challenge-response | None |
 
-| Mode | Signaling | What you transfer by hand | Auth | Internet |
-|---|---|---|---|---|
-| **Configure** (primary) | nostr relays | a shared 125-char secret (once per device, at setup) | pre-shared secret | required |
-| **PIN quick pair** | local network only (Bonjour/DNS-SD, or a typed host IP when multicast is blocked) | an 8-character PIN that rotates every 60 s (plus, optionally, the host's LAN IP) | Argon2id PIN challenge-response (mutual, in-band) | **not used** |
+### Configure mode
 
-- **Configure** links all of your devices under one **standing secret**. That secret is a single opaque 125-character string you copy between devices as one piece; internally it carries two independent halves — a 128-bit **rendezvous channel** used to find your devices, and a 256-bit **auth token** used to admit them. Only the channel drives anything a relay can see, and only the token ever crosses the wire, so nothing published on a relay is derived from the credential that authorizes a session. A setup wizard generates the secret on the first device (shown as a masked hint plus fingerprint, with an explicit **Copy secret** action) or imports it on the next (masked paste, fingerprint confirmation); it stays in the config until you explicitly **Clear secret**. Each device gets a collision-resistant identity `<name>_<suffix>` — a short name you choose plus a permanent random 8-character suffix minted on first launch. The home screen is then the hub: your identity plus two actions — **Start** hosts a connection (nothing else needed on that device), **Join** opens the device picker. Nostr stays dormant until you pick one of those: only then does the device broadcast an encrypted presence record on public nostr relays under a keypair derived from the secret's **rendezvous channel** (authorship *is* the proof of channel possession); returning to the hub stops the broadcast, and the idle hub — or using only quick mode — touches no relays at all. The picker shows your other devices (with when each record was last broadcast — no online/offline guesswork: relay freshness is unreliable, so nothing is gated on it and the iroh dial itself is the liveness check), where you select the device to join. Any listed device can be joined — if it isn't hosting yet, the join retries every few seconds for up to 10 attempts, so starting the host shortly afterward works; if those attempts expire, press Join again. You never type the other device's name, and identical short names are distinguished by their high-entropy suffixes. A restarted host is re-resolved automatically.
-- **PIN quick pair** is the fastest ad-hoc pairing and is always local-network-only. The starting device shows a short code (with a **Copy PIN** action), which you type on the joining device in two four-character groups. The fields uppercase and map look-alikes as you go, auto-advance between groups, and distinguish an incomplete code from a fully typed mistake. The PIN both locates the starting device and authenticates the connection in-band; no standing secret ever exists.
+Every duocb installation generates its own permanent application keypair. This
+key is separate from iroh's ephemeral transport key:
 
-  The encrypted rendezvous record is advertised as a spec-compliant Bonjour/DNS-SD service (`_duocb-pin._udp`) whose SRV/A records carry the host's direct addresses. No third-party server participates: discovery stays on the local network and all session traffic travels directly between the two devices, never through a relay. The desktop flow interoperates with the iOS app's **Local network only** channel. This is a discovery policy, not a packet-level on-link boundary: reflected mDNS, a VPN or overlay, globally routed interfaces, or a custom peer that already knows the endpoint and PIN can extend the direct path beyond a conventional LAN.
+- The application private key signs the device's portable identity card and
+  authenticates the duocb wire handshake.
+- The signed identity card contains the final device name and application
+  public key. The final name is `<short-name>_<permanent-random-suffix>`; the
+  suffix is minted once per installation and stays stable across renames and
+  identity resets.
+- The iroh key creates the current QUIC endpoint and node id. It is used for
+  signaling and transport establishment, never as the saved duocb identity.
 
-  A captured rendezvous record is an offline PIN-guessing target. Argon2id makes each guess expensive, and a guessed PIN is useful only before the first peer claims the server. Once paired, the server stops publishing PINs and binds the session to that peer's QUIC-authenticated node id, so later PIN recovery cannot admit a different identity or decrypt the established QUIC session.
+Pairing is mutual. On each device:
 
-  Networks that block multicast can use the manual-IP path: the host also displays its LAN IPv4 and serves the same PIN-encrypted record over a small unicast listener. Leaving the joiner's optional IP field blank uses mDNS; entering the displayed IP fetches the record directly. The field locks the joiner's detected network prefix and rejects out-of-range addresses as a typo check (a whole pasted address is accepted, and loopback is allowed for same-machine testing). This input validation is a convenience, not a packet-level boundary.
+1. Copy its signed identity card.
+2. Paste and import the other device's card.
 
-The iroh identity is **ephemeral** — a fresh node id and PIN sequence are minted for every session, and nothing of them is ever persisted. Within a session the node id is stable: it is held for the session's whole lifetime (in every mode), so a temporary disconnection — even one that outlasts the client's retry budget, where pressing Join again with the same PIN or peer starts a new attempt — reconnects under the same identity instead of being refused as a stranger by the already-paired peer. Explicitly stopping/disconnecting (or quitting the app) ends the session and invalidates those ephemeral credentials. The configure mode's secret, device name, and suffix persist; its presence record just lists the device, while a separate short-lived hosting record carries each session's fresh node id for as long as it hosts.
+Import verifies the signature before saving `{name, public key, signed card}`.
+A device only accepts application keys in its own local trusted list. The list
+is capped at 128 entries.
 
-## Install / build
+When a trusted device starts a connection, it publishes a separate NIP-44
+encrypted hosting record for each trusted peer. The record carries only the
+current ephemeral iroh node id. A joining device resolves the selected
+application public key, establishes the iroh connection, and then both sides
+sign a fresh transcript containing:
 
-Prebuilt packages are published by the manual release workflow (Actions → *Release (Manual)*) for Linux (amd64/arm64) and macOS (arm64). Stable releases also include Windows (amd64); prerelease runs skip the Windows build.
+- both application public keys;
+- two random nonces;
+- the dialer/listener roles; and
+- both QUIC-authenticated iroh node ids.
 
-From source:
+Clipboard traffic starts only after both signatures verify and both local
+trust checks pass.
+
+### Optional Nostr peer-list backup
+
+Configure mode can use a manually entered or generated `dc1.…` directory
+channel. It is a standalone 128-bit backup/discovery channel, not an
+authentication key.
+
+Each installation publishes its own complete peer list as an NIP-44 encrypted,
+signed, bounded snapshot. Backups:
+
+- are selected by the owner's application public key;
+- are capped at 128 peers and 128 KiB decoded;
+- use 8 KiB chunks with hashes and a committed header; and
+- alternate between two replaceable slots, retaining one fallback generation.
+
+The channel can also reveal signed self-cards published by other owners on that
+channel. They are candidates only: the UI never trusts them automatically.
+
+#### Fresh-install recovery
+
+Save both the private key (`nsec1…`) and the directory channel. On a fresh
+installation:
+
+1. Choose **Restore a private key** and enter the `nsec`.
+2. Enter the saved `dc1.…` channel.
+3. duocb looks up backups authored by the restored public key and decrypts them
+   with the channel.
+4. If a valid complete backup exists, duocb displays an offer with its signed
+   name, generation, and peer list.
+5. Select the peers to recover and explicitly choose **Restore selected**, or
+   choose **Keep local state**.
+
+Accepting the restore also recovers the signed short name and its permanent
+suffix. Restore is never automatic. Entering an existing channel queries
+before publishing, so a fresh empty install cannot overwrite the backup it is
+trying to recover. The private key alone cannot recover the list because the
+channel is intentionally separate and is required to locate/decrypt the
+backup.
+
+### Quick mode
+
+Quick mode remains identity-free. The host displays a rotating eight-character
+PIN; the joiner enters it. The PIN locates the host and drives a mutual
+Argon2id-backed challenge-response.
+
+The desktop quick flow is LAN-only and uses Bonjour-compatible DNS-SD. Where
+multicast is blocked, enter the LAN IP shown by the host to use the unicast side
+channel. No saved application key, trusted peer, or backup channel participates.
+
+## Build and run
 
 ```sh
-cargo build --release        # binary at target/release/duocb
+cargo build --release
+cargo run
 ```
 
-On Linux CI/minimal systems, the Slint UI needs: `libxkbcommon-dev libwayland-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libfontconfig1-dev` plus OpenGL (mesa). The first build downloads the prebuilt Skia binaries for the text renderer, so expect it to take a while.
+On Linux, Slint needs the usual Wayland/X11, fontconfig, and OpenGL development
+libraries. The release binary is `target/release/duocb`.
 
-The UI renders in the platform's native fonts (San Francisco/Menlo on macOS, Segoe UI/Consolas on Windows, the fontconfig defaults on Linux); set `DUOCB_UI_FONT` to override the UI font family.
+For two instances on one machine, use separate config paths:
 
-## Usage
+```sh
+cargo run -- --config /tmp/duocb-peer1.json
+cargo run -- --config /tmp/duocb-peer2.json
+```
 
-Run `duocb` on both devices.
-
-**Configure mode (primary):**
-
-1. **First device:** the setup wizard opens on launch. Press `G` to generate the secret (copy it somewhere safe), then name the device. The home screen becomes the hub: your identity (e.g. `mac-book_a7B2c3D4`), the secret's fingerprint, and the Start/Join actions.
-2. **Other device:** press `I`, paste the same secret (confirm the fingerprint matches), and name it.
-3. **Pair:** press `S` (Start) on one device; on the other press `C` (Join) to open the device picker, select it (`R` refreshes the list), and press `Enter`. Joining first and starting shortly afterward also works: the join retries every few seconds for up to 10 attempts. If it gives up first, press Join again after the host starts.
-
-**Quick options:** press `Q` on both devices; no shared secret or device setup is required. Quick pairing is local-network-only: press `S` on the starting device, then enter its displayed PIN on the other device and press `C` (or click **Join**). Discovery uses Bonjour/DNS-SD and session traffic is direct, with no third-party server. If multicast is blocked, enter the host IP shown by the starting device in the joiner's optional IP field.
-
-**Paired:** both sides now show the same session panel — `Ctrl/⌘+S` (or the button) reads your clipboard and sends it, and a compose field sends typed text directly (Enter) without touching the clipboard; received items appear in the inbox where you can **Peek** (view without copying) and **Copy** (the only action that writes that received item to your clipboard). Either device can send at any time; the outbox above the inbox shows the last item you sent (size + CRC) so the other side can confirm it matches what arrived.
-
-The joining device reconnects automatically if the connection drops — a fixed retry every few seconds, giving up after 10 consecutive failures (press Join again to resume). The starting device stays listening after its peer disconnects, but only the **same** peer may reconnect — any other device (a *restarted* joining device, which has a new identity, or a third device) is refused immediately with a busy signal rather than left hanging; restart the connection to pair a fresh session.
-
-### Keyboard shortcuts
-
-`Ctrl` is used on Windows and Linux; `⌘` (Command) is used on macOS.
-
-| Key | Where | Action |
-|---|---|---|
-| `G` / `I` | home (configure setup) | generate a new secret / import an existing one |
-| `S` | home / quick options | start (host) a connection |
-| `C` | home (configure hub) | open the device picker |
-| `C` / `Enter` | device picker | join the selected device |
-| `R` / `↑` `↓` | device picker | refresh the device list / move the selection |
-| `Esc` | device picker | back to the hub |
-| `Q` | home | open the quick options |
-| `C` | quick options | join with the entered PIN |
-| `Ctrl/⌘+Enter` | quick-mode join forms | connect |
-| `Esc` | any screen (no field focused) | back to home, stopping the session |
-| `Ctrl/⌘+T` | when available | copy the PIN (PIN host) or the secret (hub) |
-| `Ctrl/⌘+S` | connected | send the current clipboard |
-| `Ctrl/⌘+P` | connected | peek/hide the newest inbox item |
-| `Ctrl/⌘+Y` | connected | copy the newest inbox item to the clipboard |
-| `Ctrl/⌘+L` | connected | clear the inbox |
+Each process holds an exclusive sibling `<config>.lock`; `-c` aliases
+`--config`, and the CLI overrides `DUOCB_CONFIG`.
 
 ## Configuration
 
-On every launch, duocb creates (if needed) and locks `duocb/config.json` under the platform's per-user config directory — `~/.config/duocb/config.json` on Linux, `~/Library/Application Support/duocb/config.json` on macOS, and `%APPDATA%\duocb\config.json` on Windows. The file stores the configure mode's state and is written and read by duocb, not meant for hand editing. The setup wizard saves the secret and device name as soon as they are entered; `device_suffix` is generated on the very first launch and never changes — it survives **Clear secret** (which removes only `secret`):
+The machine-managed config lives under the platform user config directory. Its
+shape is:
 
 ```json
 {
-  "secret": "eyJ2IjoxfQ.…",
+  "version": 1,
+  "identity_secret": "nsec1…",
   "my_name": "mac-book",
-  "device_suffix": "a7B2c3D4"
+  "self_card": "{ signed Nostr event JSON }",
+  "directory_channel": "dc1.…",
+  "peers": ["{ signed peer card JSON }"],
+  "backup_generation": 4,
+  "backup_dirty": false
 }
 ```
 
-The config is **per-machine**: the permanent suffix is this device's identity, so
-copying a config file to another machine is not supported — import the secret
-through the wizard there instead. Existing configs must contain a
-`device_suffix`; there is no migration or backward compatibility.
+Malformed keys, cards, channels, duplicates, mismatched self-cards, legacy
+fields, and oversized peer lists are startup errors. Saves use an owner-only
+temporary file and atomic rename. Clipboard text, inbox, and outbox are never
+persisted.
 
-Only one duocb process may use a config path at a time. The process holds an
-exclusive OS lock on a sibling `<config>.lock` file for its lifetime, preventing
-two local instances from accidentally claiming the same device identity. Config
-saves flush complete JSON to `<config>.tmp` and atomically rename it over the
-configured path. For same-machine end-to-end testing, give each process its own
-config (each mints its own suffix; keep the secret equal):
+## Security notes
 
-```sh
-duocb --config /tmp/duocb-mac1.json
-duocb --config /tmp/duocb-mac2.json
-```
+- QUIC/TLS 1.3 encrypts the transport.
+- The application-key handshake authenticates configured peers independently
+  of the iroh transport key.
+- Pairwise hosting records are encrypted to the intended trusted peer.
+- Directory backups are encrypted with the optional channel and signed by
+  their owning application key. Anyone holding the channel can read channel
+  backups, so store it with the private key.
+- Nostr relays and iroh infrastructure may observe metadata and timing.
+- Clipboard items are UTF-8 text capped at 1 MiB.
+- A server links one peer at a time. Configure mode pins the stable application
+  identity while allowing its later iroh transport id to change.
 
-`-c` is an alias for `--config`; `DUOCB_CONFIG=/path/to/config.json` provides the
-same override for test harnesses. A command-line path takes precedence over the
-environment variable.
-
-If the selected config exists but cannot be read or parsed, duocb prints an
-error and exits during startup instead of silently replacing it with defaults.
-
-Clipboard content and the inbox are never persisted anywhere.
-
-## Security model
-
-- The transport is iroh QUIC (TLS 1.3); the starting device's node id **is** its public key, so the joining device always talks to the endpoint it typed/resolved, end to end.
-- Configure-mode signaling records on public nostr relays are NIP-44-encrypted under keys derived from the shared secret's rendezvous channel. The secret's auth token is **not** an input to anything a relay can see, so nothing published is derived from the credential that authorizes a session. Presence records carry each device's display name and, while hosting, its **ephemeral node id** inside the ciphertext. Quick pairing publishes no relay record.
-- The node id is not a credential: every connection must pass in-band auth (the secret's token half must match, or a mutual PIN proof) before the clipboard channel opens, and the first authenticated peer claims the connection for the whole session.
-- Clipboard payloads are capped at 1 MiB per item, text only.
-
-## Limitations
-
-- **Two devices, one pairing per server session.** By design.
-- **Text only** (UTF-8). No images or files.
-- A **crashed** peer (vs. a clean disconnect) is detected at the QUIC idle timeout (~30 s), after which the starting device accepts its reconnect and the joining device starts retrying; clean disconnects are instant.
-- Very large X11 clipboards transferred via INCR (multi-megabyte) may fail to read; you get an error banner and the connection is unaffected.
-- On X11 without a clipboard manager, text copied *from* duocb disappears when duocb exits (standard X11 selection semantics).
-
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design: threading model, wire protocol, signaling schemes, and key derivations.
-
-## Acknowledgements
-
-duocb's transport, signaling, and authentication stack is ported from [duopipe](../duopipe), which tunnels SOCKS5 over the same iroh + nostr foundation.
-
-The desktop UI is made with [Slint](https://slint.dev), used under the Slint Royalty-Free License.
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for protocol details and
+[ios/duocb.h](ios/duocb.h) for the strict iOS FFI.

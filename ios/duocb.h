@@ -1,128 +1,68 @@
 /*
  * duocb.h — C interface to libduocb.xcframework for the iOS app.
  * Hand-maintained; keep in sync with crates/duocb-ffi/src/lib.rs.
- * Build with ./build-ios.sh (stages dist/ios/libduocb.xcframework + this header).
  *
- * Configure mode: every device shares one standing secret — a 125-char opaque
- * string carrying both a rendezvous channel and an auth token, handled as one
- * piece — and broadcasts a presence record under its unique display identity
- * "<name>_<suffix>" (e.g. "mac-book_a7B2c3D4"). Role "hub" broadcasts presence
- * and browses the peer list without a session (the screen where the user picks
- * what to do); role "start" hosts (its record carries the node id); role
- * "join" dials exactly the device named by "peer". To move from browsing to a
- * session, stop the hub instance and start a fresh one with the chosen role
- * (and, for join, the peer display picked from the last "peer_list" event).
+ * Configure mode uses one persistent application keypair per installation.
+ * The private key authenticates duocb's wire protocol and signs a portable
+ * identity card containing `<short-name>_<permanent-suffix>`. It is unrelated
+ * to iroh's ephemeral transport key. Pairing is mutual: each installation
+ * persists the other installation's verified signed card in its local "peers"
+ * list.
+ * Generate the suffix once, persist it with the private key, and reuse it for
+ * every renamed/replacement self-card.
  *
- * Quick mode: ephemeral device-to-device pairing with no standing state and no
- * identity. Role "quick_host" publishes a rotating 8-char PIN (a "pin_rotated"
- * event fires on every rotation until a peer pairs, then "pin_cleared"); role
- * "quick_join" dials the PIN typed by the user. For quick_host the rendezvous
- * "channel" is "nostr_lan" (default, the desktop "P" preset — nostr relays
- * carry the rendezvous on iOS; the connection can still be LAN-direct) or "lan"
- * (LAN-only, the desktop "L" preset: a Bonjour/DNS-SD service through the
- * system daemon, no third-party server, direct addresses dialed as resolved).
- * quick_join takes NO channel — it is read from the PIN's first character (a
- * LAN-only PIN uses the "lan" path, anything else "nostr_lan"), so the two
- * sides can never mismatch. For a LAN-only PIN, quick_join may also carry an
- * optional "ip" (the host's LAN IPv4, shown on the hosting device) to pair over
- * the unicast side channel where multicast is blocked; omit it to resolve via
- * mDNS. "lan" needs Info.plist keys: NSBonjourServices must list
- * "_duocb-pin._udp" and NSLocalNetworkUsageDescription must be set; joining
- * triggers the Local Network permission prompt on first use. The nostr-only
- * preset remains desktop-only.
+ * An optional directory_channel is a standalone 128-bit channel used only for
+ * encrypted Nostr peer-list backups and signed-card discovery. The channel is
+ * not an authentication credential. Backup restore is caller-controlled:
+ * duocb_check_backup emits a preview and never modifies local state.
  *
- * Lifecycle:
- *   1. duocb_init_logging()                                   (once, optional)
- *   2. duocb_start(configJson, errBuf, errLen) -> handle      (NULL on error;
- *        errBuf holds the message). ONE instance per process at a time.
- *   3. duocb_next_event(handle, buf, len) in a loop on a timer:
- *        1 = one JSON event written, call again; 0 = none pending;
- *        -1 = NULL handle; -2 = buf too small (event retained, retry larger).
- *   -  duocb_refresh_peers(handle)             (re-fetch the device list; the
- *                                               result arrives as a "peer_list"
- *                                               event. The hub role fetches once
- *                                               on start by itself.)
- *   -  duocb_send_clipboard(handle, utf8Text)  (outcome arrives as an event)
- *   -  duocb_query_conn_path(handle)           (answer arrives as a "conn_path" event)
- *   4. duocb_stop(handle)                      (frees the handle)
+ * Configure config JSON:
+ * {
+ *   "role": "hub" | "start" | "join",
+ *   "identity_secret": "nsec1…",
+ *   "self_card": "{ signed Nostr event JSON }",
+ *   "peers": ["{ signed peer card JSON }"],       // max 128
+ *   "peer_public_key": "hex or npub1…",           // join only; must be in peers
+ *   "directory_channel": "dc1.…",                 // optional
+ *   "backup_generation": 7,                       // persisted, monotonic
+ *   "relays": ["wss://…"]                         // optional
+ * }
  *
- * Config JSON (configure mode):
- *   {"role":"hub"|"start"|"join","secret":"eyJ2IjoxfQ.…","name":"mac1",
- *                                              secret: exactly DUOCB_SECRET_LEN
- *                                              chars; generate with
- *                                              duocb_generate_secret or import
- *                                              from another device
- *    "suffix":"a7B2c3D4",                      permanent 8-char device id; mint
- *                                              once with duocb_generate_suffix
- *                                              and persist forever (Keychain)
- *    "peer":"mac2_x9Y8z7W6",                   join role only: the target
- *                                              device's display identity
- *    "relays":["wss://…"]}                     relays optional (built-in defaults)
+ * "hub" starts the runtime without a connection. Directory and backup work is
+ * explicit through the functions below. "start" publishes pairwise encrypted
+ * hosting records for locally trusted peers. "join" resolves exactly the
+ * selected trusted application public key. Authentication uses the application
+ * keys; Nostr and iroh only signal and establish the transport.
  *
- * Config JSON (quick mode — no secret/name/suffix/peer):
+ * Quick mode remains identity-free:
  *   {"role":"quick_host"}
- *   {"role":"quick_host","channel":"lan"}      LAN-only preset (see above)
- *   {"role":"quick_join","pin":"abcd-2345"}    pin: as typed by the user
- *                                              (dashes/spaces/lowercase ok;
- *                                              rejected with an error if the
- *                                              check digit doesn't match). No
- *                                              "channel" key — it is inferred
- *                                              from the PIN's first character.
- *   {"role":"quick_join","pin":"gh…","ip":"192.168.1.42"}
- *                                              ip: optional, LAN-only PIN only —
- *                                              the host's IPv4 (dotted-quad, no
- *                                              port) shown on the hosting device.
- *                                              Present pairs over the unicast
- *                                              side channel (multicast-free);
- *                                              omitted resolves via mDNS. A
- *                                              malformed IP is rejected; ignored
- *                                              for a non-LAN-only PIN. Build this
- *                                              value with duocb_resolve_join_ip
- *                                              (below), which range-checks the
- *                                              entry against this device's subnet.
+ *   {"role":"quick_host","channel":"lan"}
+ *   {"role":"quick_join","pin":"abcd-2345"}
+ *   {"role":"quick_join","pin":"…","ip":"192.168.1.42"}
  *
- * Events (one JSON object per duocb_next_event call), by "type":
- *   server_ready      {node_id, secret_fingerprint}
- *   client_ready      {node_id, secret_fingerprint}
- *   status            {state: idle|starting|listening|resolving|connecting|
- *                             authenticating|connected|reconnecting,
- *                      attempt?, max?}          (attempt/max only when reconnecting)
- *   peer_paired       {peer_node_id}
+ * quick_host channel is "nostr_lan" (default) or "lan". quick_join infers the
+ * channel from the PIN. LAN mode uses Bonjour `_duocb-pin._udp`; the app must
+ * declare NSBonjourServices and NSLocalNetworkUsageDescription.
+ *
+ * Event JSON types:
+ *   server_ready      {node_id, identity_public_key}
+ *   client_ready      {node_id, identity_public_key}
+ *   status            {state, attempt?, max?}
+ *   peer_paired       {peer_node_id, peer_public_key}
  *   peer_disconnected {}
- *   conn_path         {paths: [{kind: direct|relay|other, display, selected}]}
- *   item_received     {text, pulled}           (text can be up to 1 MiB; a
- *                                               2 MiB buffer always fits.
- *                                               pulled=true marks a resume
- *                                               re-delivery of the peer's
- *                                               latest item — skip it if the
- *                                               inbox already holds that text)
+ *   conn_path         {paths:[{kind,display,selected}]}
+ *   item_received     {text,pulled}
  *   item_sent         {}
- *   pin_rotated       {pin_display, seconds_left, host_lan_ip} (quick_host: the
- *                                               current PIN as "XXXX-XXXX" and
- *                                               how long until it rotates; fires
- *                                               again on every rotation.
- *                                               host_lan_ip is the host's LAN
- *                                               IPv4 on the "lan" channel — show
- *                                               it so the joiner can type it for
- *                                               the typed-IP unicast fallback —
- *                                               and null on other channels)
- *   pin_cleared       {}                        (quick_host: a peer paired or
- *                                               publishing stopped — hide the
- *                                               PIN)
- *   peer_list         {peers: [{display, name, suffix,
- *                               last_seen_unix}]}   (no online/offline or
- *                                               hosting flag: relay freshness is
- *                                               unreliable. Any listed peer is
- *                                               joinable — a join re-resolves and
- *                                               retries, and the iroh dial is the
- *                                               real liveness check)
- *   presence_conflict {message}                (another live process publishes
- *                                               as this device; broadcasting
- *                                               stopped)
+ *   pin_rotated       {pin_display,seconds_left,host_lan_ip}
+ *   pin_cleared       {}
+ *   directory_cards   {cards:[{name,short_name,suffix,public_key,npub,card}]}
+ *   backup_found      {backup:null|{generation,self_card,peers:[...]}}
+ *   backup_published  {generation}
+ *   backup_check_failed   {message}
+ *   backup_publish_failed {message}
  *   error             {message}
  *
- * All strings are NUL-terminated UTF-8. All functions are NULL-safe and never
- * unwind into Swift (the Rust workspace builds with panic=abort).
+ * All strings are NUL-terminated UTF-8. One DuocbHandle may run per process.
  */
 #ifndef DUOCB_H
 #define DUOCB_H
@@ -135,119 +75,78 @@ extern "C" {
 
 typedef struct DuocbHandle DuocbHandle;
 
-/* Route Rust log output to stderr (Xcode console / unified log). Idempotent. */
+#define DUOCB_IDENTITY_BUF_LEN 128
+#define DUOCB_SUFFIX_BUF_LEN 16
+#define DUOCB_PUBLIC_KEY_BUF_LEN 128
+#define DUOCB_IDENTITY_CARD_BUF_LEN 4096
+#define DUOCB_IDENTITY_CARD_INFO_BUF_LEN 512
+#define DUOCB_DIRECTORY_CHANNEL_BUF_LEN 64
+
 void duocb_init_logging(void);
 
-/* Secret helpers for the setup UX. Pass the buffer lengths below: a secret is
- * DUOCB_SECRET_LEN chars and does NOT fit the 64-byte buffer that sufficed for
- * the old 47-char token format — an undersized buffer returns 0 and writes a
- * truncated (useless) value. */
-#define DUOCB_SECRET_LEN 125        /* characters, excluding the NUL */
-#define DUOCB_SECRET_BUF_LEN 128    /* pass as out_len for a secret */
-#define DUOCB_FINGERPRINT_BUF_LEN 32 /* fingerprints are 19 chars + NUL */
-
-/* Generate a fresh secret. 1 = written, 0 = buffer too small, -1 = NULL buffer. */
-int duocb_generate_secret(char *out_buf, size_t out_len);
-
-/* Generate this device's permanent 8-char identity suffix. Call once on first
- * launch and persist the result forever — it must never change, even when the
- * secret is replaced. 1 = written, 0 = buffer too small, -1 = NULL buffer. */
+/* Identity/card/channel helpers.
+ * Generation/output functions: 1 = written, 0 = buffer too small,
+ * -1 = NULL or invalid input. Validation: 1 = valid, 0 = invalid with a
+ * message written to err_buf when supplied, -1 = NULL/non-UTF-8 input. */
+int duocb_generate_identity(char *out_buf, size_t out_len);
+/* Generate once and persist the permanent suffix appended to the short name. */
 int duocb_generate_suffix(char *out_buf, size_t out_len);
+int duocb_validate_identity(const char *private_key,
+                            char *err_buf,
+                            size_t err_len);
+int duocb_identity_public_key(const char *private_key,
+                              char *out_buf,
+                              size_t out_len);
+int duocb_create_identity_card(const char *private_key,
+                               const char *name,
+                               const char *suffix,
+                               char *out_buf,
+                               size_t out_len);
+int duocb_validate_identity_card(const char *card,
+                                 char *err_buf,
+                                 size_t err_len);
+/* Writes JSON with name, short_name, suffix, public_key, and npub. */
+int duocb_identity_card_info(const char *card,
+                             char *out_buf,
+                             size_t out_len);
+int duocb_generate_directory_channel(char *out_buf, size_t out_len);
+int duocb_validate_directory_channel(const char *channel,
+                                     char *err_buf,
+                                     size_t err_len);
 
-/* 1 = valid, 0 = invalid (reason written to err_buf), -1 = NULL argument.
- * Surrounding/embedded whitespace is ignored, so a line-wrapped paste is fine. */
-int duocb_validate_secret(const char *secret, char *err_buf, size_t err_len);
-
-/* Display fingerprint ("XXXX-XXXX-XXXX-XXXX", uppercase hex) of a valid secret;
- * it covers the whole secret, so matching fingerprints on two devices mean
- * matching secrets.
- * 1 = written, 0 = buffer too small, -1 = NULL argument or invalid secret. */
-int duocb_secret_fingerprint(const char *secret, char *out_buf, size_t out_len);
-
-/* Normalize a user-typed quick-pair PIN to canonical form (8 uppercase
- * Crockford characters): strips dashes/spaces, uppercases, maps I/L->1 and
- * O->0, and verifies the trailing check digit. Use for live validation of the
- * join field; duocb_start re-normalizes anyway. 1 = valid (canonical PIN
- * written), 0 = invalid PIN, -1 = NULL argument or buffer < 9 bytes. */
+/* Quick-pair helpers. */
 int duocb_normalize_pin(const char *pin, char *out_buf, size_t out_len);
-
-/* Whether a quick-pair PIN is LAN-only (its first character encodes the
- * channel). Use to reveal the optional host-IP field on the join screen. The
- * PIN is normalized first, so any user-typed form is accepted. 1 = LAN-only,
- * 0 = not LAN-only or the PIN is invalid/incomplete, -1 = NULL or non-UTF-8
- * argument. */
 int duocb_pin_is_lan_only(const char *pin);
-
-/* Describe how the LAN-only join screen should constrain the optional host-IP
- * entry to THIS device's own subnet (both devices must share a LAN, so the
- * host's IP falls inside one of this device's private IPv4 subnets). Writes a
- * JSON object to out_buf:
- *
- *   {"prefix":"10.22.33.","placeholder":"last octet","hint":"","label":"10.22.33.0/24"}
- *
- * "prefix" is the locked network part to show non-editable ahead of the field
- * (the user types only the host part). "placeholder" describes the editable
- * tail ("last octet" / "last 2 octets") for the field's placeholder text.
- * "hint" is a range hint for a partial-octet subnet (e.g. a /20), else "".
- * "label" is the CIDR for the out-of-range message. All four are "" when no
- * private subnet is detected — fall back to a free full-IP entry then.
- * 1 = written, 0 = buffer too small (a 256-byte buffer is ample), -1 = NULL
- * buffer. */
+/* Writes {"prefix","placeholder","hint","label"} for the optional LAN IP UI. */
 int duocb_join_ip_context(char *out_buf, size_t out_len);
+/* 1 = in-range address written, 0 = out of range, 2 = empty/use mDNS,
+ * -1 = malformed/NULL/buffer too small. */
+int duocb_resolve_join_ip(const char *entry,
+                          char *out_buf,
+                          size_t out_len);
 
-/* Validate what the user typed into the host-IP entry against this device's
- * subnet, resolving the host part after the locked prefix (or a whole pasted
- * address) into a full IPv4 written to out_buf — pass exactly that as the
- * config "ip" to duocb_start. 1 = in range (address written), 0 = out of range
- * (show "IP out of range" using the "label" above), 2 = empty entry (resolve
- * via mDNS; pass no "ip"), -1 = malformed / NULL input / buffer too small. */
-int duocb_resolve_join_ip(const char *entry, char *out_buf, size_t out_len);
+/* Start and event lifecycle. duocb_next_event returns 1 = event written,
+ * 0 = none pending, -1 = NULL handle, -2 = buffer too small (event retained). */
+DuocbHandle *duocb_start(const char *config_json,
+                         char *err_buf,
+                         size_t err_len);
+int duocb_next_event(const DuocbHandle *handle,
+                     char *out_buf,
+                     size_t out_len);
 
-/* Start a session (configure or quick mode, per the config's "role").
- * Returns a non-NULL handle, or NULL with the error message in err_buf. */
-DuocbHandle *duocb_start(const char *config_json, char *err_buf, size_t err_len);
+/* Explicit Nostr operations: 0 = requested, -1 = NULL handle,
+ * -2 = no directory_channel configured. */
+int duocb_refresh_directory(const DuocbHandle *handle);
+int duocb_check_backup(const DuocbHandle *handle);
+int duocb_publish_backup(const DuocbHandle *handle);
 
-/* Drain one pending event as JSON (see header comment for return codes). */
-int duocb_next_event(const DuocbHandle *handle, char *out_buf, size_t out_len);
-
-/* Re-fetch the presence records of the other devices sharing the secret; the
- * result arrives as a {"type":"peer_list"} event. At most one fetch runs at a
- * time (extra requests while one is in flight are dropped).
- * 0 = requested, -1 = NULL handle. */
-int duocb_refresh_peers(const DuocbHandle *handle);
-
-/* Quick-host only: mint and publish a fresh PIN immediately, invalidating
- * every previously shown PIN. The new code arrives as the next
- * {"type":"pin_rotated"} event; an "error" event if no PIN is being published
- * (wrong role, or a peer already paired). 0 = requested, -1 = NULL handle. */
+/* Session operations. */
 int duocb_refresh_pin(const DuocbHandle *handle);
-
-/* Queue a clipboard text for the peer. 0 = queued (outcome arrives as an
- * "item_sent" or "error" event), -1 = NULL/invalid argument. */
 int duocb_send_clipboard(const DuocbHandle *handle, const char *text);
-
-/* Request a point-in-time connection-path snapshot; the reply arrives as a
- * {"type":"conn_path"} event. 0 = requested, -1 = NULL handle. */
 int duocb_query_conn_path(const DuocbHandle *handle);
-
-/* 1 = runtime alive, 0 = runtime ended (fatal — stop and start fresh),
- * -1 = NULL handle. */
 int duocb_is_running(const DuocbHandle *handle);
-
-/* Re-issue the session command this handle was started with, on its
- * still-running runtime. The runtime keeps the session identity and pairing
- * state (node id, the host's pair claim, the joiner's pinned dial target)
- * until the handle is stopped, so after the session ends on its own — e.g.
- * the joiner gave up reconnecting ("could not reach the peer…" then
- * {"state":"idle"}) — this resumes the same pairing: the same node id dials
- * the same target and the peer recognizes it, with no re-pairing and no fresh
- * PIN. A fresh duocb_start would mint a new identity, which an already-paired
- * peer refuses. Progress arrives as the usual status events.
- * 0 = requested; -1 = NULL handle; -2 = hub role (nothing to reconnect);
- * -3 = runtime unavailable (it died — duocb_stop and start fresh). */
+/* 0 = requested, -1 = NULL, -2 = hub, -3 = runtime unavailable. */
 int duocb_reconnect(const DuocbHandle *handle);
-
-/* Stop the session and free the handle. NULL is a safe no-op. */
 void duocb_stop(DuocbHandle *handle);
 
 #ifdef __cplusplus

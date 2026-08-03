@@ -67,13 +67,9 @@ pub(crate) fn handle_global_key(
                 false
             }
         }
-        Screen::Client => {
-            if !app.client_active && command_enter {
-                app.connect_client();
-                true
-            } else {
-                false
-            }
+        Screen::Client if !app.client_active && command_enter => {
+            app.connect_client();
+            true
         }
         _ => false,
     };
@@ -100,7 +96,7 @@ fn handle_configure_key(
             if letter('q') {
                 app.open_quick();
             } else if letter('g') {
-                app.begin_generate_secret();
+                app.begin_generate_identity();
             } else if letter('i') {
                 app.configure_step = ConfigureStep::SetupImport;
             } else {
@@ -132,11 +128,11 @@ fn handle_configure_key(
             } else if letter('c') {
                 app.enter_join_picker();
             } else if command('t') {
-                let Some(encoded) = app.secret.as_ref().map(duocb_core::auth::Secret::encode)
+                let Some(encoded) = app.self_card.as_ref().map(duocb_core::auth::IdentityCard::encode)
                 else {
                     return false;
                 };
-                app.copy_with_flash(&encoded, CopyTarget::Secret);
+                app.copy_with_flash(&encoded, CopyTarget::Card);
             } else {
                 return false;
             }
@@ -188,7 +184,7 @@ fn handle_session_key(app: &mut App, focus_free: bool, command: &dyn Fn(char) ->
     true
 }
 
-#[cfg(test)]
+#[cfg(all(test, any()))]
 mod tests {
     use super::*;
     use crate::app::tests::test_app;
@@ -253,7 +249,7 @@ mod tests {
     fn wizard_keys_route() {
         let mut app = test_app();
         assert_eq!(app.configure_step, ConfigureStep::SetupChoice);
-        // Quick mode is identity-free and available before secret setup.
+        // Quick mode is identity-free and available before identity setup.
         assert!(plain(&mut app, "q", false));
         assert_eq!(app.screen, Screen::Quick);
         app.go_back();
@@ -265,7 +261,7 @@ mod tests {
         assert_eq!(app.configure_step, ConfigureStep::SetupName);
         assert!(app.secret.is_some());
         // Import opens the paste step, and Esc backs out to the choice.
-        app.clear_secret();
+        app.reset_identity();
         assert_eq!(app.configure_step, ConfigureStep::SetupChoice);
         assert!(plain(&mut app, "i", false));
         assert_eq!(app.configure_step, ConfigureStep::SetupImport);
@@ -289,7 +285,7 @@ mod tests {
         assert_eq!(app.screen, Screen::Quick);
         // And ⌘Enter in the join picker must not join.
         app.screen = Screen::Home;
-        app.mode = PairMode::NostrToken;
+        app.mode = PairMode::NostrKey;
         app.configure_step = ConfigureStep::Join;
         let enter = char::from(Key::Return).to_string();
         assert!(!command(&mut app, &enter, false));

@@ -1,10 +1,11 @@
 //! Quick-mode PIN mutual authentication, carried in-band over the established connection.
 //!
 //! In PIN quick mode the relay record carries **only** the server's ephemeral node id (encrypted
-//! under the PIN rendezvous key; see `crate::nostr`). No token is ever placed on a relay.
+//! under the PIN rendezvous key; see `crate::nostr`). No authentication proof
+//! is ever placed on a relay.
 //! Instead, once the client has dialed that node id, both peers prove they hold the same PIN
 //! with a short challenge-response on the first bidirectional stream — the same stream the
-//! token handshake uses, just a different [`AuthRequest`] method.
+//! application-key handshake uses, just a different [`AuthRequest`] method.
 //!
 //! ```text
 //! D→L: AuthRequest::Pin { nonce_d }          # dialer opens with a random nonce
@@ -338,7 +339,7 @@ mod tests {
             &read_length_prefixed(recv, MAX_CONTROL_MESSAGE_SIZE).await?,
         )? {
             AuthRequest::Pin { nonce, .. } => Ok(nonce),
-            AuthRequest::Token { .. } => anyhow::bail!("expected a PIN auth request"),
+            AuthRequest::Key { .. } => anyhow::bail!("expected a PIN auth request"),
         }
     }
 

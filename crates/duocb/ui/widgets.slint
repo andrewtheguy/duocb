@@ -87,18 +87,18 @@ export component BackHeader inherits HorizontalLayout {
 
 /// The standing configure-mode identity, kept visible while a session runs,
 /// without showing or exposing the secret itself.
-export component TokenPairingSummary inherits Card {
+export component IdentityPairingSummary inherits Card {
     CardTitle { text: "Configured pairing"; }
     LabeledValue { label: "This device:"; value: UiState.display-identity; }
     if UiState.joined-peer != "": LabeledValue { label: "Joining:"; value: UiState.joined-peer; }
     if UiState.node-id-short != "": LabeledValue { label: "This node:"; value: UiState.node-id-short; }
     if UiState.peer-node-id-short != "": LabeledValue { label: "Paired with:"; value: UiState.peer-node-id-short; }
-    if UiState.session-fingerprint != "": LabeledValue {
-        label: "Secret fingerprint:";
-        value: UiState.session-fingerprint;
+    if UiState.session-public-key != "": LabeledValue {
+        label: "Application public key:";
+        value: UiState.session-public-key;
     }
-    if UiState.session-fingerprint != "": Small {
-        text: "Must match on both devices.";
+    if UiState.session-public-key != "": Small {
+        text: "This is separate from the ephemeral iroh node id.";
     }
 }
 

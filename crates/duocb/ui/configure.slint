@@ -13,18 +13,18 @@ component ChoiceStep inherits VerticalLayout {
     alignment: start;
     spacing: Theme.pad-m;
     Card {
-        CardTitle { text: "Set up the shared secret"; }
+        CardTitle { text: "Set up this device"; }
         Weak {
-            text: "All of your devices share one secret. Create it on the first device, then import the same secret on every other one.";
+            text: "Each duocb installation has its own permanent identity key. Pair devices by exchanging their signed identity cards.";
         }
         Rectangle { height: Theme.pad-s; }
         BigButton {
-            text: "🔑 Create a new secret";
+            text: "🔑 Create a new identity";
             hint: "G";
             clicked => { Actions.begin-generate(); }
         }
         WideButton {
-            text: "📥 Use an existing secret";
+            text: "📥 Restore a private key";
             hint: "I";
             clicked => { Actions.open-import(); }
         }
@@ -32,25 +32,38 @@ component ChoiceStep inherits VerticalLayout {
 }
 
 component ImportStep inherits VerticalLayout {
-    out property <bool> field-focused: entry.has-focus;
+    out property <bool> field-focused: entry.has-focus || channel-entry.has-focus;
     alignment: start;
     spacing: Theme.pad-m;
     Card {
-        CardTitle { text: "Import the shared secret"; }
-        Body { text: "Paste the secret copied from your other device:"; }
+        CardTitle { text: "Restore this device identity"; }
+        Body { text: "Paste the nsec private key saved from this device:"; }
         entry := LineEdit {
             input-type: InputType.password;
-            placeholder-text: "…";
-            text <=> UiState.in-import-secret;
+            placeholder-text: "nsec1…";
+            text <=> UiState.in-private-key;
             edited => { Actions.fields-edited(); }
             accepted => { Actions.use-imported(); }
         }
-        if UiState.import-fingerprint != "": LabeledValue {
-            label: "Secret fingerprint:";
-            value: UiState.import-fingerprint;
+        if UiState.import-public-key != "": LabeledValue {
+            label: "Public identity:";
+            value: UiState.import-public-key;
         }
-        if UiState.import-fingerprint != "": Small {
-            text: "Confirm this matches on the other device.";
+        if UiState.import-public-key != "": Small {
+            text: "This public identity is derived from the private key.";
+        }
+        Rectangle { height: Theme.pad-s; }
+        Body { text: "Optional: enter its backup channel to look for an encrypted peer-list backup:"; }
+        channel-entry := LineEdit {
+            placeholder-text: "dc1.…";
+            text <=> UiState.in-directory-channel;
+            edited => { Actions.fields-edited(); }
+        }
+        if UiState.channel-error != "": Text {
+            text: UiState.channel-error;
+            color: Theme.warn;
+            font-size: Theme.font-body;
+            wrap: word-wrap;
         }
         if UiState.import-error != "": Text {
             text: UiState.import-error;
@@ -63,9 +76,10 @@ component ImportStep inherits VerticalLayout {
             spacing: Theme.pad-s;
             alignment: start;
             Button {
-                text: "✔ Use this secret";
+                text: "✔ Restore key";
                 primary: true;
-                enabled: UiState.import-valid;
+                enabled: UiState.import-valid
+                    && (UiState.in-directory-channel == "" || UiState.channel-valid);
                 clicked => { Actions.use-imported(); }
             }
             Button {
@@ -90,7 +104,7 @@ component NameStep inherits VerticalLayout {
             accepted => { Actions.save-name(); }
         }
         if UiState.name-preview != "": LabeledValue {
-            label: "Broadcast as:";
+            label: "Signed card name:";
             value: UiState.name-preview;
         }
         if UiState.name-error != "": Text {
@@ -118,6 +132,7 @@ component NameStep inherits VerticalLayout {
 }
 
 component HubStep inherits VerticalLayout {
+    out property <bool> field-focused: peer-card-entry.has-focus || channel-entry.has-focus;
     alignment: start;
     spacing: Theme.pad-m;
     Card {
@@ -133,27 +148,35 @@ component HubStep inherits VerticalLayout {
             }
             Button { text: "Rename"; clicked => { Actions.rename(); } }
         }
-        if UiState.has-secret: HorizontalLayout {
+        if UiState.has-identity: HorizontalLayout {
             spacing: Theme.pad-s;
             alignment: start;
-            Text { text: "Secret:"; font-size: Theme.font-body; vertical-alignment: center; }
+            Text { text: "Public key:"; font-size: Theme.font-body; vertical-alignment: center; }
             Mono {
-                text: UiState.secret-hint;
+                text: UiState.public-key-short;
                 horizontal-stretch: 1;
                 vertical-alignment: center;
             }
             Button {
-                text: UiState.copied-secret ? "✔ Copied" : "Copy secret";
-                clicked => { Actions.copy-secret(); }
+                text: UiState.copied-card ? "✔ Copied" : "Copy identity card";
+                clicked => { Actions.copy-card(); }
             }
-            Button { text: "Clear secret…"; clicked => { Actions.request-clear-secret(); } }
         }
-        if UiState.has-secret: LabeledValue {
-            label: "Fingerprint:";
-            value: UiState.secret-fingerprint;
+        if UiState.has-identity: LabeledValue {
+            label: "Full public identity:";
+            value: UiState.public-key;
         }
-        if UiState.has-secret: Small {
-            text: "Must match on every device.";
+        if UiState.has-identity: Small {
+            text: "Paste this device's signed card into each device that should trust it.";
+        }
+        if UiState.has-identity: HorizontalLayout {
+            spacing: Theme.pad-s;
+            alignment: start;
+            Button {
+                text: UiState.copied-private-key ? "✔ Private key copied" : "Back up private key";
+                clicked => { Actions.copy-private-key(); }
+            }
+            Button { text: "Reset identity…"; clicked => { Actions.request-reset-identity(); } }
         }
         Small { text: "Config: " + UiState.config-path; wrap: char-wrap; }
         if UiState.presence-conflict != "": Text {
@@ -161,6 +184,97 @@ component HubStep inherits VerticalLayout {
             color: Theme.warn;
             font-size: Theme.font-body;
             wrap: word-wrap;
+        }
+    }
+    Card {
+        CardTitle { text: "Trust another device"; }
+        Body {
+            text: "Paste the other device's signed identity card. Pairing is mutual, so import this device's card there too.";
+        }
+        peer-card-entry := LineEdit {
+            placeholder-text: "{ signed identity card JSON }";
+            text <=> UiState.in-peer-card;
+            edited => { Actions.fields-edited(); }
+            accepted => { Actions.import-peer-card(); }
+        }
+        if UiState.peer-card-error != "": Text {
+            text: UiState.peer-card-error;
+            color: Theme.warn;
+            font-size: Theme.font-body;
+            wrap: word-wrap;
+        }
+        HorizontalLayout {
+            alignment: start;
+            Button {
+                text: "Import trusted device";
+                primary: true;
+                enabled: UiState.peer-card-valid;
+                clicked => { Actions.import-peer-card(); }
+            }
+        }
+        if UiState.peers.length > 0: Small { text: "Trusted devices (" + UiState.peers.length + "/128)"; }
+        for row in UiState.peers: HorizontalLayout {
+            spacing: Theme.pad-s;
+            Mono {
+                text: row.line;
+                horizontal-stretch: 1;
+                vertical-alignment: center;
+            }
+            Button { text: "Remove"; clicked => { Actions.remove-peer(row.public-key); } }
+        }
+    }
+    Card {
+        CardTitle { text: "Encrypted Nostr backup"; }
+        Weak {
+            text: "A backup channel stores a bounded, encrypted copy of this identity's peer list. Save it with the private key; the channel is not an authentication key.";
+        }
+        channel-entry := LineEdit {
+            placeholder-text: "dc1.…";
+            text <=> UiState.in-directory-channel;
+            edited => { Actions.fields-edited(); }
+            accepted => { Actions.set-channel(); }
+        }
+        if UiState.channel-error != "": Text {
+            text: UiState.channel-error;
+            color: Theme.warn;
+            font-size: Theme.font-body;
+            wrap: word-wrap;
+        }
+        HorizontalLayout {
+            spacing: Theme.pad-s;
+            alignment: start;
+            Button {
+                text: "Use entered channel";
+                enabled: UiState.channel-valid;
+                clicked => { Actions.set-channel(); }
+            }
+            Button { text: "Generate new channel"; clicked => { Actions.generate-channel(); } }
+            if UiState.has-channel: Button {
+                text: UiState.copied-channel ? "✔ Copied" : "Copy channel";
+                clicked => { Actions.copy-channel(); }
+            }
+        }
+        Small { text: UiState.backup-status; }
+        if UiState.has-channel: HorizontalLayout {
+            spacing: Theme.pad-s;
+            alignment: start;
+            Button { text: "Check for my backup"; clicked => { Actions.check-backup(); } }
+            Button { text: "Find devices on channel"; clicked => { Actions.refresh-peers(); } }
+        }
+        if UiState.directory-candidates.length > 0: Small {
+            text: "Signed cards found on this channel. Review before trusting:";
+        }
+        for row in UiState.directory-candidates: HorizontalLayout {
+            spacing: Theme.pad-s;
+            Mono {
+                text: row.line;
+                horizontal-stretch: 1;
+                vertical-alignment: center;
+            }
+            Button {
+                text: "Trust";
+                clicked => { Actions.trust-directory-card(row.public-key); }
+            }
         }
     }
     BigButton {
@@ -198,7 +312,7 @@ component JoinStep inherits VerticalLayout {
         if UiState.peers-empty-text != "": Weak { text: UiState.peers-empty-text; }
         for row in UiState.peers: SelectableRow {
             selected: row.selected;
-            clicked => { Actions.toggle-peer(row.suffix); }
+            clicked => { Actions.toggle-peer(row.public-key); }
             Mono {
                 text: row.line;
                 horizontal-stretch: 1;
@@ -229,7 +343,8 @@ export component HomeScreen inherits ScrollView {
     /// plain-letter shortcuts). Only the visible step's field counts.
     out property <bool> field-focused:
         (UiState.configure-step == ConfigureStep.setup-import && import-step.field-focused)
-        || (UiState.configure-step == ConfigureStep.setup-name && name-step.field-focused);
+        || (UiState.configure-step == ConfigureStep.setup-name && name-step.field-focused)
+        || (UiState.configure-step == ConfigureStep.ready && hub-step.field-focused);
     viewport-width: root.width;
     viewport-height: max(root.height, content.preferred-height);
     horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
@@ -242,7 +357,7 @@ export component HomeScreen inherits ScrollView {
         Text { text: "duocb"; font-size: Theme.font-title; font-weight: 800; }
         Body { text: "Peer-to-peer clipboard sharing between two devices."; }
         Weak {
-            text: "Both devices can send and receive. One device starts a connection; the other joins it.";
+            text: "Both devices can send and receive. Configured devices authenticate with their application identity keys; quick mode still uses a PIN.";
         }
         Rectangle { height: Theme.pad-s; }
 
@@ -272,7 +387,7 @@ export component HomeScreen inherits ScrollView {
             clicked => { Actions.open-quick(); }
         }
         if UiState.configure-step == ConfigureStep.setup-choice || UiState.configure-step == ConfigureStep.ready: Small {
-            text: "Quick pair connects directly to a nearby duocb device via a short PIN, even when it doesn't share your secret.";
+            text: "Quick pair connects directly to a nearby duocb device via a short PIN and does not use saved identities.";
             horizontal-alignment: center;
         }
         if UiState.configure-step == ConfigureStep.setup-choice || UiState.configure-step == ConfigureStep.ready: Small {

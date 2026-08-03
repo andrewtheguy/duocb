@@ -1,51 +1,21 @@
-//! Nostr side channel for the configure mode's device presence and rendezvous.
-//!
-//! Everything here is keyed off the [`Channel`] — the 128-bit rendezvous half of
-//! the standing secret (see [`crate::auth`]). The auth token half is
-//! deliberately *not* reachable from this module: relays see the channel-derived
-//! public key, and no relay-visible value may be a function of the credential
-//! that authorizes a session.
-//!
-//! All devices sharing one channel derive the *same* nostr keypair from it, so
-//! authorship of an event under that key **is** the proof of channel possession
-//! — a presence record is "a message signed by the channel". Each running device
-//! publishes one kind-30078 parameterized-replaceable **presence record** under a
-//! `d` tag of `duocb:presence:<sha256(channel||identity)>`, where `identity` is
-//! the device's collision-resistant display identity `<name>_<suffix>` (see
-//! `crate::identity`). The hash is salted with the channel so identities cannot
-//! be enumerated on relays.
-//!
-//! The record content is NIP-44 **self-encrypted** under the channel-derived
-//! keypair and carries a JSON [`PresenceRecord`]: the plaintext display name
-//! (readable only by secret holders), the permanent per-device suffix, and a
-//! random per-publisher-run id. It is a directory entry only — it says "this
-//! device exists / was last seen at `created_at`" and carries **no** dial target
-//! or hosting/liveness signal. A peer fetches every record under the shared
-//! author key, decrypts them into a device list, and the user picks a device to
-//! join.
-//!
-//! The dial target is negotiated separately, out of the directory: while a
-//! device is hosting a connection it publishes a short-lived **hosting record**
-//! (see [`publish_hosting`]) keyed off the same channel+identity, carrying only
-//! its current ephemeral iroh node id and self-expiring via NIP-40 so it leaves
-//! no standing liveness on relays. On join, the client resolves that record for
-//! the selected identity (see [`lookup_hosting`]) to learn the node id to dial;
-//! its absence means the device is not currently hosting. The **token** half of
-//! the secret still gates the actual connection in-band, so locating a device and
-//! being allowed to talk to it stay separate.
+//! Nostr signaling for configured peers, encrypted peer-list backups, and
+//! quick-mode PIN rendezvous.
 
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use iroh::EndpointId;
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::auth::Channel;
+use crate::auth::{
+    DirectoryChannel, Identity, IdentityCard, MAX_TRUSTED_PEERS,
+};
 use crate::pin;
 
-/// Default public relays used when none are configured.
 pub const DEFAULT_NOSTR_RELAYS: &[&str] = &[
     "wss://nos.lol",
     "wss://relay.nostr.net",
@@ -53,102 +23,36 @@ pub const DEFAULT_NOSTR_RELAYS: &[&str] = &[
     "wss://relay.snort.social",
 ];
 
-/// Parameterized-replaceable event kind (NIP-78 application-specific data) used to
-/// carry presence records. Replaceable, so the latest publish supersedes the previous.
-const PRESENCE_KIND_U16: u16 = 30078;
-/// Base of the `d` tag identifying duocb presence (directory) records; the
-/// per-device identity hash is appended (see [`presence_dtag`]).
-const PRESENCE_DTAG_BASE: &str = "duocb:presence";
-/// Base of the `d` tag identifying duocb hosting records; the per-device identity
-/// hash is appended (see [`hosting_dtag`]). A separate slot from presence so the
-/// dial target lives outside the directory listing.
-const HOSTING_DTAG_BASE: &str = "duocb:hosting";
-/// Domain separation for deriving the nostr key from the rendezvous channel.
-/// `v2` is the channel-keyed derivation; `v1` hashed the whole auth token.
-const KEY_DERIVATION_DOMAIN: &[u8] = b"duocb:nostr-rendezvous:v2";
-/// Domain separation for hashing a device's display identity into its presence `d` tag.
-const PRESENCE_DOMAIN: &[u8] = b"duocb:presence-id:v2";
-/// Domain separation for hashing a device's display identity into its hosting `d`
-/// tag. Distinct from [`PRESENCE_DOMAIN`] so the two records for one device hash
-/// to unrelated tags and cannot be correlated on relays.
-const HOSTING_DOMAIN: &[u8] = b"duocb:hosting-id:v2";
-
-/// Payload schema version; records with any other value are rejected on decode
-/// (strict no backward compatibility).
-pub const PRESENCE_VERSION: u32 = 2;
-
-/// How long a hosting record stays on relays (NIP-40). Comfortably longer than
-/// [`PRESENCE_REPUBLISH_INTERVAL`] so it stays alive across the heartbeat while a
-/// device keeps hosting, then self-cleans shortly after hosting stops.
+const BACKUP_HEADER_KIND_U16: u16 = 30383;
+const BACKUP_CHUNK_KIND_U16: u16 = 30384;
+const HOSTING_KIND_U16: u16 = 30385;
+const BACKUP_VERSION: u32 = 1;
+const HOSTING_VERSION: u32 = 1;
+const CHANNEL_KEY_DOMAIN: &[u8] = b"duocb:directory-channel-key:v1";
+const PAIR_TAG_DOMAIN: &[u8] = b"duocb:pairwise-hosting:v1";
+const BACKUP_HEADER_DTAG: &str = "duocb:backup-header:v1";
+const BACKUP_CHUNK_DTAG: &str = "duocb:backup-chunk:v1";
+const MAX_BACKUP_BYTES: usize = 128 * 1024;
+const BACKUP_CHUNK_BYTES: usize = 8 * 1024;
+const MAX_BACKUP_CHUNKS: usize = 16;
+const MAX_CARRIER_CONTENT: usize = 16 * 1024;
+const BACKUP_QUERY_LIMIT: usize = 128;
 const HOSTING_EVENT_TTL_SECS: u64 = 300;
-
-/// Steady-state heartbeat between presence republishes.
-pub const PRESENCE_REPUBLISH_INTERVAL: Duration = Duration::from_secs(120);
-/// Faster republish cadence right after the publisher starts, so a fresh device
-/// shows up quickly even if a relay dropped the first publish.
-pub const PRESENCE_STARTUP_INTERVAL: Duration = Duration::from_secs(10);
-/// Number of startup-cadence cycles before settling on the steady heartbeat.
-pub const PRESENCE_STARTUP_CYCLES: u32 = 6;
-/// Records older than this are dropped from the peer list entirely.
-pub const PRESENCE_HIDE_AFTER_SECS: u64 = 7 * 24 * 3600;
-
-/// Timeout for establishing relay connections.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// Timeout for a presence fetch/lookup query.
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(15);
 
-fn presence_kind() -> Kind {
-    Kind::from_u16(PRESENCE_KIND_U16)
+fn backup_header_kind() -> Kind {
+    Kind::from_u16(BACKUP_HEADER_KIND_U16)
 }
 
-/// Build a `d` tag for a device: the given `base` tag plus a hex SHA-256 of the
-/// (trimmed) display identity, salted with the `domain` and the shared
-/// `channel`. The salt means an identity cannot be guessed or enumerated on
-/// relays without the channel; all parties share it, so all derive the same tag.
-/// The `domain` also decouples the presence and hosting tags for one device.
-fn identity_dtag(base: &str, domain: &[u8], channel: Channel, identity: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(domain);
-    hasher.update(channel.as_bytes());
-    hasher.update(identity.trim().as_bytes());
-    let digest = hasher.finalize();
-    let mut tag = String::with_capacity(base.len() + 1 + digest.len() * 2);
-    tag.push_str(base);
-    tag.push(':');
-    for b in digest {
-        use std::fmt::Write as _;
-        let _ = write!(tag, "{b:02x}");
-    }
-    tag
+fn backup_chunk_kind() -> Kind {
+    Kind::from_u16(BACKUP_CHUNK_KIND_U16)
 }
 
-/// The `d` tag for a device's presence (directory) record.
-fn presence_dtag(channel: Channel, identity: &str) -> String {
-    identity_dtag(PRESENCE_DTAG_BASE, PRESENCE_DOMAIN, channel, identity)
+fn hosting_kind() -> Kind {
+    Kind::from_u16(HOSTING_KIND_U16)
 }
 
-/// The `d` tag for a device's hosting record (the out-of-directory dial target).
-fn hosting_dtag(channel: Channel, identity: &str) -> String {
-    identity_dtag(HOSTING_DTAG_BASE, HOSTING_DOMAIN, channel, identity)
-}
-
-/// Derive the shared nostr identity from the rendezvous `channel`. Both peers run
-/// this on the same channel and get the same keypair, so the server publishes and
-/// the client looks up under one author key with no extra identifier exchanged.
-/// The auth token is not an input: this key's *public* half goes on relays.
-pub fn derive_keys(channel: Channel) -> Result<Keys> {
-    let mut hasher = Sha256::new();
-    hasher.update(KEY_DERIVATION_DOMAIN);
-    hasher.update(channel.as_bytes());
-    let digest = hasher.finalize();
-    let secret =
-        SecretKey::from_slice(&digest).context("deriving nostr secret key from the channel")?;
-    Ok(Keys::new(secret))
-}
-
-/// Connect a no-signer nostr client to the given relays. Events are signed by the
-/// caller before sending, so no signer is configured here. Bails if none can be
-/// added, or if none is actually connected once the connect wait elapses.
 async fn connect_client(relays: &[String]) -> Result<Client> {
     let client = Client::default();
     let mut added = 0;
@@ -178,283 +82,499 @@ async fn connect_client(relays: &[String]) -> Result<Client> {
     Ok(client)
 }
 
-/// The NIP-44-encrypted content of a presence (directory) record. Authorship
-/// under the channel-derived key proves channel possession; the payload carries
-/// the plaintext display name (readable only by channel holders) plus the minimum
-/// a peer needs to *list* this device. It deliberately carries no dial target or
-/// hosting/liveness signal — that is the hosting record's job (see
-/// [`publish_hosting`]).
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct PresenceRecord {
-    /// Must equal [`PRESENCE_VERSION`]; anything else is rejected on decode.
-    pub version: u32,
-    /// The user-chosen short name (without the suffix).
-    pub name: String,
-    /// The permanent per-device suffix — the stable key peers dedupe by.
-    pub suffix: String,
-    /// Random id minted per publisher start. A record under our own `d` tag
-    /// carrying a foreign `run_id` means another live process publishes as us.
-    pub run_id: String,
+/// Derive the encryption recipient used by one optional backup channel.
+pub fn derive_channel_keys(channel: DirectoryChannel) -> Result<Keys> {
+    let mut hasher = Sha256::new();
+    hasher.update(CHANNEL_KEY_DOMAIN);
+    hasher.update(channel.as_bytes());
+    let secret =
+        SecretKey::from_slice(&hasher.finalize()).context("deriving directory channel key")?;
+    Ok(Keys::new(secret))
 }
 
-impl PresenceRecord {
-    /// The full display identity `<name>_<suffix>` this record is tagged under.
-    pub fn display(&self) -> String {
-        crate::identity::display_identity(&self.name, &self.suffix)
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BackupBody {
+    version: u32,
+    generation: u64,
+    self_card: String,
+    peers: Vec<String>,
+}
+
+/// Fully validated recovery material owned by one application identity.
+#[derive(Clone, Debug)]
+pub struct BackupSnapshot {
+    pub generation: u64,
+    pub self_card: IdentityCard,
+    pub peers: Vec<IdentityCard>,
+}
+
+impl BackupSnapshot {
+    pub fn new(
+        generation: u64,
+        self_card: IdentityCard,
+        peers: Vec<IdentityCard>,
+    ) -> Result<Self> {
+        if peers.len() > MAX_TRUSTED_PEERS {
+            anyhow::bail!("backup has more than {MAX_TRUSTED_PEERS} peers");
+        }
+        let mut seen = HashSet::new();
+        for peer in &peers {
+            if peer.public_key() == self_card.public_key() {
+                anyhow::bail!("backup peer list contains its owner");
+            }
+            if !seen.insert(peer.public_key()) {
+                anyhow::bail!("backup peer list contains a duplicate public key");
+            }
+        }
+        let snapshot = Self {
+            generation,
+            self_card,
+            peers,
+        };
+        snapshot.encoded_body()?;
+        Ok(snapshot)
+    }
+
+    fn encoded_body(&self) -> Result<Vec<u8>> {
+        let bytes = serde_json::to_vec(&BackupBody {
+            version: BACKUP_VERSION,
+            generation: self.generation,
+            self_card: self.self_card.encode(),
+            peers: self.peers.iter().map(IdentityCard::encode).collect(),
+        })
+        .context("serializing peer backup")?;
+        if bytes.len() > MAX_BACKUP_BYTES {
+            anyhow::bail!("peer backup exceeds {MAX_BACKUP_BYTES} bytes");
+        }
+        Ok(bytes)
+    }
+
+    fn decode(bytes: &[u8], owner: PublicKey) -> Result<Self> {
+        if bytes.len() > MAX_BACKUP_BYTES {
+            anyhow::bail!("peer backup exceeds {MAX_BACKUP_BYTES} bytes");
+        }
+        let body: BackupBody =
+            serde_json::from_slice(bytes).context("peer backup payload is invalid")?;
+        if body.version != BACKUP_VERSION {
+            anyhow::bail!("peer backup version {} is unsupported", body.version);
+        }
+        let self_card = IdentityCard::parse(&body.self_card)?;
+        if self_card.public_key() != owner {
+            anyhow::bail!("peer backup owner does not match its signed self-card");
+        }
+        let peers = body
+            .peers
+            .iter()
+            .map(|card| IdentityCard::parse(card))
+            .collect::<Result<Vec<_>>>()?;
+        Self::new(body.generation, self_card, peers)
     }
 }
 
-/// A peer as shown in the device list, decoded from its newest presence record.
-/// Deliberately carries no hosting/liveness signal: relay timing is too
-/// unreliable to derive an online/offline verdict from, so every listed device
-/// is joinable and the join re-resolves the record and lets iroh's dial be the
-/// actual liveness check (the dial target lives in the record, not here — see
-/// [`crate::net`]'s client session).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PeerInfo {
-    /// The peer's short name.
-    pub name: String,
-    /// The peer's permanent suffix (stable selection key).
-    pub suffix: String,
-    /// `created_at` of the peer's newest record, unix seconds.
-    pub last_seen_unix: u64,
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BackupHeader {
+    version: u32,
+    generation: u64,
+    slot: u8,
+    snapshot_id: String,
+    chunks: u8,
+    peer_count: u16,
+    self_card: String,
+    chunk_hashes: Vec<String>,
 }
 
-impl PeerInfo {
-    /// The peer's full display identity `<name>_<suffix>`.
-    pub fn display(&self) -> String {
-        crate::identity::display_identity(&self.name, &self.suffix)
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BackupChunk {
+    version: u32,
+    generation: u64,
+    slot: u8,
+    snapshot_id: String,
+    index: u8,
+    data: String,
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn backup_dtag(base: &str, slot: u8, index: Option<usize>) -> String {
+    match index {
+        Some(index) => format!("{base}:{slot}:{index}"),
+        None => format!("{base}:{slot}"),
     }
 }
 
-/// Publish (or replace) this device's presence record under the channel-derived
-/// key, tagged with its display identity so every device stays distinct.
-pub async fn publish_presence(
-    channel: Channel,
-    record: &PresenceRecord,
-    relays: &[String],
-) -> Result<()> {
-    let keys = derive_keys(channel)?;
-    let payload = serde_json::to_string(record).context("serializing presence record")?;
-    // Self-encryption under the shared (channel-derived) keypair: any peer with
-    // the same channel derives the same key to decrypt; relays see only ciphertext.
+fn encrypted_carrier(
+    identity: &Identity,
+    recipient: PublicKey,
+    kind: Kind,
+    dtag: String,
+    plaintext: String,
+) -> Result<Event> {
     let content = nip44::encrypt(
-        keys.secret_key(),
-        &keys.public_key(),
-        payload,
+        identity.keys().secret_key(),
+        &recipient,
+        plaintext,
         nip44::Version::V2,
     )
-    .context("encrypting presence record for nostr")?;
-    let client = connect_client(relays).await?;
-    let event = EventBuilder::new(presence_kind(), content)
-        .tags([Tag::identifier(presence_dtag(channel, &record.display()))])
-        .sign_with_keys(&keys)
-        .context("signing presence event")?;
-    let res = client.send_event(&event).await;
-    client.disconnect().await;
-    res.context("publishing presence event to relays")?;
-    Ok(())
+    .context("encrypting Nostr carrier")?;
+    if content.len() > MAX_CARRIER_CONTENT {
+        anyhow::bail!("encrypted Nostr carrier exceeds {MAX_CARRIER_CONTENT} bytes");
+    }
+    EventBuilder::new(kind, content)
+        .tags([Tag::identifier(dtag), Tag::public_key(recipient)])
+        .sign_with_keys(identity.keys())
+        .context("signing Nostr carrier")
 }
 
-/// Decode presence records out of fetched events: keep only duocb presence `d`
-/// tags, silently skip anything that does not decrypt or parse to a
-/// current-version [`PresenceRecord`] (old record formats are rejected, not
-/// migrated). Returns each record with its event `created_at` in unix seconds.
-fn presence_from_events<'a>(
-    keys: &Keys,
-    events: impl IntoIterator<Item = &'a Event>,
-) -> Vec<(PresenceRecord, u64)> {
-    let dtag_prefix = format!("{PRESENCE_DTAG_BASE}:");
-    events
-        .into_iter()
-        .filter(|event| {
-            event
-                .tags
-                .identifier()
-                .is_some_and(|dtag| dtag.starts_with(&dtag_prefix))
-        })
-        .filter_map(|event| {
-            let plaintext =
-                nip44::decrypt(keys.secret_key(), &keys.public_key(), &event.content).ok()?;
-            let record: PresenceRecord = serde_json::from_str(&plaintext).ok()?;
-            (record.version == PRESENCE_VERSION).then_some((record, event.created_at.as_secs()))
-        })
-        .collect()
+fn decrypt_channel_carrier(
+    channel_keys: &Keys,
+    event: &Event,
+) -> Result<String> {
+    event.verify().context("Nostr carrier signature is invalid")?;
+    nip44::decrypt(
+        channel_keys.secret_key(),
+        &event.pubkey,
+        &event.content,
+    )
+    .context("decrypting Nostr carrier")
 }
 
-/// Fetch every presence record published under the shared channel-derived author
-/// key (including this device's own — see [`build_peer_list`] for self-exclusion).
-pub async fn fetch_presence_records(
-    channel: Channel,
-    relays: &[String],
-) -> Result<Vec<(PresenceRecord, u64)>> {
-    let keys = derive_keys(channel)?;
-    let client = connect_client(relays).await?;
-    let filter = Filter::new()
-        .kind(presence_kind())
-        .author(keys.public_key());
-    let events = client.fetch_events(filter, LOOKUP_TIMEOUT).await;
-    client.disconnect().await;
-    let events = events.context("querying nostr relays for presence records")?;
-    Ok(presence_from_events(&keys, events.iter()))
-}
-
-/// Look up the presence record published under a specific display identity.
-/// Returns the newest valid record, or `Ok(None)` when none exists (or the
-/// stored record is unreadable — indistinguishable from absent, by design). A
-/// relay failure is an `Err`, so callers can tell "no record" from "no answer".
-pub async fn lookup_presence(
-    channel: Channel,
-    identity: &str,
-    relays: &[String],
-) -> Result<Option<(PresenceRecord, u64)>> {
-    let keys = derive_keys(channel)?;
-    let client = connect_client(relays).await?;
-    let filter = Filter::new()
-        .kind(presence_kind())
-        .author(keys.public_key())
-        .identifier(presence_dtag(channel, identity))
-        .limit(1);
-    let events = client.fetch_events(filter, LOOKUP_TIMEOUT).await;
-    client.disconnect().await;
-    let events = events.context("querying nostr relays for the peer's presence record")?;
-    let latest = events.iter().max_by_key(|e| e.created_at);
-    Ok(latest.and_then(|event| presence_from_events(&keys, [event]).pop()))
-}
-
-/// Publish (or replace) this device's hosting record: its current ephemeral iroh
-/// node id, NIP-44 self-encrypted under the channel-derived key and tagged under
-/// this device's hosting `d` tag. A parameterized-replaceable event (same kind as
-/// presence, distinct `d` tag) so a new node id supersedes the previous, with a
-/// NIP-40 expiration so the record self-cleans once the device stops refreshing
-/// it (i.e. stops hosting) — leaving no standing dial target or liveness behind.
-pub async fn publish_hosting(
-    channel: Channel,
-    identity: &str,
-    node_id: &EndpointId,
+/// Publish a complete, bounded peer-list backup. Two alternating replaceable
+/// slots retain one fallback generation without unbounded relay growth.
+pub async fn publish_backup(
+    identity: &Identity,
+    channel: DirectoryChannel,
+    snapshot: &BackupSnapshot,
     relays: &[String],
 ) -> Result<()> {
-    let keys = derive_keys(channel)?;
-    // Same `{node_id}` self-encrypted payload the PIN rendezvous uses; reused
-    // here for the out-of-directory hosting record (see `crate::pin_record`).
-    let content = crate::pin_record::encrypt_pin_payload(&keys, node_id)?;
-    let expiration = Timestamp::now() + HOSTING_EVENT_TTL_SECS;
+    if snapshot.self_card.public_key() != identity.public_key() {
+        anyhow::bail!("cannot publish a backup owned by another identity");
+    }
+    let body = snapshot.encoded_body()?;
+    let chunks: Vec<&[u8]> = body.chunks(BACKUP_CHUNK_BYTES).collect();
+    if chunks.is_empty() || chunks.len() > MAX_BACKUP_CHUNKS {
+        anyhow::bail!("peer backup needs too many chunks");
+    }
+    let slot = (snapshot.generation % 2) as u8;
+    let snapshot_id = sha256_hex(&body);
+    let channel_keys = derive_channel_keys(channel)?;
+    let recipient = channel_keys.public_key();
+    let chunk_hashes: Vec<String> = chunks.iter().map(|chunk| sha256_hex(chunk)).collect();
+
     let client = connect_client(relays).await?;
-    let event = EventBuilder::new(presence_kind(), content)
-        .tags([Tag::identifier(hosting_dtag(channel, identity))])
-        .tag(Tag::expiration(expiration))
-        .sign_with_keys(&keys)
-        .context("signing hosting event")?;
-    let res = client.send_event(&event).await;
+    for (index, bytes) in chunks.iter().enumerate() {
+        let payload = serde_json::to_string(&BackupChunk {
+            version: BACKUP_VERSION,
+            generation: snapshot.generation,
+            slot,
+            snapshot_id: snapshot_id.clone(),
+            index: index as u8,
+            data: URL_SAFE_NO_PAD.encode(bytes),
+        })
+        .context("serializing peer backup chunk")?;
+        let event = encrypted_carrier(
+            identity,
+            recipient,
+            backup_chunk_kind(),
+            backup_dtag(BACKUP_CHUNK_DTAG, slot, Some(index)),
+            payload,
+        )?;
+        client
+            .send_event(&event)
+            .await
+            .context("publishing peer backup chunk")?;
+    }
+
+    let header = serde_json::to_string(&BackupHeader {
+        version: BACKUP_VERSION,
+        generation: snapshot.generation,
+        slot,
+        snapshot_id,
+        chunks: chunks.len() as u8,
+        peer_count: snapshot.peers.len() as u16,
+        self_card: snapshot.self_card.encode(),
+        chunk_hashes,
+    })
+    .context("serializing peer backup header")?;
+    let event = encrypted_carrier(
+        identity,
+        recipient,
+        backup_header_kind(),
+        backup_dtag(BACKUP_HEADER_DTAG, slot, None),
+        header,
+    )?;
+    let sent = client.send_event(&event).await;
     client.disconnect().await;
-    res.context("publishing hosting event to relays")?;
+    sent.context("publishing peer backup header")?;
     Ok(())
 }
 
-/// Resolve the dial target for a device by its display identity: the node id from
-/// its current hosting record. Returns `Ok(None)` when no readable record exists
-/// — the device is not hosting (or has stopped and the record expired). A relay
-/// failure is an `Err`, so callers can tell "not hosting" from "no answer".
-pub async fn lookup_hosting(
-    channel: Channel,
-    identity: &str,
-    relays: &[String],
-) -> Result<Option<EndpointId>> {
-    let keys = derive_keys(channel)?;
-    let client = connect_client(relays).await?;
-    let filter = Filter::new()
-        .kind(presence_kind())
-        .author(keys.public_key())
-        .identifier(hosting_dtag(channel, identity))
-        .limit(1);
-    let events = client.fetch_events(filter, LOOKUP_TIMEOUT).await;
-    client.disconnect().await;
-    let events = events.context("querying nostr relays for the peer's hosting record")?;
-    let latest = events.iter().max_by_key(|e| e.created_at);
-    Ok(latest.and_then(|event| crate::pin_record::decrypt_pin_payload(&keys, &event.content)))
+fn decode_header(channel_keys: &Keys, event: &Event) -> Result<BackupHeader> {
+    if event.kind != backup_header_kind() {
+        anyhow::bail!("not a peer backup header");
+    }
+    let plaintext = decrypt_channel_carrier(channel_keys, event)?;
+    let header: BackupHeader =
+        serde_json::from_str(&plaintext).context("peer backup header is invalid")?;
+    if header.version != BACKUP_VERSION
+        || header.slot > 1
+        || header.chunks == 0
+        || header.chunks as usize > MAX_BACKUP_CHUNKS
+        || header.peer_count as usize > MAX_TRUSTED_PEERS
+        || header.chunk_hashes.len() != header.chunks as usize
+    {
+        anyhow::bail!("peer backup header violates protocol bounds");
+    }
+    let card = IdentityCard::parse(&header.self_card)?;
+    if card.public_key() != event.pubkey {
+        anyhow::bail!("peer backup header owner does not match its self-card");
+    }
+    Ok(header)
 }
 
-/// Assemble the UI-facing peer list from fetched records: drop records older
-/// than [`PRESENCE_HIDE_AFTER_SECS`], keep only the newest record per suffix (a
-/// renamed device's old-identity record loses to its new one), and exclude this
-/// device's own suffix. Sorted by display name. Deliberately no online/offline
-/// or hosting verdict — relay freshness is not reliable enough to gate anything
-/// on, so every listed device is joinable.
-pub fn build_peer_list(
-    records: Vec<(PresenceRecord, u64)>,
-    own_suffix: &str,
-    now_secs: u64,
-) -> Vec<PeerInfo> {
-    let mut newest_by_suffix: std::collections::HashMap<String, (PresenceRecord, u64)> =
-        std::collections::HashMap::new();
-    for (record, created_at) in records {
-        if record.suffix == own_suffix {
+fn assemble_snapshot(
+    channel_keys: &Keys,
+    owner: PublicKey,
+    header: &BackupHeader,
+    events: &[Event],
+) -> Result<BackupSnapshot> {
+    let mut by_index: HashMap<usize, Vec<u8>> = HashMap::new();
+    for event in events {
+        if event.pubkey != owner || event.kind != backup_chunk_kind() {
             continue;
         }
-        if now_secs.saturating_sub(created_at) > PRESENCE_HIDE_AFTER_SECS {
+        let Ok(plaintext) = decrypt_channel_carrier(channel_keys, event) else {
+            continue;
+        };
+        let Ok(chunk) = serde_json::from_str::<BackupChunk>(&plaintext) else {
+            continue;
+        };
+        if chunk.version != BACKUP_VERSION
+            || chunk.generation != header.generation
+            || chunk.slot != header.slot
+            || chunk.snapshot_id != header.snapshot_id
+            || chunk.index as usize >= header.chunks as usize
+        {
             continue;
         }
-        match newest_by_suffix.entry(record.suffix.clone()) {
+        let bytes = URL_SAFE_NO_PAD
+            .decode(&chunk.data)
+            .context("peer backup chunk data is invalid")?;
+        let index = chunk.index as usize;
+        if sha256_hex(&bytes) == header.chunk_hashes[index] {
+            by_index.insert(index, bytes);
+        }
+    }
+    if by_index.len() != header.chunks as usize {
+        anyhow::bail!("peer backup snapshot is incomplete");
+    }
+    let mut body = Vec::new();
+    for index in 0..header.chunks as usize {
+        body.extend_from_slice(&by_index.remove(&index).expect("all indices checked"));
+    }
+    if sha256_hex(&body) != header.snapshot_id {
+        anyhow::bail!("peer backup snapshot hash does not match its header");
+    }
+    let snapshot = BackupSnapshot::decode(&body, owner)?;
+    if snapshot.generation != header.generation
+        || snapshot.peers.len() != header.peer_count as usize
+        || snapshot.self_card.encode() != header.self_card
+    {
+        anyhow::bail!("peer backup snapshot does not match its header");
+    }
+    Ok(snapshot)
+}
+
+/// Find, but do not apply, the newest complete backup for one restored identity.
+pub async fn lookup_backup(
+    owner: PublicKey,
+    channel: DirectoryChannel,
+    relays: &[String],
+) -> Result<Option<BackupSnapshot>> {
+    let channel_keys = derive_channel_keys(channel)?;
+    let client = connect_client(relays).await?;
+    let filter = Filter::new()
+        .authors([owner])
+        .kinds([backup_header_kind(), backup_chunk_kind()])
+        .limit(2 + 2 * MAX_BACKUP_CHUNKS);
+    let events = client.fetch_events(filter, LOOKUP_TIMEOUT).await;
+    client.disconnect().await;
+    let events = events.context("querying Nostr for peer backup")?;
+    let all: Vec<Event> = events.into_iter().collect();
+    let mut headers: Vec<(u64, BackupHeader)> = all
+        .iter()
+        .filter_map(|event| {
+            decode_header(&channel_keys, event)
+                .ok()
+                .map(|header| (event.created_at.as_secs(), header))
+        })
+        .collect();
+    headers.sort_by_key(|(created_at, header)| {
+        std::cmp::Reverse((header.generation, *created_at))
+    });
+    for (_, header) in headers {
+        if let Ok(snapshot) = assemble_snapshot(&channel_keys, owner, &header, &all) {
+            return Ok(Some(snapshot));
+        }
+    }
+    Ok(None)
+}
+
+/// Fetch backup owners as signed-card candidates. Applying or restoring any
+/// candidate remains a caller/UI decision.
+pub async fn fetch_directory_cards(
+    channel: DirectoryChannel,
+    relays: &[String],
+) -> Result<Vec<IdentityCard>> {
+    let channel_keys = derive_channel_keys(channel)?;
+    let client = connect_client(relays).await?;
+    let filter = Filter::new()
+        .kind(backup_header_kind())
+        .pubkey(channel_keys.public_key())
+        .limit(2 * BACKUP_QUERY_LIMIT);
+    let events = client.fetch_events(filter, LOOKUP_TIMEOUT).await;
+    client.disconnect().await;
+    let events = events.context("querying Nostr backup directory")?;
+    let mut newest: HashMap<PublicKey, (u64, IdentityCard)> = HashMap::new();
+    for event in events.iter() {
+        let Ok(header) = decode_header(&channel_keys, event) else {
+            continue;
+        };
+        let Ok(card) = IdentityCard::parse(&header.self_card) else {
+            continue;
+        };
+        match newest.entry(card.public_key()) {
             std::collections::hash_map::Entry::Vacant(slot) => {
-                slot.insert((record, created_at));
+                slot.insert((header.generation, card));
             }
             std::collections::hash_map::Entry::Occupied(mut slot) => {
-                if created_at > slot.get().1 {
-                    slot.insert((record, created_at));
+                if header.generation > slot.get().0 {
+                    slot.insert((header.generation, card));
                 }
             }
         }
     }
-    let mut peers: Vec<PeerInfo> = newest_by_suffix
-        .into_values()
-        .map(|(record, created_at)| PeerInfo {
-            name: record.name,
-            suffix: record.suffix,
-            last_seen_unix: created_at,
-        })
-        .collect();
-    peers.sort_by_key(|p| p.display());
-    peers
+    let mut cards: Vec<IdentityCard> = newest.into_values().map(|(_, card)| card).collect();
+    cards.sort_by(|a, b| a.name().cmp(b.name()).then(a.npub().cmp(&b.npub())));
+    cards.truncate(MAX_TRUSTED_PEERS);
+    Ok(cards)
+}
+
+fn pair_dtag(host: PublicKey, peer: PublicKey) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(PAIR_TAG_DOMAIN);
+    hasher.update(host.as_bytes());
+    hasher.update(peer.as_bytes());
+    format!("duocb:hosting:v1:{}", sha256_hex(&hasher.finalize()))
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HostingRecord {
+    version: u32,
+    node_id: String,
+}
+
+/// Publish the host's ephemeral iroh endpoint separately and privately for each
+/// trusted application identity.
+pub async fn publish_hosting(
+    identity: &Identity,
+    peers: &[IdentityCard],
+    node_id: &EndpointId,
+    relays: &[String],
+) -> Result<()> {
+    if peers.is_empty() {
+        return Ok(());
+    }
+    let payload = serde_json::to_string(&HostingRecord {
+        version: HOSTING_VERSION,
+        node_id: node_id.to_string(),
+    })
+    .context("serializing hosting record")?;
+    let expiration = Timestamp::now() + HOSTING_EVENT_TTL_SECS;
+    let client = connect_client(relays).await?;
+    let mut first_error = None;
+    for peer in peers {
+        let content = nip44::encrypt(
+            identity.keys().secret_key(),
+            &peer.public_key(),
+            &payload,
+            nip44::Version::V2,
+        )
+        .context("encrypting pairwise hosting record")?;
+        let event = EventBuilder::new(hosting_kind(), content)
+            .tags([
+                Tag::identifier(pair_dtag(identity.public_key(), peer.public_key())),
+                Tag::public_key(peer.public_key()),
+                Tag::expiration(expiration),
+            ])
+            .sign_with_keys(identity.keys())
+            .context("signing pairwise hosting record")?;
+        if let Err(error) = client.send_event(&event).await
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    }
+    client.disconnect().await;
+    if let Some(error) = first_error {
+        return Err(error).context("publishing pairwise hosting record");
+    }
+    Ok(())
+}
+
+/// Resolve a selected trusted peer's current ephemeral iroh endpoint.
+pub async fn lookup_hosting(
+    identity: &Identity,
+    peer: PublicKey,
+    relays: &[String],
+) -> Result<Option<EndpointId>> {
+    let client = connect_client(relays).await?;
+    let filter = Filter::new()
+        .kind(hosting_kind())
+        .author(peer)
+        .identifier(pair_dtag(peer, identity.public_key()))
+        .limit(1);
+    let events = client.fetch_events(filter, LOOKUP_TIMEOUT).await;
+    client.disconnect().await;
+    let events = events.context("querying Nostr for pairwise hosting record")?;
+    let Some(event) = events.iter().max_by_key(|event| event.created_at) else {
+        return Ok(None);
+    };
+    event.verify().context("hosting record signature is invalid")?;
+    let plaintext = nip44::decrypt(
+        identity.keys().secret_key(),
+        &peer,
+        &event.content,
+    )
+    .context("decrypting pairwise hosting record")?;
+    let record: HostingRecord =
+        serde_json::from_str(&plaintext).context("hosting record payload is invalid")?;
+    if record.version != HOSTING_VERSION {
+        return Ok(None);
+    }
+    Ok(record.node_id.parse().ok())
 }
 
 // ============================================================================
 // Quick-mode PIN rendezvous
 // ============================================================================
-//
-// The nostr transport for the encrypted PIN record (see `crate::pin_record`
-// for the shared codec, and `crate::lan` for the mDNS transport). Unlike the
-// node-id discovery above (keyed off the shared auth token), here the client
-// starts with nothing but the PIN; the lookup is by **author key** — the
-// `(pin, bucket)`-derived public key — so no extra tag is needed.
-//
-// The record is a regular (stored, non-replaceable) event carrying the NIP-44
-// encrypted `{node_id}` payload, with a NIP-40 expiration so per-bucket records
-// coexist briefly (for boundary look-back) then self-clean.
 
-/// Regular (stored, non-replaceable) event kind for PIN rendezvous records. Deliberately
-/// *not* the replaceable 30078 used above, so each 60s bucket's record coexists long
-/// enough for the client's adjacent-bucket look-back.
 const PIN_KIND_U16: u16 = 9421;
-/// How long a published PIN record stays on relays (NIP-40). A few rotation periods so a
-/// client that reads the PIN late still finds the prior bucket's record, but stale records
-/// self-clean soon after.
 const PIN_EVENT_TTL_SECS: u64 = 3 * pin::BUCKET_SECS;
-/// Lookup timeout for a PIN record fetch. Shorter than the node-id lookup: the client
-/// queries all adjacent buckets in one round-trip, and a wrong/expired PIN should fail
-/// fast so the user can re-read the current code.
 const PIN_LOOKUP_TIMEOUT: Duration = Duration::from_secs(8);
 
 fn pin_kind() -> Kind {
     Kind::from_u16(PIN_KIND_U16)
 }
 
-/// Publish a PIN rendezvous record for one bucket: the server's ephemeral node id,
-/// NIP-44 self-encrypted under `keys` (the `(pin, bucket)`-derived keypair, derived
-/// by the caller — the KDF is Argon2id and must run off the async executor), as a
-/// stored event that expires after a few rotation periods.
 pub async fn publish_pin_record(keys: &Keys, node_id: &EndpointId, relays: &[String]) -> Result<()> {
     let content = crate::pin_record::encrypt_pin_payload(keys, node_id)?;
-
     let expiration = Timestamp::now() + PIN_EVENT_TTL_SECS;
     let client = connect_client(relays).await?;
     let event = EventBuilder::new(pin_kind(), content)
@@ -467,23 +587,14 @@ pub async fn publish_pin_record(keys: &Keys, node_id: &EndpointId, relays: &[Str
     Ok(())
 }
 
-/// Look up the PIN rendezvous record on nostr relays, trying each candidate
-/// keypair (the caller derives one per adjacent bucket — see
-/// `pin_record::candidate_keys`; all are queried in a single relay
-/// round-trip). Returns the decrypted node id, or `Ok(None)` when no matching
-/// record is found (wrong or expired PIN). The connection is then
-/// authenticated in-band with the same PIN (see `crate::pin_auth`).
 pub async fn lookup_pin_record(
     candidates: &[Keys],
     relays: &[String],
 ) -> Result<Option<EndpointId>> {
-    // Map public key -> keys so a returned event decrypts with the right
-    // bucket's secret.
-    let by_pubkey: std::collections::HashMap<PublicKey, &Keys> = candidates
+    let by_pubkey: HashMap<PublicKey, &Keys> = candidates
         .iter()
         .map(|keys| (keys.public_key(), keys))
         .collect();
-
     let client = connect_client(relays).await?;
     let filter = Filter::new()
         .kind(pin_kind())
@@ -491,18 +602,15 @@ pub async fn lookup_pin_record(
     let events = client.fetch_events(filter, PIN_LOOKUP_TIMEOUT).await;
     client.disconnect().await;
     let events = events.context("querying nostr relays for the PIN record")?;
-
-    // Prefer the most recent record across all matching buckets.
     let mut candidates: Vec<_> = events.iter().collect();
-    candidates.sort_by_key(|e| std::cmp::Reverse(e.created_at));
+    candidates.sort_by_key(|event| std::cmp::Reverse(event.created_at));
     for event in candidates {
         let Some(keys) = by_pubkey.get(&event.pubkey) else {
             continue;
         };
-        let Some(node_id) = crate::pin_record::decrypt_pin_payload(keys, &event.content) else {
-            continue;
-        };
-        return Ok(Some(node_id));
+        if let Some(node_id) = crate::pin_record::decrypt_pin_payload(keys, &event.content) {
+            return Ok(Some(node_id));
+        }
     }
     Ok(None)
 }
@@ -511,279 +619,153 @@ pub async fn lookup_pin_record(
 mod tests {
     use super::*;
 
-    use crate::auth::Secret;
-
-    /// A deterministic channel for derivation vectors.
-    fn channel(byte: u8) -> Channel {
-        Channel::for_tests([byte; 16])
-    }
-
     #[test]
-    fn derive_keys_is_deterministic_and_channel_specific() {
-        let a = derive_keys(channel(1)).unwrap();
-        let a_again = derive_keys(channel(1)).unwrap();
-        let b = derive_keys(channel(2)).unwrap();
-        assert_eq!(
-            a.public_key(),
-            a_again.public_key(),
-            "same channel must derive the same key"
-        );
-        assert_ne!(
-            a.public_key(),
-            b.public_key(),
-            "different channels must derive different keys"
-        );
-    }
-
-    #[test]
-    fn derive_keys_ignores_the_token_half() {
-        // Two secrets sharing a channel are the same rendezvous, even though
-        // their credentials differ — that decoupling is the whole point.
-        let a = Secret::generate();
-        let encoded = a.encode();
-        let b = Secret::parse(&encoded).unwrap();
-        assert_eq!(
-            derive_keys(a.channel()).unwrap().public_key(),
-            derive_keys(b.channel()).unwrap().public_key()
-        );
-
-        // And a fresh secret (new channel *and* new token) is a different one.
-        let c = Secret::generate();
-        assert_ne!(
-            derive_keys(a.channel()).unwrap().public_key(),
-            derive_keys(c.channel()).unwrap().public_key()
-        );
-    }
-
-    #[test]
-    fn derive_keys_uses_the_v2_channel_domain() {
-        // Guards against reverting to the v1 formula, which hashed the encoded
-        // token string instead of the raw channel bytes.
-        let ch = channel(0);
-        let mut hasher = Sha256::new();
-        hasher.update(b"duocb:nostr-rendezvous:v1");
-        hasher.update(ch.as_bytes());
-        let v1 = Keys::new(SecretKey::from_slice(&hasher.finalize()).unwrap());
-        assert_ne!(derive_keys(ch).unwrap().public_key(), v1.public_key());
-    }
-
-    fn record(name: &str, suffix: &str, run_id: &str) -> PresenceRecord {
-        PresenceRecord {
-            version: PRESENCE_VERSION,
-            name: name.to_string(),
-            suffix: suffix.to_string(),
-            run_id: run_id.to_string(),
-        }
-    }
-
-    fn presence_event(
-        channel: Channel,
-        keys: &Keys,
-        record: &PresenceRecord,
-        created_at: u64,
-    ) -> Event {
-        let content = nip44::encrypt(
-            keys.secret_key(),
-            &keys.public_key(),
-            serde_json::to_string(record).unwrap(),
-            nip44::Version::V2,
+    fn backup_round_trip_validation_and_bounds() {
+        let owner = Identity::generate();
+        let peer = Identity::generate();
+        let snapshot = BackupSnapshot::new(
+            7,
+            owner.card("owner", "a7B2c3D4").unwrap(),
+            vec![peer.card("peer", "x9Y8z7W6").unwrap()],
         )
         .unwrap();
-        EventBuilder::new(presence_kind(), content)
-            .tags([Tag::identifier(presence_dtag(channel, &record.display()))])
-            .custom_created_at(Timestamp::from_secs(created_at))
-            .sign_with_keys(keys)
-            .unwrap()
-    }
-
-    #[test]
-    fn presence_dtag_is_deterministic_identity_and_channel_specific() {
-        let ch = channel(7);
-        let a = presence_dtag(ch, "web1_a7B2c3D4");
-        let a_again = presence_dtag(ch, "web1_a7B2c3D4");
-        let b = presence_dtag(ch, "web2_x9Y8z7W6");
-        assert_eq!(
-            a, a_again,
-            "same channel + identity must derive the same d tag"
-        );
-        assert_ne!(a, b, "different identities must derive different d tags");
-        assert!(a.starts_with(PRESENCE_DTAG_BASE), "d tag was: {a}");
-
-        // Trimming: surrounding whitespace must not change the tag.
-        assert_eq!(a, presence_dtag(ch, "  web1_a7B2c3D4  "));
-
-        // Salt: the same identity under a different channel derives a different tag.
-        let other = presence_dtag(channel(8), "web1_a7B2c3D4");
-        assert_ne!(a, other, "the channel salts the identity hash");
-
-        // The presence and hosting tags for one device stay uncorrelated.
-        assert_ne!(a, hosting_dtag(ch, "web1_a7B2c3D4"));
-    }
-
-    #[test]
-    fn presence_record_round_trips_through_encrypted_event_content() {
-        let ch = channel(3);
-        let keys = derive_keys(ch).unwrap();
-        let rec = record("mac-book", "a7B2c3D4", "run1");
-        let event = presence_event(ch, &keys, &rec, 100);
-
-        // The plaintext name must not appear on the relay.
-        assert!(!event.content.contains("mac-book"), "name leaked in clear");
-
-        let decoded = presence_from_events(&keys, [&event]);
-        assert_eq!(decoded, vec![(rec, 100)]);
-    }
-
-    #[test]
-    fn presence_decoding_skips_foreign_and_malformed_records() {
-        let ch = channel(4);
-        let keys = derive_keys(ch).unwrap();
-
-        let good = record("mac1", "a7B2c3D4", "run1");
-        let good_event = presence_event(ch, &keys, &good, 300);
-
-        // Encrypted under a different channel: must be skipped, not error.
-        let foreign = channel(5);
-        let foreign_keys = derive_keys(foreign).unwrap();
-        let undecryptable = presence_event(foreign, &foreign_keys, &good, 400);
-        // Re-sign under our author key so only decryption distinguishes it.
-        let undecryptable = EventBuilder::new(presence_kind(), undecryptable.content.clone())
-            .tags([Tag::identifier(presence_dtag(ch, "x"))])
-            .sign_with_keys(&keys)
+        let decoded = BackupSnapshot::decode(&snapshot.encoded_body().unwrap(), owner.public_key())
             .unwrap();
+        assert_eq!(decoded.generation, 7);
+        assert_eq!(decoded.self_card.name(), "owner_a7B2c3D4");
+        assert_eq!(decoded.peers[0].public_key(), peer.public_key());
 
-        // Old bare-node-id payload shape: decrypts but is not a PresenceRecord.
-        let legacy_content = nip44::encrypt(
-            keys.secret_key(),
-            &keys.public_key(),
-            iroh::SecretKey::generate().public().to_string(),
-            nip44::Version::V2,
-        )
-        .unwrap();
-        let legacy = EventBuilder::new(presence_kind(), legacy_content)
-            .tags([Tag::identifier(presence_dtag(ch, "legacy"))])
-            .sign_with_keys(&keys)
-            .unwrap();
-
-        // Wrong payload version: parses but must be rejected.
-        let mut future = record("mac9", "q5R6s7T8", "run9");
-        future.version = PRESENCE_VERSION + 1;
-        let future_event = presence_event(ch, &keys, &future, 500);
-
-        // Wrong d-tag base (an unrelated 30078 record): filtered before decrypting.
-        let unrelated = EventBuilder::new(presence_kind(), "junk")
-            .tags([Tag::identifier("someapp:other:abc".to_string())])
-            .sign_with_keys(&keys)
-            .unwrap();
-
-        let decoded = presence_from_events(
-            &keys,
-            [&good_event, &undecryptable, &legacy, &future_event, &unrelated],
-        );
-        assert_eq!(decoded, vec![(good, 300)]);
-    }
-
-    #[test]
-    fn build_peer_list_dedupes_by_suffix_excludes_self_and_ages_records() {
-        let now = 1_000_000u64;
-        let records = vec![
-            // Own record: excluded regardless of freshness.
-            (record("me", "meMEmeM2", "r0"), now),
-            // A device renamed from "old-name" to "new-name": same suffix, the
-            // newer record must win and carry the new name.
-            (record("old-name", "a7B2c3D4", "r1"), now - 5_000),
-            (record("new-name", "a7B2c3D4", "r1"), now - 10),
-            (record("laptop", "x9Y8z7W6", "r2"), now - 5_000),
-            // Ancient record: hidden entirely.
-            (
-                record("dusty", "q5R6s7T8", "r3"),
-                now - PRESENCE_HIDE_AFTER_SECS - 1,
-            ),
-        ];
-
-        let peers = build_peer_list(records, "meMEmeM2", now);
-        assert_eq!(peers.len(), 2, "peers were: {peers:?}");
-
-        // Sorted by display name.
-        let laptop = &peers[0];
-        assert_eq!(laptop.display(), "laptop_x9Y8z7W6");
-        assert_eq!(laptop.last_seen_unix, now - 5_000);
-
-        // The renamed device keeps its newer record's name and timestamp.
-        let renamed = &peers[1];
-        assert_eq!(renamed.display(), "new-name_a7B2c3D4");
-        assert_eq!(renamed.last_seen_unix, now - 10);
-    }
-
-    #[test]
-    fn wrong_channel_cannot_decrypt_presence() {
-        let real = channel(9);
-        let publisher = derive_keys(real).unwrap();
-        let rec = record("mac1", "a7B2c3D4", "run1");
-        let event = presence_event(real, &publisher, &rec, 100);
-        // A peer with a different channel derives a different key and cannot read it.
-        let attacker = derive_keys(channel(10)).unwrap();
-        assert!(
-            nip44::decrypt(attacker.secret_key(), &attacker.public_key(), &event.content)
-                .is_err(),
-            "decryption must fail under a different channel"
-        );
-        assert!(presence_from_events(&attacker, [&event]).is_empty());
-    }
-
-    #[tokio::test]
-    #[ignore = "uses public nostr relays"]
-    async fn public_relay_presence_round_trip() {
-        let relays: Vec<String> = DEFAULT_NOSTR_RELAYS
-            .iter()
-            .map(|relay| relay.to_string())
+        let too_many = (0..=MAX_TRUSTED_PEERS)
+            .map(|index| {
+                Identity::generate()
+                    .card(&format!("peer-{index}"), "x9Y8z7W6")
+                    .unwrap()
+            })
             .collect();
-        let ch = Secret::generate().channel();
-        let host = record("relay-host", &crate::identity::generate_suffix(), "run1");
-
-        publish_presence(ch, &host, &relays)
-            .await
-            .expect("publish presence record");
-
-        let fetched = fetch_presence_records(ch, &relays)
-            .await
-            .expect("fetch presence records");
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let peers = build_peer_list(fetched, "notMYsfx", now);
-        peers
-            .iter()
-            .find(|p| p.suffix == host.suffix)
-            .expect("published device appears in the peer list");
-
-        // The directory record round-trips as-is (no dial target inside it).
-        let (looked_up, _) = lookup_presence(ch, &host.display(), &relays)
-            .await
-            .expect("lookup presence")
-            .expect("record exists");
-        assert_eq!(looked_up, host);
-
-        // The dial target is negotiated out-of-directory: before hosting, no
-        // hosting record exists; after publishing one, the node id round-trips.
-        assert_eq!(
-            lookup_hosting(ch, &host.display(), &relays)
-                .await
-                .expect("lookup hosting"),
-            None,
-            "no hosting record before the device hosts"
+        assert!(
+            BackupSnapshot::new(
+                8,
+                owner.card("owner", "a7B2c3D4").unwrap(),
+                too_many
+            )
+            .is_err()
         );
-        let node_id = iroh::SecretKey::generate().public();
-        publish_hosting(ch, &host.display(), &node_id, &relays)
-            .await
-            .expect("publish hosting record");
+    }
+
+    #[test]
+    fn backup_rejects_duplicates_and_wrong_owner() {
+        let owner = Identity::generate();
+        let peer = Identity::generate()
+            .card("peer", "x9Y8z7W6")
+            .unwrap();
+        assert!(
+            BackupSnapshot::new(
+                1,
+                owner.card("owner", "a7B2c3D4").unwrap(),
+                vec![peer.clone(), peer]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn pair_tags_are_ordered_and_transport_independent() {
+        let a = Identity::generate();
+        let b = Identity::generate();
         assert_eq!(
-            lookup_hosting(ch, &host.display(), &relays)
-                .await
-                .expect("lookup hosting"),
-            Some(node_id),
-            "the hosting record resolves the dial target",
+            pair_dtag(a.public_key(), b.public_key()),
+            pair_dtag(a.public_key(), b.public_key())
+        );
+        assert_ne!(
+            pair_dtag(a.public_key(), b.public_key()),
+            pair_dtag(b.public_key(), a.public_key())
+        );
+    }
+
+    #[test]
+    fn encrypted_chunk_snapshot_requires_a_complete_hash_committed_set() {
+        let owner = Identity::generate();
+        let channel = DirectoryChannel::generate();
+        let snapshot = BackupSnapshot::new(
+            12,
+            owner.card("owner", "a7B2c3D4").unwrap(),
+            vec![
+                Identity::generate().card("phone", "x9Y8z7W6").unwrap(),
+                Identity::generate().card("laptop", "p3Q4r5S6").unwrap(),
+            ],
+        )
+        .unwrap();
+        let body = snapshot.encoded_body().unwrap();
+        let chunks: Vec<&[u8]> = body.chunks(BACKUP_CHUNK_BYTES).collect();
+        let slot = (snapshot.generation % 2) as u8;
+        let snapshot_id = sha256_hex(&body);
+        let channel_keys = derive_channel_keys(channel).unwrap();
+        let recipient = channel_keys.public_key();
+        let chunk_hashes: Vec<String> =
+            chunks.iter().map(|chunk| sha256_hex(chunk)).collect();
+        let chunk_events: Vec<Event> = chunks
+            .iter()
+            .enumerate()
+            .map(|(index, bytes)| {
+                let payload = serde_json::to_string(&BackupChunk {
+                    version: BACKUP_VERSION,
+                    generation: snapshot.generation,
+                    slot,
+                    snapshot_id: snapshot_id.clone(),
+                    index: index as u8,
+                    data: URL_SAFE_NO_PAD.encode(bytes),
+                })
+                .unwrap();
+                encrypted_carrier(
+                    &owner,
+                    recipient,
+                    backup_chunk_kind(),
+                    backup_dtag(BACKUP_CHUNK_DTAG, slot, Some(index)),
+                    payload,
+                )
+                .unwrap()
+            })
+            .collect();
+        let header_event = encrypted_carrier(
+            &owner,
+            recipient,
+            backup_header_kind(),
+            backup_dtag(BACKUP_HEADER_DTAG, slot, None),
+            serde_json::to_string(&BackupHeader {
+                version: BACKUP_VERSION,
+                generation: snapshot.generation,
+                slot,
+                snapshot_id,
+                chunks: chunks.len() as u8,
+                peer_count: snapshot.peers.len() as u16,
+                self_card: snapshot.self_card.encode(),
+                chunk_hashes,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let header = decode_header(&channel_keys, &header_event).unwrap();
+        let restored =
+            assemble_snapshot(&channel_keys, owner.public_key(), &header, &chunk_events).unwrap();
+        assert_eq!(restored.generation, 12);
+        assert_eq!(restored.peers.len(), 2);
+
+        assert!(
+            assemble_snapshot(
+                &channel_keys,
+                owner.public_key(),
+                &header,
+                &chunk_events[1..],
+            )
+            .is_err()
+        );
+        assert!(
+            decrypt_channel_carrier(
+                Identity::generate().keys(),
+                &header_event,
+            )
+            .is_err()
         );
     }
 }

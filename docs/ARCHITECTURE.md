@@ -1,198 +1,214 @@
-# duocb Architecture
+# duocb architecture
 
-duocb is a two-device P2P clipboard-sharing desktop app: a **Slint** front end over a **tokio** networking runtime that pairs two iroh endpoints (QUIC/TLS 1.3), authenticates in-band, and then pumps clipboard items over one long-lived bidirectional stream. Configure-mode signaling uses **nostr**; desktop quick pairing is **local-network-only** — mDNS/DNS-SD multicast, or, where multicast is blocked, a unicast side channel the joiner reaches by typing the host's LAN IP. The portable core and iOS FFI also retain their selectable internet-capable PIN channel.
+duocb separates three concerns that deliberately use different keys:
 
-The transport/signaling/auth stack is a port of [duopipe](../../duopipe)'s peer runtime with the SOCKS payload replaced by a clipboard message stream and the ratatui TUI replaced by a Slint GUI. Domain separation is complete: ALPN `duocb/1` and `duocb:*` KDF salts/tags, so duocb and duopipe peers can never interoperate or collide on relays.
+| Layer | Key lifetime | Purpose |
+|---|---|---|
+| Application identity | Persistent per installation | Signed identity cards, local trust, configure-mode wire authentication, Nostr authorship |
+| iroh endpoint | Ephemeral per logical session | QUIC/TLS endpoint identity, signaling target, connection establishment |
+| Directory channel | Optional, manually portable | Encrypted peer-list backup and signed-card discovery |
 
-## Contents
+The directory channel never authenticates a connection. The application key is
+never used as an iroh secret key. The iroh key never determines local trust.
 
-- [Threading model: UI ↔ runtime](#threading-model-ui--runtime)
-- [Sessions and connection lifecycle](#sessions-and-connection-lifecycle)
-- [Wire protocol](#wire-protocol)
-- [Signaling](#signaling)
-- [Authentication](#authentication)
-- [Key derivations](#key-derivations)
-- [Endpoint and discovery](#endpoint-and-discovery)
-- [Clipboard handling](#clipboard-handling)
-- [Persistence](#persistence)
-- [Security model](#security-model)
-- [Limitations](#limitations)
+## Workspace boundaries
 
-## Threading model: UI ↔ runtime
+- `duocb-core`: portable identity/card types, protocol framing, Nostr
+  signaling/backups, PIN support, and the headless tokio runtime.
+- `duocb`: Slint desktop app, local config, clipboard access, recovery UI.
+- `duocb-ffi`: strict C surface for iOS; the hand-written header is
+  `ios/duocb.h`.
 
-Slint's event loop owns the main thread; a dedicated thread runs a tokio multi-thread runtime. The two sides share **no mutable state** — channels only:
+The Slint event loop and tokio runtime communicate only with `UiCommand` and
+`NetEvent` channels.
 
-```mermaid
-graph LR
-    subgraph "UI thread (Slint event loop)"
-        A[App<br/>screens, inbox/outbox, inputs]
-        CB[SystemClipboard<br/>arboard, UI thread only]
-    end
-    subgraph "net thread (tokio)"
-        M[net_main<br/>command loop]
-        S[session task<br/>server or client]
-        PR[presence publisher<br/>standing, configure mode]
-        P[PIN publisher task]
-    end
-    A -- "UiCommand (tokio mpsc, sync send)" --> M
-    M -- "NetEvent (std mpsc) + wake callback" --> A
-    M --> S
-    M --> PR
-    S --> P
-    S -. "hosting node id (watch)" .-> PR
-```
+## Persistent identity and local trust
 
-- **UI → runtime:** `tokio::sync::mpsc::unbounded_channel<UiCommand>` — `StartServer{mode}`, `StopServer`, `Connect{spec}`, `Disconnect`, `SendClipboard{text}`, `QueryConnPath`, `SetPresence{identity?}`, `RefreshPeers`, `Shutdown`. Unbounded senders are synchronous, so the UI thread never blocks.
-- **Runtime → UI:** `std::sync::mpsc::channel<NetEvent>`; every send is followed by the wake callback, which notifies a `tokio::sync::Notify`. A `slint::spawn_local` task on the event loop awaits that signal, drains the receiver, applies the events to `App`, and pushes the result into the UI through one idempotent `App::sync` projection (all rendering state lives in the `UiState` Slint global; the non-Send app state never leaves the main thread). A 500 ms heartbeat timer drives time-derived state: peek expiry, flashes, the PIN countdown, last-seen labels, and the device picker's 30 s auto-refresh.
-- **Rendering:** the winit backend with Slint's **Skia** renderer (not the default femtovg), chosen for native-quality text: font lookup goes through CoreText / DirectWrite / fontconfig. `main.rs` pushes per-platform font families into the UI once at startup — `".SF NS"` (the San Francisco system font's hidden family name; the friendly aliases don't resolve) + Menlo on macOS, Segoe UI + Consolas on Windows, fontconfig defaults on Linux — and `DUOCB_UI_FONT` overrides the UI family. List properties (peers, inbox, connection paths) are diffed into their `VecModel`s row-by-row rather than replaced, so the heartbeat re-sync never re-instantiates unchanged rows.
-- **Events:** `ServerReady{node_id, secret_fingerprint?, pairing_code?}`, `ClientReady{node_id, secret_fingerprint?}`, `PinRotated{pin_display, seconds_left}` / `PinCleared`, `Status(ConnStatus)`, `PeerPaired` / `PeerDisconnected`, `ConnPath(paths)`, `ItemReceived{text, pulled}` / `ItemSent`, `PeerList{peers}`, `PresenceConflict{message}`, `Error(message)`.
-- **Presence publisher:** owned by `net_main`, independent of sessions. `SetPresence(Some(identity))` (issued by the UI once secret + name are configured) starts it; it broadcasts this device's presence record and keeps it fresh until `SetPresence(None)` (secret cleared) or shutdown. A configure-mode server session feeds its node id through a `tokio::sync::watch` channel; the publisher republishes immediately on change, so hosting state propagates without coupling the session to the publisher's lifetime. `RefreshPeers` spawns a one-shot fetch (at most one in flight) answered with `PeerList`.
-- **Shutdown:** window close → `UiCommand::Shutdown` → the runtime cancels its session (connection closed with code 0, endpoints closed) and returns; the UI joins the thread.
+`auth::Identity` wraps a secp256k1/Nostr keypair:
 
-The `EventSender`'s wake callback is optional, so the whole runtime runs headless in integration tests (`net/runtime.rs` tests pair two real endpoints in-process).
+- private encoding: NIP-19 `nsec`;
+- public display encoding: NIP-19 `npub`;
+- wire/trust key: the 32-byte public key.
 
-## Sessions and connection lifecycle
+An identity card is a signed kind `30382` Nostr event with a fixed identifier
+and a versioned JSON body containing the validated final device name,
+`<short-name>_<permanent-random-suffix>`. The suffix is persisted separately
+from the application key so it remains stable across renames and identity
+resets; accepting a recovered self-card restores its suffix. Parsing checks the
+event signature, kind, identifier, schema, name and suffix rules, and 2 KiB
+size cap.
 
-`net_main` owns **at most one session** (server *or* client); starting a new one cancels and replaces the current one. A session owns a `CancellationToken`, a task handle, and the `clip_tx` channel that feeds outbound clipboard items into whatever connection is currently live.
+Each local peer entry is the full verified card, so the saved name is bound to
+the public key. Trust is local and capped at 128 unique public keys. Neither a
+directory result nor a backup is applied automatically.
 
-**Server session** (`run_server_session`):
+## Configure-mode signaling
 
-1. Create the listening endpoint (fresh ephemeral identity) → emit `ServerReady` → `Listening`.
-2. Signaling: configure mode publishes its node id into the hosting watch channel (a drop-guard clears it on every exit path), and the standing presence publisher carries it to the relays; PIN mode spawns its rotating-PIN publisher (on the LAN-only channel that publisher also starts a unicast side-channel listener on a PIN-derived port, serving the same encrypted record so a joiner who types this host's LAN IP can pair where multicast is blocked).
-3. Accept loop, **one connection served at a time**: `accept_serveable` accepts the single session stream and `auth_as_listener` on it → `PeerPaired` → pump clipboard on that same stream until the connection dies → `PeerDisconnected`, keep listening. The accept keeps running *during* the pump: any dialer that isn't the claimed peer is refused immediately with a `SERVER_BUSY` close (its node id is QUIC/TLS-authenticated, so no in-band auth is needed to turn it away), and a fresh connection from the *paired* peer preempts the current one — a seamless reconnect that doesn't wait on the dead connection's ~30 s idle timeout.
-4. A `PairClaim` (below) restricts the whole session to one peer identity; it also gates `accept_serveable`, so a busy or already-paired server turns away every other dialer promptly rather than leaving it to hang.
+Starting a configure-mode server creates an iroh endpoint with a fresh
+session-scoped key. For each locally trusted card, the host publishes a kind
+`30385` parameterized replaceable event:
 
-**Client session** (`run_client_session`) — resolve/connect/auth loop with reconnect:
+- author: host application key;
+- `p` recipient: exactly one trusted application key;
+- `d`: SHA-256 over a domain plus ordered host/peer public keys;
+- content: NIP-44 encrypted `{version, node_id}`;
+- NIP-40 expiry: five minutes.
 
-1. Resolve the target **each attempt**: configure mode = look up the **selected peer's** hosting record by its exact identity tag and dial the node id inside (so a restarted host with a fresh node id self-heals; a missing hosting id is retried and counts toward the attempt bound); PIN mode = rendezvous lookup on its configured channel (the desktop always supplies LAN-only; a typed host IP fetches the record from that host's unicast side channel instead of browsing mDNS), with a **pinned node id fast path** after the first pairing (the PIN has rotated out of discovery, but the server retains our pairing key, so reconnects dial the remembered id and re-prove the same PIN in-band).
-2. Self-dial guard, then connect (10 s timeout) → open the single session stream, auth on it → `Connected` → pump on the same stream.
-3. On a failed or dropped attempt: **fixed-interval reconnect** — retry every 3 s, giving up after `MAX_CONNECT_ATTEMPTS` (10) *consecutive* failures with a surfaced error. The counter resets to zero on any successful connection, so the bound applies uniformly (a dropped session never retries without end) yet a flaky-but-recovering link never trips it. **Auth failures are fatal** — the credential won't get better on its own; the session ends and the error is surfaced. A `SERVER_BUSY` close from an already-paired server is treated the same way (fatal, no retry).
+The host refreshes these pairwise records while listening. A joiner queries the
+selected trusted author and pair-specific identifier, decrypts with its
+application key, and obtains the ephemeral iroh node id. No shared group
+presence key or broadcast list exists.
 
-## Wire protocol
+This signaling only answers “where is the selected application identity
+hosting now?” The subsequent wire handshake proves who is on the connection.
 
-Per connection (client = dialer), a **single** QUIC bidirectional stream carries both phases in order:
+## Configure-mode authentication
 
-1. **Auth** runs first: `AuthRequest` (`method` tag selects `Token{auth_token}` or `Pin{nonce}`) and the corresponding response flow. 10 s timeout, close codes: `1` auth failed, `2` auth timeout, `3` server busy (already paired with another device — sent before any stream is accepted), `0` clean shutdown.
-2. **Clipboard** — on success the *same* stream stays open (the send side is never `finish`ed) and carries any number of v2 `ClipMsg` frames in both directions. `ClipBody` is tagged as `Item{text, sent_at_ms}`, `PullLatest`, or `Latest{text, sent_at_ms}`; the latter two recover each side's most recent sent item after a reconnect.
-
-There is no separate control channel and no `Hello` handshake: a clipboard app has exactly one data stream, so the two-stream split inherited from the multiplexed duopipe/flextunnel tunnel earns nothing here (auth succeeding already proves the stream is open and bidirectional). Collapsing to one stream saves a stream-open and a round-trip per connection.
-
-**Framing:** 4-byte big-endian length prefix + JSON body, with a `version` field validated on decode (`DUOCB_PROTO_VERSION = 2`) and strict frame boundaries (trailing bytes rejected). Two size caps applied per read by phase: auth/control frames 16 KiB, clipboard frames **1 MiB** (checked against the *encoded* frame). Oversize on send is rejected locally with an error event — nothing hits the wire and the session lives on; an oversize length prefix on receive is a protocol error that drops the connection.
-
-There is no application-level keepalive: QUIC keep-alives (15 s) and the idle timeout (30 s) provide liveness, and the pump ends when the stream read fails — so an ungracefully dropped peer is reaped within ~30 s and the reconnect path takes over.
-
-The pump (`pump_clipboard`) runs the writer (drain `clip_rx` → encode → write) and reader (read frame → `ItemReceived`) as two independent futures over the stream's send/recv halves — no `select!` over a partial frame read, so framing can't be corrupted by cancellation.
-
-## Signaling
-
-Both nostr schemes publish NIP-44 (v2) self-encrypted content; no auth token is ever placed on a relay, and nothing relay-visible is derived from one. Default relays: `nos.lol`, `relay.nostr.net`, `relay.primal.net`, `relay.snort.social`.
-
-### Configure-mode presence (kind 30078, parameterized-replaceable)
-
-- All devices sharing the secret derive the **same nostr keypair** from its **channel half** (`auth::Channel`, 16 raw bytes): `SecretKey = SHA-256("duocb:nostr-rendezvous:v2" ‖ channel)`. Authorship under that key is the proof of channel possession — every presence record is effectively signed by the channel. The auth token half is deliberately not an input: this keypair's *public* half is published, so no relay-visible value may be a function of the credential that admits a session. `nostr.rs` only ever receives a `Channel`, which makes that structural rather than a convention.
-- Each device has a collision-resistant display identity `<name>_<suffix>` (`crate::identity`): a user-chosen short name (`A-Za-z0-9-`, ≤ 24 chars) plus a permanent random 8-char suffix from an unambiguous mixed-case alphabet (no `0 O o 1 l I`), minted on first launch. Devices may freely share short names; an exact random-suffix collision is possible in principle but negligible at the intended device count.
-- One **presence record** per device, `d` tag `duocb:presence:<hex SHA-256("duocb:presence-id:v2" ‖ channel ‖ identity)>` — salted with the channel so identities can't be enumerated. The encrypted payload is JSON: `{version, name, suffix, run_id}` — the plaintext display name (readable only by secret holders), the stable suffix, and a random per-publisher-run id. It is a **directory entry only**: it says "this device exists, last seen at `created_at`" and carries no dial target and no hosting/liveness signal.
-- The dial target lives in a separate **hosting record**, published only while a device is actually hosting: same kind and author key, `d` tag `duocb:hosting:<hex SHA-256("duocb:hosting-id:v2" ‖ channel ‖ identity)>` (a distinct domain, so a device's two tags don't correlate on relays), carrying the current ephemeral node id as the same `{node_id}` self-encrypted payload the PIN rendezvous uses, with a **NIP-40 expiry of 300 s** so it self-cleans once the device stops refreshing it — leaving no standing dial target or liveness on relays. On join the client resolves this record for the selected identity; its absence means that device is not currently hosting.
-- The standing publisher runs whenever secret + name are configured: a quick startup burst (6 × 10 s), then a 120 s heartbeat, plus an immediate republish when the hosting state changes. After the first publish it re-reads its own tag; a record carrying a **foreign `run_id`** means another live process is publishing as this device — it emits `PresenceConflict` and stops rather than fight over the record.
-- The peer list is fetched by **author key alone** and decoded client-side: records older than 7 days are dropped, the newest record per **suffix** wins (a renamed device's old-identity record disappears), and this device's own suffix is excluded. Each row shows the record's raw age, deliberately **not** an online/offline verdict — relay timing is too unreliable to derive one, so nothing is gated on it: any listed device may be joined, the dial re-resolves the record on every retry, and the iroh dial is the actual liveness check. The joiner picks a specific device from this list; nothing is auto-selected.
-
-### Internet-capable PIN rendezvous (core/iOS FFI; kind 9421, regular events with NIP-40 expiry)
-
-The desktop Quick options flow does not select this channel: it always uses the LAN-only discovery path below and rejects PINs that encode an internet-capable channel. The portable core and iOS FFI retain this transport for their selectable `nostr_lan` mode.
-
-- Every 60 s bucket the server mints a fresh 8-char Crockford PIN (7 random chars ≈ 35 bits + a position-weighted check digit that rejects typos at input time).
-- Both sides derive a per-`(pin, bucket)` nostr keypair via **Argon2id** (64 MiB, t=3) with salt `"duocb:pin-rendezvous:v1" ‖ bucket_be`; the record is found by **author key alone** — only a PIN holder can derive it.
-- Records expire after 3 buckets (NIP-40), and the client searches buckets `{cur, cur−1, cur+1}` in one query, so a code read late or across a rotation boundary still resolves.
-- The publisher stops (and the UI clears the code) the moment a peer pairs — no more peers will be accepted that session.
-
-#### LAN-only discovery: mDNS + the manual-IP unicast side channel
-
-The LAN-only channel advertises the encrypted record as a spec-compliant Bonjour/DNS-SD service (`_duocb-pin._udp`, `crate::lan::dnssd`) whose SRV/A/AAAA records carry the host's direct addresses; the joiner dials those as resolved. Where multicast is blocked, the same host *also* serves the record over a **unicast side channel** (`crate::lan::unicast`): a small TCP listener whose port (`lan::side_channel_port`) is a projection of the **same Argon2-derived rendezvous public key the DNS-SD instance label uses** — not of the PIN string — mapped into the ephemeral range. Because the key rotates per bucket the port does too, so the joiner probes the port each of its adjacent-bucket candidate keys derives (concurrently, first decryptable record wins), mirroring the DNS-SD candidate-label match; no port is ever typed. Different PINs almost always map to different ports, so hosts on one LAN normally coexist, but the range is finite (16384 ports) so a collision is possible and would make a second host's listener fail to bind on the shared port (the publisher only warns, and mDNS still carries the rendezvous). The listener returns the same NIP-44 ciphertext plus the host's direct socket addresses. A joiner who types the host's LAN IP fetches that record directly (no multicast), decrypts it with the PIN, and dials the returned addresses — otherwise it browses mDNS. The presence of a typed IP is the only thing that selects the path; the PIN is identical either way and the in-band PIN auth is unchanged, so the side channel only bootstraps discovery (like mDNS) and a spoofed node id still cannot pass auth. Deriving the port from the Argon2 key (rather than a fast hash of the PIN) means an open port leaks no cheap pre-filter of the PIN: mapping a candidate PIN to its port costs an Argon2 evaluation, exactly as it does to map one to a DNS-SD instance label. The listener follows the rotating PIN with a one-period look-back (mirroring the mDNS advert window) and is withdrawn once a peer pairs.
-
-The joiner's typed-IP entry is constrained to *its own* subnet, purely as an input aid (`crate::subnet`). Since both devices must share a LAN, the host's address falls inside one of the joiner's own private IPv4 subnets, read (address + netmask) from the local interfaces via `netdev` — the default-route interface's subnet is primary. The join UI locks that subnet's whole network octets ahead of the field (so `10.22.33.0/24` leaves only the last octet to type, `10.22.32.0/20` locks `10.22.` and hints the `10.22.32.0 – 10.22.47.255` range), and rejects a well-formed address that lands outside every detected subnet with an "IP out of range" message before the dial. A whole address pasted verbatim is accepted too, and loopback (`127/8`) always is, so same-machine testing over `127.0.0.1` still works; when no private subnet is detected the field falls back to free full-IP entry. This is a typo-catcher, **not** a packet-level boundary — it never gates the actual dial (which still accepts any well-formed IPv4), consistent with "LAN-only" describing discovery rather than a subnet boundary. The same logic backs the iOS join screen through the `duocb_join_ip_context` / `duocb_resolve_join_ip` FFI.
-
-## Authentication
-
-Knowing a node id never suffices; every connection authenticates on the session stream before any clipboard frame flows.
-
-**Token method** (configure mode only): the client sends `AuthRequest::Token{auth_token}` carrying the secret's **token half** (43-char base64url of 32 raw bytes, re-encoded canonically by `Secret::wire_token`); the server checks membership in its accepted set and replies `AuthResponse{accepted, reason}`. The channel half never enters the handshake.
-
-The standing secret itself (`auth::Secret`) is a JWT-shaped envelope of exactly 125 characters — three dot-separated base64url (no padding) sections:
-
-```
-eyJ2IjoxfQ.<110 chars>.<3 chars>
-│          │            └─ CRC16-CCITT-FALSE(channel ‖ token), big-endian u16
-│          └─ {"ch":"<22 chars = 16 bytes>","tk":"<43 chars = 32 bytes>"}
-└─ {"v":1}   constant, so it doubles as the duocb marker
-```
-
-The checksum covers the **raw** channel and token bytes, so it is encoding-independent and catches a spliced or partially-pasted secret; a mangled first section is caught by the strict `{"v":1}` check instead. Section lengths are fixed (10/110/3), which pins one canonical rendering per secret — `deny_unknown_fields` on both JSON objects and `URL_SAFE_NO_PAD`'s rejection of padding and non-zero trailing bits do the rest. `Secret::parse` strips ASCII whitespace first, so a line-wrapped paste rejoins; it has no `Display` or `Serialize`, so only an explicit `encode()` can render it.
-
-The 16-hex-digit SHA-256 fingerprint (uppercase, grouped `XXXX-XXXX-XXXX-XXXX`) shown in the UI is taken over **both** halves, so matching fingerprints on two devices mean fully matching secrets. The secret is never displayed in plain text: entry fields are masked, and the fingerprint appears as soon as the input parses.
-
-**PIN method** (PIN quick pair, both LAN and nostr channels): a 4-message mutual challenge-response on the session stream —
+Wire protocol version 3 removes token authentication. The dialer opens one
+bidirectional QUIC stream:
 
 ```text
-C→S: AuthRequest::Pin { nonce_c }
-S→C: PinChallenge     { nonce_s }
-C→S: PinResponse      { proof_c }            proof_c = seal(k, "dialer"   | nonce_c | nonce_s | id_c | id_s)
-S→C: PinConfirm       { accepted, proof_s }  proof_s = seal(k, "listener" | nonce_c | nonce_s | id_c | id_s)
+C → S  KeyRequest   {client application pubkey, nonce_c}
+S → C  KeyChallenge {server application pubkey, nonce_s, signature_s}
+C → S  KeyProof     {signature_c}
+S → C  AuthResponse {accepted}
 ```
 
-`k` is derived from the PIN-shaped secret string alone (Argon2id, salt `"duocb:pin-auth:v1"` — deliberately bucket-independent so a PIN client never guesses the rendezvous bucket), and `seal` is NIP-44 self-encryption whose MAC makes a wrong-secret proof unverifiable. Direction strings and both nonces prevent replay across directions and handshakes; the expected proof plaintext is compared in constant time. **Both peers' node ids are also folded into every proof** (`id_c` the client's, `id_s` the server's): each side takes the peer's id from the QUIC/TLS-authenticated `Connection::remote_id()` and its own from its endpoint, so a proof verifies only when both agree on the two ids. The server thereby validates that the client's claimed identity is the one QUIC authenticated (and the client validates the server) — binding each proof to that pair of ids, so a proof captured on one connection cannot be forwarded or replayed onto a connection with different endpoints. This only defends against parties that do **not** possess the PIN: anyone holding the PIN can mint fresh proofs for whatever node ids it presents, so the binding does not defeat a relay/intermediary that knows the PIN. A PIN server checks its last three rotating keys, and a reconnecting paired peer can also use the exact key it originally paired with. No new application credential is negotiated: iroh's QUIC/TLS handshake independently establishes the connection's traffic-encryption keys, which are not derived from the PIN or nostr record.
+Before signing or accepting, both sides require the presented application key
+to match a locally trusted card. Both signatures cover a domain-separated
+transcript containing:
 
-**PairClaim — one pair per server session:** the first authenticated node id claims the endpoint, and the claim is committed *before* the acceptance frame is written. The claim intentionally survives the peer's disconnects — that peer (and only it) reconnects freely — but a *restarted* peer has a fresh ephemeral identity and is refused; the UI error says to stop/start the server to re-pair. Once the claim exists, `accept_serveable` rejects every other node id **before accepting a stream**, using close code 3 (`SERVER_BUSY`); the client treats that close as a fatal auth error and never retries. Reconnecting therefore requires both the originally paired endpoint's private key (proved by QUIC/TLS) and the original PIN-derived proof. Learning that PIN after the claim is committed is insufficient from any other endpoint identity and does not reveal past or current QUIC traffic keys. Separate authentication failures and timeouts use close codes 1/2, which the client also maps to fatal auth errors.
+```text
+protocol version
+role = dialer | listener
+client application key
+server application key
+nonce_c
+nonce_s
+client iroh node id
+server iroh node id
+```
 
-## Key derivations
+The iroh ids come from the QUIC/TLS-authenticated connection, binding the proof
+to this transport without treating the transport key as the persistent
+identity. Nonces and roles prevent replay/reflection.
 
-| Purpose | Function | Input | Notes |
-|---|---|---|---|
-| nostr identity (configure mode) | SHA-256 | `"duocb:nostr-rendezvous:v2"` ‖ channel | same keypair on all devices; token is **not** an input |
-| presence `d` tag (configure mode) | SHA-256 | `"duocb:presence-id:v2"` ‖ channel ‖ identity | channel-salted identity hash |
-| hosting `d` tag (configure mode) | SHA-256 | `"duocb:hosting-id:v2"` ‖ channel ‖ identity | separate domain, so the two tags for one device don't correlate |
-| PIN rendezvous key | Argon2id 64 MiB/t3 | PIN, salt `"duocb:pin-rendezvous:v1"` ‖ bucket | per-bucket nostr keypair |
-| PIN/session-secret auth key | Argon2id 64 MiB/t3 | PIN-shaped secret, salt `"duocb:pin-auth:v1"` | bucket-independent, distinct domain |
-| secret checksum | CRC16-CCITT-FALSE | channel ‖ token (raw bytes) | 2 bytes, the envelope's third section |
-| secret fingerprint | SHA-256 (first 8 bytes) | channel ‖ token (raw bytes) | 16 uppercase hex digits, grouped `XXXX-XXXX-XXXX-XXXX`, display only |
+The server's one-peer claim stores the stable application public key in
+configure mode. A reconnect may present a new iroh node id if it proves the same
+trusted application key; the claim updates the transport id. Quick mode has no
+application identity and continues to claim the session's iroh id.
 
-A PIN rendezvous event is an offline guessing target: its author key and ciphertext let an attacker check a candidate `(PIN, bucket)` pair. Argon2id (64 MiB, t=3) makes each guess expensive, while 60 s rotation and the server retaining only the three most recent PIN keys limit a PIN's usefulness before the first pairing to roughly three minutes. NIP-40's 180 s expiry asks relays to remove stale records but cannot prevent an observer from archiving them. A successful guess reveals the PIN itself, which derives both the rendezvous key and the in-band authentication key; the event's encrypted payload contains only the ephemeral node id and no part of a standing secret. After pairing, `PairClaim` makes that recovered PIN insufficient by itself: a reconnect must also authenticate as the already-claimed iroh endpoint, and the independently negotiated QUIC traffic keys remain secret.
+## Directory backup and recovery
 
-## Endpoint and discovery
+`DirectoryChannel` encodes 16 random bytes as:
 
-`net/endpoint.rs` builds both endpoints (`Endpoint::builder(presets::Empty)` with an explicit ring crypto provider — required by iroh 1.0 on the Empty preset), tuned by the mode's `EndpointReadiness`:
+```text
+dc1.<22 base64url chars>.<3-char CRC16>
+```
 
-- ALPN `duocb/1` (server side only; a mismatch fails the QUIC handshake).
-- Transport: idle timeout 30 s (prompt dead-peer reaping), keep-alive 15 s; default congestion control.
-- Relays + discovery, **except LAN-only**: `RelayMode::Default` (n0 public relays as fallback path) plus n0 pkarr publisher + DNS resolver **and mDNS**. The client dials a **bare `EndpointAddr::new(node_id)`**; iroh resolves actual addresses via these services and hole-punches, falling back to a relay.
-- **LAN-only PIN (`EndpointReadiness::LanDirect`)**: `RelayMode::Disabled` and *only* the mDNS address lookup — no Nostr rendezvous, relay, or n0 DNS/pkarr publish or resolve. Both LAN-only discovery paths supply the host's direct addresses with the record (DNS-SD SRV/A/AAAA, or the unicast side channel's payload), so the dial target is a fully-addressed `EndpointAddr` and needs no mDNS resolution — which is why the typed-IP path works even where multicast is blocked. No third-party server participates: all session traffic uses a direct device-to-device QUIC path and is never relayed through a middle server. "LAN-only" describes discovery, not a packet-level subnet boundary: direct addresses are not filtered and inbound connections are not rejected by source subnet, so reflected mDNS, VPN/overlay networks, globally routed interfaces, or a custom peer possessing the endpoint details and PIN can extend the direct path beyond a conventional LAN.
-- The identity is never persisted: every session is a fresh Ed25519 key, so node ids (and everything derived from them) are per-run.
+SHA-256 with a fixed domain derives a Nostr keypair used as the NIP-44
+recipient/decryption key. The channel is portable but independent from the
+application private key.
 
-Connection-path status is **pulled on demand**, not watched: `connection_paths(conn)` returns a point-in-time snapshot of the connection's paths (`ConnPath { kind, display, selected }`) — `Connection::paths()` is itself a snapshot, so no background task is involved. The UI's "Connection path" button issues `QueryConnPath`, the runtime answers with `ConnPath(paths)` read from the live connection, and the result is shown in a dismissible modal. A separate background watcher exists **only for logging** the selected path and its changes (relay → direct); it is spawned only when debug logging is enabled (`RUST_LOG=duocb=debug`) and logs at `debug!`, so normal runs are quiet.
+A backup body contains:
 
-## Clipboard handling
+```text
+version, generation, signed self-card, [signed peer cards]
+```
 
-- One **long-lived, lazily created** `arboard::Clipboard` lives on the UI thread for the whole process. On X11, clipboard ownership belongs to the providing connection — a per-operation instance would lose the copied text the moment it dropped.
-- Reads/writes happen directly on the UI thread on button press (text selections are sub-millisecond IPC); failures (e.g. a huge INCR transfer) surface as a dismissible error banner and never affect the connection.
-- **Receive side:** items go into a `Vec<ClipItem>` in app memory, newest first, capped at the **last 5** (older ones drop). Each item shows metadata only until peeked — size hint, a CRC-32 fingerprint (computed once on arrival), and the received time — so the two devices can compare an item without revealing it. *Peek* renders the text read-only, truncated past 4096 chars and auto-hidden after 15 s; within the received-item flow, *Copy* is the **only** action that writes the system clipboard (and always yields the full, untruncated text). There is no auto-copy and no persistence.
-- **Send side:** explicit action only (`Ctrl+S` on Windows/Linux, `⌘S` on macOS, or the button reads the clipboard and sends). There is no clipboard watcher. The **last item sent** is kept in a one-slot outbox (same `ClipItem`, promoted from a pending buffer once `ItemSent` confirms it left the wire) and shown above the inbox with its size/CRC, so the receiver can confirm a match. The runtime also retains that one item in memory for the session lifetime; whenever a stream reconnects, each side sends `PullLatest`, answers with `Latest` when it has something, and the receiving UI deduplicates a recovery delivery it already holds.
+Validation enforces:
 
-## Persistence
+- the self-card owner equals the event author and requested restored identity;
+- at most 128 unique peers;
+- no self entry;
+- every card signature and schema;
+- at most 128 KiB decoded.
 
-The default file is `duocb/config.json` under the platform's per-user config directory (`~/.config` on Linux, `~/Library/Application Support` on macOS, `%APPDATA%` on Windows) with the configure mode's three fields: `secret` (the standing secret, in its encoded 125-char form), `my_name` (this device's short name), and `device_suffix` (the permanent 8-char identity suffix, generated on the first launch with this config file and never regenerated — it survives clearing the secret). The config is **per-machine**; copying it to another device is not supported. It is machine-managed JSON, not intended for hand editing. The setup wizard persists the secret as soon as it is generated/imported and the name as soon as it is confirmed; **Clear secret** (an explicit, confirmed action) removes only `secret`. `--config`/`-c` or `DUOCB_CONFIG` selects an alternative file; the CLI wins over the environment. The process holds an exclusive OS lock on a sibling `<config>.lock` file for its lifetime, so one resolved config cannot back two simultaneous local instances. Same-machine configure-mode E2E peers must therefore use distinct config paths, allowing the instances to run independently and mint separate suffixes, while both configs share the same `secret`. Keeping the lock on a stable sidecar inode allows each save to write and flush complete new JSON to a sibling `<config>.tmp` and atomically rename it over the configured path; a process crash during a save therefore leaves either the old or new complete config rather than a torn in-place write. An unreadable, malformed, or existing suffix-less config is a startup error; only a missing file loads defaults for a first launch. Nothing else is stored: no identity keys, no peer list, no clipboard content, no inbox or outbox.
+Bodies are split into 8 KiB chunks, at most 16. Chunk records are kind `30384`;
+headers are kind `30383`. Every chunk carries generation, slot, snapshot id,
+index, and base64url data. The header commits the generation, peer count,
+signed self-card, chunk count, snapshot SHA-256, and each chunk hash.
 
-The secret is never displayed in full: both the generation step and the hub render it as a mask ending in its last four characters — enough to spot-check that a paste into a place without fingerprint support took the right value — with an explicit "Copy secret" action (for onboarding the next device) plus the fingerprint. The running role screens retain an identity summary: this device's display identity, the secret fingerprint, both local and paired node ids once available, and — on the joiner — which device it is joining.
+Generation parity selects one of two `d`-tag slots. Chunks publish first and the
+header last, so a header is a commit point; the other slot retains a complete
+fallback generation. Lookup tries newest complete generations first and ignores
+partial, mismatched, duplicated, or undecryptable material.
 
-## Security model
+### Restore state machine
 
-- **Trust boundary:** the two devices. The pairing secret (the standing secret or a PIN) is assumed to be transferred between your own devices over a path you already trust.
-- **Transport:** QUIC/TLS 1.3, authenticated by the peer's node id (its public key). The client always connects to exactly the id resolved through discovery (nostr, mDNS, or the unicast side channel).
-- **Relays and signaling servers** (nostr relays, n0 infrastructure) see ciphertext under channel-derived keys and standard QUIC metadata; without the secret/PIN they cannot decrypt the presence records (which carry the plaintext device name **inside** the ciphertext) or pass in-band authentication. A configured device publishes its (encrypted) presence on a ~2-minute heartbeat whenever the app runs, so relay operators observe event timing and author-key activity — a deliberate footprint for the always-current device list. Before a server is claimed, a party that obtains the secret or successfully guesses a current PIN has the corresponding in-band authentication credential, which is why secret secrecy and the PIN KDF/rotation window matter. Learning only a device's relay-visible material (its author key) yields nothing usable for authentication — that is what decoupling the channel from the token buys. After the first pairing, the PIN alone is no longer sufficient: every connection is also bound to the already-claimed QUIC peer identity, and the PIN does not derive the QUIC traffic keys.
-- **Debug hygiene:** `Secret` and `Channel` print `Secret(***)` / `Channel(***)`, the wire token is wrapped in a type whose `Debug` prints `AuthToken(***)`, and the config's `Debug` redacts the stored secret — so none of them leak through logs.
+```mermaid
+flowchart LR
+    A[Restore nsec] --> B[Enter dc1 channel]
+    B --> C[Query headers authored by restored public key]
+    C --> D{Complete valid backup?}
+    D -- no --> E[Allow first local backup]
+    D -- yes --> F[Show signed name and selectable peer preview]
+    F --> G[Explicit Restore selected]
+    F --> H[Explicit Keep local state]
+```
 
-## Limitations
+Entering an existing channel sets a lookup-pending guard before any local
+publish. A successful “not found” result allows the first backup. Confirming a
+restore applies only selected cards and publishes a new generation reflecting
+that selection. Rejecting the offer publishes the retained local state at a
+generation newer than the discovered snapshot.
 
-- Two devices, one pairing per server session — by design (duopipe's model).
-- Text only; 1 MiB cap per item.
-- A crashed peer is detected at the QUIC idle timeout (~30 s); clean disconnects propagate immediately.
-- Multi-megabyte X11 INCR clipboard reads may fail (clean error, connection unaffected).
-- LAN-only PIN pairing relies on mDNS being usable on the local network segment, or — where multicast is blocked — on the joiner typing the host's LAN IP for the unicast side channel. Its traffic is always direct and never uses a middle server, but LAN subnet membership is not enforced at the packet level.
+Kind `30383` headers also provide a bounded channel directory: decryptable
+headers expose their owners' verified self-cards. The UI presents these as
+untrusted candidates with an explicit Trust action.
+
+## Quick mode
+
+Quick PIN pairing is unchanged by the configure-mode identity migration. A
+rotating Crockford PIN drives:
+
+- Argon2id-derived rendezvous keys for Nostr and/or LAN discovery;
+- a separate Argon2id-derived in-band mutual proof;
+- mDNS/DNS-SD or an optional typed-IP unicast lookup in LAN-only mode.
+
+Quick mode persists no application key, peer card, directory channel, iroh key,
+PIN, or session.
+
+## Runtime commands and events
+
+Key configure commands:
+
+- `StartServer::NostrKey { KeyIdentity }`
+- `Connect::NostrKey { KeyIdentity, peer_public_key }`
+- `PublishBackup { KeyIdentity }`
+- `CheckBackup { identity, channel, relays }`
+- `RefreshDirectory { channel, relays }`
+
+Recovery events are data-only:
+
+- `DirectoryCards { cards }`
+- `BackupFound { snapshot: Option<BackupSnapshot> }`
+- `BackupPublished { generation }`
+
+The runtime never mutates caller-owned trust. Desktop and iOS decide whether to
+trust a directory card or restore a snapshot.
+
+## Persistence and bounds
+
+Desktop config stores the application private key, optional signed self-card
+short name and permanent suffix, optional channel, signed peer cards, backup generation, and dirty
+flag. Loading is strict: invalid or legacy data is an error, not a migration or
+silent drop. Files are owner-only, protected by a sibling process-lifetime
+lock, and atomically replaced through a flushed temporary file.
+
+Clipboard content is never persisted. Inbox retention is five items in memory;
+wire clipboard frames are capped at 1 MiB.
+
+## Security assumptions
+
+- Identity cards and backup channels are transferred over a path the owner
+  trusts.
+- Possession of a directory channel permits backup decryption but not wire
+  authentication.
+- Possession of an application private key permits impersonating that
+  installation and decrypting pairwise records addressed to it.
+- Nostr relays may omit, retain, reorder, or replay events. Signatures,
+  generation selection, hashes, bounds, and explicit user confirmation make
+  those behaviors fail closed or remain visible.
+- iroh and relay infrastructure can observe connection/event metadata even
+  though payloads are encrypted.

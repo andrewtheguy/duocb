@@ -3,32 +3,36 @@
 //! replaced by a single long-lived clipboard stream.
 //!
 //! Per connection (client = dialer): the client opens a single bidirectional
-//! stream and authenticates on it (token or PIN); on success that same stream
+//! stream and authenticates on it (application key or PIN); on success that same stream
 //! stays open and both sides pump [`ClipMsg`] frames in both directions until
 //! the connection dies or the session is cancelled.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use iroh::{EndpointAddr, EndpointId};
+use rand::RngCore as _;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::auth::is_token_valid;
+use crate::auth::{Identity, verify_auth_signature};
 use crate::net::endpoint::{
     EndpointReadiness, connect_to_server, connection_paths, create_client_endpoint,
     create_server_endpoint, watch_connection_paths,
 };
 use crate::net::{
-    ConnStatus, DialSpec, EventSender, NetEvent, PinChannel, ServerMode, TokenIdentity, UiCommand,
+    ConnStatus, DialSpec, EventSender, KeyIdentity, NetEvent, PinChannel, ServerMode, UiCommand,
 };
 use crate::protocol::{
-    AuthRequest, AuthResponse, ClipBody, ClipMsg, MAX_CLIP_MESSAGE_SIZE,
-    MAX_CONTROL_MESSAGE_SIZE, decode_auth_request, decode_auth_response, decode_clip_msg,
-    encode_auth_request, encode_auth_response, encode_clip_msg, read_length_prefixed,
+    AuthRequest, AuthResponse, ClipBody, ClipMsg, KeyChallenge, KeyProof,
+    MAX_CLIP_MESSAGE_SIZE, MAX_CONTROL_MESSAGE_SIZE, decode_auth_request,
+    decode_auth_response, decode_clip_msg, decode_key_challenge, decode_key_proof,
+    encode_auth_request, encode_auth_response, encode_clip_msg, encode_key_challenge,
+    encode_key_proof, read_length_prefixed,
 };
 
 /// Retain only the PIN keys from the sender's current and previous rotation buckets for
@@ -38,7 +42,7 @@ const RECENT_PIN_CACHE: usize = 2;
 /// Timeout for the authentication handshake.
 const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Connection close code for authentication failure (invalid token/PIN).
+/// Connection close code for authentication failure (invalid application key/PIN).
 const AUTH_FAILED_CODE: u32 = 1;
 
 /// Connection close code for authentication timeout (no auth within deadline).
@@ -68,7 +72,7 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(3);
 /// the server's claim.
 const MAX_CONNECT_ATTEMPTS: u32 = 10;
 
-/// Marker error for fatal authentication failures (wrong token/PIN, explicit
+/// Marker error for fatal authentication failures (wrong application key/PIN, explicit
 /// rejection, auth timeout). The client session ends on these instead of
 /// retrying — the credential won't get better on its own.
 #[derive(Debug)]
@@ -141,11 +145,14 @@ struct PairClaim {
 /// The peer that holds a [`PairClaim`], plus the material needed to let it reconnect.
 #[derive(Clone)]
 struct ClaimedPeer {
-    /// The paired client's node id (its public key; authenticated by the iroh/QUIC handshake).
-    node_id: EndpointId,
+    /// Configure mode claims the stable application identity. Quick mode has no
+    /// such identity and claims the session-scoped iroh id instead.
+    application_key: Option<nostr_sdk::PublicKey>,
+    node_id: Option<EndpointId>,
     /// The PIN auth key that verified this peer at pairing (PIN mode only). Retained so the
     /// paired peer can complete the in-band challenge-response on reconnect even after its PIN
-    /// has rotated out of the server's recent-bucket cache. `None` for token pairings.
+    /// has rotated out of the server's recent-bucket cache. `None` for
+    /// application-key pairings.
     pin_key: Option<nostr_sdk::Keys>,
 }
 
@@ -166,14 +173,39 @@ impl PairClaim {
     /// peer already held it (a reconnect/retry). Returns `false` if another node id won the
     /// claim first (a race between two first-time dialers), in which case the caller must
     /// reject this peer.
-    fn commit(&self, node_id: EndpointId, pin_key: Option<nostr_sdk::Keys>) -> bool {
+    fn commit_key(&self, public_key: nostr_sdk::PublicKey, node_id: EndpointId) -> bool {
         let mut g = self.peer.lock();
         match g.as_ref() {
-            Some(c) if c.node_id != node_id => false,
+            Some(c) if c.application_key != Some(public_key) => false,
+            Some(_) => {
+                if let Some(claimed) = g.as_mut() {
+                    claimed.node_id = Some(node_id);
+                }
+                true
+            }
+            None => {
+                *g = Some(ClaimedPeer {
+                    application_key: Some(public_key),
+                    node_id: Some(node_id),
+                    pin_key: None,
+                });
+                self.paired.cancel();
+                true
+            }
+        }
+    }
+
+    fn commit_pin(&self, node_id: EndpointId, pin_key: nostr_sdk::Keys) -> bool {
+        let mut g = self.peer.lock();
+        match g.as_ref() {
+            Some(c) if c.node_id != Some(node_id) => false,
             Some(_) => true,
             None => {
-                *g = Some(ClaimedPeer { node_id, pin_key });
-                // First pairing: signal watchers (the PIN publisher stops here).
+                *g = Some(ClaimedPeer {
+                    application_key: None,
+                    node_id: Some(node_id),
+                    pin_key: Some(pin_key),
+                });
                 self.paired.cancel();
                 true
             }
@@ -202,15 +234,15 @@ enum SessionKey {
     ServerPin {
         channel: PinChannel,
     },
-    ServerToken {
-        secret: crate::auth::Secret,
+    ServerKey {
+        public_key: nostr_sdk::PublicKey,
     },
     ClientPin {
         canonical_pin: String,
     },
-    ClientToken {
-        secret: crate::auth::Secret,
-        peer_display: String,
+    ClientKey {
+        public_key: nostr_sdk::PublicKey,
+        peer_public_key: nostr_sdk::PublicKey,
     },
 }
 
@@ -219,18 +251,18 @@ fn session_key(kind: &SessionKind) -> SessionKey {
         SessionKind::Server(ServerMode::Pin { channel, .. }) => {
             SessionKey::ServerPin { channel: *channel }
         }
-        SessionKind::Server(ServerMode::NostrToken { identity }) => SessionKey::ServerToken {
-            secret: identity.secret.clone(),
+        SessionKind::Server(ServerMode::NostrKey { identity }) => SessionKey::ServerKey {
+            public_key: identity.identity.public_key(),
         },
         SessionKind::Client(DialSpec::Pin { canonical_pin, .. }) => SessionKey::ClientPin {
             canonical_pin: canonical_pin.clone(),
         },
-        SessionKind::Client(DialSpec::NostrToken {
+        SessionKind::Client(DialSpec::NostrKey {
             identity,
-            peer_display,
-        }) => SessionKey::ClientToken {
-            secret: identity.secret.clone(),
-            peer_display: peer_display.clone(),
+            peer_public_key,
+        }) => SessionKey::ClientKey {
+            public_key: identity.identity.public_key(),
+            peer_public_key: *peer_public_key,
         },
     }
 }
@@ -295,11 +327,6 @@ type Bi = (iroh::endpoint::SendStream, iroh::endpoint::RecvStream);
 /// Never persisted; a fresh session starts empty.
 type LastSent = Arc<parking_lot::Mutex<Option<(String, u64)>>>;
 
-/// Shared channel carrying the hosting state (the server endpoint's node id
-/// while a configure-mode session is listening, `None` otherwise) from the
-/// session into the standing presence publisher, which republishes on change.
-type HostingTx = Arc<tokio::sync::watch::Sender<Option<EndpointId>>>;
-
 /// A running server or client session: its cancel token, task handle, the
 /// channel that feeds outbound clipboard items into the active connection, and
 /// the shared connection slot for on-demand path queries.
@@ -316,7 +343,6 @@ struct Session {
 fn start_session(
     kind: SessionKind,
     events: EventSender,
-    hosting: Option<HostingTx>,
     memory: &SessionMemory,
 ) -> Session {
     let cancel = CancellationToken::new();
@@ -342,7 +368,6 @@ fn start_session(
                     clip_rx,
                     task_conn,
                     last_sent,
-                    hosting,
                     task_pin_refresh,
                     secret,
                     claim,
@@ -392,86 +417,27 @@ async fn stop_session(session: &mut Option<Session>) {
     }
 }
 
-/// The standing presence publisher task and the identity it broadcasts.
-struct Presence {
-    cancel: CancellationToken,
-    handle: JoinHandle<()>,
-    identity: TokenIdentity,
-}
-
-async fn stop_presence(presence: &mut Option<Presence>) {
-    if let Some(p) = presence.take() {
-        p.cancel.cancel();
-        let _ = p.handle.await;
-    }
-}
-
-/// Random per-publisher-run id (16 hex chars) carried in presence records so a
-/// publisher can recognize a record written by another live process under its
-/// own identity.
-fn generate_run_id() -> String {
-    let bytes: [u8; 8] = rand::Rng::random(&mut rand::rng());
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-fn spawn_presence(identity: TokenIdentity, hosting: &HostingTx, events: EventSender) -> Presence {
-    let cancel = CancellationToken::new();
-    let handle = tokio::spawn(run_presence_publisher(
-        identity.clone(),
-        generate_run_id(),
-        hosting.subscribe(),
-        events,
-        cancel.clone(),
-    ));
-    Presence {
-        cancel,
-        handle,
-        identity,
-    }
-}
-
-/// The runtime's main loop: consume UI commands until shutdown. At most one
-/// session (server or client) runs at a time; starting a new one replaces the
-/// current one. The presence publisher is independent of sessions: it runs from
-/// [`UiCommand::SetPresence`] until stopped, with the hosting watch channel
-/// carrying the current server node id into its records.
+/// The runtime's main loop. Backup and directory operations are one-shot tasks
+/// and never mutate caller-owned local trust.
 pub async fn net_main(mut cmd_rx: mpsc::UnboundedReceiver<UiCommand>, events: EventSender) {
     let mut session: Option<Session> = None;
-    // Identity + pairing state for the current logical session, spanning
-    // session-task restarts (see [`SessionMemory`]). Cleared only by the
-    // explicit stop commands, so a temporary disconnection — even one that
-    // outlives a session task — never demotes a pairing to "re-pair".
     let mut memory: Option<SessionMemory> = None;
-    let mut presence: Option<Presence> = None;
-    // One in-flight peer-list fetch at a time; a completed handle is replaced.
-    let mut peer_fetch: Option<JoinHandle<()>> = None;
-    let hosting: HostingTx = Arc::new(tokio::sync::watch::channel(None).0);
+    let mut backup_lookup_task: Option<JoinHandle<()>> = None;
+    let mut directory_lookup_task: Option<JoinHandle<()>> = None;
 
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
             UiCommand::StartServer { mode } => {
                 stop_session(&mut session).await;
-                let session_hosting = if let ServerMode::NostrToken { identity } = &mode {
-                    // Hosting requires the presence publisher: its record is how
-                    // peers find this device's node id. Ensure it runs for this
-                    // exact identity (the UI normally has it running already).
-                    if presence.as_ref().is_none_or(|p| p.identity != *identity) {
-                        stop_presence(&mut presence).await;
-                        presence = Some(spawn_presence(identity.clone(), &hosting, events.clone()));
-                    }
-                    Some(hosting.clone())
-                } else {
-                    None
-                };
                 let kind = SessionKind::Server(mode);
                 let mem = remember(&mut memory, session_key(&kind));
-                session = Some(start_session(kind, events.clone(), session_hosting, mem));
+                session = Some(start_session(kind, events.clone(), mem));
             }
             UiCommand::Connect { spec } => {
                 stop_session(&mut session).await;
                 let kind = SessionKind::Client(spec);
                 let mem = remember(&mut memory, session_key(&kind));
-                session = Some(start_session(kind, events.clone(), None, mem));
+                session = Some(start_session(kind, events.clone(), mem));
             }
             UiCommand::StopServer | UiCommand::Disconnect => {
                 stop_session(&mut session).await;
@@ -501,42 +467,83 @@ pub async fn net_main(mut cmd_rx: mpsc::UnboundedReceiver<UiCommand>, events: Ev
                     .unwrap_or_default();
                 events.send(NetEvent::ConnPath(paths));
             }
-            UiCommand::SetPresence { identity } => {
-                stop_presence(&mut presence).await;
-                if let Some(identity) = identity {
-                    presence = Some(spawn_presence(identity, &hosting, events.clone()));
-                }
-            }
-            UiCommand::RefreshPeers => {
-                if peer_fetch.as_ref().is_some_and(|h| !h.is_finished()) {
-                    // A fetch is already running; its answer is on the way.
-                } else if let Some(p) = &presence {
-                    let identity = p.identity.clone();
-                    let events = events.clone();
-                    // Spawned so a slow relay lookup never blocks this loop.
-                    peer_fetch = Some(tokio::spawn(async move {
-                        match crate::nostr::fetch_presence_records(
-                            identity.secret.channel(),
+            UiCommand::PublishBackup { identity } => {
+                let events = events.clone();
+                tokio::spawn(async move {
+                    let identity = *identity;
+                    let Some(channel) = identity.channel else {
+                        events.error("Configure a backup channel first");
+                        return;
+                    };
+                    let snapshot = crate::nostr::BackupSnapshot::new(
+                        identity.backup_generation,
+                        identity.self_card,
+                        identity.peers,
+                    );
+                    match snapshot {
+                        Ok(snapshot) => match crate::nostr::publish_backup(
+                            &identity.identity,
+                            channel,
+                            &snapshot,
                             &identity.relays,
                         )
                         .await
                         {
-                            Ok(records) => {
-                                let now = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_secs())
-                                    .unwrap_or(0);
-                                let peers =
-                                    crate::nostr::build_peer_list(records, &identity.suffix, now);
-                                events.send(NetEvent::PeerList { peers });
-                            }
-                            Err(e) => {
-                                events.error(format!("Could not refresh the device list: {e:#}"));
+                            Ok(()) => events.send(NetEvent::BackupPublished {
+                                generation: identity.backup_generation,
+                            }),
+                            Err(error) => events.send(NetEvent::BackupPublishFailed {
+                                message: format!("Could not back up peer list: {error:#}"),
+                            }),
+                        },
+                        Err(error) => events.send(NetEvent::BackupPublishFailed {
+                            message: format!("Could not build peer backup: {error:#}"),
+                        }),
+                    }
+                });
+            }
+            UiCommand::CheckBackup {
+                identity,
+                channel,
+                relays,
+            } => {
+                if backup_lookup_task
+                    .as_ref()
+                    .is_none_or(|task| task.is_finished())
+                {
+                    let events = events.clone();
+                    backup_lookup_task = Some(tokio::spawn(async move {
+                        match crate::nostr::lookup_backup(
+                            identity.public_key(),
+                            channel,
+                            &relays,
+                        )
+                        .await
+                        {
+                            Ok(snapshot) => events.send(NetEvent::BackupFound {
+                                snapshot: snapshot.map(Box::new),
+                            }),
+                            Err(error) => events.send(NetEvent::BackupCheckFailed {
+                                message: format!("Could not check for backup: {error:#}"),
+                            }),
+                        }
+                    }));
+                }
+            }
+            UiCommand::RefreshDirectory { channel, relays } => {
+                if directory_lookup_task
+                    .as_ref()
+                    .is_none_or(|task| task.is_finished())
+                {
+                    let events = events.clone();
+                    directory_lookup_task = Some(tokio::spawn(async move {
+                        match crate::nostr::fetch_directory_cards(channel, &relays).await {
+                            Ok(cards) => events.send(NetEvent::DirectoryCards { cards }),
+                            Err(error) => {
+                                events.error(format!("Could not refresh directory: {error:#}"))
                             }
                         }
                     }));
-                } else {
-                    events.error("Set up the secret and device name first");
                 }
             }
             UiCommand::Shutdown => break,
@@ -544,9 +551,11 @@ pub async fn net_main(mut cmd_rx: mpsc::UnboundedReceiver<UiCommand>, events: Ev
     }
 
     stop_session(&mut session).await;
-    stop_presence(&mut presence).await;
-    if let Some(fetch) = peer_fetch.take() {
-        fetch.abort();
+    if let Some(task) = backup_lookup_task.take() {
+        task.abort();
+    }
+    if let Some(task) = directory_lookup_task.take() {
+        task.abort();
     }
 }
 
@@ -563,25 +572,6 @@ impl Drop for PublisherGuard {
     }
 }
 
-/// Marks this device as hosting for the lifetime of a configure-mode server
-/// session: publishes the node id into the hosting watch channel on creation
-/// and clears it on drop, so every session exit path (stop, error, replacement)
-/// reliably flips the presence record back to non-hosting.
-struct HostingGuard(HostingTx);
-
-impl HostingGuard {
-    fn new(tx: HostingTx, node_id: EndpointId) -> Self {
-        tx.send_replace(Some(node_id));
-        Self(tx)
-    }
-}
-
-impl Drop for HostingGuard {
-    fn drop(&mut self) {
-        self.0.send_replace(None);
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn run_server_session(
     mode: ServerMode,
@@ -590,7 +580,6 @@ async fn run_server_session(
     mut clip_rx: mpsc::UnboundedReceiver<String>,
     conn_slot: ConnSlot,
     last_sent: LastSent,
-    hosting: Option<HostingTx>,
     pin_refresh: Option<Arc<tokio::sync::Notify>>,
     secret: iroh::SecretKey,
     claim: PairClaim,
@@ -605,7 +594,7 @@ async fn run_server_session(
     // connects in the background for a cross-network dial.
     let readiness = match &mode {
         ServerMode::Pin { channel, .. } => pin_channel_readiness(*channel),
-        ServerMode::NostrToken { .. } => EndpointReadiness::RelayOnline,
+        ServerMode::NostrKey { .. } => EndpointReadiness::RelayOnline,
     };
     let endpoint = match create_server_endpoint(readiness, secret).await {
         Ok(ep) => ep,
@@ -622,33 +611,45 @@ async fn run_server_session(
     // client authenticates and lives until the server is stopped — surviving
     // a restarted session task, whose paired peer reconnects seamlessly.
 
-    // Wire tokens accepted from clients — configure mode only, and the token half
-    // of the secret only. The PIN quick mode authenticates with the in-band PIN
-    // challenge-response instead.
-    let (tokens, secret_fingerprint): (HashSet<String>, Option<String>) = match &mode {
-        ServerMode::NostrToken { identity } => (
-            HashSet::from([identity.secret.wire_token()]),
-            Some(identity.secret.fingerprint()),
+    let (key_identity, identity_public_key): (Option<KeyIdentity>, Option<String>) = match &mode {
+        ServerMode::NostrKey { identity } => (
+            Some((**identity).clone()),
+            Some(identity.identity.to_npub()),
         ),
-        ServerMode::Pin { .. } => (HashSet::new(), None),
+        ServerMode::Pin { .. } => (None, None),
     };
     events.send(NetEvent::ServerReady {
         node_id: node_id.to_string(),
-        secret_fingerprint,
+        identity_public_key,
     });
     events.status(ConnStatus::Listening);
 
     let pin_cache = matches!(mode, ServerMode::Pin { .. }).then(|| recent_pins.clone());
 
-    // Configure mode: mark this device as hosting for the session's lifetime.
-    // The standing presence publisher (owned by the command loop) picks the
-    // node id up from the watch channel and republishes; the guard's drop
-    // clears it on every exit path.
-    let _hosting_guard = hosting.map(|tx| HostingGuard::new(tx, node_id));
-
     // Mode-specific signaling publisher, aborted on session teardown.
     let _publisher: Option<PublisherGuard> = match &mode {
-        ServerMode::NostrToken { .. } => None,
+        ServerMode::NostrKey { identity } => {
+            let identity = identity.clone();
+            let cancel = cancel.clone();
+            Some(PublisherGuard(tokio::spawn(async move {
+                loop {
+                    if let Err(error) = crate::nostr::publish_hosting(
+                        &identity.identity,
+                        &identity.peers,
+                        &node_id,
+                        &identity.relays,
+                    )
+                    .await
+                    {
+                        log::warn!("Failed to publish pairwise hosting records: {error:#}");
+                    }
+                    tokio::select! {
+                        _ = cancel.cancelled() => return,
+                        _ = tokio::time::sleep(Duration::from_secs(120)) => {}
+                    }
+                }
+            })))
+        }
         ServerMode::Pin { relays, channel } => {
             Some(PublisherGuard(tokio::spawn(run_pin_publisher(
                 endpoint.clone(),
@@ -678,7 +679,7 @@ async fn run_server_session(
     loop {
         let conn = match pending.take() {
             Some(conn) => conn,
-            None => match accept_serveable(&endpoint, &claim, &cancel).await {
+            None => match accept_serveable(&endpoint, &claim, &cancel, true).await {
                 Some(conn) => conn,
                 None => break,
             },
@@ -689,8 +690,16 @@ async fn run_server_session(
 
         // Auth runs on the single session stream; on success the same stream
         // stays open for clipboard frames (no separate data stream / handshake).
-        let (send, recv) =
-            match auth_as_listener(&conn, &tokens, pin_cache.as_ref(), &claim, node_id).await {
+        let (send, recv, peer_public_key) =
+            match auth_as_listener(
+                &conn,
+                key_identity.as_ref(),
+                pin_cache.as_ref(),
+                &claim,
+                node_id,
+            )
+            .await
+            {
             Ok(streams) => streams,
             Err(e) => {
                 log::warn!("Auth failed for {remote_id}: {e:#}");
@@ -700,6 +709,7 @@ async fn run_server_session(
         };
         events.send(NetEvent::PeerPaired {
             peer_node_id: remote_id.to_string(),
+            peer_public_key: peer_public_key.map(|key| key.to_hex()),
         });
 
         // Debug-only path logging; on-demand status reads `conn_slot` directly.
@@ -720,7 +730,7 @@ async fn run_server_session(
                 }
                 None
             }
-            next = accept_serveable(&endpoint, &claim, &cancel) => next,
+            next = accept_serveable(&endpoint, &claim, &cancel, false) => next,
         };
         *conn_slot.lock() = None;
 
@@ -761,6 +771,7 @@ async fn accept_serveable(
     endpoint: &iroh::Endpoint,
     claim: &PairClaim,
     cancel: &CancellationToken,
+    allow_new_transport_for_key_claim: bool,
 ) -> Option<iroh::endpoint::Connection> {
     loop {
         let incoming = tokio::select! {
@@ -784,7 +795,8 @@ async fn accept_serveable(
         // that isn't the paired peer is turned away here — before any in-band
         // auth — with a BUSY close it recognizes and gives up on.
         if let Some(claimed) = claim.peek()
-            && claimed.node_id != conn.remote_id()
+            && claimed.node_id != Some(conn.remote_id())
+            && (claimed.application_key.is_none() || !allow_new_transport_for_key_claim)
         {
             log::warn!(
                 "Refusing {}: already paired with another device",
@@ -821,7 +833,7 @@ async fn run_client_session(
     // or the typed-IP side channel), so its readiness is `LanDirect`.
     let readiness = match &spec {
         DialSpec::Pin { channel, .. } => pin_channel_readiness(*channel),
-        DialSpec::NostrToken { .. } => EndpointReadiness::RelayOnline,
+        DialSpec::NostrKey { .. } => EndpointReadiness::RelayOnline,
     };
     let endpoint = match create_client_endpoint(readiness, secret).await {
         Ok(ep) => ep,
@@ -832,13 +844,13 @@ async fn run_client_session(
         }
     };
     let own_id = endpoint.id();
-    let secret_fingerprint = match &spec {
-        DialSpec::NostrToken { identity, .. } => Some(identity.secret.fingerprint()),
+    let identity_public_key = match &spec {
+        DialSpec::NostrKey { identity, .. } => Some(identity.identity.to_npub()),
         DialSpec::Pin { .. } => None,
     };
     events.send(NetEvent::ClientReady {
         node_id: own_id.to_string(),
-        secret_fingerprint,
+        identity_public_key,
     });
 
     // Consecutive failed attempts, reset to zero on every successful connection
@@ -858,9 +870,9 @@ async fn run_client_session(
         // Resolve the target each attempt: configure mode re-queries the chosen
         // peer's presence record, so a restarted host's fresh node id is found.
         let resolved: Result<EndpointAddr> = match &spec {
-            DialSpec::NostrToken {
+            DialSpec::NostrKey {
                 identity,
-                peer_display,
+                peer_public_key,
             } => {
                 events.status(ConnStatus::Resolving);
                 // The dial target lives in the peer's hosting record, not the
@@ -869,10 +881,10 @@ async fn run_client_session(
                 // is not currently hosting.
                 tokio::select! {
                     _ = cancel.cancelled() => return,
-                    r = crate::nostr::lookup_hosting(identity.secret.channel(), peer_display, &identity.relays) => match r {
+                    r = crate::nostr::lookup_hosting(&identity.identity, *peer_public_key, &identity.relays) => match r {
                         Ok(Some(id)) => Ok(EndpointAddr::new(id)),
                         Ok(None) => Err(anyhow::anyhow!(
-                            "'{peer_display}' is not hosting a connection — press Start on that device (and confirm it uses the same secret)"
+                            "The selected peer is not hosting a connection — press Start on that device"
                         )),
                         Err(e) => Err(e.context("nostr hosting lookup failed")),
                     },
@@ -923,8 +935,17 @@ async fn run_client_session(
                 // Auth runs on the single session stream; on success the same
                 // stream stays open for clipboard frames.
                 let auth_result = match &spec {
-                    DialSpec::NostrToken { identity, .. } => {
-                        auth_as_dialer(&conn, &identity.secret).await
+                    DialSpec::NostrKey {
+                        identity,
+                        peer_public_key,
+                    } => {
+                        auth_as_dialer_key(
+                            &conn,
+                            &identity.identity,
+                            *peer_public_key,
+                            own_id,
+                        )
+                        .await
                     }
                     DialSpec::Pin { canonical_pin, .. } => {
                         auth_as_dialer_pin(&conn, canonical_pin, own_id).await
@@ -945,6 +966,12 @@ async fn run_client_session(
                         let remote_id = conn.remote_id();
                         events.send(NetEvent::PeerPaired {
                             peer_node_id: remote_id.to_string(),
+                            peer_public_key: match &spec {
+                                DialSpec::NostrKey {
+                                    peer_public_key, ..
+                                } => Some(peer_public_key.to_hex()),
+                                DialSpec::Pin { .. } => None,
+                            },
                         });
                         events.status(ConnStatus::Connected);
                         // Debug-only path logging; on-demand status reads
@@ -1123,115 +1150,6 @@ async fn pump_clipboard(
 // ============================================================================
 // Signaling publishers
 // ============================================================================
-
-/// Configure mode: broadcast this device's presence record and keep it fresh.
-/// Runs from `SetPresence` until stopped, independent of sessions; the hosting
-/// watch channel feeds the current server node id into the record, and a change
-/// there triggers an immediate republish. After the first publish, finding a
-/// record under our own identity written by a different publisher run means
-/// another live process is broadcasting as this device — surface the conflict
-/// and stop rather than fight over the record.
-async fn run_presence_publisher(
-    identity: TokenIdentity,
-    run_id: String,
-    mut hosting_rx: tokio::sync::watch::Receiver<Option<EndpointId>>,
-    events: EventSender,
-    cancel: CancellationToken,
-) {
-    let display = identity.display();
-    let mut publishes: u32 = 0;
-    loop {
-        // The nostr round-trips (conflict lookup + publish) run raced against
-        // the cancel token: stopping the publisher must not wait out a relay
-        // round-trip — the iOS FFI's stop (and with it the app's screen
-        // transition away from the hub) blocks on this task ending.
-        let cycle = async {
-            if publishes > 0 {
-                match crate::nostr::lookup_presence(
-                    identity.secret.channel(),
-                    &display,
-                    &identity.relays,
-                )
-                    .await
-                {
-                    Ok(Some((record, _))) if record.run_id != run_id => {
-                        events.send(NetEvent::PresenceConflict {
-                            message: format!(
-                                "Another process is broadcasting as '{display}' — stopped \
-                                 publishing presence. Is a second instance using this device's \
-                                 config?"
-                            ),
-                        });
-                        return false;
-                    }
-                    // Our own record, no record, or a network error: nothing provable.
-                    _ => {}
-                }
-            }
-
-            // Snapshot (and mark seen, so the wait below only fires on the next
-            // change) the current hosting state before publishing.
-            let hosting: Option<EndpointId> = *hosting_rx.borrow_and_update();
-            let record = crate::nostr::PresenceRecord {
-                version: crate::nostr::PRESENCE_VERSION,
-                name: identity.name.clone(),
-                suffix: identity.suffix.clone(),
-                run_id: run_id.clone(),
-            };
-            match crate::nostr::publish_presence(
-                identity.secret.channel(),
-                &record,
-                &identity.relays,
-            )
-            .await
-            {
-                Ok(()) => log::info!("Published presence to nostr"),
-                Err(e) => log::warn!("Failed to publish presence to nostr: {e:#}"),
-            }
-            // While hosting, refresh the out-of-directory hosting record that
-            // carries the dial target; when idle, publish nothing and let the
-            // last record expire (NIP-40) so no standing liveness lingers.
-            if let Some(node_id) = hosting {
-                match crate::nostr::publish_hosting(
-                    identity.secret.channel(),
-                    &display,
-                    &node_id,
-                    &identity.relays,
-                )
-                .await
-                {
-                    Ok(()) => log::info!("Published hosting record to nostr"),
-                    Err(e) => log::warn!("Failed to publish hosting record to nostr: {e:#}"),
-                }
-            }
-            true
-        };
-        tokio::select! {
-            _ = cancel.cancelled() => return,
-            keep_publishing = cycle => if !keep_publishing { return },
-        }
-        publishes = publishes.saturating_add(1);
-
-        // Re-publish quickly for the first few cycles, then settle to the slow
-        // heartbeat; a hosting change republishes immediately.
-        let interval = if publishes <= crate::nostr::PRESENCE_STARTUP_CYCLES {
-            crate::nostr::PRESENCE_STARTUP_INTERVAL
-        } else {
-            crate::nostr::PRESENCE_REPUBLISH_INTERVAL
-        };
-        tokio::select! {
-            _ = cancel.cancelled() => return,
-            changed = hosting_rx.changed() => {
-                if changed.is_err() {
-                    // The hosting sender is owned by the command loop; it going
-                    // away means the runtime is tearing down.
-                    return;
-                }
-            }
-            _ = tokio::time::sleep(interval) => {}
-        }
-    }
-}
 
 /// The endpoint-readiness gate for a PIN channel selection: LAN-only must not
 /// wait on a relay at all, the default nostr+LAN prefers one but tolerates
@@ -1551,7 +1469,7 @@ fn auth_close_reason(conn: &iroh::endpoint::Connection) -> Option<String> {
             let code = u64::from(app.error_code);
             if code == u64::from(AUTH_FAILED_CODE) {
                 Some(
-                    "Authentication rejected by the peer — wrong token/PIN, or it is still \
+                    "Authentication rejected by the peer — untrusted application key/wrong PIN, or it is still \
                      paired with a previous session (Stop and Start the server to re-pair)"
                         .to_string(),
                 )
@@ -1571,66 +1489,111 @@ fn auth_close_reason(conn: &iroh::endpoint::Connection) -> Option<String> {
     }
 }
 
-/// Authenticate as the dialer with the standing secret. On success the opened
-/// stream is returned (send side *not* finished): the same stream carries the
-/// clipboard afterward.
-///
-/// Takes the whole [`crate::auth::Secret`] and extracts the wire token here, so
-/// "only the token half ever leaves this device" lives in exactly one place. The
-/// channel half stays behind — it is relay-visible material and has no business
-/// in the handshake.
-async fn auth_as_dialer(conn: &iroh::endpoint::Connection, secret: &crate::auth::Secret) -> Result<Bi> {
-    // Opening the stream and sending the request can fail if the listener has
-    // already closed the connection (e.g. a BUSY refusal, which the listener
-    // sends without ever accepting a stream). Surface that as the fatal reason
-    // it is, rather than a generic transport error the client would retry on.
-    let opened = async {
-        let (mut send, recv) = conn.open_bi().await.context("opening session stream")?;
-        let request = AuthRequest::new(secret.wire_token());
-        send.write_all(&encode_auth_request(&request)?).await?;
-        Ok::<Bi, anyhow::Error>((send, recv))
-    };
-    let (send, mut recv) = match opened.await {
-        Ok(streams) => streams,
-        Err(e) => {
-            if let Some(reason) = auth_close_reason(conn) {
-                return Err(auth_failure(reason));
-            }
-            return Err(e);
-        }
-    };
-
-    let response_bytes = match tokio::time::timeout(
-        AUTH_TIMEOUT,
-        read_length_prefixed(&mut recv, MAX_CONTROL_MESSAGE_SIZE),
-    )
-    .await
-    {
-        Err(_) => return Err(auth_failure("Auth response timed out")),
-        Ok(Err(e)) => {
-            // The response never arrived; if the peer closed with an auth code,
-            // surface that as the fatal auth failure it is.
-            if let Some(reason) = auth_close_reason(conn) {
-                return Err(auth_failure(reason));
-            }
-            return Err(e.context("Failed to read auth response"));
-        }
-        Ok(Ok(bytes)) => bytes,
-    };
-    let response = decode_auth_response(&response_bytes).context("Invalid auth response")?;
-
-    if !response.accepted {
-        let reason = response.reason.unwrap_or_else(|| "Unknown".to_string());
-        return Err(auth_failure(format!("Authentication rejected: {reason}")));
-    }
-
-    log::info!("Authenticated with peer successfully");
-    Ok((send, recv))
+fn random_nonce() -> String {
+    let mut nonce = [0u8; 32];
+    rand::rng().fill_bytes(&mut nonce);
+    URL_SAFE_NO_PAD.encode(nonce)
 }
 
-/// Authenticate as the dialer using the quick-mode PIN (in-band challenge-response). No token
-/// crosses the wire. The whole exchange is bounded by [`AUTH_TIMEOUT`] and any failure is an
-/// [`AuthFailure`] — fatal for this target, exactly like a wrong token. On success the opened
+#[allow(clippy::too_many_arguments)]
+fn key_auth_transcript(
+    role: &str,
+    client_key: nostr_sdk::PublicKey,
+    server_key: nostr_sdk::PublicKey,
+    client_nonce: &str,
+    server_nonce: &str,
+    client_node: EndpointId,
+    server_node: EndpointId,
+) -> Vec<u8> {
+    fn field(output: &mut Vec<u8>, value: &[u8]) {
+        output.extend_from_slice(&(value.len() as u32).to_be_bytes());
+        output.extend_from_slice(value);
+    }
+
+    let mut transcript = Vec::with_capacity(256);
+    transcript.extend_from_slice(&crate::protocol::DUOCB_PROTO_VERSION.to_be_bytes());
+    field(&mut transcript, role.as_bytes());
+    field(&mut transcript, client_key.as_bytes());
+    field(&mut transcript, server_key.as_bytes());
+    field(&mut transcript, client_nonce.as_bytes());
+    field(&mut transcript, server_nonce.as_bytes());
+    field(&mut transcript, client_node.to_string().as_bytes());
+    field(&mut transcript, server_node.to_string().as_bytes());
+    transcript
+}
+
+/// Mutual configure-mode authentication using the persistent application key.
+async fn auth_as_dialer_key(
+    conn: &iroh::endpoint::Connection,
+    identity: &Identity,
+    expected_peer: nostr_sdk::PublicKey,
+    own_node: EndpointId,
+) -> Result<Bi> {
+    let handshake = async {
+        let (mut send, mut recv) = conn.open_bi().await.context("opening session stream")?;
+        let client_nonce = random_nonce();
+        let request = AuthRequest::key(identity.public_key().to_hex(), &client_nonce);
+        send.write_all(&encode_auth_request(&request)?).await?;
+
+        let challenge_bytes =
+            read_length_prefixed(&mut recv, MAX_CONTROL_MESSAGE_SIZE).await?;
+        let challenge =
+            decode_key_challenge(&challenge_bytes).context("invalid key-auth challenge")?;
+        let server_key = nostr_sdk::PublicKey::parse(&challenge.public_key)
+            .context("listener supplied an invalid application key")?;
+        if server_key != expected_peer {
+            anyhow::bail!("listener application key does not match the selected peer");
+        }
+        let listener_transcript = key_auth_transcript(
+            "listener",
+            identity.public_key(),
+            server_key,
+            &client_nonce,
+            &challenge.nonce,
+            own_node,
+            conn.remote_id(),
+        );
+        verify_auth_signature(server_key, &listener_transcript, &challenge.proof)?;
+
+        let dialer_transcript = key_auth_transcript(
+            "dialer",
+            identity.public_key(),
+            server_key,
+            &client_nonce,
+            &challenge.nonce,
+            own_node,
+            conn.remote_id(),
+        );
+        let proof = KeyProof::new(identity.sign_auth(&dialer_transcript));
+        send.write_all(&encode_key_proof(&proof)?).await?;
+
+        let response_bytes =
+            read_length_prefixed(&mut recv, MAX_CONTROL_MESSAGE_SIZE).await?;
+        let response =
+            decode_auth_response(&response_bytes).context("invalid key-auth response")?;
+        if !response.accepted {
+            anyhow::bail!(
+                "authentication rejected: {}",
+                response.reason.unwrap_or_else(|| "unknown reason".into())
+            );
+        }
+        Ok::<Bi, anyhow::Error>((send, recv))
+    };
+    match tokio::time::timeout(AUTH_TIMEOUT, handshake).await {
+        Err(_) => Err(auth_failure("Application-key authentication timed out")),
+        Ok(Err(error)) => {
+            if let Some(reason) = auth_close_reason(conn) {
+                return Err(auth_failure(reason));
+            }
+            Err(auth_failure(format!("{error:#}")))
+        }
+        Ok(Ok(streams)) => Ok(streams),
+    }
+}
+
+/// Authenticate as the dialer using the quick-mode PIN (in-band
+/// challenge-response). The whole exchange is bounded by [`AUTH_TIMEOUT`] and
+/// any failure is an [`AuthFailure`] — fatal for this target. On success the opened
 /// stream is returned (not finished) for the clipboard.
 async fn auth_as_dialer_pin(
     conn: &iroh::endpoint::Connection,
@@ -1668,42 +1631,25 @@ async fn auth_as_dialer_pin(
     }
 }
 
-/// Authenticate as the listener. Accepts either the standing secret's token half (see
-/// [`crate::auth::Secret::wire_token`]) or (PIN mode) a PIN proof; `pin_cache` holds the
-/// recent-bucket PIN keys and is `None` outside PIN mode.
-///
-/// `claim` enforces the one-pair-at-a-time rule across all modes: if another node id already
-/// holds the claim this peer is refused up front; otherwise a successful handshake commits this
-/// peer as the pair. The claimed peer may reconnect freely — its own node id always passes the
-/// gate, and in PIN mode the key it paired with is added to the candidate set so its proof
-/// still verifies after the PIN has rotated out of `pin_cache`.
 async fn auth_as_listener(
     conn: &iroh::endpoint::Connection,
-    auth_tokens: &HashSet<String>,
+    key_identity: Option<&KeyIdentity>,
     pin_cache: Option<&RecentPins>,
     claim: &PairClaim,
     own_id: iroh::EndpointId,
-) -> Result<Bi> {
+) -> Result<(iroh::endpoint::SendStream, iroh::endpoint::RecvStream, Option<nostr_sdk::PublicKey>)> {
     let remote_id = conn.remote_id();
-
-    // Pre-auth gate: this endpoint pairs with one peer at a time. `existing` is the current
-    // claim; if it belongs to a different node id we still run the handshake (so the dialer
-    // gets a proper rejection instead of a bare connection drop) but with no valid credentials,
-    // guaranteeing it fails. If it belongs to this peer, `reconnect_key` lets its rotated PIN
-    // still verify.
     let existing = claim.peek();
-    let claimed_by_other = existing.as_ref().is_some_and(|c| c.node_id != remote_id);
+    let pin_claimed_by_other = existing.as_ref().is_some_and(|claimed| {
+        claimed.application_key.is_some() || claimed.node_id != Some(remote_id)
+    });
     let reconnect_key = existing
         .as_ref()
-        .filter(|c| c.node_id == remote_id)
+        .filter(|claimed| {
+            claimed.application_key.is_none() && claimed.node_id == Some(remote_id)
+        })
         .and_then(|c| c.pin_key.clone());
-    if claimed_by_other {
-        log::warn!("Refusing {remote_id}: already paired with another device");
-    }
 
-    // Auth runs on the single session stream; on success that same stream (send
-    // side left open) is returned for the clipboard. Rejection paths finish the
-    // send side to flush the reason before the connection is closed below.
     let auth_result = tokio::time::timeout(AUTH_TIMEOUT, async {
         let (mut send, mut recv) = conn
             .accept_bi()
@@ -1714,38 +1660,66 @@ async fn auth_as_listener(
             .await
             .context("Failed to read auth request")?;
         match decode_auth_request(&request_bytes).context("Invalid auth request")? {
-            AuthRequest::Token { auth_token, .. } => {
-                if claimed_by_other || !is_token_valid(auth_token.as_str(), auth_tokens) {
-                    let reason = if claimed_by_other {
-                        "Already paired with another device"
-                    } else {
-                        log::warn!("Invalid auth token from {remote_id}");
-                        "That device's secret does not match this one"
-                    };
-                    let response = AuthResponse::rejected(reason);
-                    send.write_all(&encode_auth_response(&response)?).await?;
-                    send.finish()?;
-                    anyhow::bail!("{reason}");
+            AuthRequest::Key {
+                public_key,
+                nonce: client_nonce,
+                ..
+            } => {
+                let identity = key_identity
+                    .ok_or_else(|| anyhow::anyhow!("listener is not in key-auth mode"))?;
+                let client_key = nostr_sdk::PublicKey::parse(&public_key)
+                    .context("dialer application key is invalid")?;
+                if identity.peer(client_key).is_none() {
+                    anyhow::bail!("dialer application key is not locally trusted");
                 }
-                // Win the one-pair claim *before* telling the dialer it is accepted, so a race
-                // loser is rejected rather than briefly told "accepted" and then dropped.
-                if !claim.commit(remote_id, None) {
-                    let response =
-                        AuthResponse::rejected("Already paired with another device");
-                    send.write_all(&encode_auth_response(&response)?).await?;
-                    send.finish()?;
-                    anyhow::bail!("another device paired first");
+                if existing.as_ref().is_some_and(|claimed| {
+                    claimed.application_key != Some(client_key)
+                }) {
+                    anyhow::bail!("already paired with another application identity");
+                }
+                let server_nonce = random_nonce();
+                let listener_transcript = key_auth_transcript(
+                    "listener",
+                    client_key,
+                    identity.identity.public_key(),
+                    &client_nonce,
+                    &server_nonce,
+                    remote_id,
+                    own_id,
+                );
+                let challenge = KeyChallenge::new(
+                    identity.identity.public_key().to_hex(),
+                    &server_nonce,
+                    identity.identity.sign_auth(&listener_transcript),
+                );
+                send.write_all(&encode_key_challenge(&challenge)?).await?;
+                let proof_bytes =
+                    read_length_prefixed(&mut recv, MAX_CONTROL_MESSAGE_SIZE).await?;
+                let proof =
+                    decode_key_proof(&proof_bytes).context("invalid dialer key proof")?;
+                let dialer_transcript = key_auth_transcript(
+                    "dialer",
+                    client_key,
+                    identity.identity.public_key(),
+                    &client_nonce,
+                    &server_nonce,
+                    remote_id,
+                    own_id,
+                );
+                verify_auth_signature(client_key, &dialer_transcript, &proof.proof)?;
+                if !claim.commit_key(client_key, remote_id) {
+                    anyhow::bail!("another application identity paired first");
                 }
                 let response = AuthResponse::accepted();
                 send.write_all(&encode_auth_response(&response)?).await?;
-                Ok::<Bi, anyhow::Error>((send, recv))
+                Ok::<_, anyhow::Error>((send, recv, Some(client_key)))
             }
             AuthRequest::Pin { nonce, .. } => {
                 // Verify the dialer's PIN proof against the recent-bucket keys, plus (for a
                 // reconnecting paired peer) the key it originally paired with. An empty
                 // candidate set — a non-PIN listener, or a peer refused by the gate — yields a
                 // clean rejection.
-                let mut candidates = if claimed_by_other {
+                let mut candidates = if pin_claimed_by_other {
                     Vec::new()
                 } else {
                     pin_cache.map(|c| c.snapshot()).unwrap_or_default()
@@ -1766,11 +1740,11 @@ async fn auth_as_listener(
                     &nonce,
                     &remote_id.to_string(),
                     &own_id.to_string(),
-                    |key| claim.commit(remote_id, Some(key.clone())),
+                    |key| claim.commit_pin(remote_id, key.clone()),
                 )
                 .await?;
                 log::info!("Peer {remote_id} authenticated via PIN");
-                Ok((send, recv))
+                Ok((send, recv, None))
             }
         }
     })
@@ -1817,11 +1791,81 @@ mod tests {
         assert_eq!(retained, vec![current_pubkey, previous_pubkey]);
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn application_keys_mutually_authenticate_over_independent_iroh_keys() {
+        let server_identity = Identity::generate();
+        let client_identity = Identity::generate();
+        let server_key_identity = KeyIdentity {
+            identity: server_identity.clone(),
+            self_card: server_identity.card("server", "a7B2c3D4").unwrap(),
+            peers: vec![client_identity.card("client", "x9Y8z7W6").unwrap()],
+            channel: None,
+            backup_generation: 0,
+            relays: Vec::new(),
+        };
+
+        let server = create_server_endpoint(
+            EndpointReadiness::LanDirect,
+            iroh::SecretKey::generate(),
+        )
+        .await
+        .unwrap();
+        let client = create_client_endpoint(
+            EndpointReadiness::LanDirect,
+            iroh::SecretKey::generate(),
+        )
+        .await
+        .unwrap();
+        assert_ne!(
+            server.id().to_string(),
+            server_identity.public_key().to_hex(),
+            "iroh and application identities must be distinct"
+        );
+
+        let server_id = server.id();
+        let server_addr = server.addr();
+        let claim = PairClaim::default();
+        let listener = {
+            let server = server.clone();
+            let claim = claim.clone();
+            tokio::spawn(async move {
+                let conn = server.accept().await.unwrap().await.unwrap();
+                auth_as_listener(
+                    &conn,
+                    Some(&server_key_identity),
+                    None,
+                    &claim,
+                    server_id,
+                )
+                .await
+            })
+        };
+
+        let conn = connect_to_server(&client, server_addr).await.unwrap();
+        let dialer = auth_as_dialer_key(
+            &conn,
+            &client_identity,
+            server_identity.public_key(),
+            client.id(),
+        )
+        .await;
+        assert!(dialer.is_ok(), "dialer key auth failed: {dialer:?}");
+        let listener = listener.await.unwrap();
+        assert!(listener.is_ok(), "listener key auth failed: {listener:?}");
+        assert_eq!(
+            claim.peek().and_then(|peer| peer.application_key),
+            Some(client_identity.public_key())
+        );
+
+        client.close().await;
+        server.close().await;
+    }
+
     /// Start a session backed by its own fresh [`SessionMemory`], for tests
     /// that don't exercise session-task restarts.
     fn start_test_session(kind: SessionKind, events: EventSender) -> Session {
         let memory = SessionMemory::new(session_key(&kind));
-        start_session(kind, events, None, &memory)
+        start_session(kind, events, &memory)
     }
 
     /// Drain events from a std receiver until `pred` matches or the deadline
@@ -1888,39 +1932,6 @@ mod tests {
 
         session.cancel.cancel();
         let _ = session.handle.await;
-    }
-
-    /// Stopping the presence publisher returns promptly even while it is in
-    /// the middle of a nostr round-trip (here: a publish hanging on an
-    /// unroutable relay). The iOS FFI's stop — and with it the app's screen
-    /// transition away from the hub — blocks on this task ending, so a relay
-    /// round-trip must never be waited out.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn stopping_presence_mid_publish_is_prompt() {
-        let _ = env_logger::builder().is_test(true).try_init();
-
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let events = EventSender::new(tx, None);
-        let hosting: HostingTx = Arc::new(tokio::sync::watch::channel(None).0);
-        let identity = TokenIdentity {
-            secret: crate::auth::Secret::generate(),
-            name: "test".to_string(),
-            suffix: "a7B2c3D4".to_string(),
-            // TEST-NET-1: unroutable, so the first publish hangs in its
-            // connect wait (CONNECT_TIMEOUT is 10s) when the stop lands.
-            relays: vec!["wss://192.0.2.1".to_string()],
-        };
-        let mut presence = Some(spawn_presence(identity, &hosting, events));
-
-        // Let the publisher enter the publish's connect wait.
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let start = Instant::now();
-        stop_presence(&mut presence).await;
-        assert!(
-            start.elapsed() < Duration::from_secs(2),
-            "stop_presence took {:?} — the publish round-trip was waited out",
-            start.elapsed()
-        );
     }
 
     /// End-to-end LAN-only PIN mode within one process: the server advertises
@@ -2190,7 +2201,7 @@ mod tests {
             SessionKind::Client(spec) => SessionKind::Client(spec.clone()),
             _ => unreachable!(),
         };
-        let cli_session = start_session(dial, EventSender::new(cli_tx, None), None, &memory);
+        let cli_session = start_session(dial, EventSender::new(cli_tx, None), &memory);
         wait_for_event(&cli_rx, Duration::from_secs(120), |ev| {
             matches!(ev, NetEvent::Status(ConnStatus::Connected)).then_some(())
         });
@@ -2212,7 +2223,7 @@ mod tests {
         // (the claim's), same pinned target (no rendezvous needed).
         let (cli2_tx, cli2_rx) = std::sync::mpsc::channel();
         let cli2_session =
-            start_session(dial_again, EventSender::new(cli2_tx, None), None, &memory);
+            start_session(dial_again, EventSender::new(cli2_tx, None), &memory);
         let node_id = wait_for_event(&cli2_rx, Duration::from_secs(30), |ev| {
             if let NetEvent::ClientReady { node_id, .. } = ev {
                 Some(node_id.clone())
@@ -2315,30 +2326,5 @@ mod tests {
         stop_session(&mut a).await;
         stop_session(&mut b).await;
         stop_session(&mut srv).await;
-    }
-
-    /// A peer-list refresh before any presence identity is configured must
-    /// answer with an actionable error instead of silently doing nothing.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn refresh_peers_without_presence_yields_error() {
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-        let (ev_tx, ev_rx) = std::sync::mpsc::channel();
-        let main = tokio::spawn(net_main(cmd_rx, EventSender::new(ev_tx, None)));
-
-        cmd_tx.send(UiCommand::RefreshPeers).unwrap();
-        let err = wait_for_event(&ev_rx, Duration::from_secs(5), |ev| {
-            if let NetEvent::Error(e) = ev {
-                Some(e.clone())
-            } else {
-                None
-            }
-        });
-        assert!(
-            err.contains("secret"),
-            "expected a setup hint, got: {err}"
-        );
-
-        cmd_tx.send(UiCommand::Shutdown).unwrap();
-        let _ = main.await;
     }
 }

@@ -5,9 +5,9 @@
 
 ## Workspace layout
 
-- `crates/duocb-core` — portable core (the standing secret in `auth.rs` — a 125-char envelope whose 128-bit channel half keys everything nostr and whose 256-bit token half authenticates the wire — plus the wire protocol, nostr signaling, and headless tokio net runtime). No GUI/clipboard/config-file deps.
+- `crates/duocb-core` — portable core (persistent per-installation application identity and signed cards in `auth.rs`, mutual key wire authentication, pairwise Nostr signaling, encrypted directory backups, quick PIN support, and the headless tokio net runtime). Application identities, optional directory channels, and ephemeral iroh transport keys are separate. No GUI/clipboard/config-file deps.
 - `crates/duocb` — desktop Slint app (binary `duocb`); owns config.rs, clipboard.rs, src/app/ (state + logic), and ui/*.slint (markup, compiled by build.rs; fluent style, Skia renderer, per-platform fonts set in main.rs).
-- `crates/duocb-ffi` — iOS staticlib (`libduocb.a`, configure mode + PIN quick pair with a selectable transport, confusingly also the JSON key `channel` and unrelated to the secret's rendezvous channel: `nostr_lan` default or `lan` — the LAN-only preset, served on iOS by the system Bonjour daemon via dns_sd.h, no multicast entitlement), hand-written `extern "C"`; the C header is hand-maintained at `ios/duocb.h` and must stay in sync.
+- `crates/duocb-ffi` — iOS staticlib (`libduocb.a`, application-key configure mode + PIN quick pair with a selectable `channel`: `nostr_lan` default or `lan`; this quick transport field is unrelated to `directory_channel`). LAN is served on iOS by the system Bonjour daemon via dns_sd.h, with no multicast entitlement. The hand-written C header at `ios/duocb.h` must stay in sync.
 - Version bumps: edit the single `[workspace.package] version` in the root Cargo.toml.
 
 ## iOS
@@ -16,14 +16,14 @@
 
 ## Config-based E2E tests on the same device
 
-Only one duocb process may use a config path at a time (it holds an exclusive OS lock on a sibling `<config>.lock` file for its lifetime, allowing JSON saves to use atomic temp-and-rename replacement). To run both peers of a configure-mode pairing on the same machine, give each process its own config location — otherwise the second fails to acquire the lock. Each config mints its own permanent `device_suffix` on first launch, so short names don't need to differ; keep the shared `secret` equal (import the same secret through the setup wizard):
+Only one duocb process may use a config path at a time (it holds an exclusive OS lock on a sibling `<config>.lock` file for its lifetime, allowing JSON saves to use atomic temp-and-rename replacement). To run both peers of a configure-mode pairing on the same machine, give each process its own config location — otherwise the second fails to acquire the lock. Each config mints its own application identity and permanent device-name suffix. Pair the instances by copying each signed identity card into the other instance's trusted-peer list:
 
 ```sh
 cargo run -- --config /tmp/duocb-peer1.json   # or DUOCB_CONFIG=/tmp/duocb-peer1.json
 cargo run -- --config /tmp/duocb-peer2.json   # or DUOCB_CONFIG=/tmp/duocb-peer2.json
 ```
 
-`-c` is an alias for `--config`; the CLI flag wins over `DUOCB_CONFIG`. Without an override, both processes resolve to the same default location (see README) and collide. Joining is by choosing Join on the home hub, which opens the device picker, and selecting the peer there (any listed device — the join retries at a fixed interval for up to 10 attempts, so press Join again if the host starts later); no peer name is typed. Configs are per-machine, never copied between machines.
+`-c` is an alias for `--config`; the CLI flag wins over `DUOCB_CONFIG`. Without an override, both processes resolve to the same default location (see README) and collide. Joining is by choosing Join on the home hub, which opens the local trusted-device picker, and selecting the peer there. The join retries at a fixed interval for up to 10 attempts, so press Join again if the host starts later. Configs are per-installation; recovery uses a saved private key plus optional directory channel and always requires explicit confirmation before applying a found peer backup.
 
 ## Running GUI apps for Linux
 
