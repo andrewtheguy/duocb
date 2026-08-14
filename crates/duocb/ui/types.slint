@@ -45,6 +45,9 @@ export struct PeerRow {
     public-key: string,
     line: string,
     note: string,
+    /// Drives the note's warning color — lapsed trust reads as a problem, not
+    /// as one more date in the row.
+    expired: bool,
     selected: bool,
 }
 

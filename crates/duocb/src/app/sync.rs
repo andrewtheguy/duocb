@@ -109,6 +109,7 @@ impl App {
                     public_key: key.clone().into(),
                     line: format!("{}  · {}", p.name(), short_id(&p.npub())).into(),
                     note: card_expiry_note(p).into(),
+                    expired: p.is_expired(),
                     selected: self.selected_peer.as_deref() == Some(key.as_str()),
                 }
             })

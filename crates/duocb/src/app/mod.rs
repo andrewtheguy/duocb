@@ -111,7 +111,7 @@ pub(crate) struct App {
 }
 
 #[cfg(test)]
-mod recovery_offer_tests {
+mod self_card_tests {
     use super::*;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -119,7 +119,7 @@ mod recovery_offer_tests {
     fn test_app() -> (App, PathBuf) {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
-            "duocb-recovery-offer-{}-{}.json",
+            "duocb-self-card-{}-{}.json",
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));

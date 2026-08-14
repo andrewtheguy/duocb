@@ -347,25 +347,25 @@ mod tests {
     /// path and cannot be allowed to fail on stale trust.
     #[test]
     fn expired_cards_still_parse_but_are_not_valid() {
-        let issued_at = unix_now() - CARD_TTL_SECS - 1;
+        let issued_at = 1_700_000_000;
         let card = Identity::generate()
             .card_issued_at("laptop", "a7B2c3D4", issued_at)
             .unwrap();
         let parsed = IdentityCard::parse(&card.encode()).unwrap();
         assert_eq!(parsed.name(), "laptop_a7B2c3D4");
-        assert!(parsed.is_expired());
+        assert!(!parsed.is_valid_at(issued_at + CARD_TTL_SECS + 1));
     }
 
     /// A peer whose clock is far ahead cannot mint a card that outlives the
     /// policy, even though the payload's own lifetime check passes.
     #[test]
     fn future_dated_cards_are_not_valid() {
-        let now = unix_now();
+        let now = 1_700_000_000;
         let card = Identity::generate()
             .card_issued_at("desktop", "a7B2c3D4", now + 10 * CARD_TTL_SECS)
             .unwrap();
         assert!(IdentityCard::parse(&card.encode()).is_ok());
-        assert!(card.is_expired());
+        assert!(!card.is_valid_at(now));
         assert!(card.is_valid_at(now + 10 * CARD_TTL_SECS));
     }
 
