@@ -1,4 +1,4 @@
-- strict no backward compatibility
+- strict no backward compatibility, legacy codes, or changelogs at all
 
 - run `cargo clippy --workspace --all-targets` and `cargo test --workspace` after rust code changes
 - no cargo fmt
