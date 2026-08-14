@@ -14,7 +14,10 @@ use std::fs::{File, OpenOptions, TryLockError};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-pub const CONFIG_VERSION: u32 = 2;
+/// Bumped to 4 with the removal of Nostr peer-list backups: a version-3 config
+/// carries `directory_channel` and the backup bookkeeping, which `deny_unknown_fields`
+/// now rejects. Failing the version check up front beats a confusing field error.
+pub const CONFIG_VERSION: u32 = 4;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -26,13 +29,8 @@ pub struct Config {
     pub device_suffix: String,
     pub my_name: Option<String>,
     pub self_card: Option<String>,
-    pub directory_channel: Option<String>,
     #[serde(default)]
     pub peers: Vec<String>,
-    #[serde(default)]
-    pub backup_generation: u64,
-    #[serde(default)]
-    pub backup_dirty: bool,
 }
 
 impl Default for Config {
@@ -43,10 +41,7 @@ impl Default for Config {
             device_suffix: duocb_core::identity::generate_suffix(),
             my_name: None,
             self_card: None,
-            directory_channel: None,
             peers: Vec::new(),
-            backup_generation: 0,
-            backup_dirty: false,
         }
     }
 }
@@ -60,10 +55,7 @@ impl std::fmt::Debug for Config {
             .field("device_suffix", &self.device_suffix)
             .field("my_name", &self.my_name)
             .field("self_card", &self.self_card.as_ref().map(|_| "<signed card>"))
-            .field("directory_channel", &self.directory_channel)
             .field("peers", &self.peers.len())
-            .field("backup_generation", &self.backup_generation)
-            .field("backup_dirty", &self.backup_dirty)
             .finish()
     }
 }
@@ -197,14 +189,6 @@ impl ConfigLock {
                 self.path.display()
             ),
         }
-        if let Some(channel) = &config.directory_channel {
-            duocb_core::auth::DirectoryChannel::parse(channel).with_context(|| {
-                format!(
-                    "config {} has an invalid directory channel",
-                    self.path.display()
-                )
-            })?;
-        }
         if config.peers.len() > duocb_core::auth::MAX_TRUSTED_PEERS {
             anyhow::bail!(
                 "config {} has more than {} trusted peers",
@@ -304,17 +288,13 @@ mod tests {
         let identity = duocb_core::auth::Identity::generate();
         let suffix = "a7B2c3D4";
         let card = identity.card(name, suffix).unwrap();
-        let channel = duocb_core::auth::DirectoryChannel::generate();
         Config {
             version: CONFIG_VERSION,
             identity_secret: identity.to_nsec(),
             device_suffix: suffix.to_string(),
             my_name: Some(name.to_string()),
             self_card: Some(card.encode()),
-            directory_channel: Some(channel.encode()),
             peers: Vec::new(),
-            backup_generation: 7,
-            backup_dirty: false,
         }
     }
 
@@ -370,7 +350,40 @@ mod tests {
                 .public_key(),
             public_key
         );
-        assert_eq!(loaded.backup_generation, 7);
+
+        drop(lock);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Trust that has aged out must still load. Card parsing is deliberately
+    /// clock-free so an expired peer stays visible and removable instead of
+    /// making the whole config unloadable on the day it lapses.
+    #[test]
+    fn an_expired_peer_card_still_loads() {
+        let dir = temp_dir();
+        let path = dir.join("config.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = acquire_lock(&path).expect("lock");
+
+        let stale = duocb_core::auth::Identity::generate()
+            .card_issued_at(
+                "laptop",
+                "x9Y8z7W6",
+                duocb_core::auth::unix_now() - duocb_core::auth::CARD_TTL_SECS - 1,
+            )
+            .unwrap();
+        assert!(stale.is_expired());
+        let mut saved = configured("desktop");
+        saved.peers = vec![stale.encode()];
+        lock.save(&saved).expect("save");
+
+        let loaded = lock.load().expect("an expired peer must not break the load");
+        assert_eq!(loaded.peers.len(), 1);
+        assert!(
+            duocb_core::auth::IdentityCard::parse(&loaded.peers[0])
+                .unwrap()
+                .is_expired()
+        );
 
         drop(lock);
         let _ = std::fs::remove_dir_all(dir);
@@ -443,7 +456,7 @@ mod tests {
         std::fs::write(
             &path,
             format!(
-                r#"{{"version":1,"identity_secret":"{}","my_name":null,"self_card":null,"directory_channel":null,"peers":[],"backup_generation":0,"backup_dirty":false}}"#,
+                r#"{{"version":1,"identity_secret":"{}","my_name":null,"self_card":null,"peers":[]}}"#,
                 identity.to_nsec()
             ),
         )

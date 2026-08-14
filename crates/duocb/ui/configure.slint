@@ -7,7 +7,7 @@ import { UiState, Actions } from "globals.slint";
 import { ConfigureStep } from "types.slint";
 import { Theme } from "theme.slint";
 import { Card, CardTitle, Body, Weak, Small, Mono, BigButton, WideButton, LabeledValue, SelectableRow } from "widgets.slint";
-import { Button, LineEdit, ScrollView } from "std-widgets.slint";
+import { Button, LineEdit, Palette, ScrollView } from "std-widgets.slint";
 
 component ChoiceStep inherits VerticalLayout {
     alignment: start;
@@ -32,7 +32,7 @@ component ChoiceStep inherits VerticalLayout {
 }
 
 component ImportStep inherits VerticalLayout {
-    out property <bool> field-focused: entry.has-focus || channel-entry.has-focus;
+    out property <bool> field-focused: entry.has-focus;
     alignment: start;
     spacing: Theme.pad-m;
     Card {
@@ -52,19 +52,6 @@ component ImportStep inherits VerticalLayout {
         if UiState.import-public-key != "": Small {
             text: "This public identity is derived from the private key.";
         }
-        Rectangle { height: Theme.pad-s; }
-        Body { text: "Optional: enter its backup channel to look for an encrypted peer-list backup:"; }
-        channel-entry := LineEdit {
-            placeholder-text: "dc1.…";
-            text <=> UiState.in-directory-channel;
-            edited => { Actions.fields-edited(); }
-        }
-        if UiState.channel-error != "": Text {
-            text: UiState.channel-error;
-            color: Theme.warn;
-            font-size: Theme.font-body;
-            wrap: word-wrap;
-        }
         if UiState.import-error != "": Text {
             text: UiState.import-error;
             color: Theme.warn;
@@ -78,8 +65,7 @@ component ImportStep inherits VerticalLayout {
             Button {
                 text: "✔ Restore key";
                 primary: true;
-                enabled: UiState.import-valid
-                    && (UiState.in-directory-channel == "" || UiState.channel-valid);
+                enabled: UiState.import-valid;
                 clicked => { Actions.use-imported(); }
             }
             Button {
@@ -132,7 +118,7 @@ component NameStep inherits VerticalLayout {
 }
 
 component HubStep inherits VerticalLayout {
-    out property <bool> field-focused: peer-card-entry.has-focus || channel-entry.has-focus;
+    out property <bool> field-focused: peer-card-entry.has-focus;
     alignment: start;
     spacing: Theme.pad-m;
     Card {
@@ -167,7 +153,7 @@ component HubStep inherits VerticalLayout {
             value: UiState.public-key;
         }
         if UiState.has-identity: Small {
-            text: "Paste this device's signed card into each device that should trust it.";
+            text: "Paste this device's signed card into each device that should trust it. Cards expire after 30 days — to renew, copy this card again and import it on every device that should keep trusting this one.";
         }
         if UiState.has-identity: HorizontalLayout {
             spacing: Theme.pad-s;
@@ -189,7 +175,7 @@ component HubStep inherits VerticalLayout {
     Card {
         CardTitle { text: "Trust another device"; }
         Body {
-            text: "Paste the other device's signed identity card. Pairing is mutual, so import this device's card there too.";
+            text: "Paste the other device's signed identity card. Pairing is mutual, so import this device's card there too. A card is good for 30 days; once it expires neither device will pair until a fresh card is imported.";
         }
         peer-card-entry := LineEdit {
             placeholder-text: "{ signed identity card JSON }";
@@ -220,61 +206,13 @@ component HubStep inherits VerticalLayout {
                 horizontal-stretch: 1;
                 vertical-alignment: center;
             }
-            Button { text: "Remove"; clicked => { Actions.remove-peer(row.public-key); } }
-        }
-    }
-    Card {
-        CardTitle { text: "Encrypted Nostr backup"; }
-        Weak {
-            text: "A backup channel stores a bounded, encrypted copy of this identity's peer list. Save it with the private key; the channel is not an authentication key.";
-        }
-        channel-entry := LineEdit {
-            placeholder-text: "dc1.…";
-            text <=> UiState.in-directory-channel;
-            edited => { Actions.fields-edited(); }
-            accepted => { Actions.set-channel(); }
-        }
-        if UiState.channel-error != "": Text {
-            text: UiState.channel-error;
-            color: Theme.warn;
-            font-size: Theme.font-body;
-            wrap: word-wrap;
-        }
-        HorizontalLayout {
-            spacing: Theme.pad-s;
-            alignment: start;
-            Button {
-                text: "Use entered channel";
-                enabled: UiState.channel-valid;
-                clicked => { Actions.set-channel(); }
-            }
-            Button { text: "Generate new channel"; clicked => { Actions.generate-channel(); } }
-            if UiState.has-channel: Button {
-                text: UiState.copied-channel ? "✔ Copied" : "Copy channel";
-                clicked => { Actions.copy-channel(); }
-            }
-        }
-        Small { text: UiState.backup-status; }
-        if UiState.has-channel: HorizontalLayout {
-            spacing: Theme.pad-s;
-            alignment: start;
-            Button { text: "Check for my backup"; clicked => { Actions.check-backup(); } }
-            Button { text: "Find devices on channel"; clicked => { Actions.refresh-peers(); } }
-        }
-        if UiState.directory-candidates.length > 0: Small {
-            text: "Signed cards found on this channel. Review before trusting:";
-        }
-        for row in UiState.directory-candidates: HorizontalLayout {
-            spacing: Theme.pad-s;
             Mono {
-                text: row.line;
-                horizontal-stretch: 1;
+                text: row.note;
+                color: row.expired ? Theme.warn : Palette.foreground;
+                wrap: no-wrap;
                 vertical-alignment: center;
             }
-            Button {
-                text: "Trust";
-                clicked => { Actions.trust-directory-card(row.public-key); }
-            }
+            Button { text: "Remove"; clicked => { Actions.remove-peer(row.public-key); } }
         }
     }
     BigButton {
@@ -297,16 +235,7 @@ component JoinStep inherits VerticalLayout {
     alignment: start;
     spacing: Theme.pad-m;
     Card {
-        HorizontalLayout {
-            spacing: Theme.pad-s;
-            alignment: start;
-            CardTitle {
-                text: "Your devices";
-                horizontal-stretch: 1;
-                vertical-alignment: center;
-            }
-            Button { text: "⟳ Refresh (R)"; clicked => { Actions.refresh-peers(); } }
-        }
+        CardTitle { text: "Your devices"; }
         if UiState.peers-updated != "": Small { text: UiState.peers-updated; }
         Rectangle { height: Theme.pad-xs; }
         if UiState.peers-empty-text != "": Weak { text: UiState.peers-empty-text; }
@@ -316,6 +245,12 @@ component JoinStep inherits VerticalLayout {
             Mono {
                 text: row.line;
                 horizontal-stretch: 1;
+                vertical-alignment: center;
+            }
+            Mono {
+                text: row.note;
+                color: row.expired ? Theme.warn : Palette.foreground;
+                wrap: no-wrap;
                 vertical-alignment: center;
             }
         }

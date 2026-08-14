@@ -38,9 +38,16 @@ export enum PairMode {
 
 /// One row of a device list. `line` is fully composed in Rust and
 /// `public-key` is the stable selection key.
+/// One trusted-device / candidate projection. `note` is kept out of `line` so
+/// it can render as its own non-wrapping element — a card's expiry date must
+/// never be broken across two lines by the char-wrapping identity text.
 export struct PeerRow {
     public-key: string,
     line: string,
+    note: string,
+    /// Drives the note's warning color — lapsed trust reads as a problem, not
+    /// as one more date in the row.
+    expired: bool,
     selected: bool,
 }
 

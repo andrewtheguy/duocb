@@ -1,4 +1,4 @@
-// Overlay modals: identity reset, backup restore, and connection paths.
+// Overlay modals: identity reset and connection paths.
 // Conditional full-window overlays with a dimmed, click-to-dismiss backdrop —
 // the same semantics as the previous UI's modals.
 
@@ -30,59 +30,13 @@ export component ResetIdentityModal inherits Rectangle {
             spacing: Theme.pad-s;
             Text { text: "Reset this identity?"; font-size: Theme.font-heading; font-weight: 700; }
             Body {
-                text: "This removes the local private key, signed card, trusted peers, and backup channel, then creates a fresh identity. Restore is only possible from a saved private key and channel.";
+                text: "This removes the local private key, signed card, and trusted peers, then creates a fresh identity. Restore is only possible from a saved private key.";
             }
             HorizontalLayout {
                 spacing: Theme.pad-s;
                 alignment: end;
                 Button { text: "Reset identity"; clicked => { Actions.confirm-reset-identity(); } }
                 Button { text: "Cancel"; clicked => { Actions.cancel-reset-identity(); } }
-            }
-        }
-    }
-}
-
-export component BackupRestoreModal inherits Rectangle {
-    ModalBackdrop { }
-    Rectangle {
-        width: min(root.width - 2 * Theme.pad-xl, 500px);
-        height: min(content.preferred-height, root.height - 2 * Theme.pad-xl);
-        x: (root.width - self.width) / 2;
-        y: (root.height - self.height) / 2;
-        background: Palette.background;
-        border-radius: Theme.radius;
-        border-width: 1px;
-        border-color: Theme.card-border;
-        TouchArea { }
-        content := VerticalLayout {
-            padding: Theme.pad-l;
-            spacing: Theme.pad-s;
-            Text { text: "Peer-list backup found"; font-size: Theme.font-heading; font-weight: 700; }
-            Body { text: UiState.backup-summary; }
-            ScrollView {
-                height: min(backup-list.preferred-height, 280px);
-                backup-list := VerticalLayout {
-                    alignment: start;
-                    spacing: Theme.pad-s;
-                    if UiState.backup-peers.length == 0: Body { text: "This backup has no peers."; }
-                    for row in UiState.backup-peers: Button {
-                        text: (row.selected ? "☑ " : "☐ ") + row.line;
-                        clicked => { Actions.toggle-backup-peer(row.public-key); }
-                    }
-                }
-            }
-            Small {
-                text: UiState.backup-selected-count + " peer(s) selected. Nothing is restored until you confirm.";
-            }
-            HorizontalLayout {
-                spacing: Theme.pad-s;
-                alignment: end;
-                Button { text: "Keep local state"; clicked => { Actions.skip-backup(); } }
-                Button {
-                    text: "Restore selected";
-                    primary: true;
-                    clicked => { Actions.restore-backup(); }
-                }
             }
         }
     }

@@ -141,8 +141,6 @@ fn handle_configure_key(
         ConfigureStep::Join => {
             if letter('c') || enter {
                 app.join_selected_peer();
-            } else if letter('r') {
-                app.refresh_peers();
             } else if down {
                 app.move_peer_selection(1);
             } else if up {
