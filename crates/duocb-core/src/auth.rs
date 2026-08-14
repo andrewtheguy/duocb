@@ -1,5 +1,4 @@
-//! Persistent configure-mode identity, portable signed peer cards, and the
-//! optional Nostr backup channel.
+//! Persistent configure-mode identity and portable signed peer cards.
 //!
 //! These credentials are deliberately unrelated to iroh's endpoint key. An
 //! [`Identity`] authenticates a duocb installation for its lifetime; iroh keys
@@ -12,9 +11,7 @@
 //! the owner to hand over a fresh card.
 
 use anyhow::{Context, Result};
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use nostr_sdk::prelude::*;
-use ::rand::RngCore as _;
 use nostr_sdk::prelude::secp256k1::Message;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -307,81 +304,6 @@ impl IdentityCard {
     }
 }
 
-/// Standalone, non-authenticating channel used only for Nostr peer backups.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct DirectoryChannel([u8; 16]);
-
-impl std::fmt::Debug for DirectoryChannel {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("DirectoryChannel(***)")
-    }
-}
-
-impl DirectoryChannel {
-    pub fn generate() -> Self {
-        let mut bytes = [0u8; 16];
-        ::rand::rng().fill_bytes(&mut bytes);
-        Self(bytes)
-    }
-
-    pub fn parse(input: &str) -> Result<Self> {
-        let compact: String = input.chars().filter(|c| !c.is_whitespace()).collect();
-        let parts: Vec<&str> = compact.split('.').collect();
-        if parts.len() != 3 || parts[0] != "dc1" {
-            anyhow::bail!("channel must have the form dc1.<channel>.<checksum>");
-        }
-        if parts[1].len() != 22 || parts[2].len() != 3 {
-            anyhow::bail!("channel has an invalid length");
-        }
-        let raw = URL_SAFE_NO_PAD
-            .decode(parts[1])
-            .context("channel is not valid base64url")?;
-        let bytes: [u8; 16] = raw
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("channel must contain exactly 128 bits"))?;
-        let checksum = URL_SAFE_NO_PAD
-            .decode(parts[2])
-            .context("channel checksum is not valid base64url")?;
-        if checksum != channel_checksum(&bytes).to_be_bytes() {
-            anyhow::bail!("channel checksum is invalid");
-        }
-        Ok(Self(bytes))
-    }
-
-    pub fn encode(&self) -> String {
-        format!(
-            "dc1.{}.{}",
-            URL_SAFE_NO_PAD.encode(self.0),
-            URL_SAFE_NO_PAD.encode(channel_checksum(&self.0).to_be_bytes())
-        )
-    }
-
-    pub fn as_bytes(&self) -> &[u8; 16] {
-        &self.0
-    }
-}
-
-fn channel_checksum(channel: &[u8; 16]) -> u16 {
-    let mut bytes = b"duocb:directory-channel:v1".to_vec();
-    bytes.extend_from_slice(channel);
-    crc16_ccitt_false(&bytes)
-}
-
-fn crc16_ccitt_false(data: &[u8]) -> u16 {
-    let mut crc = 0xFFFFu16;
-    for &byte in data {
-        crc ^= (byte as u16) << 8;
-        for _ in 0..8 {
-            crc = if crc & 0x8000 != 0 {
-                (crc << 1) ^ 0x1021
-            } else {
-                crc << 1
-            };
-        }
-    }
-    crc
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -421,8 +343,8 @@ mod tests {
         assert_eq!(card.remaining_secs_at(expires_at), 0);
     }
 
-    /// An aged-out card must still parse — config load and backup decode run
-    /// through the same path and cannot be allowed to fail on stale trust.
+    /// An aged-out card must still parse — config load runs through the same
+    /// path and cannot be allowed to fail on stale trust.
     #[test]
     fn expired_cards_still_parse_but_are_not_valid() {
         let issued_at = unix_now() - CARD_TTL_SECS - 1;
@@ -501,19 +423,6 @@ mod tests {
             .unwrap()
             .encode();
         assert!(IdentityCard::parse(&card.replace("desktop", "laptop")).is_err());
-    }
-
-    #[test]
-    fn channel_round_trip_checksum_and_uniqueness() {
-        let first = DirectoryChannel::generate();
-        let second = DirectoryChannel::generate();
-        assert_ne!(first, second);
-        assert_eq!(DirectoryChannel::parse(&first.encode()).unwrap(), first);
-
-        let mut broken = first.encode();
-        let last = broken.pop().unwrap();
-        broken.push(if last == 'A' { 'B' } else { 'A' });
-        assert!(DirectoryChannel::parse(&broken).is_err());
     }
 
     #[test]

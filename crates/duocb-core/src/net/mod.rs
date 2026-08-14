@@ -19,8 +19,6 @@ pub struct KeyIdentity {
     pub identity: crate::auth::Identity,
     pub self_card: crate::auth::IdentityCard,
     pub peers: Vec<crate::auth::IdentityCard>,
-    pub channel: Option<crate::auth::DirectoryChannel>,
-    pub backup_generation: u64,
     pub relays: Vec<String>,
 }
 
@@ -115,19 +113,6 @@ pub enum UiCommand {
     /// Request a point-in-time snapshot of the live connection's paths, answered
     /// with [`NetEvent::ConnPath`]. Empty if no connection is up.
     QueryConnPath,
-    /// Publish a local-first encrypted peer-list snapshot.
-    PublishBackup { identity: Box<KeyIdentity> },
-    /// Find recovery material without applying it.
-    CheckBackup {
-        identity: crate::auth::Identity,
-        channel: crate::auth::DirectoryChannel,
-        relays: Vec<String>,
-    },
-    /// Fetch signed-card candidates from a backup channel.
-    RefreshDirectory {
-        channel: crate::auth::DirectoryChannel,
-        relays: Vec<String>,
-    },
     Shutdown,
 }
 
@@ -188,15 +173,6 @@ pub enum NetEvent {
     /// back — which the UI should drop if it already holds that content.
     ItemReceived { text: String, pulled: bool },
     ItemSent,
-    DirectoryCards {
-        cards: Vec<crate::auth::IdentityCard>,
-    },
-    BackupFound {
-        snapshot: Option<Box<crate::nostr::BackupSnapshot>>,
-    },
-    BackupPublished { generation: u64 },
-    BackupCheckFailed { message: String },
-    BackupPublishFailed { message: String },
     Error(String),
 }
 

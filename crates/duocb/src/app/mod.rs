@@ -9,13 +9,12 @@ pub(crate) mod item;
 pub(crate) mod keys;
 mod sync;
 
-use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use crate::clipboard::SystemClipboard;
 use crate::{ConfigureStep, PairMode, Screen};
 use duocb_core::net::endpoint::ConnPath;
-use duocb_core::auth::{DirectoryChannel, Identity, IdentityCard};
+use duocb_core::auth::{Identity, IdentityCard};
 use duocb_core::net::{ConnStatus, KeyIdentity, NetEvent, NetHandle, UiCommand};
 use item::ClipItem;
 
@@ -44,22 +43,9 @@ pub(crate) struct App {
     pub(crate) saved_name: Option<String>,
     pub(crate) device_suffix: String,
     pub(crate) self_card: Option<IdentityCard>,
-    pub(crate) directory_channel: Option<DirectoryChannel>,
-    pub(crate) backup_generation: u64,
-    pub(crate) backup_dirty: bool,
-    pub(crate) backup_check_pending: bool,
-    /// Entered/restored channels cannot publish until lookup completes and any
-    /// found snapshot is explicitly accepted or rejected.
-    pub(crate) backup_publish_blocked: bool,
-    pub(crate) backup_publish_requested_at: Option<Instant>,
     pub(crate) configure_step: ConfigureStep,
-    /// Locally trusted peers. Nostr results never enter this list automatically.
+    /// Locally trusted peers, added only by importing a signed card.
     pub(crate) peers: Vec<IdentityCard>,
-    pub(crate) directory_candidates: Vec<IdentityCard>,
-    pub(crate) recovery_snapshot: Option<duocb_core::nostr::BackupSnapshot>,
-    pub(crate) recovery_selected: HashSet<String>,
-    pub(crate) peers_refreshed_at: Option<Instant>,
-    pub(crate) peers_requested_at: Option<Instant>,
     /// Selected peer by hex application public key.
     pub(crate) selected_peer: Option<String>,
     pub(crate) joined_peer: Option<String>,
@@ -87,7 +73,6 @@ pub(crate) struct App {
     pub(crate) in_my_name: String,
     pub(crate) in_private_key: String,
     pub(crate) in_peer_card: String,
-    pub(crate) in_directory_channel: String,
     /// The joiner's PIN entry, split into its two `XXXX` groups (one text field
     /// each) so grouping never edits a field's text mid-keystroke.
     pub(crate) in_pin_a: String,
@@ -146,76 +131,29 @@ mod recovery_offer_tests {
         )
     }
 
+    /// A self-card close to expiry is re-minted at startup, so the copy a user
+    /// hands out always has plenty of life left.
     #[test]
-    fn found_backup_is_only_applied_after_explicit_restore() {
+    fn a_stale_self_card_is_re_minted_on_load() {
         let (mut app, path) = test_app();
-        let peer = Identity::generate().card("phone", "x9Y8z7W6").unwrap();
-        let snapshot = duocb_core::nostr::BackupSnapshot::new(
-            5,
-            app.identity.card("restored-name", "a7B2c3D4").unwrap(),
-            vec![peer.clone()],
-        )
-        .unwrap();
-        app.backup_dirty = true;
-        app.backup_check_pending = true;
-
-        app.apply_event(NetEvent::BackupFound {
-            snapshot: Some(Box::new(snapshot)),
-        });
-        assert!(app.saved_name.is_none());
-        assert!(app.peers.is_empty());
-        assert!(app.recovery_snapshot.is_some());
-        assert!(app.backup_publish_blocked);
-
-        app.tick();
-        assert!(
-            app.backup_publish_requested_at.is_none(),
-            "an offered backup must block local publication"
+        app.saved_name = Some("desktop".into());
+        app.device_suffix = "a7B2c3D4".into();
+        app.self_card = Some(
+            app.identity
+                .card_issued_at(
+                    "desktop",
+                    "a7B2c3D4",
+                    duocb_core::auth::unix_now() - duocb_core::auth::CARD_TTL_SECS - 1,
+                )
+                .unwrap(),
         );
+        assert!(app.self_card.as_ref().unwrap().is_expired());
 
-        app.restore_offered_backup();
-        assert_eq!(app.saved_name.as_deref(), Some("restored-name"));
-        assert_eq!(app.device_suffix, "a7B2c3D4");
-        assert_eq!(
-            app.self_card.as_ref().unwrap().name(),
-            "restored-name_a7B2c3D4"
-        );
-        assert_eq!(app.peers, vec![peer]);
-        assert!(!app.backup_publish_blocked);
+        app.renew_self_card_if_stale();
 
-        app.net.shutdown();
-        drop(app);
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(format!("{}.lock", path.display()));
-    }
-
-    /// A backup can be older than the 30-day card lifetime. Restoring one must
-    /// not reinstate a dead self-card: the restored state is persisted and
-    /// published immediately, so a stale card would be handed out and backed up
-    /// in a form no peer accepts.
-    #[test]
-    fn restoring_an_expired_self_card_re_mints_it() {
-        let (mut app, path) = test_app();
-        let stale = app
-            .identity
-            .card_issued_at(
-                "restored-name",
-                "a7B2c3D4",
-                duocb_core::auth::unix_now() - duocb_core::auth::CARD_TTL_SECS - 1,
-            )
-            .unwrap();
-        assert!(stale.is_expired());
-        let snapshot = duocb_core::nostr::BackupSnapshot::new(5, stale, Vec::new()).unwrap();
-
-        app.apply_event(NetEvent::BackupFound {
-            snapshot: Some(Box::new(snapshot)),
-        });
-        app.restore_offered_backup();
-
-        let restored = app.self_card.as_ref().expect("a self card is restored");
-        assert!(!restored.is_expired(), "the restored card must be current");
-        assert_eq!(restored.name(), "restored-name_a7B2c3D4");
-        assert_eq!(app.device_suffix, "a7B2c3D4");
+        let renewed = app.self_card.as_ref().expect("a self card is held");
+        assert!(!renewed.is_expired(), "the renewed card must be current");
+        assert_eq!(renewed.name(), "desktop_a7B2c3D4");
 
         let persisted = IdentityCard::parse(&app.config_lock.load().unwrap().self_card.unwrap())
             .expect("the persisted card parses");
@@ -262,7 +200,6 @@ mod recovery_offer_tests {
 pub(crate) enum CopyTarget {
     Card,
     PrivateKey,
-    Channel,
     Pin,
     Outbox,
     Inbox(usize),
@@ -298,10 +235,6 @@ impl App {
             .filter(|card| card.public_key() != identity.public_key())
             .take(duocb_core::auth::MAX_TRUSTED_PEERS)
             .collect();
-        let directory_channel = config
-            .directory_channel
-            .as_deref()
-            .and_then(|channel| DirectoryChannel::parse(channel).ok());
         let configure_step = match (&saved_name, &self_card) {
             (Some(_), Some(_)) => ConfigureStep::Ready,
             _ => ConfigureStep::SetupChoice,
@@ -319,19 +252,8 @@ impl App {
             saved_name: saved_name.clone(),
             device_suffix,
             self_card,
-            directory_channel,
-            backup_generation: config.backup_generation,
-            backup_dirty: config.backup_dirty,
-            backup_check_pending: false,
-            backup_publish_blocked: false,
-            backup_publish_requested_at: None,
             configure_step,
             peers,
-            directory_candidates: Vec::new(),
-            recovery_snapshot: None,
-            recovery_selected: HashSet::new(),
-            peers_refreshed_at: None,
-            peers_requested_at: None,
             selected_peer: None,
             joined_peer: None,
             confirm_reset_identity: false,
@@ -346,7 +268,6 @@ impl App {
             in_my_name: saved_name.unwrap_or_default(),
             in_private_key: String::new(),
             in_peer_card: String::new(),
-            in_directory_channel: config.directory_channel.unwrap_or_default(),
             in_pin_a: String::new(),
             in_pin_b: String::new(),
             in_join_ip: String::new(),
@@ -377,16 +298,13 @@ impl App {
             return;
         };
         self.self_card = Some(fresh);
-        if self.save_configure_config() {
-            self.mark_backup_dirty();
-        }
+        self.save_configure_config();
     }
 
     /// A replacement for the current self-card when it is close to expiry, or
     /// `None` when it is still current (or there is nothing to re-mint).
     /// Separate from [`App::renew_self_card_if_stale`] so a caller that is about
-    /// to persist and publish anyway can swap the card in without triggering a
-    /// second save and backup generation.
+    /// to persist anyway can swap the card in without triggering a second save.
     fn freshly_minted_self_card(&self) -> Option<IdentityCard> {
         let card = self.self_card.as_ref()?;
         let name = self.saved_name.as_deref()?;
@@ -500,54 +418,6 @@ impl App {
                 }
                 self.sent_flash = Some(Instant::now());
             }
-            NetEvent::DirectoryCards { cards } => {
-                self.directory_candidates = cards
-                    .into_iter()
-                    .filter(|card| card.public_key() != self.identity.public_key())
-                    .collect();
-                self.peers_refreshed_at = Some(Instant::now());
-            }
-            NetEvent::BackupFound { snapshot } => {
-                self.backup_check_pending = false;
-                match snapshot.map(|snapshot| *snapshot) {
-                    Some(snapshot) => {
-                        self.backup_publish_blocked = true;
-                        self.recovery_selected = snapshot
-                            .peers
-                            .iter()
-                            .map(|peer| peer.public_key().to_hex())
-                            .collect();
-                        self.recovery_snapshot = Some(snapshot);
-                    }
-                    None => {
-                        self.backup_publish_blocked = false;
-                        self.recovery_snapshot = None;
-                        self.recovery_selected.clear();
-                        // The lookup completed successfully and found no prior
-                        // state for this key. The local list can now safely
-                        // become the first backup on the entered channel.
-                        self.mark_backup_dirty();
-                    }
-                }
-            }
-            NetEvent::BackupPublished { generation } => {
-                if generation == self.backup_generation {
-                    self.backup_dirty = false;
-                    self.backup_publish_requested_at = None;
-                    self.save_configure_config();
-                }
-            }
-            NetEvent::BackupCheckFailed { message } => {
-                self.backup_check_pending = false;
-                self.backup_publish_blocked = true;
-                self.error = Some(message);
-            }
-            NetEvent::BackupPublishFailed { message } => {
-                // Leave the dirty bit set and retain a retry timestamp so the
-                // heartbeat retries after the normal backoff, not immediately.
-                self.backup_publish_requested_at = Some(Instant::now());
-                self.error = Some(message);
-            }
             NetEvent::Error(message) => {
                 // A rejected send (e.g. oversize) reports an error instead of
                 // ItemSent, so drop its pending text — it must never be promoted
@@ -558,19 +428,12 @@ impl App {
         }
     }
 
-    /// Periodic work, driven by the UI's heartbeat timer: peek auto-hide and
-    /// the device picker's list refresh. Flash/countdown expiry needs no state
-    /// change — `sync` derives those from timestamps.
+    /// Periodic work, driven by the UI's heartbeat timer: peek auto-hide.
+    /// Flash/countdown expiry needs no state change — `sync` derives those from
+    /// timestamps.
     pub(crate) fn tick(&mut self) {
         for item in self.inbox.iter_mut().chain(self.outbox.iter_mut()) {
             item.tick_peek();
-        }
-        if self.backup_dirty
-            && self
-                .backup_publish_requested_at
-                .is_none_or(|requested| requested.elapsed() >= Duration::from_secs(120))
-        {
-            self.publish_backup();
         }
     }
 
@@ -658,8 +521,6 @@ impl App {
             identity: self.identity.clone(),
             self_card: self.self_card.clone()?,
             peers: self.peers.clone(),
-            channel: self.directory_channel,
-            backup_generation: self.backup_generation,
             relays: default_relays(),
         })
     }
@@ -682,10 +543,7 @@ impl App {
             device_suffix: self.device_suffix.clone(),
             my_name: self.saved_name.clone(),
             self_card: self.self_card.as_ref().map(IdentityCard::encode),
-            directory_channel: self.directory_channel.map(|channel| channel.encode()),
             peers: self.peers.iter().map(IdentityCard::encode).collect(),
-            backup_generation: self.backup_generation,
-            backup_dirty: self.backup_dirty,
         };
         match self.config_lock.save(&cfg) {
             Ok(()) => true,
@@ -696,81 +554,24 @@ impl App {
         }
     }
 
-    fn mark_backup_dirty(&mut self) {
-        self.backup_generation = self.backup_generation.saturating_add(1);
-        self.backup_dirty = self.directory_channel.is_some();
-        self.save_configure_config();
-        self.publish_backup();
-    }
-
-    pub(crate) fn publish_backup(&mut self) {
-        if self.backup_dirty
-            && !self.backup_check_pending
-            && !self.backup_publish_blocked
-            && let Some(identity) = self.key_identity()
-            && identity.channel.is_some()
-        {
-            self.backup_publish_requested_at = Some(Instant::now());
-            self.net.send(UiCommand::PublishBackup {
-                identity: Box::new(identity),
-            });
-        }
-    }
-
-    pub(crate) fn refresh_peers(&mut self) {
-        if let Some(channel) = self.directory_channel {
-            self.peers_requested_at = Some(Instant::now());
-            self.net.send(UiCommand::RefreshDirectory {
-                channel,
-                relays: default_relays(),
-            });
-        }
-    }
-
     pub(crate) fn begin_generate_identity(&mut self) {
         self.identity = Identity::generate();
         self.saved_name = None;
         self.self_card = None;
         self.peers.clear();
-        self.directory_channel = None;
-        self.backup_generation = 0;
-        self.backup_dirty = false;
-        self.backup_check_pending = false;
-        self.backup_publish_blocked = false;
-        self.backup_publish_requested_at = None;
-        self.in_directory_channel.clear();
-        self.recovery_snapshot = None;
-        self.recovery_selected.clear();
         self.reset_name_field();
         self.configure_step = ConfigureStep::SetupName;
     }
 
     pub(crate) fn use_imported_identity(&mut self) {
         if let Ok(identity) = Identity::parse_nsec(&self.in_private_key) {
-            let channel = if self.in_directory_channel.trim().is_empty() {
-                None
-            } else {
-                DirectoryChannel::parse(&self.in_directory_channel).ok()
-            };
             self.identity = identity;
             self.saved_name = None;
             self.self_card = None;
             self.peers.clear();
-            self.directory_candidates.clear();
-            self.directory_channel = channel;
-            self.backup_generation = 0;
-            self.backup_dirty = false;
-            self.backup_check_pending = false;
-            self.backup_publish_blocked = channel.is_some();
-            self.backup_publish_requested_at = None;
-            self.recovery_snapshot = None;
-            self.recovery_selected.clear();
             self.in_private_key.clear();
             self.configure_step = ConfigureStep::SetupName;
             self.save_configure_config();
-            if self.directory_channel.is_some() {
-                self.check_backup();
-            }
         }
     }
 
@@ -796,7 +597,6 @@ impl App {
         self.self_card = Some(card);
         if self.save_configure_config() {
             self.configure_step = ConfigureStep::Ready;
-            self.mark_backup_dirty();
         }
     }
 
@@ -813,19 +613,9 @@ impl App {
         self.saved_name = None;
         self.self_card = None;
         self.peers.clear();
-        self.directory_candidates.clear();
-        self.directory_channel = None;
-        self.backup_generation = 0;
-        self.backup_dirty = false;
-        self.backup_check_pending = false;
-        self.backup_publish_blocked = false;
-        self.backup_publish_requested_at = None;
         self.selected_peer = None;
-        self.recovery_snapshot = None;
-        self.recovery_selected.clear();
         self.in_private_key.clear();
         self.in_peer_card.clear();
-        self.in_directory_channel.clear();
         self.save_configure_config();
         self.configure_step = ConfigureStep::SetupChoice;
     }
@@ -918,40 +708,7 @@ impl App {
             self.peers.push(card);
         }
         self.in_peer_card.clear();
-        self.mark_backup_dirty();
-    }
-
-    pub(crate) fn trust_directory_card(&mut self, public_key: &str) {
-        let Some(card) = self
-            .directory_candidates
-            .iter()
-            .find(|card| card.public_key().to_hex() == public_key)
-            .cloned()
-        else {
-            return;
-        };
-        if self
-            .peers
-            .iter()
-            .any(|peer| peer.public_key() == card.public_key())
-        {
-            return;
-        }
-        // The directory listing filters these out, but a candidate can age out
-        // between the refresh and the click.
-        if card.is_expired() {
-            self.error = Some(format!(
-                "That identity card expired on {} — copy a fresh one from the other device",
-                card_expiry_date(&card)
-            ));
-            return;
-        }
-        if self.peers.len() >= duocb_core::auth::MAX_TRUSTED_PEERS {
-            self.error = Some("The trusted-peer limit is 128".into());
-            return;
-        }
-        self.peers.push(card);
-        self.mark_backup_dirty();
+        self.save_configure_config();
     }
 
     pub(crate) fn remove_peer(&mut self, public_key: &str) {
@@ -962,99 +719,8 @@ impl App {
             if self.selected_peer.as_deref() == Some(public_key) {
                 self.selected_peer = None;
             }
-            self.mark_backup_dirty();
+            self.save_configure_config();
         }
-    }
-
-    pub(crate) fn set_directory_channel(&mut self) {
-        match DirectoryChannel::parse(&self.in_directory_channel) {
-            Ok(channel) => {
-                self.directory_channel = Some(channel);
-                self.in_directory_channel = channel.encode();
-                // An entered channel may already hold a backup for a restored
-                // key. Persist the channel, but do not publish until lookup has
-                // offered that backup (or confirmed none exists).
-                self.backup_dirty = false;
-                self.backup_publish_blocked = true;
-                self.save_configure_config();
-                self.check_backup();
-            }
-            Err(error) => self.error = Some(format!("Invalid backup channel: {error:#}")),
-        }
-    }
-
-    pub(crate) fn generate_directory_channel(&mut self) {
-        let channel = DirectoryChannel::generate();
-        self.directory_channel = Some(channel);
-        self.in_directory_channel = channel.encode();
-        self.backup_publish_blocked = false;
-        self.mark_backup_dirty();
-        self.refresh_peers();
-    }
-
-    pub(crate) fn check_backup(&mut self) {
-        if let Some(channel) = self.directory_channel {
-            self.backup_check_pending = true;
-            self.backup_publish_blocked = true;
-            self.net.send(UiCommand::CheckBackup {
-                identity: self.identity.clone(),
-                channel,
-                relays: default_relays(),
-            });
-        }
-    }
-
-    pub(crate) fn restore_offered_backup(&mut self) {
-        let Some(snapshot) = self.recovery_snapshot.take() else {
-            return;
-        };
-        if snapshot.self_card.public_key() != self.identity.public_key() {
-            return;
-        }
-        self.saved_name = Some(snapshot.self_card.short_name().to_string());
-        self.in_my_name = snapshot.self_card.short_name().to_string();
-        self.device_suffix = snapshot.self_card.suffix().to_string();
-        self.self_card = Some(snapshot.self_card);
-        // A backup outlives the card inside it, so a restored self-card can
-        // already be stale. Re-mint before the state below is persisted and
-        // published, or this device would hand out — and back up — a card that
-        // no peer will accept.
-        if let Some(fresh) = self.freshly_minted_self_card() {
-            self.self_card = Some(fresh);
-        }
-        self.peers = snapshot
-            .peers
-            .into_iter()
-            .filter(|peer| {
-                self.recovery_selected
-                    .contains(&peer.public_key().to_hex())
-            })
-            .collect();
-        self.recovery_selected.clear();
-        self.backup_generation = snapshot.generation;
-        self.backup_dirty = false;
-        self.backup_check_pending = false;
-        self.backup_publish_blocked = false;
-        self.configure_step = ConfigureStep::Ready;
-        // A partial restore is a new local snapshot; publishing it ensures the
-        // user's explicit selection is what future recovery offers contain.
-        self.mark_backup_dirty();
-    }
-
-    pub(crate) fn toggle_recovery_peer(&mut self, public_key: &str) {
-        if !self.recovery_selected.remove(public_key) {
-            self.recovery_selected.insert(public_key.to_string());
-        }
-    }
-
-    pub(crate) fn skip_offered_backup(&mut self) {
-        let Some(snapshot) = self.recovery_snapshot.take() else {
-            return;
-        };
-        self.recovery_selected.clear();
-        self.backup_publish_blocked = false;
-        self.backup_generation = self.backup_generation.max(snapshot.generation);
-        self.mark_backup_dirty();
     }
 
     /// Whether the "sent ✓" flash should currently show.
@@ -1088,8 +754,8 @@ impl App {
     }
 
     pub(crate) fn stop_presence(&mut self) {
-        // Configure-mode Nostr work is one-shot (backup/directory) or scoped to
-        // a running server session; there is no standing presence publisher.
+        // Configure-mode Nostr work is scoped to a running server session's
+        // hosting-record publisher; there is no standing presence publisher.
     }
 
     /// Open the quick-options screen (ad-hoc rotating-PIN pairing).

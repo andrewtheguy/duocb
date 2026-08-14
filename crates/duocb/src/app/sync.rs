@@ -10,7 +10,7 @@ use super::{
     App, CopyTarget, card_expiry_date, card_expiry_note, item::ClipItem, item::PEEK_LIMIT, short_id,
 };
 use crate::{ClipRow, MainWindow, PathRow, PeerRow, UiState};
-use duocb_core::auth::{DirectoryChannel, IdentityCard};
+use duocb_core::auth::IdentityCard;
 use duocb_core::net::ConnStatus;
 use duocb_core::net::endpoint::ConnPathKind;
 use duocb_core::subnet::JoinIpOutcome;
@@ -42,7 +42,6 @@ impl App {
         let copied = self.copied_target();
         s.set_copied_card(copied == Some(CopyTarget::Card));
         s.set_copied_private_key(copied == Some(CopyTarget::PrivateKey));
-        s.set_copied_channel(copied == Some(CopyTarget::Channel));
         s.set_copied_pin(copied == Some(CopyTarget::Pin));
         let name = self.in_my_name.trim();
         match duocb_core::identity::validate_name(name) {
@@ -99,91 +98,6 @@ impl App {
         };
         s.set_peer_card_valid(peer_card_valid);
         s.set_peer_card_error(peer_card_error.into());
-        let (channel_valid, channel_error) =
-            match DirectoryChannel::parse(&self.in_directory_channel) {
-                Ok(_) => (true, String::new()),
-                Err(_) if self.in_directory_channel.trim().is_empty() => {
-                    (false, String::new())
-                }
-                Err(error) => (false, format!("{error:#}")),
-            };
-        s.set_channel_valid(channel_valid);
-        s.set_channel_error(channel_error.into());
-        s.set_has_channel(self.directory_channel.is_some());
-        s.set_channel_display(
-            self.directory_channel
-                .map(|channel| channel.encode())
-                .unwrap_or_default()
-                .into(),
-        );
-        s.set_backup_status(if self.directory_channel.is_none() {
-            "No Nostr backup channel configured".into()
-        } else if self.backup_check_pending {
-            "Checking for an encrypted peer-list backup…".into()
-        } else if self.backup_publish_blocked {
-            "Backup publication is paused until recovery is resolved or a check succeeds".into()
-        } else if self.backup_dirty {
-            "Peer-list backup pending".into()
-        } else {
-            "Peer-list backup is current".into()
-        });
-        s.set_backup_found(self.recovery_snapshot.is_some());
-        s.set_backup_summary(
-            self.recovery_snapshot
-                .as_ref()
-                .map(|snapshot| {
-                    format!(
-                        "Backup generation {} for “{}” contains {} peer(s). Choose which peers to restore.",
-                        snapshot.generation,
-                        snapshot.self_card.name(),
-                        snapshot.peers.len()
-                    )
-                })
-                .unwrap_or_default()
-                .into(),
-        );
-        s.set_backup_selected_count(self.recovery_selected.len() as i32);
-        let backup_rows: Vec<PeerRow> = self
-            .recovery_snapshot
-            .as_ref()
-            .map(|snapshot| {
-                snapshot
-                    .peers
-                    .iter()
-                    .map(|peer| {
-                        let key = peer.public_key().to_hex();
-                        PeerRow {
-                            public_key: key.clone().into(),
-                            line: format!("{}  · {}", peer.name(), short_id(&peer.npub())).into(),
-                            note: SharedString::default(),
-                            selected: self.recovery_selected.contains(&key),
-                        }
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        if let Some(model) = diffed_model(&s.get_backup_peers(), backup_rows) {
-            s.set_backup_peers(model);
-        }
-        let candidate_rows: Vec<PeerRow> = self
-            .directory_candidates
-            .iter()
-            .filter(|candidate| {
-                !self
-                    .peers
-                    .iter()
-                    .any(|peer| peer.public_key() == candidate.public_key())
-            })
-            .map(|candidate| PeerRow {
-                public_key: candidate.public_key().to_hex().into(),
-                line: format!("{}  · {}", candidate.name(), short_id(&candidate.npub())).into(),
-                note: card_expiry_note(candidate).into(),
-                selected: false,
-            })
-            .collect();
-        if let Some(model) = diffed_model(&s.get_directory_candidates(), candidate_rows) {
-            s.set_directory_candidates(model);
-        }
 
         // Device picker.
         let rows: Vec<PeerRow> = self
@@ -343,7 +257,6 @@ impl App {
         s.set_in_my_name(self.in_my_name.clone().into());
         s.set_in_private_key(self.in_private_key.clone().into());
         s.set_in_peer_card(self.in_peer_card.clone().into());
-        s.set_in_directory_channel(self.in_directory_channel.clone().into());
         s.set_in_pin_a(self.in_pin_a.clone().into());
         s.set_in_pin_b(self.in_pin_b.clone().into());
         s.set_in_join_ip(self.in_join_ip.clone().into());

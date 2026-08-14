@@ -5,7 +5,7 @@
 
 ## Workspace layout
 
-- `crates/duocb-core` — portable core (persistent per-installation application identity and signed cards in `auth.rs`, mutual key wire authentication, pairwise Nostr signaling, encrypted directory backups, quick PIN support, and the headless tokio net runtime). Application identities, optional directory channels, and ephemeral iroh transport keys are separate. No GUI/clipboard/config-file deps.
+- `crates/duocb-core` — portable core (persistent per-installation application identity and signed cards in `auth.rs`, mutual key wire authentication, pairwise Nostr signaling, quick PIN support, and the headless tokio net runtime). Application identities and ephemeral iroh transport keys are separate. No GUI/clipboard/config-file deps.
 - `crates/duocb` — desktop Slint app (binary `duocb`); owns config.rs, clipboard.rs, src/app/ (state + logic), and ui/*.slint (markup, compiled by build.rs; fluent style, Skia renderer, per-platform fonts set in main.rs).
 - Version bumps: edit the single `[workspace.package] version` in the root Cargo.toml.
 - Desktop-only. iOS support (the `duocb-ffi` staticlib, `ios/duocb.h`, `build-ios.sh`, and the release workflow's xcframework job) was removed while the core is being refactored; do not re-add it or reintroduce `target_os = "ios"` branches.
@@ -19,4 +19,4 @@ cargo run -- --config /tmp/duocb-peer1.json   # or DUOCB_CONFIG=/tmp/duocb-peer1
 cargo run -- --config /tmp/duocb-peer2.json   # or DUOCB_CONFIG=/tmp/duocb-peer2.json
 ```
 
-`-c` is an alias for `--config`; the CLI flag wins over `DUOCB_CONFIG`. Without an override, both processes resolve to the same default location (see README) and collide. Joining is by choosing Join on the home hub, which opens the local trusted-device picker, and selecting the peer there. The join retries at a fixed interval for up to 10 attempts, so press Join again if the host starts later. Configs are per-installation; recovery uses a saved private key plus optional directory channel and always requires explicit confirmation before applying a found peer backup.
+`-c` is an alias for `--config`; the CLI flag wins over `DUOCB_CONFIG`. Without an override, both processes resolve to the same default location (see README) and collide. Joining is by choosing Join on the home hub, which opens the local trusted-device picker, and selecting the peer there. The join retries at a fixed interval for up to 10 attempts, so press Join again if the host starts later. Configs are per-installation. There is no peer-list backup: a saved private key restores the identity only, and the trusted-peer list is rebuilt by re-importing each peer's card.

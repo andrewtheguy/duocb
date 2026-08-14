@@ -450,13 +450,10 @@ async fn stop_session(session: &mut Option<Session>) {
     }
 }
 
-/// The runtime's main loop. Backup and directory operations are one-shot tasks
-/// and never mutate caller-owned local trust.
+/// The runtime's main loop. It never mutates caller-owned local trust.
 pub async fn net_main(mut cmd_rx: mpsc::UnboundedReceiver<UiCommand>, events: EventSender) {
     let mut session: Option<Session> = None;
     let mut memory: Option<SessionMemory> = None;
-    let mut backup_lookup_task: Option<JoinHandle<()>> = None;
-    let mut directory_lookup_task: Option<JoinHandle<()>> = None;
 
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
@@ -500,96 +497,11 @@ pub async fn net_main(mut cmd_rx: mpsc::UnboundedReceiver<UiCommand>, events: Ev
                     .unwrap_or_default();
                 events.send(NetEvent::ConnPath(paths));
             }
-            UiCommand::PublishBackup { identity } => {
-                let events = events.clone();
-                tokio::spawn(async move {
-                    let identity = *identity;
-                    let Some(channel) = identity.channel else {
-                        events.error("Configure a backup channel first");
-                        return;
-                    };
-                    let snapshot = crate::nostr::BackupSnapshot::new(
-                        identity.backup_generation,
-                        identity.self_card,
-                        identity.peers,
-                    );
-                    match snapshot {
-                        Ok(snapshot) => match crate::nostr::publish_backup(
-                            &identity.identity,
-                            channel,
-                            &snapshot,
-                            &identity.relays,
-                        )
-                        .await
-                        {
-                            Ok(()) => events.send(NetEvent::BackupPublished {
-                                generation: identity.backup_generation,
-                            }),
-                            Err(error) => events.send(NetEvent::BackupPublishFailed {
-                                message: format!("Could not back up peer list: {error:#}"),
-                            }),
-                        },
-                        Err(error) => events.send(NetEvent::BackupPublishFailed {
-                            message: format!("Could not build peer backup: {error:#}"),
-                        }),
-                    }
-                });
-            }
-            UiCommand::CheckBackup {
-                identity,
-                channel,
-                relays,
-            } => {
-                if backup_lookup_task
-                    .as_ref()
-                    .is_none_or(|task| task.is_finished())
-                {
-                    let events = events.clone();
-                    backup_lookup_task = Some(tokio::spawn(async move {
-                        match crate::nostr::lookup_backup(
-                            identity.public_key(),
-                            channel,
-                            &relays,
-                        )
-                        .await
-                        {
-                            Ok(snapshot) => events.send(NetEvent::BackupFound {
-                                snapshot: snapshot.map(Box::new),
-                            }),
-                            Err(error) => events.send(NetEvent::BackupCheckFailed {
-                                message: format!("Could not check for backup: {error:#}"),
-                            }),
-                        }
-                    }));
-                }
-            }
-            UiCommand::RefreshDirectory { channel, relays } => {
-                if directory_lookup_task
-                    .as_ref()
-                    .is_none_or(|task| task.is_finished())
-                {
-                    let events = events.clone();
-                    directory_lookup_task = Some(tokio::spawn(async move {
-                        match crate::nostr::fetch_directory_cards(channel, &relays).await {
-                            Ok(cards) => events.send(NetEvent::DirectoryCards { cards }),
-                            Err(error) => {
-                                events.error(format!("Could not refresh directory: {error:#}"))
-                            }
-                        }
-                    }));
-                }
-            }
             UiCommand::Shutdown => break,
         }
     }
 
     stop_session(&mut session).await;
-    if let Some(task) = backup_lookup_task.take() {
-        task.abort();
-    }
-    if let Some(task) = directory_lookup_task.take() {
-        task.abort();
-    }
 }
 
 // ============================================================================
@@ -1869,8 +1781,6 @@ mod tests {
             identity: server_identity.clone(),
             self_card: server_identity.card("server", "a7B2c3D4").unwrap(),
             peers: vec![client_identity.card("client", "x9Y8z7W6").unwrap()],
-            channel: None,
-            backup_generation: 0,
             relays: Vec::new(),
         };
 
@@ -1951,8 +1861,6 @@ mod tests {
             identity: server_identity.clone(),
             self_card: server_identity.card("server", "a7B2c3D4").unwrap(),
             peers: vec![stale],
-            channel: None,
-            backup_generation: 0,
             relays: Vec::new(),
         };
 
@@ -2053,8 +1961,6 @@ mod tests {
             identity: identity.clone(),
             self_card: identity.card("client", "x9Y8z7W6").unwrap(),
             peers: vec![stale],
-            channel: None,
-            backup_generation: 0,
             // Empty relay list: reaching the lookup at all would fail this test
             // for the wrong reason, so the refusal must come first.
             relays: Vec::new(),

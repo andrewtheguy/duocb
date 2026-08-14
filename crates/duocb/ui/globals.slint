@@ -43,7 +43,6 @@ export global UiState {
     // (inbox/outbox rows carry their own `copied` flag in ClipRow).
     in property <bool> copied-card;
     in property <bool> copied-private-key;
-    in property <bool> copied-channel;
     in property <bool> copied-pin;
     in property <bool> name-valid;
     /// "Broadcast as" preview when the name is valid, "" otherwise.
@@ -61,16 +60,6 @@ export global UiState {
     in property <string> name-rules;
     in property <bool> peer-card-valid;
     in property <string> peer-card-error;
-    in property <bool> channel-valid;
-    in property <string> channel-error;
-    in property <bool> has-channel;
-    in property <string> channel-display;
-    in property <string> backup-status;
-    in property <bool> backup-found;
-    in property <string> backup-summary;
-    in property <int> backup-selected-count;
-    in property <[PeerRow]> backup-peers;
-    in property <[PeerRow]> directory-candidates;
 
     // Device picker.
     in property <[PeerRow]> peers;
@@ -142,7 +131,6 @@ export global UiState {
     in-out property <string> in-my-name;
     in-out property <string> in-private-key;
     in-out property <string> in-peer-card;
-    in-out property <string> in-directory-channel;
     in-out property <string> in-pin-a;
     in-out property <string> in-pin-b;
     /// The joiner's optional host-IP entry (shown only for a LAN-only PIN).
@@ -166,7 +154,6 @@ export global Actions {
     callback rename();
     callback copy-card();
     callback copy-private-key();
-    callback copy-channel();
     callback request-reset-identity();
     callback confirm-reset-identity();
     callback cancel-reset-identity();
@@ -175,17 +162,9 @@ export global Actions {
     callback begin-server();
     callback enter-join-picker();
     callback leave-join-picker();
-    callback refresh-peers();
     callback toggle-peer(public-key: string);
     callback remove-peer(public-key: string);
     callback import-peer-card();
-    callback trust-directory-card(public-key: string);
-    callback generate-channel();
-    callback set-channel();
-    callback check-backup();
-    callback restore-backup();
-    callback skip-backup();
-    callback toggle-backup-peer(public-key: string);
     callback join-selected();
 
     // Quick options / client.

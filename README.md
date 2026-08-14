@@ -60,44 +60,6 @@ sign a fresh transcript containing:
 Clipboard traffic starts only after both signatures verify and both local
 trust checks pass.
 
-### Optional Nostr peer-list backup
-
-Configure mode can use a manually entered or generated `dc1.…` directory
-channel. It is a standalone 128-bit backup/discovery channel, not an
-authentication key.
-
-Each installation publishes its own complete peer list as an NIP-44 encrypted,
-signed, bounded snapshot. Backups:
-
-- are selected by the owner's application public key;
-- are capped at 128 peers and 128 KiB decoded;
-- use 8 KiB chunks with hashes and a committed header; and
-- alternate between two replaceable slots, retaining one fallback generation.
-
-The channel can also reveal signed self-cards published by other owners on that
-channel. They are candidates only: the UI never trusts them automatically.
-
-#### Fresh-install recovery
-
-Save both the private key (`nsec1…`) and the directory channel. On a fresh
-installation:
-
-1. Choose **Restore a private key** and enter the `nsec`.
-2. Enter the saved `dc1.…` channel.
-3. duocb looks up backups authored by the restored public key and decrypts them
-   with the channel.
-4. If a valid complete backup exists, duocb displays an offer with its signed
-   name, generation, and peer list.
-5. Select the peers to recover and explicitly choose **Restore selected**, or
-   choose **Keep local state**.
-
-Accepting the restore also recovers the signed short name and its permanent
-suffix. Restore is never automatic. Entering an existing channel queries
-before publishing, so a fresh empty install cannot overwrite the backup it is
-trying to recover. The private key alone cannot recover the list because the
-channel is intentionally separate and is required to locate/decrypt the
-backup.
-
 ### Quick mode
 
 Quick mode remains identity-free. The host displays a rotating eight-character
@@ -106,7 +68,7 @@ Argon2id-backed challenge-response.
 
 The desktop quick flow is LAN-only and uses Bonjour-compatible DNS-SD. Where
 multicast is blocked, enter the LAN IP shown by the host to use the unicast side
-channel. No saved application key, trusted peer, or backup channel participates.
+channel. No saved application key or trusted peer participates.
 
 ## Build and run
 
@@ -135,19 +97,16 @@ shape is:
 
 ```json
 {
-  "version": 3,
+  "version": 4,
   "identity_secret": "nsec1…",
   "device_suffix": "a7B2c3D4",
   "my_name": "mac-book",
   "self_card": "{ signed Nostr event JSON }",
-  "directory_channel": "dc1.…",
-  "peers": ["{ signed peer card JSON }"],
-  "backup_generation": 4,
-  "backup_dirty": false
+  "peers": ["{ signed peer card JSON }"]
 }
 ```
 
-Malformed keys, cards, channels, duplicates, mismatched self-cards, legacy
+Malformed keys, cards, duplicates, mismatched self-cards, legacy
 fields, and oversized peer lists are startup errors. An *expired* card is not:
 it loads and is shown as expired, so lapsed trust is visible rather than
 silently dropped. Saves use an owner-only
@@ -160,9 +119,8 @@ persisted.
 - The application-key handshake authenticates configured peers independently
   of the iroh transport key.
 - Pairwise hosting records are encrypted to the intended trusted peer.
-- Directory backups are encrypted with the optional channel and signed by
-  their owning application key. Anyone holding the channel can read channel
-  backups, so store it with the private key.
+- Trust is local only: the trusted-peer list never leaves the device, so a lost
+  config is re-paired by re-importing each peer's card.
 - Nostr relays and iroh infrastructure may observe metadata and timing.
 - Clipboard items are UTF-8 text capped at 1 MiB.
 - A server links one peer at a time. Configure mode pins the stable application

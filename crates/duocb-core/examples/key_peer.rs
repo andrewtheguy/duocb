@@ -33,8 +33,6 @@ fn main() {
         identity: identity.clone(),
         self_card: self_card.clone(),
         peers: vec![peer.clone()],
-        channel: None,
-        backup_generation: 0,
         relays: duocb_core::nostr::DEFAULT_NOSTR_RELAYS
             .iter()
             .map(|relay| relay.to_string())

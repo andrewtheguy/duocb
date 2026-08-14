@@ -9,7 +9,7 @@ import { HomeScreen } from "configure.slint";
 import { QuickScreen } from "quick.slint";
 import { ServerScreen } from "server.slint";
 import { ClientScreen } from "client.slint";
-import { BackupRestoreModal, ResetIdentityModal, ConnPathModal } from "modals.slint";
+import { ResetIdentityModal, ConnPathModal } from "modals.slint";
 
 // Everything the Rust side needs by name.
 export { UiState, Actions, Screen, ConfigureStep, PairMode, PeerRow, ClipRow, PathRow }
@@ -101,6 +101,5 @@ export component MainWindow inherits Window {
     }
 
     if UiState.show-reset-identity: ResetIdentityModal { }
-    if UiState.backup-found: BackupRestoreModal { }
     if UiState.show-conn-path: ConnPathModal { }
 }
