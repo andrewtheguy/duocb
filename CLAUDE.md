@@ -3,12 +3,16 @@
 - run `cargo clippy --workspace --all-targets` and `cargo test --workspace` after rust code changes
 - no cargo fmt
 
-## Workspace layout
+# Workspace layout
 
 - `crates/duocb-core` — portable core (persistent per-installation application identity and signed cards in `auth.rs`, mutual key wire authentication, pairwise Nostr signaling, LAN-setup PIN support and card exchange, and the headless tokio net runtime). Application identities and ephemeral iroh transport keys are separate. No GUI/clipboard/config-file deps.
 - `crates/duocb` — desktop Slint app (binary `duocb`); owns config.rs, clipboard.rs, src/app/ (state + logic), and ui/*.slint (markup, compiled by build.rs; fluent style, Skia renderer, per-platform fonts set in main.rs).
 - Version bumps: edit the single `[workspace.package] version` in the root Cargo.toml.
 - Desktop-only. iOS support (the `duocb-ffi` staticlib, `ios/duocb.h`, `build-ios.sh`, and the release workflow's xcframework job) was removed while the core is being refactored; do not re-add it or reintroduce `target_os = "ios"` branches.
+
+# E2E tests
+
+- Add keyboard shortcuts to ctas to facilitate e2e testing.
 
 ## Config-based E2E tests on the same device
 
