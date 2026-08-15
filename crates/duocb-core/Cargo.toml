@@ -6,8 +6,6 @@ description.workspace = true
 
 [dependencies]
 iroh.workspace = true
-iroh-mdns-address-lookup.workspace = true
-mdns-sd.workspace = true
 rustls.workspace = true
 futures.workspace = true
 nostr-sdk.workspace = true
@@ -25,6 +23,20 @@ serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 log.workspace = true
+
+# Both of these open multicast sockets in-process, which iOS gates behind the
+# `com.apple.developer.networking.multicast` entitlement Apple grants only by
+# exception. There, `lan::dnssd`'s ios backend talks to the system mDNSResponder
+# daemon instead (no entitlement needed), and iroh's mDNS address lookup is
+# simply omitted — see `net::endpoint::create_endpoint_builder`.
+[target.'cfg(not(target_os = "ios"))'.dependencies]
+iroh-mdns-address-lookup.workspace = true
+mdns-sd.workspace = true
+
+# dns_sd.h lives in libSystem; libc supplies poll(2) and the sockaddr layouts
+# the DNS-SD callbacks hand back.
+[target.'cfg(target_os = "ios")'.dependencies]
+libc.workspace = true
 
 [dev-dependencies]
 env_logger.workspace = true

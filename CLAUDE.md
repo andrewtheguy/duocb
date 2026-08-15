@@ -7,8 +7,17 @@
 
 - `crates/duocb-core` — portable core (persistent per-installation application identity and signed cards in `auth.rs`, mutual key wire authentication, pairwise hosting signaling and the card-setup PIN rendezvous — both over LAN and/or Nostr — plus the card exchange itself, and the headless tokio net runtime). Application identities and ephemeral iroh transport keys are separate. No GUI/clipboard/config-file deps.
 - `crates/duocb` — desktop Slint app (binary `duocb`); owns config.rs, clipboard.rs, src/app/ (state + logic), and ui/*.slint (markup, compiled by build.rs; fluent style, Skia renderer, per-platform fonts set in main.rs).
+- `crates/duocb-ffi` — the iOS staticlib (`libduocb.a`), a thin C shim over `duocb_core::net`: a JSON config in, JSON events out, plus the pure setup helpers. No policy — a card received over card setup is handed up verified but untrusted, and only the app (after the user compares fingerprints) decides to store it. Its C surface is the hand-maintained `ios/duocb.h`; keep the two in step. Excluded from `default-members`, so a plain `cargo build`/`clippy`/`test` at the root stays desktop-only — use `-p duocb-ffi` to reach it, and `./build-ios.sh` to produce `dist/ios/libduocb.xcframework`. The sibling app is `../duocb-ios`.
 - Version bumps: edit the single `[workspace.package] version` in the root Cargo.toml.
-- Desktop-only. iOS support (the `duocb-ffi` staticlib, `ios/duocb.h`, `build-ios.sh`, and the release workflow's xcframework job) was removed while the core is being refactored; do not re-add it or reintroduce `target_os = "ios"` branches.
+
+## iOS and multicast
+
+Exactly one thing is compiled out on iOS: **iroh's own mDNS address lookup** (`iroh-mdns-address-lookup`), because it opens multicast sockets in-process and iOS gates those behind `com.apple.developer.networking.multicast`, an entitlement Apple grants by exception. Regular mDNS is *not* lost — `lan/dnssd.rs` has two backends behind one contract, and the iOS half drives the system mDNSResponder daemon over `dns_sd.h`, which does the multicast on the app's behalf and needs only the ordinary Local Network permission.
+
+Two consequences worth remembering before changing this area:
+
+- `EndpointReadiness::LanDirect` has *no* address lookup at all on iOS. It survives because no LAN dial ever uses a bare node id: both rendezvous backends return the host's direct socket addresses and `LanFound::endpoint_addr` attaches them. Anything that makes a LAN-only dial depend on resolving a node id will work everywhere except iOS.
+- `mdns-sd` and `iroh-mdns-address-lookup` are `cfg(not(target_os = "ios"))` dependencies and `libc` is an iOS-only one, so a `use` of either outside its platform half breaks the iOS build and nothing else. Build it with `./build-ios.sh` (or at least `cargo check -p duocb-ffi --target aarch64-apple-ios`) after touching `lan/`, `net/endpoint.rs`, or the FFI.
 
 # E2E tests
 
