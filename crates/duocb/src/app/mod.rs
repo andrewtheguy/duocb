@@ -37,7 +37,8 @@ pub(crate) struct App {
     pub(crate) status: ConnStatus,
     pub(crate) error: Option<String>,
 
-    /// Which transport(s) card setup uses to trade the PIN rendezvous record.
+    /// Which transport(s) carry signaling: card setup's PIN rendezvous record
+    /// and the pairwise hosting record a clipboard session is found through.
     /// Defaults to LAN-first-then-nostr; the `--lan-only` / `--nostr-only` CLI
     /// flags pin it to a single channel so a test can exercise one path without
     /// the other quietly covering for it. Fixed for the process — it is a

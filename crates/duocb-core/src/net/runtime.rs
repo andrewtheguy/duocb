@@ -1387,6 +1387,17 @@ async fn run_hosting_publisher(
             .filter(|card| card.is_valid_at(now))
             .cloned()
             .collect();
+        // Every trusted card lapsed while the session was up: withdraw the LAN
+        // advertisements rather than leave records standing for peers that can
+        // no longer pair. Only the local channel needs saying — the relay copy
+        // just stops being refreshed and ages out of its TTL.
+        if live.is_empty() && advertised.is_some() {
+            log::info!(
+                "Withdrawing the local-network advertisement — no trusted peer's card is still valid"
+            );
+            adverts.clear();
+            advertised = None;
+        }
         // Nothing to publish and nobody who could dial: not a failure to report.
         if !live.is_empty() {
             let mut published = false;

@@ -81,6 +81,9 @@ pub enum ServerMode {
     /// Like [`CardSetup`](Self::CardSetup), the host publishes everywhere it can
     /// rather than falling back — it cannot know which channel the joiner will
     /// find it on. Only the joiner falls back (see [`DialSpec::Key`]).
+    ///
+    /// The relays published to are the ones on `identity`, as in
+    /// [`DialSpec::Key`]; they are ignored on [`SignalChannel::LanOnly`].
     Key {
         identity: Box<KeyIdentity>,
         channel: SignalChannel,
