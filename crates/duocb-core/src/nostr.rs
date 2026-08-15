@@ -1,6 +1,7 @@
-//! Nostr signaling: pairwise hosting records for configured peers and
-//! quick-mode PIN rendezvous.
+//! Nostr signaling: pairwise hosting records for configured peers and the
+//! card-setup PIN rendezvous.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -157,6 +158,85 @@ pub async fn lookup_hosting(
         return Ok(None);
     }
     Ok(record.node_id.parse().ok())
+}
+
+// ============================================================================
+// Card-setup PIN rendezvous
+// ============================================================================
+
+const PIN_KIND_U16: u16 = 9421;
+/// How long a published PIN record stays useful: three rotation periods, which
+/// covers the look-back window a joiner searches (`pin_record::candidate_keys`)
+/// without leaving stale records resolvable much beyond it. A resolved stale
+/// record leads to an auth rejection anyway — the auth key rotates with the
+/// displayed code.
+const PIN_EVENT_TTL_SECS: u64 = 3 * crate::pin::BUCKET_SECS;
+/// Shorter than the hosting lookup: this one is on the critical path of a
+/// person waiting with a 60-second code on screen.
+const PIN_LOOKUP_TIMEOUT: Duration = Duration::from_secs(8);
+
+fn pin_kind() -> Kind {
+    Kind::from_u16(PIN_KIND_U16)
+}
+
+/// Publish the card-setup rendezvous record — the same encrypted node-id record
+/// the LAN backends carry (see `crate::pin_record`) — to the relays, signed by
+/// (and addressed under) the `(pin, bucket)`-derived keypair.
+///
+/// This is the fallback path that lets two devices on different networks trade
+/// cards. It puts the record where anyone can fetch it, so its secrecy rests
+/// entirely on the PIN: the lookup key is Argon2id-derived, and the record only
+/// yields an ephemeral node id, which is not a credential — dialing it still
+/// has to pass the in-band PIN auth, and the card that crosses is not trusted
+/// until a human compares fingerprints (`crate::card_exchange`).
+pub async fn publish_pin_record(keys: &Keys, node_id: &EndpointId, relays: &[String]) -> Result<()> {
+    let content = crate::pin_record::encrypt_pin_payload(keys, node_id)?;
+    let expiration = Timestamp::now() + PIN_EVENT_TTL_SECS;
+    let client = connect_client(relays).await?;
+    let event = EventBuilder::new(pin_kind(), content)
+        .tag(Tag::expiration(expiration))
+        .sign_with_keys(keys)
+        .context("signing PIN record")?;
+    let res = client.send_event(&event).await;
+    client.disconnect().await;
+    res.context("publishing PIN record to relays")?;
+    Ok(())
+}
+
+/// Fetch the card-setup rendezvous record from the relays, trying each
+/// candidate keypair (one per adjacent rotation bucket — see
+/// `pin_record::candidate_keys`), newest event first. `Ok(None)` when no
+/// candidate's record answered or none decrypted, i.e. a wrong or expired PIN.
+///
+/// Unlike the LAN backends this returns a bare node id: the record carries no
+/// direct addresses, so the dialer's own discovery (n0 DNS/pkarr, relays)
+/// resolves it — which is what makes this the cross-network path.
+pub async fn lookup_pin_record(
+    candidates: &[Keys],
+    relays: &[String],
+) -> Result<Option<EndpointId>> {
+    let by_pubkey: HashMap<PublicKey, &Keys> = candidates
+        .iter()
+        .map(|keys| (keys.public_key(), keys))
+        .collect();
+    let client = connect_client(relays).await?;
+    let filter = Filter::new()
+        .kind(pin_kind())
+        .authors(by_pubkey.keys().copied());
+    let events = client.fetch_events(filter, PIN_LOOKUP_TIMEOUT).await;
+    client.disconnect().await;
+    let events = events.context("querying nostr relays for the PIN record")?;
+    let mut found: Vec<_> = events.iter().collect();
+    found.sort_by_key(|event| std::cmp::Reverse(event.created_at));
+    for event in found {
+        let Some(keys) = by_pubkey.get(&event.pubkey) else {
+            continue;
+        };
+        if let Some(node_id) = crate::pin_record::decrypt_pin_payload(keys, &event.content) {
+            return Ok(Some(node_id));
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]

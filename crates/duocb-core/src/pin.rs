@@ -1,10 +1,11 @@
-//! Short, human-typable PIN that authenticates a LAN setup session.
+//! Short, human-typable PIN that authenticates a card-setup session.
 //!
-//! In LAN setup the host shares its ephemeral node id over the local network without
-//! any copy-paste: it shows a short PIN that **rotates every 60 seconds**. The PIN
-//! is the only secret the joiner types; both sides turn it into a keypair
-//! (via [`derive_key_material`]) that locates and decrypts a single rendezvous record
-//! carrying the node id (see `crate::lan`).
+//! In card setup the host shares its ephemeral node id without any copy-paste: it
+//! shows a short PIN that **rotates every 60 seconds**. The PIN is the only secret
+//! the joiner types; both sides turn it into a keypair (via [`derive_key_material`])
+//! that locates and decrypts a single rendezvous record carrying the node id —
+//! carried on the local network (`crate::lan`), the nostr relays (`crate::nostr`),
+//! or both, depending on the selected channel.
 //!
 //! The PIN alphabet is **Crockford base32** — unambiguous letters/numbers only (no
 //! `I L O U`). It is always *displayed* uppercase and grouped (`XXXX-XXXX`); input is
@@ -22,8 +23,8 @@
 //! 60-second rotation plus a short record TTL bound the exposure window. Test builds
 //! stretch with the Argon2id minimum instead — see [`WORK_FACTORS`].
 //!
-//! The PIN authenticates the *channel*, never an identity. It is deliberately not
-//! sufficient to become a trusted device: the cards that cross a LAN-setup connection
+//! The PIN authenticates the *connection*, never an identity. It is deliberately not
+//! sufficient to become a trusted device: the cards that cross a card-setup connection
 //! are only imported after the user compares fingerprints (see `crate::card_exchange`).
 //!
 //! Two independent keys are derived from a PIN, both with the same Argon2id work factor but

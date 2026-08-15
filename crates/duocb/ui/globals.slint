@@ -35,7 +35,7 @@ export global UiState {
     in property <string> display-identity;
     in property <bool> has-identity;
     /// This device's key fingerprint — the value the user compares against the
-    /// other device during LAN setup, and the one shown beside each trusted peer.
+    /// other device during card setup, and the one shown beside each trusted peer.
     in property <string> own-fingerprint;
     in property <string> public-key;
     in property <string> config-path;
@@ -75,8 +75,9 @@ export global UiState {
     in property <string> peer-node-id-short;
     /// The persistent application public key shown in the pairing summary.
     in property <string> session-public-key;
-    /// The host's LAN IPv4 on the LAN-only channel (so the joiner can type it
-    /// for the manual-IP side channel), "" on other channels / before it's known.
+    /// The host's LAN IPv4 while the local-network channel is in use (so the
+    /// joiner can type it for the manual-IP side channel), "" on the nostr-only
+    /// channel or before an address is known.
     in property <string> host-lan-ip;
     in property <string> pin-display;
     /// "refreshes in 42s", composed in Rust; "" while no PIN shows.
@@ -106,7 +107,16 @@ export global UiState {
     in property <string> join-ip-error;
     in property <bool> dial-ready;
 
-    // LAN setup confirmation. The user compares `incoming-fingerprint` here
+    // Card setup.
+    /// Whether the local-network rendezvous is in use, so the screens offer the
+    /// manual host-IP path (which only exists on that channel).
+    in property <bool> setup-lan-enabled;
+    /// The heading and body describing how the two devices will find each other
+    /// on the channel this process was launched with, composed in Rust.
+    in property <string> setup-channel-title;
+    in property <string> setup-channel-note;
+
+    // Card-setup confirmation. The user compares `incoming-fingerprint` here
     // against `own-fingerprint` as shown on the other device; they must match
     // before the card is worth importing.
     in property <string> incoming-name;
@@ -143,7 +153,7 @@ export global UiState {
 export global Actions {
     // Navigation.
     callback go-back();
-    callback open-lan-setup();
+    callback open-card-setup();
     callback dismiss-error();
 
     // Configure wizard.
@@ -169,12 +179,12 @@ export global Actions {
     callback import-peer-card();
     callback join-selected();
 
-    // LAN setup.
+    // Card setup.
     /// Show a PIN on this device so the other one can type it.
-    callback host-lan-setup();
-    /// Dial what the LAN-setup entry holds (the typed PIN, plus an optional
+    callback host-card-setup();
+    /// Dial what the card-setup entry holds (the typed PIN, plus an optional
     /// host IP).
-    callback join-lan-setup();
+    callback join-card-setup();
     /// Trust the card that arrived — only after the user has compared
     /// fingerprints.
     callback import-received-card();

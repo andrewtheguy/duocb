@@ -1,5 +1,5 @@
-//! LAN transports for the encrypted PIN rendezvous record that bootstraps a LAN
-//! setup session. Both backends carry the same record (see `crate::pin_record`):
+//! LAN transports for the encrypted PIN rendezvous record that bootstraps a
+//! card-setup session. Both backends carry the same record (see `crate::pin_record`):
 //! the NIP-44 ciphertext of the host's ephemeral node id, under a service
 //! instance label derived from the `(pin, bucket)` public key — so a record is
 //! found by deriving its key from the typed PIN, never by naming a device.
@@ -124,7 +124,7 @@ pub async fn dnssd_lookup_pin_record(candidates: &[Keys]) -> Result<Option<PinFo
     dnssd::lookup(candidates).await
 }
 
-/// Start the LAN-only channel's unicast side channel: a listener on the port
+/// Start the unicast side channel: a listener on the port
 /// derived from the record keypair ([`side_channel_port`]) serving the same
 /// PIN-encrypted node-id record, so a joiner who types the host's LAN IP can
 /// pair where multicast is blocked. Dropping the returned [`UnicastListener`]
@@ -137,7 +137,7 @@ pub async fn unicast_advertise_pin_record(
     unicast::advertise(keys, node_id, addrs).await
 }
 
-/// Fetch the LAN-only PIN record from the host's unicast side channel at `ip`,
+/// Fetch the PIN record from the host's unicast side channel at `ip`,
 /// trying the port each candidate keypair derives to (adjacent buckets, as for
 /// the DNS-SD lookup). Returns the decrypted node id and the host's direct socket
 /// addresses, or `Ok(None)` when nothing reachable answered or the record did not

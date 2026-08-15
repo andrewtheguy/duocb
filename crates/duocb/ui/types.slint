@@ -3,17 +3,17 @@
 
 /// Which screen is showing. `server`/`client` are the two connection roles;
 /// both peers send and receive once paired — the role only decides who sets the
-/// connection up. The three `lan-*` screens are the trust-bootstrap path, which
-/// never carries a connection at all.
+/// connection up. The three `card-*` screens are the trust-bootstrap path,
+/// which never carries clipboard content at all.
 export enum Screen {
     /// The configure mode's wizard/hub — the primary flow.
     home,
-    /// LAN setup: choose to show a PIN or to type one.
-    lan-setup,
-    /// LAN setup in progress: showing a PIN, or dialing one.
-    lan-pairing,
-    /// LAN setup finished: compare fingerprints, then import or cancel.
-    lan-confirm,
+    /// Card setup: choose to show a PIN or to type one.
+    card-setup,
+    /// Card setup in progress: showing a PIN, or dialing one.
+    card-pairing,
+    /// Card setup finished: compare fingerprints, then import or cancel.
+    card-confirm,
     /// Start a connection: this device hosts and shows credentials.
     server,
     /// Join a connection: this device enters credentials and dials.

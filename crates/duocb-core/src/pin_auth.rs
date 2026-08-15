@@ -1,6 +1,6 @@
-//! Quick-mode PIN mutual authentication, carried in-band over the established connection.
+//! Card-setup PIN mutual authentication, carried in-band over the established connection.
 //!
-//! In PIN quick mode the relay record carries **only** the server's ephemeral node id (encrypted
+//! In card setup the rendezvous record carries **only** the server's ephemeral node id (encrypted
 //! under the PIN rendezvous key; see `crate::nostr`). No authentication proof
 //! is ever placed on a relay.
 //! Instead, once the client has dialed that node id, both peers prove they hold the same PIN

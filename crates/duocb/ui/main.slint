@@ -6,7 +6,7 @@ import { UiState, Actions } from "globals.slint";
 import { Screen, ConfigureStep, PeerRow, ClipRow, PathRow } from "types.slint";
 import { Theme } from "theme.slint";
 import { HomeScreen } from "configure.slint";
-import { LanSetupScreen, LanPairingScreen, LanConfirmScreen } from "lan.slint";
+import { CardSetupScreen, CardPairingScreen, CardConfirmScreen } from "card_setup.slint";
 import { ServerScreen } from "server.slint";
 import { ClientScreen } from "client.slint";
 import { ResetIdentityModal, ConnPathModal } from "modals.slint";
@@ -28,7 +28,7 @@ export component MainWindow inherits Window {
     /// fields count.
     out property <bool> any-field-focused:
         (UiState.screen == Screen.home && home.field-focused)
-        || (UiState.screen == Screen.lan-setup && lan-setup.field-focused)
+        || (UiState.screen == Screen.card-setup && card-setup.field-focused)
         || (UiState.screen == Screen.server && server.field-focused)
         || (UiState.screen == Screen.client && client.field-focused);
 
@@ -93,9 +93,9 @@ export component MainWindow inherits Window {
                 // Screens are all instantiated (visibility-toggled) so their
                 // `field-focused` out-properties stay referencable above.
                 home := HomeScreen { visible: UiState.screen == Screen.home; }
-                lan-setup := LanSetupScreen { visible: UiState.screen == Screen.lan-setup; }
-                LanPairingScreen { visible: UiState.screen == Screen.lan-pairing; }
-                LanConfirmScreen { visible: UiState.screen == Screen.lan-confirm; }
+                card-setup := CardSetupScreen { visible: UiState.screen == Screen.card-setup; }
+                CardPairingScreen { visible: UiState.screen == Screen.card-pairing; }
+                CardConfirmScreen { visible: UiState.screen == Screen.card-confirm; }
                 server := ServerScreen { visible: UiState.screen == Screen.server; }
                 client := ClientScreen { visible: UiState.screen == Screen.client; }
             }

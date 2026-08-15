@@ -52,7 +52,7 @@ clock can stretch a real lifetime.
 
 The clipboard handshake carries raw application public keys, never a card, so
 each side enforces expiry against **its own stored copy** and there is no
-renewal protocol. (A card does cross the wire during LAN setup, but that is the
+renewal protocol. (A card does cross the wire during card setup, but that is the
 hand-over itself — see below — and the receiving side still judges it locally.) The listener refuses a dialer whose stored card has
 lapsed before signing anything, and closes with a dedicated code so the dialer
 can say precisely what is wrong; the dialer refuses symmetrically before
@@ -125,7 +125,7 @@ identity. Nonces and roles prevent replay/reflection.
 
 The server's one-peer claim stores the stable application public key in
 configure mode. A reconnect may present a new iroh node id if it proves the same
-trusted application key; the claim updates the transport id. LAN setup has no
+trusted application key; the claim updates the transport id. Card setup has no
 application identity to claim and claims the session's iroh id instead.
 
 ### Key fingerprints
@@ -136,17 +136,17 @@ uppercase hex characters. It is taken over the **key**, not a card: a renewed
 card is new bytes with a new timestamp and signature, while local trust is keyed
 on the public key, so the value a user reads must not move when a card is
 re-minted. It is shown for this device on the hub, beside every trusted peer,
-and on both sides of the LAN-setup confirmation.
+and on both sides of the card-setup confirmation.
 
-## LAN setup
+## Card setup
 
 The trust-bootstrap path, for two devices that cannot copy and paste a card
 between them. It is not a connection mode: it produces trusted peer cards, and
 every subsequent connection is an ordinary configure-mode one.
 
-A rotating Crockford PIN drives DNS-SD (or typed-IP unicast) discovery via an
-Argon2id-derived rendezvous key, then a separate Argon2id-derived in-band mutual
-proof. On the connection that authenticates, both sides exchange cards:
+A rotating Crockford PIN drives discovery via an Argon2id-derived rendezvous
+key, then a separate Argon2id-derived in-band mutual proof. On the connection
+that authenticates, both sides exchange cards:
 
 ```text
 D→L  AuthRequest::Pin  {nonce_d}
@@ -178,6 +178,39 @@ when the exchange finishes is answered with a BUSY close rather than left
 waiting. Nothing but the imported card is persisted: no PIN, iroh key, or
 session survives.
 
+### Rendezvous channels
+
+The rendezvous record itself — NIP-44 ciphertext of the host's ephemeral node
+id, keyed by the `(pin, bucket)` public key — is the same on every transport
+(`pin_record`). What differs is where it is put and looked for, chosen at launch
+by `SetupChannel`:
+
+| Channel | Host publishes | Joiner looks | Endpoint gate |
+|---|---|---|---|
+| `LanThenNostr` (default) | DNS-SD + unicast side channel **and** relays | local network, then relays if that missed | `DirectAddr` |
+| `LanOnly` (`--lan-only`) | DNS-SD + unicast side channel | local network only | `LanDirect` (relay-less) |
+| `NostrOnly` (`--nostr-only`) | relays | relays only | `RelayOnline` |
+
+The two roles are deliberately asymmetric. The host publishes on *every* enabled
+channel — it cannot know which one the joiner will reach it on, and a record
+only helps if it is already in place. The joiner is the one that falls back, and
+it does so sequentially rather than racing: the local lookup answers in well
+under a second when the other device is there, so the common case never touches
+a relay. A LAN error is logged and treated like a miss; an error surfaces only
+when nothing was found on any enabled channel.
+
+Only the default channel needs both stacks, which is why it gates on
+`DirectAddr` — waiting for a relay would stall a pairing that may never need
+one, while the relay connects in the background for the fallback. `LanOnly`
+builds a relay-less endpoint (no third-party server at all); `NostrOnly`
+requires the relay before it can publish, and its record carries no direct
+addresses, so the dialer's own discovery resolves the node id.
+
+Publishing to public relays widens who can *fetch* a record, so it rests
+entirely on the PIN: the lookup key is Argon2id-derived, the payload is only an
+ephemeral node id, dialing it still requires the in-band PIN proof, and nothing
+is trusted without the fingerprint check below.
+
 ### Why the fingerprint check is load-bearing
 
 The PIN proves possession of a short code, not an identity. It is ~35 bits and
@@ -201,7 +234,7 @@ the value compared never crossed the network.
 - **Auto-exchange leaks nothing.** A card is public material its owner hands out
   by copy-paste anyway, and carries no private key. Receiving one is not
   trusting it; only Import writes to the trusted list.
-- **Bounded blast radius.** A LAN-setup connection carries no clipboard content,
+- **Bounded blast radius.** A card-setup connection carries no clipboard content,
   so a card slipped past an inattentive user grants only what any imported card
   grants: the ability to be dialed as a trusted peer, which still requires the
   mutual application-key handshake and the victim choosing to Join.
@@ -212,13 +245,13 @@ Key commands:
 
 - `StartServer::NostrKey { KeyIdentity }`
 - `Connect::NostrKey { KeyIdentity, peer_public_key }`
-- `StartServer::LanSetup { self_card }`
-- `Connect::LanSetup { canonical_pin, self_card, target_ip }`
+- `StartServer::CardSetup { self_card, channel, relays }`
+- `Connect::CardSetup { canonical_pin, self_card, target_ip, channel, relays }`
 
-and the LAN-setup event `NetEvent::PeerCardReceived(IdentityCard)`.
+and the card-setup event `NetEvent::PeerCardReceived(IdentityCard)`.
 
 The runtime never mutates caller-owned trust; the host app owns the peer list
-and passes a snapshot of it in with each command. That still holds for LAN
+and passes a snapshot of it in with each command. That still holds for card
 setup: the runtime only *delivers* a verified card, and the host app decides
 whether it is trusted.
 
@@ -236,8 +269,8 @@ wire clipboard frames are capped at 1 MiB.
 ## Security assumptions
 
 - Identity cards are transferred over a path the owner trusts: a clipboard the
-  owner controls, or a LAN-setup connection whose fingerprint the owner checked.
-  Skipping that check reduces LAN setup's security to the PIN alone.
+  owner controls, or a card-setup connection whose fingerprint the owner checked.
+  Skipping that check reduces card setup's security to the PIN alone.
 - Card expiry bounds how long a leaked or abandoned card stays useful, but only
   against a peer whose clock is roughly correct: expiry is enforced locally, so
   a device whose clock is set far back keeps honouring a lapsed card.

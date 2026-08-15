@@ -1,8 +1,10 @@
-// LAN setup: bootstrap trust between two devices that cannot copy and paste
-// identity cards to each other. A rotating PIN authenticates a local-network
-// channel, both devices swap signed cards over it, and the user confirms the
-// fingerprint before anything is trusted. No clipboard content ever crosses a
-// LAN-setup connection — that is what the configure-mode session is for.
+// Card setup: bootstrap trust between two devices that cannot copy and paste
+// identity cards to each other. A rotating PIN authenticates a short-lived
+// connection, both devices swap signed cards over it, and the user confirms the
+// fingerprint before anything is trusted. How the two devices find each other
+// (local network, relays, or local-then-relays) is chosen at launch and
+// described by `setup-channel-note`. No clipboard content ever crosses a
+// card-setup connection — that is what the configure-mode session is for.
 
 import { UiState, Actions } from "globals.slint";
 import { Theme } from "theme.slint";
@@ -10,7 +12,7 @@ import { Card, CardTitle, Body, Weak, Small, Mono, BigButton, WideButton, BackHe
 import { Button, LineEdit, ScrollView } from "std-widgets.slint";
 
 // Step one: choose a role. Show a PIN here, or type the one shown there.
-export component LanSetupScreen inherits ScrollView {
+export component CardSetupScreen inherits ScrollView {
     out property <bool> field-focused:
         pin-a.has-focus || pin-b.has-focus || ip-entry.has-focus;
     viewport-width: root.width;
@@ -22,9 +24,9 @@ export component LanSetupScreen inherits ScrollView {
         alignment: start;
         spacing: Theme.pad-m;
 
-        BackHeader { title: "LAN setup"; }
+        BackHeader { title: "Trade cards"; }
         Weak {
-            text: "Trade identity cards with a nearby device over the local network — for when you can't copy and paste a card between them.";
+            text: "Trade identity cards with another device over the network — for when you can't copy and paste a card between them.";
         }
 
         Card {
@@ -35,9 +37,9 @@ export component LanSetupScreen inherits ScrollView {
         }
 
         Card {
-            CardTitle { text: "Local network only"; }
+            CardTitle { text: UiState.setup-channel-title; }
             Small {
-                text: "No third-party server participates: discovery uses Bonjour (DNS-SD) and traffic stays direct between the devices. If multicast is blocked, the joining device can type the IP shown while hosting. This is a discovery policy, not a packet-level subnet boundary; reflected mDNS, a VPN/overlay, or globally routed addresses can extend the direct path beyond a conventional LAN.";
+                text: UiState.setup-channel-note;
             }
         }
 
@@ -46,7 +48,7 @@ export component LanSetupScreen inherits ScrollView {
             BigButton {
                 text: "📡 Show a PIN on this device";
                 hint: "S";
-                clicked => { Actions.host-lan-setup(); }
+                clicked => { Actions.host-card-setup(); }
             }
             Small {
                 text: "A short PIN appears on this device. Enter it on the other device within a minute — it renews every 60 seconds until a device answers.";
@@ -77,7 +79,7 @@ export component LanSetupScreen inherits ScrollView {
                             Actions.fields-edited();
                             if UiState.pin-a-full { pin-b.focus(); }
                         }
-                        accepted => { Actions.join-lan-setup(); }
+                        accepted => { Actions.join-card-setup(); }
                     }
                     Text {
                         text: "-";
@@ -99,7 +101,7 @@ export component LanSetupScreen inherits ScrollView {
                                 EventResult.reject
                             }
                         }
-                        accepted => { Actions.join-lan-setup(); }
+                        accepted => { Actions.join-card-setup(); }
                     }
                 }
                 // Neutral progress while typing; a warning only once the whole
@@ -114,11 +116,20 @@ export component LanSetupScreen inherits ScrollView {
                 }
             }
 
-            // Optional host-IP entry. Kept instantiated (so `ip-entry` can
-            // report focus for shortcut gating).
+            // Optional host-IP entry, for the local-network channel only —
+            // there is no side-channel listener to reach on a nostr-only run.
+            // Kept instantiated (so `ip-entry` can report focus for shortcut
+            // gating) and hidden rather than dropped.
             ip-col := VerticalLayout {
                 alignment: start;
                 spacing: Theme.pad-xs;
+                visible: UiState.setup-lan-enabled;
+                // `visible` alone still reserves the layout space, which would
+                // leave a hole where the field was, so the height is pinned to
+                // zero as well. Both bounds are needed: the column's min-height
+                // comes from its children and would otherwise win over the cap.
+                min-height: UiState.setup-lan-enabled ? ip-col.preferred-height : 0px;
+                max-height: UiState.setup-lan-enabled ? ip-col.preferred-height : 0px;
                 Small {
                     text: "Optional — only if the other device isn't found automatically. Type the IP it shows.";
                 }
@@ -136,7 +147,7 @@ export component LanSetupScreen inherits ScrollView {
                         placeholder-text: UiState.join-ip-prefix != "" ? UiState.join-ip-placeholder : "Host IP (optional)";
                         text <=> UiState.in-join-ip;
                         edited => { Actions.fields-edited(); }
-                        accepted => { Actions.join-lan-setup(); }
+                        accepted => { Actions.join-card-setup(); }
                     }
                 }
                 if UiState.join-ip-hint != "": Small {
@@ -153,7 +164,7 @@ export component LanSetupScreen inherits ScrollView {
                 text: "🔗 Join";
                 hint: "C";
                 enabled: UiState.dial-ready;
-                clicked => { Actions.join-lan-setup(); }
+                clicked => { Actions.join-card-setup(); }
             }
             Small {
                 text: "Type the PIN shown on the hosting device.";
@@ -163,7 +174,7 @@ export component LanSetupScreen inherits ScrollView {
 }
 
 // Step two: this device is showing a PIN, or dialing one.
-export component LanPairingScreen inherits ScrollView {
+export component CardPairingScreen inherits ScrollView {
     out property <bool> field-focused: false;
     viewport-width: root.width;
     viewport-height: max(root.height, content.preferred-height);
@@ -174,7 +185,7 @@ export component LanPairingScreen inherits ScrollView {
         alignment: start;
         spacing: Theme.pad-m;
 
-        BackHeader { title: "LAN setup"; }
+        BackHeader { title: "Trade cards"; }
         Body { text: "Status: " + UiState.status-text; }
 
         if UiState.pin-display != "": VerticalLayout {
@@ -233,7 +244,7 @@ export component LanPairingScreen inherits ScrollView {
 
 // Step three: the cards have crossed. The user compares fingerprints before
 // anything is written to the trusted list.
-export component LanConfirmScreen inherits ScrollView {
+export component CardConfirmScreen inherits ScrollView {
     out property <bool> field-focused: false;
     viewport-width: root.width;
     viewport-height: max(root.height, content.preferred-height);

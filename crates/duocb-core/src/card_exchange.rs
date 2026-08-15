@@ -1,9 +1,9 @@
-//! LAN setup's payload step: swapping signed identity cards over a connection
+//! Card setup's payload step: swapping signed identity cards over a connection
 //! the PIN handshake has already authenticated.
 //!
-//! This is the whole point of a LAN setup session. Configure mode moves cards by
+//! This is the whole point of a card-setup session. Configure mode moves cards by
 //! copy-paste, which two devices with no shared clipboard cannot do; here the
-//! rotating PIN authenticates a short-lived local channel and the cards cross it
+//! rotating PIN authenticates a short-lived connection and the cards cross it
 //! directly. Once both sides have imported, they are ordinary configure-mode
 //! peers and every later connection runs the application-key handshake instead.
 //!

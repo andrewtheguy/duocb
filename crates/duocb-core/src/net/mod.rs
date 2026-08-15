@@ -30,24 +30,67 @@ impl KeyIdentity {
     }
 }
 
+/// Which transport(s) carry the card-setup rendezvous record — the same
+/// encrypted node-id record either way (see `crate::pin_record`), found by
+/// deriving its key from the typed PIN.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SetupChannel {
+    /// The default: try the local network first (Bonjour/DNS-SD, or the typed
+    /// host IP), and fall back to nostr relays when nothing local answers.
+    /// LAN-first because it resolves in well under a second, needs no
+    /// third-party server, and is the common case — two devices in one room.
+    /// The nostr fallback is what lets two devices on *different* networks
+    /// trade cards at all.
+    #[default]
+    LanThenNostr,
+    /// Nostr relays only — the internet is required, and no mDNS query or
+    /// side-channel listener is used. Test/diagnostic override.
+    NostrOnly,
+    /// Local network only: mDNS discovery plus direct device-to-device traffic,
+    /// with no third-party server involved. Not a packet-level subnet boundary.
+    /// Test/diagnostic override, and the choice for an offline pairing.
+    LanOnly,
+}
+
+impl SetupChannel {
+    /// Whether the local-network backends (DNS-SD and the unicast side channel)
+    /// participate.
+    pub fn lan(self) -> bool {
+        matches!(self, Self::LanThenNostr | Self::LanOnly)
+    }
+
+    /// Whether the nostr relay backend participates.
+    pub fn nostr(self) -> bool {
+        matches!(self, Self::LanThenNostr | Self::NostrOnly)
+    }
+}
+
 /// How the server signals its ephemeral node id to the client.
 #[derive(Debug, Clone)]
 pub enum ServerMode {
     /// Configure mode: publish pairwise hosting records and authenticate with
     /// the persistent application key.
     NostrKey { identity: Box<KeyIdentity> },
-    /// LAN setup: show a rotating PIN, publish the rendezvous record under
-    /// per-bucket PIN-derived keys over DNS-SD, and authenticate a joiner with
-    /// the in-band PIN challenge-response. A unicast side-channel listener runs
-    /// alongside (see `crate::lan::unicast`) serving the same PIN-encrypted
-    /// record, so a joiner who types this host's LAN IP can still pair where
-    /// multicast is blocked.
+    /// Card setup: show a rotating PIN, publish the rendezvous record under
+    /// per-bucket PIN-derived keys on the enabled channel(s), and authenticate
+    /// a joiner with the in-band PIN challenge-response. Whenever the LAN
+    /// channel is enabled a unicast side-channel listener runs alongside the
+    /// DNS-SD advertisement (see `crate::lan::unicast`) serving the same
+    /// PIN-encrypted record, so a joiner who types this host's LAN IP can still
+    /// pair where multicast is blocked.
+    ///
+    /// The host publishes on *every* enabled channel — it cannot know which one
+    /// the joiner will find it on; only the joiner falls back (see
+    /// [`DialSpec::CardSetup`]).
     ///
     /// The session exists only to hand `self_card` over and take the joiner's in
     /// return; it never carries clipboard traffic and ends as soon as the cards
     /// have crossed.
-    LanSetup {
+    CardSetup {
         self_card: Box<crate::auth::IdentityCard>,
+        channel: SetupChannel,
+        /// Relays for the nostr rendezvous; ignored on [`SetupChannel::LanOnly`].
+        relays: Vec<String>,
     },
 }
 
@@ -59,18 +102,28 @@ pub enum DialSpec {
         identity: Box<KeyIdentity>,
         peer_public_key: nostr_sdk::PublicKey,
     },
-    /// Resolve the host through the rotating-PIN rendezvous on the local
-    /// network, prove PIN possession in-band, then swap identity cards.
+    /// Resolve the host through the rotating-PIN rendezvous, prove PIN
+    /// possession in-band, then swap identity cards.
+    ///
+    /// On [`SetupChannel::LanThenNostr`] the lookups run in order, not in
+    /// parallel: the local one first, and the relays only if it finds nothing.
+    /// The LAN answers in well under a second when the peer is there, so the
+    /// common case never touches a relay.
     ///
     /// `Some(target_ip)` fetches the PIN-encrypted node-id record from the
     /// host's unicast side channel at that address (the joiner typed the IP the
     /// host displayed — this is the path that works where multicast is blocked);
     /// `None` browses DNS-SD. The side-channel port is derived from the PIN's
-    /// rendezvous key (see `crate::lan`), so no port is ever typed.
-    LanSetup {
+    /// rendezvous key (see `crate::lan`), so no port is ever typed. Either way
+    /// it is the LAN half of the lookup, so it is ignored on
+    /// [`SetupChannel::NostrOnly`].
+    CardSetup {
         canonical_pin: String,
         self_card: Box<crate::auth::IdentityCard>,
         target_ip: Option<std::net::IpAddr>,
+        channel: SetupChannel,
+        /// Relays for the nostr rendezvous; ignored on [`SetupChannel::LanOnly`].
+        relays: Vec<String>,
     },
 }
 
@@ -81,11 +134,13 @@ pub enum UiCommand {
     StopServer,
     Connect { spec: DialSpec },
     Disconnect,
-    /// LAN setup: mint and publish a fresh PIN immediately, invalidating every
+    /// Card setup: mint and publish a fresh PIN immediately, invalidating every
     /// previously shown PIN — their auth keys are dropped and their LAN
     /// advertisements withdrawn, so a stale code can resolve at most an auth
-    /// rejection. The new code arrives as the next [`NetEvent::PinRotated`].
-    /// An error event if no LAN-setup server session is running.
+    /// rejection. (A relay copy of an older record just ages out of its TTL,
+    /// which is the same outcome once its auth key is gone.) The new code
+    /// arrives as the next [`NetEvent::PinRotated`]. An error event if no
+    /// card-setup server session is running.
     RefreshPin,
     SendClipboard { text: String },
     /// Request a point-in-time snapshot of the live connection's paths, answered
@@ -103,7 +158,8 @@ pub enum ConnStatus {
     Starting,
     /// Server: listening, no peer yet.
     Listening,
-    /// Client: resolving the target via nostr.
+    /// Client: resolving the target — a peer's hosting record, or the PIN
+    /// rendezvous on whichever channel(s) card setup is using.
     Resolving,
     /// Client: dialing the resolved node id.
     Connecting,
@@ -127,26 +183,27 @@ pub enum NetEvent {
         node_id: String,
         identity_public_key: Option<String>,
     },
-    /// LAN setup: a fresh PIN was minted (display form, `XXXX-XXXX`).
+    /// Card setup: a fresh PIN was minted (display form, `XXXX-XXXX`).
     /// `host_lan_ip` is this host's LAN IPv4, so the UI can offer it for the
-    /// joiner's manual-IP side channel; `None` when none was detected.
+    /// joiner's manual-IP side channel; `None` when none was detected or the
+    /// LAN channel is disabled (there is no side channel to reach then).
     PinRotated {
         pin_display: String,
         seconds_left: u64,
         host_lan_ip: Option<String>,
     },
-    /// LAN setup: paired (or stopped) — stop showing a PIN.
+    /// Card setup: paired (or stopped) — stop showing a PIN.
     PinCleared,
     Status(ConnStatus),
     /// A peer authenticated. `peer_public_key` is the trusted application key in
-    /// configure mode, and always `None` in LAN setup: nothing on that
+    /// configure mode, and always `None` in card setup: nothing on that
     /// connection authenticates an application identity, so the card that
     /// follows is unverified until a human compares its fingerprint.
     PeerPaired {
         peer_node_id: String,
         peer_public_key: Option<String>,
     },
-    /// LAN setup: the peer's signed identity card arrived on the
+    /// Card setup: the peer's signed identity card arrived on the
     /// PIN-authenticated connection. Boxed to keep the enum small.
     ///
     /// The runtime decides nothing about it — the card is verified as
