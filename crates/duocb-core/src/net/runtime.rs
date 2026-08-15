@@ -25,7 +25,7 @@ use crate::net::endpoint::{
     create_server_endpoint, watch_connection_paths,
 };
 use crate::net::{
-    ConnStatus, DialSpec, EventSender, KeyIdentity, NetEvent, PinChannel, ServerMode, UiCommand,
+    ConnStatus, DialSpec, EventSender, KeyIdentity, NetEvent, ServerMode, UiCommand,
 };
 use crate::protocol::{
     AuthRequest, AuthResponse, ClipBody, ClipMsg, KeyChallenge, KeyProof,
@@ -110,9 +110,11 @@ impl std::fmt::Display for ExpiredCard {
 impl std::error::Error for ExpiredCard {}
 
 /// The wording both roles use when their stored card for the other side has
-/// lapsed. Cards are local trust records, never exchanged during the handshake,
-/// so each side judges its own copy — and both should say the same thing about
-/// it, whether it surfaces as a listener refusal or a dialer's own pre-check.
+/// lapsed. Cards are local trust records — the clipboard handshake carries raw
+/// public keys, never a card — so each side judges its own copy, and both
+/// should say the same thing about it whether it surfaces as a listener refusal
+/// or a dialer's own pre-check. (A card does cross the wire during LAN setup,
+/// but that is the hand-over itself, not this handshake.)
 fn expired_card_message(card: &IdentityCard) -> String {
     format!(
         "The identity card for {} expired — ask that device for a fresh card and import it again",
@@ -179,15 +181,10 @@ struct PairClaim {
 /// The peer that holds a [`PairClaim`], plus the material needed to let it reconnect.
 #[derive(Clone)]
 struct ClaimedPeer {
-    /// Configure mode claims the stable application identity. Quick mode has no
+    /// Configure mode claims the stable application identity. LAN setup has no
     /// such identity and claims the session-scoped iroh id instead.
     application_key: Option<nostr_sdk::PublicKey>,
     node_id: Option<EndpointId>,
-    /// The PIN auth key that verified this peer at pairing (PIN mode only). Retained so the
-    /// paired peer can complete the in-band challenge-response on reconnect even after its PIN
-    /// has rotated out of the server's recent-bucket cache. `None` for
-    /// application-key pairings.
-    pin_key: Option<nostr_sdk::Keys>,
 }
 
 impl PairClaim {
@@ -221,7 +218,6 @@ impl PairClaim {
                 *g = Some(ClaimedPeer {
                     application_key: Some(public_key),
                     node_id: Some(node_id),
-                    pin_key: None,
                 });
                 self.paired.cancel();
                 true
@@ -229,7 +225,11 @@ impl PairClaim {
         }
     }
 
-    fn commit_pin(&self, node_id: EndpointId, pin_key: nostr_sdk::Keys) -> bool {
+    /// Commit a LAN-setup joiner as the pair. Unlike the configure-mode claim
+    /// this is never re-presented: a LAN-setup session ends the moment the cards
+    /// cross, so the claim only has to turn away a second dialer arriving
+    /// mid-exchange.
+    fn commit_pin(&self, node_id: EndpointId) -> bool {
         let mut g = self.peer.lock();
         match g.as_ref() {
             Some(c) if c.node_id != Some(node_id) => false,
@@ -238,7 +238,6 @@ impl PairClaim {
                 *g = Some(ClaimedPeer {
                     application_key: None,
                     node_id: Some(node_id),
-                    pin_key: Some(pin_key),
                 });
                 self.paired.cancel();
                 true
@@ -256,22 +255,16 @@ enum SessionKind {
     Client(DialSpec),
 }
 
-/// Client-side dial target pinned at the first successful pairing (PIN mode),
-/// shared between the command loop's [`SessionMemory`] and the session task.
-type PinnedAddr = Arc<parking_lot::Mutex<Option<EndpointAddr>>>;
-
 /// What a session's identity is bound to. Reusing [`SessionMemory`] is only
 /// correct while the session is "the same" from the user's point of view —
 /// same role and same credential/target; anything else mints fresh state.
 #[derive(Clone, PartialEq, Eq)]
 enum SessionKey {
-    ServerPin {
-        channel: PinChannel,
-    },
+    ServerLanSetup,
     ServerKey {
         public_key: nostr_sdk::PublicKey,
     },
-    ClientPin {
+    ClientLanSetup {
         canonical_pin: String,
     },
     ClientKey {
@@ -282,15 +275,15 @@ enum SessionKey {
 
 fn session_key(kind: &SessionKind) -> SessionKey {
     match kind {
-        SessionKind::Server(ServerMode::Pin { channel, .. }) => {
-            SessionKey::ServerPin { channel: *channel }
-        }
+        SessionKind::Server(ServerMode::LanSetup { .. }) => SessionKey::ServerLanSetup,
         SessionKind::Server(ServerMode::NostrKey { identity }) => SessionKey::ServerKey {
             public_key: identity.identity.public_key(),
         },
-        SessionKind::Client(DialSpec::Pin { canonical_pin, .. }) => SessionKey::ClientPin {
-            canonical_pin: canonical_pin.clone(),
-        },
+        SessionKind::Client(DialSpec::LanSetup { canonical_pin, .. }) => {
+            SessionKey::ClientLanSetup {
+                canonical_pin: canonical_pin.clone(),
+            }
+        }
         SessionKind::Client(DialSpec::NostrKey {
             identity,
             peer_public_key,
@@ -306,9 +299,9 @@ fn session_key(kind: &SessionKind) -> SessionKey {
 /// A session task can end while the pairing is still good — the client gives
 /// up after [`MAX_CONNECT_ATTEMPTS`], an auth exchange dies mid-handshake, a
 /// host restarts the session — and the endpoint identity is what the peer's
-/// pair claim is bound to. Keeping the secret key (and with it the node id),
-/// the server's claim, and the client's pinned dial target here lets the next
-/// task reconnect as the same peer instead of being refused as a stranger.
+/// pair claim is bound to. Keeping the secret key (and with it the node id) and
+/// the server's claim here lets the next task reconnect as the same peer
+/// instead of being refused as a stranger.
 /// Cleared on [`UiCommand::StopServer`]/[`UiCommand::Disconnect`] — the user
 /// ending the session is the one legitimate way to unpair — and replaced when
 /// a session starts under a different key. Never persisted; a fresh process
@@ -316,13 +309,10 @@ fn session_key(kind: &SessionKind) -> SessionKey {
 struct SessionMemory {
     key: SessionKey,
     secret: iroh::SecretKey,
-    /// Server: the one-pair-per-session claim (holds the paired peer's node id
-    /// and, in PIN mode, the key that lets its rotated PIN re-verify).
+    /// Server: the one-pair-per-session claim (holds the paired peer's node id).
     claim: PairClaim,
-    /// Server (PIN mode): the recent rotation buckets' auth keys.
+    /// LAN-setup host: the recent rotation buckets' auth keys.
     recent_pins: RecentPins,
-    /// Client (PIN mode): the dial target pinned at the first pairing.
-    pinned_addr: PinnedAddr,
 }
 
 impl SessionMemory {
@@ -332,7 +322,6 @@ impl SessionMemory {
             secret: iroh::SecretKey::generate(),
             claim: PairClaim::default(),
             recent_pins: RecentPins::default(),
-            pinned_addr: PinnedAddr::default(),
         }
     }
 }
@@ -370,7 +359,7 @@ struct Session {
     clip_tx: mpsc::UnboundedSender<String>,
     conn: ConnSlot,
     /// Kicks the PIN publisher into an immediate rotate-and-revoke (see
-    /// [`UiCommand::RefreshPin`]). `Some` only for a PIN-mode server session.
+    /// [`UiCommand::RefreshPin`]). `Some` only for a LAN-setup host session.
     pin_refresh: Option<Arc<tokio::sync::Notify>>,
 }
 
@@ -384,16 +373,31 @@ fn start_session(
     let task_cancel = cancel.clone();
     let conn: ConnSlot = Arc::new(parking_lot::Mutex::new(None));
     let task_conn = conn.clone();
-    let pin_refresh = matches!(&kind, SessionKind::Server(ServerMode::Pin { .. }))
+    let pin_refresh = matches!(&kind, SessionKind::Server(ServerMode::LanSetup { .. }))
         .then(|| Arc::new(tokio::sync::Notify::new()));
     let task_pin_refresh = pin_refresh.clone();
     let secret = memory.secret.clone();
     let claim = memory.claim.clone();
     let recent_pins = memory.recent_pins.clone();
-    let pinned_addr = memory.pinned_addr.clone();
     let handle = tokio::spawn(async move {
         let last_sent = LastSent::default();
+        // LAN setup takes neither `clip_rx` nor the connection slot: it never
+        // carries clipboard traffic, and dropping the receiver here means a
+        // stray `SendClipboard` fails loudly at the command loop instead of
+        // being silently swallowed by a session that would never transmit it.
         match kind {
+            SessionKind::Server(ServerMode::LanSetup { self_card }) => {
+                run_lan_setup_host(
+                    *self_card,
+                    events,
+                    task_cancel,
+                    task_pin_refresh.unwrap_or_default(),
+                    secret,
+                    claim,
+                    recent_pins,
+                )
+                .await
+            }
             SessionKind::Server(mode) => {
                 run_server_session(
                     mode,
@@ -402,10 +406,23 @@ fn start_session(
                     clip_rx,
                     task_conn,
                     last_sent,
-                    task_pin_refresh,
                     secret,
                     claim,
-                    recent_pins,
+                )
+                .await
+            }
+            SessionKind::Client(DialSpec::LanSetup {
+                canonical_pin,
+                self_card,
+                target_ip,
+            }) => {
+                run_lan_setup_joiner(
+                    canonical_pin,
+                    *self_card,
+                    target_ip,
+                    events,
+                    task_cancel,
+                    secret,
                 )
                 .await
             }
@@ -418,7 +435,6 @@ fn start_session(
                     task_conn,
                     last_sent,
                     secret,
-                    pinned_addr,
                 )
                 .await
             }
@@ -525,23 +541,17 @@ async fn run_server_session(
     mut clip_rx: mpsc::UnboundedReceiver<String>,
     conn_slot: ConnSlot,
     last_sent: LastSent,
-    pin_refresh: Option<Arc<tokio::sync::Notify>>,
     secret: iroh::SecretKey,
     claim: PairClaim,
-    recent_pins: RecentPins,
 ) {
+    let ServerMode::NostrKey { identity } = mode else {
+        unreachable!("LAN setup hosts run in run_lan_setup_host");
+    };
     events.status(ConnStatus::Starting);
 
-    // Only the modes that hard-require the internet gate on the relay coming
-    // online (`online()` never resolves offline, so they fail fast without
-    // it). The PIN quick mode gates on a first local address only — the PIN
-    // shows immediately and LAN signaling needs no internet, while the relay
-    // connects in the background for a cross-network dial.
-    let readiness = match &mode {
-        ServerMode::Pin { channel, .. } => pin_channel_readiness(*channel),
-        ServerMode::NostrKey { .. } => EndpointReadiness::RelayOnline,
-    };
-    let endpoint = match create_server_endpoint(readiness, secret).await {
+    // Configure mode hard-requires the internet: its signaling is a nostr relay
+    // record, and `online()` never resolves offline, so gate on the relay.
+    let endpoint = match create_server_endpoint(EndpointReadiness::RelayOnline, secret).await {
         Ok(ep) => ep,
         Err(e) => {
             events.error(format!("Failed to start: {e:#}"));
@@ -551,72 +561,48 @@ async fn run_server_session(
     };
     let node_id = endpoint.id();
 
-    // One pairing per logical session (all modes). The claim (owned by the
-    // command loop, like the endpoint identity) is empty until the first
-    // client authenticates and lives until the server is stopped — surviving
-    // a restarted session task, whose paired peer reconnects seamlessly.
-
-    let (key_identity, identity_public_key): (Option<KeyIdentity>, Option<String>) = match &mode {
-        ServerMode::NostrKey { identity } => (
-            Some((**identity).clone()),
-            Some(identity.identity.to_npub()),
-        ),
-        ServerMode::Pin { .. } => (None, None),
-    };
+    // One pairing per logical session. The claim (owned by the command loop,
+    // like the endpoint identity) is empty until the first client authenticates
+    // and lives until the server is stopped — surviving a restarted session
+    // task, whose paired peer reconnects seamlessly.
+    let key_identity = (*identity).clone();
     events.send(NetEvent::ServerReady {
         node_id: node_id.to_string(),
-        identity_public_key,
+        identity_public_key: Some(identity.identity.to_npub()),
     });
     events.status(ConnStatus::Listening);
 
-    let pin_cache = matches!(mode, ServerMode::Pin { .. }).then(|| recent_pins.clone());
-
-    // Mode-specific signaling publisher, aborted on session teardown.
-    let _publisher: Option<PublisherGuard> = match &mode {
-        ServerMode::NostrKey { identity } => {
-            let identity = identity.clone();
-            let cancel = cancel.clone();
-            Some(PublisherGuard(tokio::spawn(async move {
-                loop {
-                    // Re-filtered every round, so a peer whose card lapses
-                    // mid-session stops being signalled to without a restart.
-                    let now = unix_now();
-                    let live: Vec<IdentityCard> = identity
-                        .peers
-                        .iter()
-                        .filter(|card| card.is_valid_at(now))
-                        .cloned()
-                        .collect();
-                    if let Err(error) = crate::nostr::publish_hosting(
-                        &identity.identity,
-                        &live,
-                        &node_id,
-                        &identity.relays,
-                    )
-                    .await
-                    {
-                        log::warn!("Failed to publish pairwise hosting records: {error:#}");
-                    }
-                    tokio::select! {
-                        _ = cancel.cancelled() => return,
-                        _ = tokio::time::sleep(Duration::from_secs(120)) => {}
-                    }
+    // Pairwise hosting-record publisher, aborted on session teardown.
+    let _publisher = PublisherGuard(tokio::spawn({
+        let cancel = cancel.clone();
+        async move {
+            loop {
+                // Re-filtered every round, so a peer whose card lapses
+                // mid-session stops being signalled to without a restart.
+                let now = unix_now();
+                let live: Vec<IdentityCard> = identity
+                    .peers
+                    .iter()
+                    .filter(|card| card.is_valid_at(now))
+                    .cloned()
+                    .collect();
+                if let Err(error) = crate::nostr::publish_hosting(
+                    &identity.identity,
+                    &live,
+                    &node_id,
+                    &identity.relays,
+                )
+                .await
+                {
+                    log::warn!("Failed to publish pairwise hosting records: {error:#}");
                 }
-            })))
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    _ = tokio::time::sleep(Duration::from_secs(120)) => {}
+                }
+            }
         }
-        ServerMode::Pin { relays, channel } => {
-            Some(PublisherGuard(tokio::spawn(run_pin_publisher(
-                endpoint.clone(),
-                recent_pins,
-                relays.clone(),
-                *channel,
-                events.clone(),
-                cancel.clone(),
-                claim.paired_signal(),
-                pin_refresh.unwrap_or_default(),
-            ))))
-        }
-    };
+    }));
 
     // Accept loop: duocb pairs exactly two devices, so at most one clipboard
     // session is served at a time. Crucially the accept keeps running *during*
@@ -645,22 +631,14 @@ async fn run_server_session(
         // Auth runs on the single session stream; on success the same stream
         // stays open for clipboard frames (no separate data stream / handshake).
         let (send, recv, peer_public_key) =
-            match auth_as_listener(
-                &conn,
-                key_identity.as_ref(),
-                pin_cache.as_ref(),
-                &claim,
-                node_id,
-            )
-            .await
-            {
-            Ok(streams) => streams,
-            Err(e) => {
-                log::warn!("Auth failed for {remote_id}: {e:#}");
-                events.status(ConnStatus::Listening);
-                continue;
-            }
-        };
+            match auth_as_listener(&conn, Some(&key_identity), None, &claim, node_id).await {
+                Ok(streams) => streams,
+                Err(e) => {
+                    log::warn!("Auth failed for {remote_id}: {e:#}");
+                    events.status(ConnStatus::Listening);
+                    continue;
+                }
+            };
         events.send(NetEvent::PeerPaired {
             peer_node_id: remote_id.to_string(),
             peer_public_key: peer_public_key.map(|key| key.to_hex()),
@@ -776,19 +754,22 @@ async fn run_client_session(
     conn_slot: ConnSlot,
     last_sent: LastSent,
     secret: iroh::SecretKey,
-    pinned_addr: PinnedAddr,
 ) {
     events.status(ConnStatus::Starting);
+
+    let DialSpec::NostrKey {
+        identity,
+        peer_public_key,
+    } = &spec
+    else {
+        unreachable!("LAN setup joiners run in run_lan_setup_joiner");
+    };
 
     // Refuse before spending an endpoint and a relay round trip on a peer whose
     // card has lapsed. The listener enforces the same rule against its own copy;
     // this side checks its own so the failure is immediate and self-explanatory
     // rather than surfacing as a remote rejection.
-    if let DialSpec::NostrKey {
-        identity,
-        peer_public_key,
-    } = &spec
-        && let Some(card) = identity.peer(*peer_public_key)
+    if let Some(card) = identity.peer(*peer_public_key)
         && !card.is_valid_at(unix_now())
     {
         events.error(expired_card_message(card));
@@ -796,16 +777,8 @@ async fn run_client_session(
         return;
     }
 
-    // Same policy as the server side: only the internet-requiring mode gates on
-    // the relay; the PIN quick mode starts resolving and dialing right away (the
-    // relay connects in the background, and a cross-network dial's own timeout
-    // covers it coming up). The LAN-only channel is relay-less either way (mDNS
-    // or the typed-IP side channel), so its readiness is `LanDirect`.
-    let readiness = match &spec {
-        DialSpec::Pin { channel, .. } => pin_channel_readiness(*channel),
-        DialSpec::NostrKey { .. } => EndpointReadiness::RelayOnline,
-    };
-    let endpoint = match create_client_endpoint(readiness, secret).await {
+    // Configure mode's signaling is a relay record, so gate on the relay.
+    let endpoint = match create_client_endpoint(EndpointReadiness::RelayOnline, secret).await {
         Ok(ep) => ep,
         Err(e) => {
             events.error(format!("Failed to start: {e:#}"));
@@ -814,13 +787,9 @@ async fn run_client_session(
         }
     };
     let own_id = endpoint.id();
-    let identity_public_key = match &spec {
-        DialSpec::NostrKey { identity, .. } => Some(identity.identity.to_npub()),
-        DialSpec::Pin { .. } => None,
-    };
     events.send(NetEvent::ClientReady {
         node_id: own_id.to_string(),
-        identity_public_key,
+        identity_public_key: Some(identity.identity.to_npub()),
     });
 
     // Consecutive failed attempts, reset to zero on every successful connection
@@ -828,53 +797,20 @@ async fn run_client_session(
     let mut attempts: u32 = 0;
 
     loop {
-        // For a PIN target: the dial target resolved on the first successful
-        // pairing (node id plus any direct addresses the rendezvous carried).
-        // Reused on every reconnect thereafter — the typed PIN has since
-        // rotated off the relay (so a fresh lookup would fail), but the server
-        // retains our pairing key, so we reconnect by node id and re-prove the
-        // same PIN in-band without the user re-typing a code. It lives in the
-        // command loop's `SessionMemory` so a successor task (a rejoin after
-        // this one gives up) reconnects the same way.
-        let pinned_pin_addr = pinned_addr.lock().clone();
-        // Resolve the target each attempt: configure mode re-queries the chosen
-        // peer's presence record, so a restarted host's fresh node id is found.
-        let resolved: Result<EndpointAddr> = match &spec {
-            DialSpec::NostrKey {
-                identity,
-                peer_public_key,
-            } => {
-                events.status(ConnStatus::Resolving);
-                // The dial target lives in the peer's hosting record, not the
-                // directory: re-resolved each attempt so a restarted host's fresh
-                // node id is found, and absent (no readable record) means the peer
-                // is not currently hosting.
-                tokio::select! {
-                    _ = cancel.cancelled() => return,
-                    r = crate::nostr::lookup_hosting(&identity.identity, *peer_public_key, &identity.relays) => match r {
-                        Ok(Some(id)) => Ok(EndpointAddr::new(id)),
-                        Ok(None) => Err(anyhow::anyhow!(
-                            "The selected peer is not hosting a connection — press Start on that device"
-                        )),
-                        Err(e) => Err(e.context("nostr hosting lookup failed")),
-                    },
-                }
-            }
-            DialSpec::Pin { .. } if pinned_pin_addr.is_some() => {
-                Ok(pinned_pin_addr.clone().unwrap())
-            }
-            DialSpec::Pin {
-                canonical_pin,
-                relays,
-                channel,
-                target_ip,
-            } => {
-                events.status(ConnStatus::Resolving);
-                tokio::select! {
-                    _ = cancel.cancelled() => return,
-                    r = resolve_pin(canonical_pin, relays, *channel, *target_ip) => r,
-                }
-            }
+        // Resolve the target each attempt: the dial target lives in the peer's
+        // hosting record, not a directory, so a restarted host's fresh node id
+        // is found, and absent (no readable record) means the peer is not
+        // currently hosting.
+        events.status(ConnStatus::Resolving);
+        let resolved: Result<EndpointAddr> = tokio::select! {
+            _ = cancel.cancelled() => return,
+            r = crate::nostr::lookup_hosting(&identity.identity, *peer_public_key, &identity.relays) => match r {
+                Ok(Some(id)) => Ok(EndpointAddr::new(id)),
+                Ok(None) => Err(anyhow::anyhow!(
+                    "The selected peer is not hosting a connection — press Start on that device"
+                )),
+                Err(e) => Err(e.context("nostr hosting lookup failed")),
+            },
         };
 
         // Self-dial guard: end the session — the target won't change.
@@ -886,8 +822,6 @@ async fn run_client_session(
             endpoint.close().await;
             return;
         }
-        let attempt_addr = resolved.as_ref().ok().cloned();
-
         let connect = match resolved {
             Ok(addr) => {
                 events.status(ConnStatus::Connecting);
@@ -904,44 +838,14 @@ async fn run_client_session(
                 events.status(ConnStatus::Authenticating);
                 // Auth runs on the single session stream; on success the same
                 // stream stays open for clipboard frames.
-                let auth_result = match &spec {
-                    DialSpec::NostrKey {
-                        identity,
-                        peer_public_key,
-                    } => {
-                        auth_as_dialer_key(
-                            &conn,
-                            &identity.identity,
-                            *peer_public_key,
-                            own_id,
-                        )
-                        .await
-                    }
-                    DialSpec::Pin { canonical_pin, .. } => {
-                        auth_as_dialer_pin(&conn, canonical_pin, own_id).await
-                    }
-                };
+                let auth_result =
+                    auth_as_dialer_key(&conn, &identity.identity, *peer_public_key, own_id).await;
                 match auth_result {
                     Ok((send, recv)) => {
-                        // Auth succeeded, so the server has committed us as its pair and
-                        // (PIN mode) stopped publishing PINs. Pin the dial target NOW so
-                        // reconnects dial this id — a fresh rendezvous lookup could
-                        // never succeed again.
-                        if matches!(spec, DialSpec::Pin { .. }) {
-                            let mut slot = pinned_addr.lock();
-                            if slot.is_none() {
-                                *slot = attempt_addr;
-                            }
-                        }
                         let remote_id = conn.remote_id();
                         events.send(NetEvent::PeerPaired {
                             peer_node_id: remote_id.to_string(),
-                            peer_public_key: match &spec {
-                                DialSpec::NostrKey {
-                                    peer_public_key, ..
-                                } => Some(peer_public_key.to_hex()),
-                                DialSpec::Pin { .. } => None,
-                            },
+                            peer_public_key: Some(peer_public_key.to_hex()),
                         });
                         events.status(ConnStatus::Connected);
                         // Debug-only path logging; on-demand status reads
@@ -1003,6 +907,232 @@ async fn run_client_session(
             _ = tokio::time::sleep(RECONNECT_DELAY) => {}
         }
     }
+}
+
+// ============================================================================
+// LAN setup sessions
+// ============================================================================
+
+/// How long the card exchange may take once the PIN handshake has accepted.
+/// Two small frames on an established connection — generous, but bounded so a
+/// peer that authenticates and then goes silent cannot hang the session.
+const CARD_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Host a LAN setup session: show a rotating PIN, accept the one joiner that
+/// proves it, swap identity cards, and stop.
+///
+/// Deliberately **one-shot**. The configure-mode host keeps accepting so a
+/// dropped peer can resume a clipboard session; here there is nothing to
+/// resume — once the cards have crossed the session's whole purpose is served,
+/// and staying up would only keep an authenticated channel open for no reason.
+/// It also takes no clipboard channel at all, so there is no path by which this
+/// session could carry content.
+async fn run_lan_setup_host(
+    self_card: IdentityCard,
+    events: EventSender,
+    cancel: CancellationToken,
+    pin_refresh: Arc<tokio::sync::Notify>,
+    secret: iroh::SecretKey,
+    claim: PairClaim,
+    recent_pins: RecentPins,
+) {
+    events.status(ConnStatus::Starting);
+    // Relay-less: the rendezvous is DNS-SD (or the typed-IP side channel) and
+    // the traffic is direct, so gate only on a first local address.
+    let endpoint = match create_server_endpoint(EndpointReadiness::LanDirect, secret).await {
+        Ok(ep) => ep,
+        Err(e) => {
+            events.error(format!("Failed to start: {e:#}"));
+            events.status(ConnStatus::Idle);
+            return;
+        }
+    };
+    let node_id = endpoint.id();
+    events.send(NetEvent::ServerReady {
+        node_id: node_id.to_string(),
+        identity_public_key: None,
+    });
+    events.status(ConnStatus::Listening);
+
+    let _publisher = PublisherGuard(tokio::spawn(run_lan_setup_publisher(
+        endpoint.clone(),
+        recent_pins.clone(),
+        events.clone(),
+        cancel.clone(),
+        claim.paired_signal(),
+        pin_refresh,
+    )));
+
+    // Serve dialers one at a time until one gets all the way through. A failed
+    // handshake must not end the session — a mistyped PIN would otherwise kick
+    // the user back a screen — so a failure loops round and keeps listening,
+    // while a completed exchange ends the session.
+    //
+    // Strictly sequential, unlike the configure-mode host, which keeps accepting
+    // during a live session so a dropped peer can resume. There is nothing to
+    // resume here, and racing an accept against the handshake risks dropping a
+    // half-accepted connection on the floor. A second device answering the same
+    // PIN therefore waits until this handshake finishes, and is then either
+    // refused by the claim or finds the endpoint closed — never served.
+    loop {
+        let Some(conn) = accept_serveable(&endpoint, &claim, &cancel, false).await else {
+            break;
+        };
+        let remote_id = conn.remote_id();
+        events.status(ConnStatus::Authenticating);
+
+        let exchange = async {
+            let (mut send, mut recv, _) =
+                auth_as_listener(&conn, None, Some(&recent_pins), &claim, node_id).await?;
+            events.send(NetEvent::PeerPaired {
+                peer_node_id: remote_id.to_string(),
+                peer_public_key: None,
+            });
+            events.status(ConnStatus::Connected);
+            tokio::time::timeout(
+                CARD_EXCHANGE_TIMEOUT,
+                crate::card_exchange::exchange_cards(&mut send, &mut recv, &self_card),
+            )
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "The other device stopped responding before its identity card arrived"
+                )
+            })?
+        }
+        .await;
+
+        match exchange {
+            Ok(peer_card) => {
+                log::info!("Exchanged identity cards with {}", peer_card.name());
+                events.send(NetEvent::PeerCardReceived(Box::new(peer_card)));
+                conn.close(SHUTDOWN_CODE.into(), b"lan-setup-complete");
+                refuse_latecomers(&endpoint).await;
+                break;
+            }
+            Err(e) => {
+                // Keep the PIN up and keep listening: the usual cause is a
+                // typo on the other device, and the user can just retype it.
+                log::warn!("LAN setup attempt from {remote_id} failed: {e:#}");
+                conn.close(AUTH_FAILED_CODE.into(), b"lan-setup-failed");
+                events.status(ConnStatus::Listening);
+            }
+        }
+    }
+
+    endpoint.close().await;
+    events.status(ConnStatus::Idle);
+    log::info!("LAN setup host stopped");
+}
+
+/// How long the host keeps answering dialers after its exchange is done, purely
+/// to turn them away properly. Short: it only has to cover devices that were
+/// already dialing when the exchange finished.
+const LATECOMER_GRACE: Duration = Duration::from_secs(3);
+
+/// Turn away anyone still dialing after the exchange is finished.
+///
+/// A second device that answered the same PIN — someone reading it over your
+/// shoulder, or just the wrong device — has an in-flight connect that nothing
+/// will ever accept. Closing the endpoint under it leaves it waiting with
+/// nothing to show the user, so complete each handshake far enough to send a
+/// BUSY close, which the dialer turns into "already paired with another
+/// device". Purely about the message: the pair claim already guarantees such a
+/// device could never have been served.
+async fn refuse_latecomers(endpoint: &iroh::Endpoint) {
+    let deadline = tokio::time::Instant::now() + LATECOMER_GRACE;
+    while let Ok(Some(incoming)) = tokio::time::timeout_at(deadline, endpoint.accept()).await {
+        match incoming.await {
+            Ok(conn) => {
+                log::info!("Refusing {}: this LAN setup is already done", conn.remote_id());
+                conn.close(SERVER_BUSY_CODE.into(), b"busy");
+            }
+            Err(e) => log::debug!("A latecomer's handshake failed before it could be refused: {e}"),
+        }
+    }
+}
+
+/// Join a LAN setup session: resolve the host from the typed PIN, prove the PIN,
+/// swap identity cards, and stop.
+///
+/// One-shot, like the host. A failure here is reported and ends the session
+/// rather than retrying: the typed PIN rotates out of the rendezvous every 60
+/// seconds, so a retry loop would mostly re-fail on a stale code — the user is
+/// better served by an error that names the fix and a Join button to press
+/// again.
+async fn run_lan_setup_joiner(
+    canonical_pin: String,
+    self_card: IdentityCard,
+    target_ip: Option<std::net::IpAddr>,
+    events: EventSender,
+    cancel: CancellationToken,
+    secret: iroh::SecretKey,
+) {
+    events.status(ConnStatus::Starting);
+    let endpoint = match create_client_endpoint(EndpointReadiness::LanDirect, secret).await {
+        Ok(ep) => ep,
+        Err(e) => {
+            events.error(format!("Failed to start: {e:#}"));
+            events.status(ConnStatus::Idle);
+            return;
+        }
+    };
+    let own_id = endpoint.id();
+    events.send(NetEvent::ClientReady {
+        node_id: own_id.to_string(),
+        identity_public_key: None,
+    });
+
+    // Everything below reports through `finish`, so every exit path closes the
+    // endpoint and lands the UI back on Idle exactly once.
+    let outcome = async {
+        events.status(ConnStatus::Resolving);
+        let addr = tokio::select! {
+            _ = cancel.cancelled() => return Ok(None),
+            r = resolve_lan_setup(&canonical_pin, target_ip) => r?,
+        };
+        if addr.id == own_id {
+            anyhow::bail!("That PIN belongs to this device — show it on one device and type it on the other");
+        }
+
+        events.status(ConnStatus::Connecting);
+        let conn = tokio::select! {
+            _ = cancel.cancelled() => return Ok(None),
+            c = connect_to_server(&endpoint, addr) => c?,
+        };
+
+        events.status(ConnStatus::Authenticating);
+        let (mut send, mut recv) = auth_as_dialer_pin(&conn, &canonical_pin, own_id).await?;
+        events.send(NetEvent::PeerPaired {
+            peer_node_id: conn.remote_id().to_string(),
+            peer_public_key: None,
+        });
+        events.status(ConnStatus::Connected);
+
+        let peer_card = tokio::time::timeout(
+            CARD_EXCHANGE_TIMEOUT,
+            crate::card_exchange::exchange_cards(&mut send, &mut recv, &self_card),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("The other device stopped responding before its identity card arrived")
+        })??;
+        conn.close(SHUTDOWN_CODE.into(), b"lan-setup-complete");
+        Ok(Some(peer_card))
+    }
+    .await;
+
+    match outcome {
+        Ok(Some(peer_card)) => {
+            log::info!("Exchanged identity cards with {}", peer_card.name());
+            events.send(NetEvent::PeerCardReceived(Box::new(peer_card)));
+        }
+        Ok(None) => {}
+        Err(e) => events.error(format!("{e:#}")),
+    }
+    endpoint.close().await;
+    events.status(ConnStatus::Idle);
+    log::info!("LAN setup joiner stopped");
 }
 
 // ============================================================================
@@ -1121,112 +1251,37 @@ async fn pump_clipboard(
 // Signaling publishers
 // ============================================================================
 
-/// The endpoint-readiness gate for a PIN channel selection: LAN-only must not
-/// wait on a relay at all, the default nostr+LAN prefers one but tolerates
-/// being offline, and nostr-only requires it.
-fn pin_channel_readiness(channel: PinChannel) -> EndpointReadiness {
-    match channel {
-        PinChannel::NostrOnly => EndpointReadiness::RelayOnline,
-        PinChannel::NostrAndLan => EndpointReadiness::DirectAddr,
-        PinChannel::LanOnly => EndpointReadiness::LanDirect,
-    }
-}
-
-/// Resolve the PIN rendezvous on the enabled channel(s): derive the candidate
-/// record keys once (see `pin_record::candidate_keys`), then query nostr
-/// relays and/or the local network — racing them when both are enabled, first
-/// hit wins.
+/// Resolve the LAN-setup rendezvous: derive the candidate record keys once (see
+/// `pin_record::candidate_keys`), then look the host up on the local network.
 ///
-/// The result is a full dial target: on the LAN-only channel both the DNS-SD
-/// and unicast records carry the host's direct addresses and they ride along;
-/// the other channels return a bare node id for iroh's discovery to resolve.
+/// The result is a full dial target — both the DNS-SD and unicast records carry
+/// the host's direct addresses, so they ride along and the dial needs no
+/// further address lookup.
 ///
-/// `target_ip` (LAN-only only): `Some(ip)` fetches the record from the host's
-/// unicast side channel at that IP — the manual-IP path that works where
-/// multicast is blocked — instead of browsing mDNS. `None` browses mDNS.
-async fn resolve_pin(
+/// `Some(target_ip)` fetches the record from the host's unicast side channel at
+/// that IP — the manual-IP path that works where multicast is blocked — instead
+/// of browsing mDNS.
+async fn resolve_lan_setup(
     canonical_pin: &str,
-    relays: &[String],
-    channel: PinChannel,
     target_ip: Option<std::net::IpAddr>,
 ) -> Result<EndpointAddr> {
     let candidates = crate::pin_record::candidate_keys(canonical_pin).await?;
-    // The no-record outcome, phrased for what the user can actually fix.
-    let miss = || match channel {
-        PinChannel::NostrOnly => anyhow::anyhow!(
-            "no peer found for that PIN (it refreshes every 60s — check the current code on the other device)"
-        ),
-        PinChannel::LanOnly if target_ip.is_some() => anyhow::anyhow!(
-            "no device answered for that PIN at that IP — check the address shown on the other device and that the code (it refreshes every 60s) matches"
-        ),
-        PinChannel::LanOnly => anyhow::anyhow!(
-            "no device found for that PIN on this network — both devices must be on the same network, and the code refreshes every 60s"
-        ),
-        PinChannel::NostrAndLan => anyhow::anyhow!(
-            "no peer found for that PIN (it refreshes every 60s — check the current code; without internet, both devices must be on the same network)"
-        ),
+    // A typed IP selects the unicast side channel (works where multicast is
+    // blocked); no IP browses mDNS.
+    let found = match target_ip {
+        Some(ip) => crate::lan::unicast_lookup_pin_record(ip, &candidates).await,
+        None => crate::lan::dnssd_lookup_pin_record(&candidates).await,
     };
-    match channel {
-        PinChannel::NostrOnly => match crate::nostr::lookup_pin_record(&candidates, relays).await {
-            Ok(Some(id)) => Ok(EndpointAddr::new(id)),
-            Ok(None) => Err(miss()),
-            Err(e) => Err(e.context("nostr PIN lookup failed")),
-        },
-        PinChannel::LanOnly => {
-            // A typed IP selects the unicast side channel (works where multicast
-            // is blocked); no IP browses mDNS. Either way the record carries the
-            // host's direct addresses, so the node id rides back dialable.
-            let found = match target_ip {
-                Some(ip) => {
-                    crate::lan::unicast_lookup_pin_record(ip, &candidates).await
-                }
-                None => crate::lan::dnssd_lookup_pin_record(&candidates).await,
-            };
-            match found {
-                Ok(Some(found)) => Ok(found.endpoint_addr()),
-                Ok(None) => Err(miss()),
-                Err(e) => Err(e.context("LAN PIN lookup failed")),
-            }
-        }
-        PinChannel::NostrAndLan => {
-            // Race both lookups; the first hit wins (the LAN answers in well
-            // under a second when the peer is local). A channel that misses or
-            // errors (e.g. nostr with no internet) leaves the outcome to the
-            // other; errors only surface when both channels failed to look.
-            let lan = crate::lan::lookup_pin_record(&candidates);
-            let nostr = crate::nostr::lookup_pin_record(&candidates, relays);
-            tokio::pin!(lan);
-            tokio::pin!(nostr);
-            let (mut lan_done, mut nostr_done) = (false, false);
-            let mut first_err: Option<anyhow::Error> = None;
-            let mut errors = 0;
-            while !(lan_done && nostr_done) {
-                let outcome = tokio::select! {
-                    r = &mut lan, if !lan_done => {
-                        lan_done = true;
-                        r.map_err(|e| e.context("LAN PIN lookup failed"))
-                    }
-                    r = &mut nostr, if !nostr_done => {
-                        nostr_done = true;
-                        r.map_err(|e| e.context("nostr PIN lookup failed"))
-                    }
-                };
-                match outcome {
-                    Ok(Some(id)) => return Ok(EndpointAddr::new(id)),
-                    Ok(None) => {}
-                    Err(e) => {
-                        log::warn!("{e:#}");
-                        errors += 1;
-                        first_err.get_or_insert(e);
-                    }
-                }
-            }
-            if errors == 2 {
-                Err(first_err.expect("two errors were recorded"))
-            } else {
-                Err(miss())
-            }
-        }
+    match found {
+        Ok(Some(found)) => Ok(found.endpoint_addr()),
+        // The no-record outcome, phrased for what the user can actually fix.
+        Ok(None) if target_ip.is_some() => Err(anyhow::anyhow!(
+            "no device answered for that PIN at that IP — check the address shown on the other device and that the code (it refreshes every 60s) matches"
+        )),
+        Ok(None) => Err(anyhow::anyhow!(
+            "no device found for that PIN on this network — both devices must be on the same network, and the code refreshes every 60s"
+        )),
+        Err(e) => Err(e.context("LAN PIN lookup failed")),
     }
 }
 
@@ -1238,21 +1293,18 @@ async fn resolve_pin(
 /// the displayed PIN) once a peer pairs — no more peers are accepted this
 /// session.
 ///
-/// On the LAN channel the record is advertised over mDNS (`crate::lan`); the
-/// previous bucket's advertisement is kept alive one extra period (`adverts`
-/// holds two guards), mirroring the look-back window the nostr record's TTL
-/// provides. All advertisements are withdrawn on exit.
+/// The record is advertised over DNS-SD (`crate::lan`); the previous bucket's
+/// advertisement is kept alive one extra period (`adverts` holds two guards) so
+/// a joiner typing a just-rotated code still resolves. All advertisements are
+/// withdrawn on exit.
 ///
 /// `refresh` (the user's "new PIN now" CTA) cuts the current period short:
 /// the next loop turn mints a fresh PIN immediately, and — unlike natural
 /// rotation, which keeps a look-back window — every previously shown PIN is
 /// revoked first.
-#[allow(clippy::too_many_arguments)]
-async fn run_pin_publisher(
+async fn run_lan_setup_publisher(
     endpoint: iroh::Endpoint,
     recent: RecentPins,
-    relays: Vec<String>,
-    channel: PinChannel,
     events: EventSender,
     cancel: CancellationToken,
     paired: CancellationToken,
@@ -1273,18 +1325,15 @@ async fn run_pin_publisher(
             break;
         }
 
-        let pin = crate::pin::generate_pin(matches!(channel, PinChannel::LanOnly));
+        let pin = crate::pin::generate_pin();
         let bucket = crate::pin::current_bucket();
-        // On the LAN-only channel, surface the host's LAN IPv4 so the UI can
-        // offer it for the joiner's manual-IP side channel. Constant across
-        // rotations, but sent with every PIN so a late-arriving UI still gets it.
-        let host_lan_ip = matches!(channel, PinChannel::LanOnly)
-            .then(|| {
-                let addrs: Vec<_> = endpoint.addr().ip_addrs().copied().collect();
-                crate::lan::preferred_lan_ipv4(&addrs)
-            })
-            .flatten()
-            .map(|ip| ip.to_string());
+        // Surface the host's LAN IPv4 so the UI can offer it for the joiner's
+        // manual-IP side channel. Constant across rotations, but sent with every
+        // PIN so a late-arriving UI still gets it.
+        let host_lan_ip = {
+            let addrs: Vec<_> = endpoint.addr().ip_addrs().copied().collect();
+            crate::lan::preferred_lan_ipv4(&addrs).map(|ip| ip.to_string())
+        };
         // Show the new code right away (before the network publish) and give it a
         // full rotation period from *now*, not from the wall-clock bucket boundary:
         // a PIN minted late in a bucket would otherwise flash for only a few
@@ -1332,66 +1381,40 @@ async fn run_pin_publisher(
         };
 
         if let Some(keys) = record_keys {
-            // LAN first: the advertisement is instant, while the nostr publish
-            // costs a relay round-trip. The LAN-only channel advertises over
-            // spec-compliant DNS-SD (Bonjour-visible, addresses load-bearing);
-            // the default channel keeps the swarm responder (see `crate::lan`).
-            if channel.lan() {
-                let addr = endpoint.addr();
-                let addrs: Vec<_> = addr.ip_addrs().copied().collect();
-                let advert = if matches!(channel, PinChannel::LanOnly) {
-                    crate::lan::dnssd_advertise_pin_record(&keys, &node_id, &addrs).await
-                } else {
-                    crate::lan::advertise_pin_record(&keys, &node_id, &addrs)
-                };
-                match advert {
-                    Ok(advert) => {
-                        adverts.push_back(advert);
-                        while adverts.len() > 2 {
-                            adverts.pop_front();
-                        }
-                        log::info!(
-                            "Advertising rotating PIN on the local network (refreshes in {}s)",
-                            crate::pin::BUCKET_SECS
-                        );
+            let addr = endpoint.addr();
+            let addrs: Vec<_> = addr.ip_addrs().copied().collect();
+            // Spec-compliant DNS-SD (Bonjour-visible, addresses load-bearing).
+            match crate::lan::dnssd_advertise_pin_record(&keys, &node_id, &addrs).await {
+                Ok(advert) => {
+                    adverts.push_back(advert);
+                    while adverts.len() > 2 {
+                        adverts.pop_front();
                     }
-                    // On the LAN-only channel the advertisement IS the
-                    // rendezvous — a shown PIN nobody can resolve must fail
-                    // loudly. The default channel still has nostr carrying the
-                    // record, so a warn will do.
-                    Err(e) if matches!(channel, PinChannel::LanOnly) => {
-                        events.error(format!(
-                            "Could not publish the PIN on the local network: {e:#}"
-                        ));
-                    }
-                    Err(e) => log::warn!("Failed to advertise PIN on the local network: {e:#}"),
+                    log::info!(
+                        "Advertising rotating PIN on the local network (refreshes in {}s)",
+                        crate::pin::BUCKET_SECS
+                    );
                 }
-                // LAN-only also serves the record over the unicast side channel
-                // (manual-IP path). It rides alongside mDNS, so a bind failure
-                // (e.g. a rare derived-port collision) only warns — mDNS still
-                // carries the rendezvous for joiners on this network.
-                if matches!(channel, PinChannel::LanOnly) {
-                    match crate::lan::unicast_advertise_pin_record(&keys, &node_id, &addrs).await {
-                        Ok(listener) => {
-                            unicast.push_back(listener);
-                            while unicast.len() > 2 {
-                                unicast.pop_front();
-                            }
-                        }
-                        Err(e) => {
-                            log::warn!("Failed to start the manual-IP side channel: {e:#}")
-                        }
-                    }
+                // The advertisement IS the rendezvous here — a shown PIN nobody
+                // can resolve must fail loudly rather than hang the joiner.
+                Err(e) => {
+                    events.error(format!(
+                        "Could not publish the PIN on the local network: {e:#}"
+                    ));
                 }
             }
-            if channel.nostr() {
-                match crate::nostr::publish_pin_record(&keys, &node_id, &relays).await {
-                    Ok(()) => log::info!(
-                        "Published rotating PIN to nostr (refreshes in {}s)",
-                        crate::pin::BUCKET_SECS
-                    ),
-                    Err(e) => log::warn!("Failed to publish PIN to nostr: {e:#}"),
+            // Also serve the record over the unicast side channel (the manual-IP
+            // path). It rides alongside DNS-SD, so a bind failure (e.g. a rare
+            // derived-port collision) only warns — multicast still carries the
+            // rendezvous for joiners on this network.
+            match crate::lan::unicast_advertise_pin_record(&keys, &node_id, &addrs).await {
+                Ok(listener) => {
+                    unicast.push_back(listener);
+                    while unicast.len() > 2 {
+                        unicast.pop_front();
+                    }
                 }
+                Err(e) => log::warn!("Failed to start the manual-IP side channel: {e:#}"),
             }
         }
 
@@ -1409,9 +1432,8 @@ async fn run_pin_publisher(
             _ = refresh.notified() => {
                 // Rotate now, and revoke everything shown so far: no retained
                 // auth key means a stale code can no longer authenticate, and
-                // dropping the advert guards withdraws the mDNS records (old
-                // nostr records just age out — resolving one only leads to an
-                // auth rejection).
+                // dropping the advert guards withdraws the mDNS records and
+                // closes the side-channel listeners.
                 recent.clear();
                 adverts.clear();
                 unicast.clear();
@@ -1616,13 +1638,6 @@ async fn auth_as_listener(
     let pin_claimed_by_other = existing.as_ref().is_some_and(|claimed| {
         claimed.application_key.is_some() || claimed.node_id != Some(remote_id)
     });
-    let reconnect_key = existing
-        .as_ref()
-        .filter(|claimed| {
-            claimed.application_key.is_none() && claimed.node_id == Some(remote_id)
-        })
-        .and_then(|c| c.pin_key.clone());
-
     let auth_result = tokio::time::timeout(AUTH_TIMEOUT, async {
         let (mut send, mut recv) = conn
             .accept_bi()
@@ -1693,18 +1708,14 @@ async fn auth_as_listener(
                 Ok::<_, anyhow::Error>((send, recv, Some(client_key)))
             }
             AuthRequest::Pin { nonce, .. } => {
-                // Verify the dialer's PIN proof against the recent-bucket keys, plus (for a
-                // reconnecting paired peer) the key it originally paired with. An empty
-                // candidate set — a non-PIN listener, or a peer refused by the gate — yields a
-                // clean rejection.
-                let mut candidates = if pin_claimed_by_other {
+                // Verify the dialer's PIN proof against the recent-bucket keys. An empty
+                // candidate set — a configure-mode listener, or a peer refused by the gate —
+                // yields a clean rejection.
+                let candidates = if pin_claimed_by_other {
                     Vec::new()
                 } else {
                     pin_cache.map(|c| c.snapshot()).unwrap_or_default()
                 };
-                if let Some(key) = &reconnect_key {
-                    candidates.push(key.clone());
-                }
                 // The claim is committed inside the handshake, right after the proof verifies
                 // and *before* the acceptance frame is sent — so a race loser is rejected
                 // in-band, not accepted-then-dropped.
@@ -1718,7 +1729,7 @@ async fn auth_as_listener(
                     &nonce,
                     &remote_id.to_string(),
                     &own_id.to_string(),
-                    |key| claim.commit_pin(remote_id, key.clone()),
+                    || claim.commit_pin(remote_id),
                 )
                 .await?;
                 log::info!("Peer {remote_id} authenticated via PIN");
@@ -1943,6 +1954,28 @@ mod tests {
         panic!("timed out waiting for event; seen: {seen:?}");
     }
 
+    /// Block until the LAN-setup host shows a PIN, and return it in the
+    /// canonical form the joiner's `DialSpec` wants — the displayed code is all
+    /// the joining user ever gets to type.
+    fn wait_for_displayed_pin(rx: &std::sync::mpsc::Receiver<NetEvent>) -> String {
+        let displayed = wait_for_event(rx, Duration::from_secs(30), |ev| {
+            if let NetEvent::PinRotated { pin_display, .. } = ev {
+                Some(pin_display.clone())
+            } else {
+                None
+            }
+        });
+        crate::pin::normalize_pin(&displayed).expect("a displayed PIN is always valid")
+    }
+
+    /// `wait_for_event` predicate pulling the card out of a `PeerCardReceived`.
+    fn received_card(ev: &NetEvent) -> Option<IdentityCard> {
+        match ev {
+            NetEvent::PeerCardReceived(card) => Some((**card).clone()),
+            _ => None,
+        }
+    }
+
     /// The dialer refuses its own lapsed card for the selected peer before it
     /// touches the network — no endpoint, no relay lookup, and an error that
     /// names the fix rather than a remote rejection.
@@ -2004,9 +2037,8 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let events = EventSender::new(tx, None);
         let session = start_test_session(
-            SessionKind::Server(ServerMode::Pin {
-                relays: Vec::new(),
-                channel: PinChannel::LanOnly,
+            SessionKind::Server(ServerMode::LanSetup {
+                self_card: Box::new(Identity::generate().card("host", "a7B2c3D4").unwrap()),
             }),
             events,
         );
@@ -2023,7 +2055,7 @@ mod tests {
         session
             .pin_refresh
             .as_ref()
-            .expect("PIN server sessions expose a refresh handle")
+            .expect("LAN-setup host sessions expose a refresh handle")
             .notify_one();
 
         // Far sooner than the rotation period (BUCKET_SECS), so only the
@@ -2035,81 +2067,69 @@ mod tests {
         let _ = session.handle.await;
     }
 
-    /// End-to-end LAN-only PIN mode within one process: the server advertises
-    /// the rotating PIN's rendezvous record over DNS-SD (no nostr at all), the
-    /// client resolves it from the displayed PIN alone — including the direct
-    /// addresses it dials explicitly — pairs via the in-band PIN handshake,
-    /// and both sides exchange one clipboard item.
+    /// Two LAN-setup peers in one process, driven exactly as the user drives
+    /// them: the host advertises the rotating PIN's rendezvous record over
+    /// DNS-SD (no nostr at all), the joiner resolves it from the displayed PIN
+    /// alone — including the direct addresses it dials explicitly — proves the
+    /// PIN in-band, and both sides come away holding the other's signed card.
     #[tokio::test(flavor = "multi_thread")]
-    async fn lan_pin_mode_pairs_and_exchanges_items() {
+    async fn lan_setup_exchanges_identity_cards() {
         let _ = env_logger::builder().is_test(true).try_init();
+
+        let host_identity = Identity::generate();
+        let join_identity = Identity::generate();
+        let host_card = host_identity.card("host", "a7B2c3D4").unwrap();
+        let join_card = join_identity.card("joiner", "x9Y8z7W6").unwrap();
 
         let (srv_tx, srv_rx) = std::sync::mpsc::channel();
         let srv_session = start_test_session(
-            SessionKind::Server(ServerMode::Pin {
-                relays: Vec::new(),
-                channel: PinChannel::LanOnly,
+            SessionKind::Server(ServerMode::LanSetup {
+                self_card: Box::new(host_card.clone()),
             }),
             EventSender::new(srv_tx, None),
         );
 
-        // The displayed PIN is all the joining user gets to type.
-        let pin_display = wait_for_event(&srv_rx, Duration::from_secs(30), |ev| {
-            if let NetEvent::PinRotated { pin_display, .. } = ev {
-                Some(pin_display.clone())
-            } else {
-                None
-            }
-        });
-        let canonical_pin =
-            crate::pin::normalize_pin(&pin_display).expect("displayed PIN is valid");
+        let canonical_pin = wait_for_displayed_pin(&srv_rx);
 
         let (cli_tx, cli_rx) = std::sync::mpsc::channel();
         let cli_session = start_test_session(
-            SessionKind::Client(DialSpec::Pin {
+            SessionKind::Client(DialSpec::LanSetup {
                 canonical_pin,
-                relays: Vec::new(),
-                channel: PinChannel::LanOnly,
+                self_card: Box::new(join_card.clone()),
                 target_ip: None,
             }),
             EventSender::new(cli_tx, None),
         );
 
-        // Both sides pair; pairing clears the displayed PIN on the server.
-        wait_for_event(&cli_rx, Duration::from_secs(120), |ev| {
-            matches!(ev, NetEvent::Status(ConnStatus::Connected)).then_some(())
+        // Each side ends up with the *other's* card — the whole point.
+        let got_by_joiner = wait_for_event(&cli_rx, Duration::from_secs(120), received_card);
+        assert_eq!(got_by_joiner.public_key(), host_identity.public_key());
+        assert_eq!(got_by_joiner.name(), "host_a7B2c3D4");
+
+        // Pairing spends the PIN, so `PinCleared` lands before the card does;
+        // catch it on the way past rather than looking for it afterwards.
+        let mut pin_cleared = false;
+        let got_by_host = wait_for_event(&srv_rx, Duration::from_secs(30), |ev| {
+            pin_cleared |= matches!(ev, NetEvent::PinCleared);
+            received_card(ev)
         });
+        assert_eq!(got_by_host.public_key(), join_identity.public_key());
+        assert_eq!(got_by_host.name(), "joiner_x9Y8z7W6");
+        assert!(pin_cleared, "pairing must stop the host showing a PIN");
+
+        // The fingerprints each side displays are the ones the *other* device
+        // shows for itself. This is exactly the comparison the user makes.
+        assert_eq!(got_by_joiner.fingerprint(), host_card.fingerprint());
+        assert_eq!(got_by_host.fingerprint(), join_card.fingerprint());
+
+        // The session ends on its own once the cards have crossed — nobody has
+        // to stop it.
         wait_for_event(&srv_rx, Duration::from_secs(30), |ev| {
-            matches!(ev, NetEvent::PinCleared).then_some(())
+            matches!(ev, NetEvent::Status(ConnStatus::Idle)).then_some(())
         });
-
-        // Client -> server.
-        cli_session
-            .clip_tx
-            .send("from the client".to_string())
-            .unwrap();
-        let text = wait_for_event(&srv_rx, Duration::from_secs(15), |ev| {
-            if let NetEvent::ItemReceived { text, .. } = ev {
-                Some(text.clone())
-            } else {
-                None
-            }
+        wait_for_event(&cli_rx, Duration::from_secs(30), |ev| {
+            matches!(ev, NetEvent::Status(ConnStatus::Idle)).then_some(())
         });
-        assert_eq!(text, "from the client");
-
-        // Server -> client.
-        srv_session
-            .clip_tx
-            .send("from the server".to_string())
-            .unwrap();
-        let text = wait_for_event(&cli_rx, Duration::from_secs(15), |ev| {
-            if let NetEvent::ItemReceived { text, .. } = ev {
-                Some(text.clone())
-            } else {
-                None
-            }
-        });
-        assert_eq!(text, "from the server");
 
         let mut cli = Some(cli_session);
         let mut srv = Some(srv_session);
@@ -2117,40 +2137,85 @@ mod tests {
         stop_session(&mut srv).await;
     }
 
-    /// End-to-end LAN-only PIN mode via the manual-IP unicast side channel: the
-    /// joiner supplies a `target_ip`, so discovery bypasses mDNS entirely and
-    /// fetches the PIN-encrypted record over TCP from the host's IP (here
-    /// loopback). The record carries the host's direct addresses, which the
-    /// joiner then dials — the whole point being pairing where multicast is
-    /// blocked.
+    /// A LAN-setup session must never move clipboard content. Sending on either
+    /// side's clip channel produces nothing on the peer — the session task drops
+    /// the receiver outright, so there is no path for content to take.
     #[tokio::test(flavor = "multi_thread")]
-    async fn lan_pin_mode_pairs_over_the_unicast_side_channel() {
+    async fn lan_setup_never_carries_clipboard_content() {
         let _ = env_logger::builder().is_test(true).try_init();
+
+        let host_card = Identity::generate().card("host", "a7B2c3D4").unwrap();
+        let join_card = Identity::generate().card("joiner", "x9Y8z7W6").unwrap();
 
         let (srv_tx, srv_rx) = std::sync::mpsc::channel();
         let srv_session = start_test_session(
-            SessionKind::Server(ServerMode::Pin {
-                relays: Vec::new(),
-                channel: PinChannel::LanOnly,
+            SessionKind::Server(ServerMode::LanSetup {
+                self_card: Box::new(host_card),
             }),
             EventSender::new(srv_tx, None),
         );
-        let pin_display = wait_for_event(&srv_rx, Duration::from_secs(30), |ev| {
-            if let NetEvent::PinRotated { pin_display, .. } = ev {
-                Some(pin_display.clone())
-            } else {
-                None
-            }
-        });
-        let canonical_pin =
-            crate::pin::normalize_pin(&pin_display).expect("displayed PIN is valid");
+        let canonical_pin = wait_for_displayed_pin(&srv_rx);
 
         let (cli_tx, cli_rx) = std::sync::mpsc::channel();
         let cli_session = start_test_session(
-            SessionKind::Client(DialSpec::Pin {
+            SessionKind::Client(DialSpec::LanSetup {
                 canonical_pin,
-                relays: Vec::new(),
-                channel: PinChannel::LanOnly,
+                self_card: Box::new(join_card),
+                target_ip: None,
+            }),
+            EventSender::new(cli_tx, None),
+        );
+
+        wait_for_event(&cli_rx, Duration::from_secs(120), received_card);
+        wait_for_event(&srv_rx, Duration::from_secs(30), received_card);
+
+        // The channel send may fail outright (the receiver is dropped) — either
+        // way nothing must reach the peer.
+        let _ = cli_session.clip_tx.send("should never arrive".to_string());
+        let _ = srv_session.clip_tx.send("nor should this".to_string());
+
+        std::thread::sleep(Duration::from_secs(3));
+        for (label, rx) in [("host", &srv_rx), ("joiner", &cli_rx)] {
+            assert!(
+                !rx.try_iter()
+                    .any(|ev| matches!(ev, NetEvent::ItemReceived { .. })),
+                "{label} received clipboard content over a LAN-setup session"
+            );
+        }
+
+        let mut cli = Some(cli_session);
+        let mut srv = Some(srv_session);
+        stop_session(&mut cli).await;
+        stop_session(&mut srv).await;
+    }
+
+    /// LAN setup over the manual-IP unicast side channel: the joiner supplies a
+    /// `target_ip`, so discovery bypasses mDNS entirely and fetches the
+    /// PIN-encrypted record over TCP from the host's IP (here loopback). The
+    /// record carries the host's direct addresses, which the joiner then dials —
+    /// the whole point being pairing where multicast is blocked.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lan_setup_exchanges_cards_over_the_unicast_side_channel() {
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        let host_identity = Identity::generate();
+        let host_card = host_identity.card("host", "a7B2c3D4").unwrap();
+        let join_card = Identity::generate().card("joiner", "x9Y8z7W6").unwrap();
+
+        let (srv_tx, srv_rx) = std::sync::mpsc::channel();
+        let srv_session = start_test_session(
+            SessionKind::Server(ServerMode::LanSetup {
+                self_card: Box::new(host_card),
+            }),
+            EventSender::new(srv_tx, None),
+        );
+        let canonical_pin = wait_for_displayed_pin(&srv_rx);
+
+        let (cli_tx, cli_rx) = std::sync::mpsc::channel();
+        let cli_session = start_test_session(
+            SessionKind::Client(DialSpec::LanSetup {
+                canonical_pin,
+                self_card: Box::new(join_card),
                 // The host serves the unicast side channel on all interfaces, so
                 // loopback reaches it on the same machine.
                 target_ip: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
@@ -2158,25 +2223,9 @@ mod tests {
             EventSender::new(cli_tx, None),
         );
 
-        wait_for_event(&cli_rx, Duration::from_secs(120), |ev| {
-            matches!(ev, NetEvent::Status(ConnStatus::Connected)).then_some(())
-        });
-        wait_for_event(&srv_rx, Duration::from_secs(30), |ev| {
-            matches!(ev, NetEvent::PinCleared).then_some(())
-        });
-
-        cli_session
-            .clip_tx
-            .send("over the side channel".to_string())
-            .unwrap();
-        let text = wait_for_event(&srv_rx, Duration::from_secs(15), |ev| {
-            if let NetEvent::ItemReceived { text, .. } = ev {
-                Some(text.clone())
-            } else {
-                None
-            }
-        });
-        assert_eq!(text, "over the side channel");
+        let got = wait_for_event(&cli_rx, Duration::from_secs(120), received_card);
+        assert_eq!(got.public_key(), host_identity.public_key());
+        wait_for_event(&srv_rx, Duration::from_secs(30), received_card);
 
         let mut cli = Some(cli_session);
         let mut srv = Some(srv_session);
@@ -2186,45 +2235,126 @@ mod tests {
 
     /// After an interrupted connection resumes, each side pulls the other's
     /// latest sent item (surfaced with `pulled: true` for UI deduplication).
+    ///
+    /// Driven directly against [`pump_clipboard`] over a pair of loopback
+    /// endpoints rather than through a full session: configure mode is the only
+    /// mode that carries clipboard traffic, and its client resolves through a
+    /// nostr relay, which a test cannot stand up. Both sides keep their
+    /// [`LastSent`] across the reconnect, exactly as `run_*_session` does.
     #[tokio::test(flavor = "multi_thread")]
     async fn resume_pulls_latest_from_both_sides() {
         let _ = env_logger::builder().is_test(true).try_init();
 
+        let server_identity = Identity::generate();
+        let client_identity = Identity::generate();
+        let server_key_identity = KeyIdentity {
+            identity: server_identity.clone(),
+            self_card: server_identity.card("server", "a7B2c3D4").unwrap(),
+            peers: vec![client_identity.card("client", "x9Y8z7W6").unwrap()],
+            relays: Vec::new(),
+        };
+
+        let server = create_server_endpoint(EndpointReadiness::LanDirect, iroh::SecretKey::generate())
+            .await
+            .unwrap();
+        let client = create_client_endpoint(EndpointReadiness::LanDirect, iroh::SecretKey::generate())
+            .await
+            .unwrap();
+        let server_id = server.id();
+        let server_addr = server.addr();
+        let claim = PairClaim::default();
+
+        // Per-side state that outlives an individual connection — this is what
+        // makes a resume a resume.
         let (srv_tx, srv_rx) = std::sync::mpsc::channel();
-        let srv_session = start_test_session(
-            SessionKind::Server(ServerMode::Pin {
-                relays: Vec::new(),
-                channel: PinChannel::LanOnly,
-            }),
-            EventSender::new(srv_tx, None),
-        );
-        let pin_display = wait_for_event(&srv_rx, Duration::from_secs(30), |ev| {
-            if let NetEvent::PinRotated { pin_display, .. } = ev {
-                Some(pin_display.clone())
-            } else {
-                None
-            }
-        });
-        let canonical_pin =
-            crate::pin::normalize_pin(&pin_display).expect("displayed PIN is valid");
-
         let (cli_tx, cli_rx) = std::sync::mpsc::channel();
-        let cli_session = start_test_session(
-            SessionKind::Client(DialSpec::Pin {
-                canonical_pin,
-                relays: Vec::new(),
-                channel: PinChannel::LanOnly,
-                target_ip: None,
-            }),
-            EventSender::new(cli_tx, None),
-        );
-        wait_for_event(&cli_rx, Duration::from_secs(60), |ev| {
-            matches!(ev, NetEvent::Status(ConnStatus::Connected)).then_some(())
-        });
+        let srv_events = EventSender::new(srv_tx, None);
+        let cli_events = EventSender::new(cli_tx, None);
+        let srv_last = LastSent::default();
+        let cli_last = LastSent::default();
+        let (srv_clip_tx, mut srv_clip_rx) = mpsc::unbounded_channel();
+        let (cli_clip_tx, mut cli_clip_rx) = mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
 
-        // One item each way, so both sessions hold a last-sent.
-        srv_session.clip_tx.send("server latest".to_string()).unwrap();
-        cli_session.clip_tx.send("client latest".to_string()).unwrap();
+        // Bring up one authenticated connection and hand back both sides'
+        // session streams.
+        #[allow(clippy::too_many_arguments)]
+        async fn connect_pair(
+            server: &iroh::Endpoint,
+            client: &iroh::Endpoint,
+            server_addr: EndpointAddr,
+            server_id: iroh::EndpointId,
+            server_key_identity: &KeyIdentity,
+            client_identity: &Identity,
+            server_public: nostr_sdk::PublicKey,
+            claim: &PairClaim,
+        ) -> (Bi, Bi, iroh::endpoint::Connection, iroh::endpoint::Connection) {
+            let listener = tokio::spawn({
+                let server = server.clone();
+                let claim = claim.clone();
+                let ident = server_key_identity.clone();
+                async move {
+                    let conn = server.accept().await.unwrap().await.unwrap();
+                    let (s, r, _) = auth_as_listener(&conn, Some(&ident), None, &claim, server_id)
+                        .await
+                        .unwrap();
+                    ((s, r), conn)
+                }
+            });
+            let conn = connect_to_server(client, server_addr).await.unwrap();
+            let dialer = auth_as_dialer_key(&conn, client_identity, server_public, client.id())
+                .await
+                .unwrap();
+            let (server_side, server_conn) = listener.await.unwrap();
+            (server_side, dialer, conn, server_conn)
+        }
+
+        // One pump round, owning its receiver for the duration and handing it
+        // back so the next round can reuse it — the receiver is session state,
+        // not connection state.
+        fn spawn_pump(
+            bi: Bi,
+            events: EventSender,
+            mut clip_rx: mpsc::UnboundedReceiver<String>,
+            cancel: CancellationToken,
+            last: LastSent,
+        ) -> JoinHandle<mpsc::UnboundedReceiver<String>> {
+            tokio::spawn(async move {
+                let (send, recv) = bi;
+                let _ = pump_clipboard(send, recv, &events, &mut clip_rx, &cancel, &last).await;
+                clip_rx
+            })
+        }
+
+        let (srv_bi, cli_bi, conn, srv_conn) = connect_pair(
+            &server,
+            &client,
+            server_addr.clone(),
+            server_id,
+            &server_key_identity,
+            &client_identity,
+            server_identity.public_key(),
+            &claim,
+        )
+        .await;
+
+        // Round one: one item each way, so both sides hold a last-sent.
+        let srv_pump = spawn_pump(
+            srv_bi,
+            srv_events.clone(),
+            srv_clip_rx,
+            cancel.clone(),
+            srv_last.clone(),
+        );
+        let cli_pump = spawn_pump(
+            cli_bi,
+            cli_events.clone(),
+            cli_clip_rx,
+            cancel.clone(),
+            cli_last.clone(),
+        );
+        srv_clip_tx.send("server latest".to_string()).unwrap();
+        cli_clip_tx.send("client latest".to_string()).unwrap();
         wait_for_event(&cli_rx, Duration::from_secs(15), |ev| {
             matches!(ev, NetEvent::ItemReceived { pulled: false, .. }).then_some(())
         });
@@ -2232,13 +2362,29 @@ mod tests {
             matches!(ev, NetEvent::ItemReceived { pulled: false, .. }).then_some(())
         });
 
-        // Interrupt: kill the live connection out from under both pumps. Both
-        // sessions stay up; the client auto-reconnects to the same node id.
-        let conn = srv_session.conn.lock().clone().expect("paired connection");
+        // Interrupt: kill the connection out from under both pumps.
         conn.close(0u32.into(), b"test interruption");
+        drop(srv_conn);
+        srv_clip_rx = srv_pump.await.unwrap();
+        cli_clip_rx = cli_pump.await.unwrap();
 
-        // On resume each side pulls the other's latest.
-        let text = wait_for_event(&cli_rx, Duration::from_secs(60), |ev| {
+        // Resume on a fresh connection, carrying each side's LastSent forward.
+        let (srv_bi, cli_bi, _conn, _srv_conn) = connect_pair(
+            &server,
+            &client,
+            server_addr,
+            server_id,
+            &server_key_identity,
+            &client_identity,
+            server_identity.public_key(),
+            &claim,
+        )
+        .await;
+        let srv_pump = spawn_pump(srv_bi, srv_events, srv_clip_rx, cancel.clone(), srv_last);
+        let cli_pump = spawn_pump(cli_bi, cli_events, cli_clip_rx, cancel.clone(), cli_last);
+
+        // On resume each side pulls the other's latest, marked for dedup.
+        let text = wait_for_event(&cli_rx, Duration::from_secs(30), |ev| {
             if let NetEvent::ItemReceived { text, pulled: true } = ev {
                 Some(text.clone())
             } else {
@@ -2255,177 +2401,73 @@ mod tests {
         });
         assert_eq!(text, "client latest");
 
-        let mut cli = Some(cli_session);
-        let mut srv = Some(srv_session);
-        stop_session(&mut cli).await;
-        stop_session(&mut srv).await;
+        cancel.cancel();
+        let _ = srv_pump.await;
+        let _ = cli_pump.await;
+        client.close().await;
+        server.close().await;
     }
 
-    /// A client session that ends after pairing (the give-up bound, an app
-    /// restarting the session) does not orphan the pairing: a successor session
-    /// under the same [`SessionMemory`] presents the same node id and pinned
-    /// dial target, so it reconnects — even though the PIN rendezvous was
-    /// withdrawn at the first pairing and the server's claim refuses every
-    /// other identity.
+    /// One PIN admits exactly one device. After a device has answered the PIN
+    /// and taken its card, a second device answering the *same* code gets
+    /// nothing — and is told so rather than left waiting.
+    ///
+    /// This is what stops a bystander who reads the PIN over your shoulder from
+    /// collecting a card of their own. The refusal's wording depends on how far
+    /// the latecomer gets before the finished host tears down (a `SERVER_BUSY`
+    /// close inside the grace window, a resolve failure after it), so the
+    /// assertion is on the outcome — no card, and an error — not the wording.
     #[tokio::test(flavor = "multi_thread")]
-    async fn restarted_client_session_reuses_identity_and_reconnects() {
+    async fn only_one_device_can_answer_a_lan_setup_pin() {
         let _ = env_logger::builder().is_test(true).try_init();
 
         let (srv_tx, srv_rx) = std::sync::mpsc::channel();
         let srv_session = start_test_session(
-            SessionKind::Server(ServerMode::Pin {
-                relays: Vec::new(),
-                channel: PinChannel::LanOnly,
+            SessionKind::Server(ServerMode::LanSetup {
+                self_card: Box::new(Identity::generate().card("host", "a7B2c3D4").unwrap()),
             }),
             EventSender::new(srv_tx, None),
         );
-        let pin_display = wait_for_event(&srv_rx, Duration::from_secs(30), |ev| {
-            if let NetEvent::PinRotated { pin_display, .. } = ev {
-                Some(pin_display.clone())
-            } else {
-                None
-            }
-        });
-        let canonical_pin =
-            crate::pin::normalize_pin(&pin_display).expect("displayed PIN is valid");
-        let dial = SessionKind::Client(DialSpec::Pin {
-            canonical_pin,
-            relays: Vec::new(),
-            channel: PinChannel::LanOnly,
-            target_ip: None,
-        });
-
-        // First pairing, under memory the command loop would hold on to.
-        let memory = SessionMemory::new(session_key(&dial));
-        let (cli_tx, cli_rx) = std::sync::mpsc::channel();
-        let dial_again = match &dial {
-            SessionKind::Client(spec) => SessionKind::Client(spec.clone()),
-            _ => unreachable!(),
-        };
-        let cli_session = start_session(dial, EventSender::new(cli_tx, None), &memory);
-        wait_for_event(&cli_rx, Duration::from_secs(120), |ev| {
-            matches!(ev, NetEvent::Status(ConnStatus::Connected)).then_some(())
-        });
-        // Pairing withdrew the PIN rendezvous — a fresh lookup can never
-        // succeed again — and bound the server's claim to this client's id.
-        wait_for_event(&srv_rx, Duration::from_secs(30), |ev| {
-            matches!(ev, NetEvent::PinCleared).then_some(())
-        });
-
-        // The client session ends (as after MAX_CONNECT_ATTEMPTS, or an app
-        // tearing the session down); the server session stays up, claimed.
-        let mut cli = Some(cli_session);
-        stop_session(&mut cli).await;
-        wait_for_event(&srv_rx, Duration::from_secs(30), |ev| {
-            matches!(ev, NetEvent::PeerDisconnected).then_some(())
-        });
-
-        // A successor session under the same memory reconnects: same node id
-        // (the claim's), same pinned target (no rendezvous needed).
-        let (cli2_tx, cli2_rx) = std::sync::mpsc::channel();
-        let cli2_session =
-            start_session(dial_again, EventSender::new(cli2_tx, None), &memory);
-        let node_id = wait_for_event(&cli2_rx, Duration::from_secs(30), |ev| {
-            if let NetEvent::ClientReady { node_id, .. } = ev {
-                Some(node_id.clone())
-            } else {
-                None
-            }
-        });
-        assert_eq!(
-            node_id,
-            memory.secret.public().to_string(),
-            "the successor session must present the session identity"
-        );
-        wait_for_event(&cli2_rx, Duration::from_secs(60), |ev| {
-            matches!(ev, NetEvent::Status(ConnStatus::Connected)).then_some(())
-        });
-
-        // The revived link carries items.
-        cli2_session
-            .clip_tx
-            .send("after the restart".to_string())
-            .unwrap();
-        let text = wait_for_event(&srv_rx, Duration::from_secs(15), |ev| {
-            if let NetEvent::ItemReceived { text, .. } = ev {
-                Some(text.clone())
-            } else {
-                None
-            }
-        });
-        assert_eq!(text, "after the restart");
-
-        let mut cli2 = Some(cli2_session);
-        let mut srv = Some(srv_session);
-        stop_session(&mut cli2).await;
-        stop_session(&mut srv).await;
-    }
-
-    /// A second device dialing a server that is already pairing with someone
-    /// else is refused promptly with a fatal "busy" error (a `SERVER_BUSY`
-    /// close), not left hanging in the reconnect loop. Both devices reach the
-    /// server via the LAN-only unicast side channel (loopback), started
-    /// concurrently — discovery is withdrawn once a peer pairs, so both must
-    /// fetch the record before either pairing completes. The server pairs
-    /// whichever authenticates first and refuses the other; the test is
-    /// order-agnostic about which wins.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn busy_server_refuses_a_third_device() {
-        let _ = env_logger::builder().is_test(true).try_init();
-
-        // Server.
-        let (srv_tx, srv_rx) = std::sync::mpsc::channel();
-        let srv_session = start_test_session(
-            SessionKind::Server(ServerMode::Pin {
-                relays: Vec::new(),
-                channel: PinChannel::LanOnly,
-            }),
-            EventSender::new(srv_tx, None),
-        );
-        let pin_display = wait_for_event(&srv_rx, Duration::from_secs(30), |ev| {
-            if let NetEvent::PinRotated { pin_display, .. } = ev {
-                Some(pin_display.clone())
-            } else {
-                None
-            }
-        });
-        let canonical_pin =
-            crate::pin::normalize_pin(&pin_display).expect("displayed PIN is valid");
-        let dial = || DialSpec::Pin {
+        let canonical_pin = wait_for_displayed_pin(&srv_rx);
+        let dial = || DialSpec::LanSetup {
             canonical_pin: canonical_pin.clone(),
-            relays: Vec::new(),
-            channel: PinChannel::LanOnly,
+            self_card: Box::new(Identity::generate().card("joiner", "x9Y8z7W6").unwrap()),
             target_ip: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
         };
 
-        // Both devices dial concurrently — both fetch the record before either
-        // pairing completes (the pairing handshake far outlasts a loopback fetch).
+        // The device the user meant to pair answers first and takes its card.
         let (a_tx, a_rx) = std::sync::mpsc::channel();
-        let a_session = start_test_session(SessionKind::Client(dial()), EventSender::new(a_tx, None));
-        let (b_tx, b_rx) = std::sync::mpsc::channel();
-        let b_session = start_test_session(SessionKind::Client(dial()), EventSender::new(b_tx, None));
+        let mut a_session =
+            Some(start_test_session(SessionKind::Client(dial()), EventSender::new(a_tx, None)));
+        wait_for_event(&a_rx, Duration::from_secs(120), received_card);
+        wait_for_event(&srv_rx, Duration::from_secs(30), received_card);
 
-        // Exactly one pairs; the other is turned away as busy. Watch both.
+        // Now the bystander tries the same code.
+        let (b_tx, b_rx) = std::sync::mpsc::channel();
+        let mut b_session =
+            Some(start_test_session(SessionKind::Client(dial()), EventSender::new(b_tx, None)));
+
         let start = Instant::now();
-        let (mut connected, mut busy) = (false, false);
-        while start.elapsed() < Duration::from_secs(90) && !(connected && busy) {
-            for rx in [&a_rx, &b_rx] {
-                match rx.recv_timeout(Duration::from_millis(100)) {
-                    Ok(NetEvent::Status(ConnStatus::Connected)) => connected = true,
-                    Ok(NetEvent::Error(e)) if e.contains("another device") => busy = true,
-                    Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        let mut refused: Option<String> = None;
+        let mut seen: Vec<String> = Vec::new();
+        while start.elapsed() < Duration::from_secs(60) && refused.is_none() {
+            match b_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(NetEvent::PeerCardReceived(_)) => {
+                    panic!("a second device must never come away with a card")
                 }
+                Ok(NetEvent::Error(e)) => refused = Some(e),
+                Ok(other) => seen.push(format!("{other:?}")),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
-        assert!(connected, "one device must pair");
-        assert!(busy, "the other device must be refused as busy");
+        assert!(
+            refused.is_some(),
+            "the second device must be told why it got nothing, not left waiting; saw {seen:?}"
+        );
 
-        let mut a = Some(a_session);
-        let mut b = Some(b_session);
-        let mut srv = Some(srv_session);
-        stop_session(&mut a).await;
-        stop_session(&mut b).await;
-        stop_session(&mut srv).await;
+        stop_session(&mut a_session).await;
+        stop_session(&mut b_session).await;
+        stop_session(&mut Some(srv_session)).await;
     }
 }

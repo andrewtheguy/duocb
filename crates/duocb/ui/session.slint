@@ -77,7 +77,7 @@ export component SessionPanel inherits Rectangle {
                 clicked => { Actions.send-clipboard(); }
             }
             Button {
-                text: "🌐 Connection path";
+                text: "🌐 Connection path (" + UiState.cmd-label + "+D)";
                 clicked => { Actions.query-conn-path(); }
             }
             if UiState.sent-flash: Text {
@@ -100,7 +100,7 @@ export component SessionPanel inherits Rectangle {
                 accepted => { Actions.compose-send(); }
             }
             Button {
-                text: "Send";
+                text: "Send (Enter)";
                 enabled: UiState.in-compose != "";
                 clicked => { Actions.compose-send(); }
             }
@@ -130,7 +130,7 @@ export component SessionPanel inherits Rectangle {
             }
         }
         Small {
-            text: "Newest: peek " + UiState.cmd-label + "+P · copy " + UiState.cmd-label + "+Y";
+            text: "Newest: peek " + UiState.cmd-label + "+P · copy " + UiState.cmd-label + "+Y · outbox copy " + UiState.cmd-label + "+O";
         }
         if UiState.inbox.length == 0: Weak { text: "Nothing received yet."; }
         // Only the inbox list scrolls (capped height); the send/compose

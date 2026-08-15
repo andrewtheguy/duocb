@@ -63,7 +63,7 @@ component ImportStep inherits VerticalLayout {
             spacing: Theme.pad-s;
             alignment: start;
             Button {
-                text: "✔ Restore key";
+                text: "✔ Restore key (U)";
                 primary: true;
                 enabled: UiState.import-valid;
                 clicked => { Actions.use-imported(); }
@@ -104,7 +104,7 @@ component NameStep inherits VerticalLayout {
             spacing: Theme.pad-s;
             alignment: start;
             Button {
-                text: "✔ Save name";
+                text: "✔ Save name (Enter)";
                 primary: true;
                 enabled: UiState.name-valid;
                 clicked => { Actions.save-name(); }
@@ -132,19 +132,19 @@ component HubStep inherits VerticalLayout {
                 horizontal-stretch: 1;
                 vertical-alignment: center;
             }
-            Button { text: "Rename"; clicked => { Actions.rename(); } }
+            Button { text: "Rename (R)"; clicked => { Actions.rename(); } }
         }
         if UiState.has-identity: HorizontalLayout {
             spacing: Theme.pad-s;
             alignment: start;
-            Text { text: "Public key:"; font-size: Theme.font-body; vertical-alignment: center; }
+            Text { text: "Fingerprint:"; font-size: Theme.font-body; vertical-alignment: center; }
             Mono {
-                text: UiState.public-key-short;
+                text: UiState.own-fingerprint;
                 horizontal-stretch: 1;
                 vertical-alignment: center;
             }
             Button {
-                text: UiState.copied-card ? "✔ Copied" : "Copy identity card";
+                text: UiState.copied-card ? "✔ Copied" : "Copy identity card (T)";
                 clicked => { Actions.copy-card(); }
             }
         }
@@ -153,24 +153,21 @@ component HubStep inherits VerticalLayout {
             value: UiState.public-key;
         }
         if UiState.has-identity: Small {
-            text: "Paste this device's signed card into each device that should trust it. Cards expire after 30 days — to renew, copy this card again and import it on every device that should keep trusting this one.";
+            text: "Paste this device's signed card into each device that should trust it, or use LAN setup below to send it over the network. Cards expire after 30 days — to renew, copy this card again and import it on every device that should keep trusting this one.";
+        }
+        if UiState.has-identity: Small {
+            text: "The fingerprint identifies this device's key. It is what the other device shows you to check during LAN setup, and it does not change when a card is renewed.";
         }
         if UiState.has-identity: HorizontalLayout {
             spacing: Theme.pad-s;
             alignment: start;
             Button {
-                text: UiState.copied-private-key ? "✔ Private key copied" : "Back up private key";
+                text: UiState.copied-private-key ? "✔ Private key copied" : "Back up private key (B)";
                 clicked => { Actions.copy-private-key(); }
             }
-            Button { text: "Reset identity…"; clicked => { Actions.request-reset-identity(); } }
+            Button { text: "Reset identity… (X)"; clicked => { Actions.request-reset-identity(); } }
         }
         Small { text: "Config: " + UiState.config-path; wrap: char-wrap; }
-        if UiState.presence-conflict != "": Text {
-            text: UiState.presence-conflict;
-            color: Theme.warn;
-            font-size: Theme.font-body;
-            wrap: word-wrap;
-        }
     }
     Card {
         CardTitle { text: "Trust another device"; }
@@ -192,7 +189,7 @@ component HubStep inherits VerticalLayout {
         HorizontalLayout {
             alignment: start;
             Button {
-                text: "Import trusted device";
+                text: "Import trusted device (I)";
                 primary: true;
                 enabled: UiState.peer-card-valid;
                 clicked => { Actions.import-peer-card(); }
@@ -292,7 +289,7 @@ export component HomeScreen inherits ScrollView {
         Text { text: "duocb"; font-size: Theme.font-title; font-weight: 800; }
         Body { text: "Peer-to-peer clipboard sharing between two devices."; }
         Weak {
-            text: "Both devices can send and receive. Configured devices authenticate with their application identity keys; quick mode still uses a PIN.";
+            text: "Both devices can send and receive, and authenticate with their application identity keys.";
         }
         Rectangle { height: Theme.pad-s; }
 
@@ -314,15 +311,16 @@ export component HomeScreen inherits ScrollView {
 
         Rectangle { vertical-stretch: 1; }
 
-        // Quick pairing needs no standing identity, so expose it both before
-        // setup and on the configured hub, matching mobile.
-        if UiState.configure-step == ConfigureStep.setup-choice || UiState.configure-step == ConfigureStep.ready: WideButton {
-            text: "⚡ Quick options — local network only";
+        // LAN setup hands over this device's signed card, so it needs an
+        // identity to exist first — unlike the old quick pairing, it is offered
+        // only from the configured hub.
+        if UiState.configure-step == ConfigureStep.ready: WideButton {
+            text: "🔗 LAN setup — trade cards over the network";
             hint: "Q";
-            clicked => { Actions.open-quick(); }
+            clicked => { Actions.open-lan-setup(); }
         }
-        if UiState.configure-step == ConfigureStep.setup-choice || UiState.configure-step == ConfigureStep.ready: Small {
-            text: "Quick pair connects directly to a nearby duocb device via a short PIN and does not use saved identities.";
+        if UiState.configure-step == ConfigureStep.ready: Small {
+            text: "Use this when you can't copy and paste identity cards between the two devices. They find each other on the local network with a short PIN, then you check fingerprints before trusting.";
             horizontal-alignment: center;
         }
         if UiState.configure-step == ConfigureStep.setup-choice || UiState.configure-step == ConfigureStep.ready: Small {

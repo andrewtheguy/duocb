@@ -1,10 +1,10 @@
-//! Short, human-typable PIN used by quick mode's nostr signaling.
+//! Short, human-typable PIN that authenticates a LAN setup session.
 //!
-//! In PIN quick mode the server shares its ephemeral node id through nostr without
+//! In LAN setup the host shares its ephemeral node id over the local network without
 //! any copy-paste: it shows a short PIN that **rotates every 60 seconds**. The PIN
-//! is the only secret the client types; both sides turn it into a nostr keypair
-//! (via [`derive_key_material`]) that locates and decrypts a single relay record
-//! carrying the node id (see `crate::nostr`).
+//! is the only secret the joiner types; both sides turn it into a keypair
+//! (via [`derive_key_material`]) that locates and decrypts a single rendezvous record
+//! carrying the node id (see `crate::lan`).
 //!
 //! The PIN alphabet is **Crockford base32** — unambiguous letters/numbers only (no
 //! `I L O U`). It is always *displayed* uppercase and grouped (`XXXX-XXXX`); input is
@@ -12,27 +12,19 @@
 //! `O` → `0` as a courtesy. The canonical form fed to the KDF is the de-grouped uppercase
 //! string.
 //!
-//! The **first character partitions the alphabet by channel**: a first char in the lower
-//! half (`0123456789ABCDEF`) marks a nostr-carrying PIN (the default nostr+LAN or the
-//! internet-only channel), while the upper half (`GHJKMNPQRSTVWXYZ`) marks a
-//! **LAN-only** PIN. The LAN-only channel speaks spec-compliant DNS-SD, which is not
-//! wire-compatible with the default channel's LAN responder (see `crate::lan`), so a joiner
-//! must know which discovery to run *before* it resolves. Encoding that one bit in the PIN
-//! lets the joiner infer the channel from the typed code alone — it never has to pick one.
-//! See [`generate_pin`] (mint side) and [`pin_is_lan_only`] (join side).
-//!
 //! The last of the PIN's characters is a **check digit** (a position-weighted sum of the
 //! preceding data characters), so a mistyped PIN is rejected on input rather than silently
-//! deriving the wrong key. That leaves 7 random data characters, but the first carries only
-//! ~4 bits (one of 16, not 32) because of the channel partition, so ~34 random bits total;
-//! the check digit adds no secrecy, only typo rejection. The PIN is a quick-mode ephemeral
-//! secret, rotated every 60s, so the 1-bit reduction is inconsequential.
+//! deriving the wrong key. That leaves 7 uniformly random data characters — 35 bits; the
+//! check digit adds no secrecy, only typo rejection.
 //!
-//! Because the PIN is short (~35 bits) and the encrypted record sits on public relays,
-//! the key derivation is deliberately slow and memory-hard (**Argon2id**): a captured
-//! record resists offline brute-force, and the 60-second rotation plus a short record TTL
-//! bound the exposure window. Test builds stretch with the Argon2id minimum instead — see
-//! [`WORK_FACTORS`].
+//! Because the PIN is short (35 bits), the key derivation is deliberately slow and
+//! memory-hard (**Argon2id**): a captured record resists offline brute-force, and the
+//! 60-second rotation plus a short record TTL bound the exposure window. Test builds
+//! stretch with the Argon2id minimum instead — see [`WORK_FACTORS`].
+//!
+//! The PIN authenticates the *channel*, never an identity. It is deliberately not
+//! sufficient to become a trusted device: the cards that cross a LAN-setup connection
+//! are only imported after the user compares fingerprints (see `crate::card_exchange`).
 //!
 //! Two independent keys are derived from a PIN, both with the same Argon2id work factor but
 //! **domain-separated** salts (see [`derive_key_material`] and [`derive_auth_key_material`]):
@@ -53,13 +45,8 @@ use rand::Rng;
 /// Crockford base32 alphabet: digits + uppercase letters minus the ambiguous `I L O U`.
 const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
-/// Index into [`ALPHABET`] that splits it in half by channel. A PIN's first character comes
-/// from the lower half (`< HALF`) for a nostr-carrying channel and the upper half (`>= HALF`)
-/// for the LAN-only channel; see the module docs and [`pin_is_lan_only`].
-const HALF: usize = ALPHABET.len() / 2;
-
 /// Number of significant characters in a PIN (the canonical, de-grouped form). The last
-/// is a check digit, leaving 7 random data characters (~35 bits).
+/// is a check digit, leaving 7 random data characters (35 bits).
 pub const PIN_LEN: usize = 8;
 
 /// Trailing characters of a PIN that form the check digit (typo detection).
@@ -119,18 +106,11 @@ fn check_char(data: &[u8]) -> u8 {
 }
 
 /// Generate a fresh random PIN in canonical form (`PIN_LEN` uppercase Crockford chars, no
-/// grouping): `PIN_DATA_LEN` random data characters followed by a check digit. The **first**
-/// character is drawn from the alphabet half selected by `lan_only` (upper half for the
-/// LAN-only channel, lower half otherwise), so [`pin_is_lan_only`] can recover the channel
-/// on the join side; the remaining data characters are uniform over the whole alphabet.
-pub fn generate_pin(lan_only: bool) -> String {
+/// grouping): `PIN_DATA_LEN` random data characters followed by a check digit. Every data
+/// character is uniform over the whole alphabet.
+pub fn generate_pin() -> String {
     let mut rng = rand::rng();
     let mut out = String::with_capacity(PIN_LEN);
-    // First data char: pick from the channel's 16-char half. 256 is a multiple of 16, so
-    // `byte % HALF` is unbiased; the `lan_only` offset lands it in the upper or lower half.
-    let base = if lan_only { HALF } else { 0 };
-    let first: u8 = rng.random();
-    out.push(ALPHABET[base + (first as usize % HALF)] as char);
     while out.len() < PIN_DATA_LEN {
         // 256 is a multiple of 32, so `byte % 32` is already unbiased; no rejection needed.
         let byte: u8 = rng.random();
@@ -138,18 +118,6 @@ pub fn generate_pin(lan_only: bool) -> String {
     }
     out.push(check_char(out.as_bytes()) as char);
     out
-}
-
-/// Whether a canonical PIN marks the **LAN-only** channel — i.e. its first character is in
-/// the upper half of the alphabet (see [`generate_pin`] and the module docs). Input is
-/// expected in canonical form (from [`normalize_pin`]); a leading char outside the alphabet
-/// reads as not-LAN-only.
-pub fn pin_is_lan_only(canonical_pin: &str) -> bool {
-    canonical_pin
-        .bytes()
-        .next()
-        .and_then(|b| ALPHABET.iter().position(|&a| a == b))
-        .is_some_and(|idx| idx >= HALF)
 }
 
 /// Normalize user-typed input to the canonical PIN form, or `None` if it is not a valid
@@ -308,43 +276,36 @@ mod tests {
 
     #[test]
     fn generated_pin_is_canonical_and_unambiguous() {
-        for lan_only in [false, true] {
-            for _ in 0..50 {
-                let pin = generate_pin(lan_only);
-                assert_eq!(pin.len(), PIN_LEN);
-                assert!(pin.chars().all(|c| ALPHABET.contains(&(c as u8))));
-                // No ambiguous characters are ever emitted.
-                assert!(!pin.contains(['I', 'L', 'O', 'U']));
-                // Normalizing a generated PIN is the identity.
-                assert_eq!(normalize_pin(&pin).as_deref(), Some(pin.as_str()));
-            }
+        for _ in 0..100 {
+            let pin = generate_pin();
+            assert_eq!(pin.len(), PIN_LEN);
+            assert!(pin.chars().all(|c| ALPHABET.contains(&(c as u8))));
+            // No ambiguous characters are ever emitted.
+            assert!(!pin.contains(['I', 'L', 'O', 'U']));
+            // Normalizing a generated PIN is the identity.
+            assert_eq!(normalize_pin(&pin).as_deref(), Some(pin.as_str()));
         }
     }
 
+    /// Every data position draws from the whole alphabet — no position is
+    /// reserved to encode anything, so the code carries its full 35 bits.
     #[test]
-    fn first_char_encodes_the_channel() {
-        for _ in 0..200 {
-            let lan = generate_pin(true);
-            assert!(pin_is_lan_only(&lan), "LAN-only PIN {lan} must read as LAN-only");
-            let first = lan.as_bytes()[0];
-            assert!(
-                ALPHABET[HALF..].contains(&first),
-                "LAN-only first char {} must be in the upper half",
-                first as char
-            );
-
-            let net = generate_pin(false);
-            assert!(!pin_is_lan_only(&net), "default PIN {net} must not read as LAN-only");
-            let first = net.as_bytes()[0];
-            assert!(
-                ALPHABET[..HALF].contains(&first),
-                "default first char {} must be in the lower half",
-                first as char
+    fn every_data_position_uses_the_whole_alphabet() {
+        let mut seen: Vec<std::collections::HashSet<u8>> =
+            vec![std::collections::HashSet::new(); PIN_DATA_LEN];
+        for _ in 0..2000 {
+            let pin = generate_pin();
+            for (i, b) in pin.as_bytes()[..PIN_DATA_LEN].iter().enumerate() {
+                seen[i].insert(*b);
+            }
+        }
+        for (i, chars) in seen.iter().enumerate() {
+            assert_eq!(
+                chars.len(),
+                ALPHABET.len(),
+                "position {i} never emitted the full alphabet"
             );
         }
-        // The two halves are disjoint and cover the whole alphabet.
-        assert_eq!(HALF, 16);
-        assert!(!pin_is_lan_only(""));
     }
 
     /// Build a valid canonical PIN from a 7-char data prefix by appending its check digit.
@@ -386,7 +347,7 @@ mod tests {
 
     #[test]
     fn normalize_rejects_single_char_typo() {
-        let pin = generate_pin(false);
+        let pin = generate_pin();
         // Flip the first data char to a different alphabet symbol; the check digit no
         // longer matches, so the typo is caught.
         let first = pin.as_bytes()[0];
@@ -404,7 +365,7 @@ mod tests {
     #[test]
     fn generated_pins_always_validate() {
         for _ in 0..200 {
-            let pin = generate_pin(rand::rng().random());
+            let pin = generate_pin();
             assert_eq!(
                 normalize_pin(&pin).as_deref(),
                 Some(pin.as_str()),

@@ -1,33 +1,25 @@
-//! LAN transports for the encrypted PIN rendezvous record — the local-network
-//! siblings of the nostr transport in `crate::nostr`. Both backends carry the
-//! same record (see `crate::pin_record`): a TXT attribute holding the NIP-44
-//! ciphertext of the server's ephemeral node id, under a service instance
-//! label derived from the `(pin, bucket)` public key — the same
-//! lookup-by-derived-key model as the nostr record's author key.
+//! LAN transports for the encrypted PIN rendezvous record that bootstraps a LAN
+//! setup session. Both backends carry the same record (see `crate::pin_record`):
+//! the NIP-44 ciphertext of the host's ephemeral node id, under a service
+//! instance label derived from the `(pin, bucket)` public key — so a record is
+//! found by deriving its key from the typed PIN, never by naming a device.
 //!
-//! Two wire backends, selected by the PIN channel:
+//! Two wire backends, used together:
 //!
-//! - **swarm** ([`advertise_pin_record`] / [`lookup_pin_record`]) — the LAN
-//!   half of the default nostr+LAN channel. swarm-discovery, the same engine
-//!   iroh's mDNS address lookup runs on (same version, socket options with
-//!   SO_REUSEADDR/SO_REUSEPORT), so this responder coexists with the one every
-//!   endpoint already runs. Its packets are mDNS-*like* but not DNS-SD
-//!   conformant (no PTR records), so only swarm peers see each other.
 //! - **dnssd** ([`dnssd_advertise_pin_record`] / [`dnssd_lookup_pin_record`])
-//!   — the LAN-only channel. Spec-compliant DNS-SD (RFC 6762/6763) via the
+//!   — the multicast path. Spec-compliant DNS-SD (RFC 6762/6763) via the
 //!   mdns-sd responder, so it interoperates with Bonjour. DNS-SD records carry
 //!   real SRV/A/AAAA data, so the lookup returns the host's direct socket
 //!   addresses ([`PinFound`]) and the joiner dials them explicitly.
-//!
-//! The two backends do not see each other on the wire: a LAN-only host is
-//! found by a LAN-only joiner, and the default channel's LAN race only finds
-//! default-channel hosts (its nostr half covers everything else).
+//! - **unicast** ([`unicast_advertise_pin_record`] / [`unicast_lookup_pin_record`])
+//!   — the fallback for networks that block multicast. The host serves the same
+//!   record on a PIN-derived TCP port and the joiner reaches it by typing the
+//!   host's LAN IP, so no port is ever typed.
 //!
 //! Session traffic remains direct between devices either way, but there is no
 //! packet-level on-link subnet filter.
 
 mod dnssd;
-mod swarm;
 mod unicast;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -40,9 +32,7 @@ use sha2::{Digest, Sha256};
 
 pub use unicast::UnicastListener;
 
-/// mDNS service name; swarm records live under `_duocb-pin._udp.local.`.
-const PIN_SERVICE_NAME: &str = "duocb-pin";
-/// The same service as a full DNS-SD type domain (dnssd backend).
+/// The DNS-SD service type PIN records are advertised under.
 const DNSSD_SERVICE_TYPE: &str = "_duocb-pin._udp.local.";
 /// TXT attribute key carrying the encrypted record content.
 const TXT_KEY: &str = "e";
@@ -89,8 +79,7 @@ fn side_channel_port(keys: &Keys) -> u16 {
 
 /// A resolved LAN rendezvous hit: the decrypted node id plus the direct socket
 /// addresses reassembled from the DNS-SD records (A/AAAA + SRV port, `p6` TXT
-/// override for the v6 socket). Empty `addrs` on the swarm path, which carries
-/// no trusted address data — there the iroh mDNS lookup resolves the dial.
+/// override for the v6 socket).
 pub struct PinFound {
     pub node_id: EndpointId,
     pub addrs: Vec<SocketAddr>,
@@ -110,57 +99,27 @@ impl PinFound {
 
 /// A live LAN advertisement of one bucket's PIN record; dropping it withdraws
 /// the record from the network.
-pub struct PinAdvert(#[expect(dead_code, reason = "held for Drop")] AdvertKind);
+pub struct PinAdvert(#[expect(dead_code, reason = "held for Drop")] dnssd::Advert);
 
-#[expect(dead_code, reason = "variants held for Drop")]
-enum AdvertKind {
-    /// swarm-discovery responder guard (default channel).
-    Swarm(swarm_discovery::DropGuard),
-    /// DNS-SD registration (LAN-only channel).
-    Dnssd(dnssd::Advert),
-}
-
-/// Advertise the PIN rendezvous record on the default channel's swarm backend:
-/// the server's ephemeral node id, encrypted under `keys` (the
-/// `(pin, bucket)`-derived keypair). `addrs` should be the endpoint's direct
-/// socket addresses (advisory on this backend — the dial resolves the node id
-/// via iroh's own mDNS lookup). Must be called within a tokio runtime.
-pub fn advertise_pin_record(
-    keys: &Keys,
-    node_id: &EndpointId,
-    addrs: &[SocketAddr],
-) -> Result<PinAdvert> {
-    swarm::advertise(keys, node_id, addrs).map(|g| PinAdvert(AdvertKind::Swarm(g)))
-}
-
-/// Look up the PIN rendezvous record on the default channel's swarm backend,
-/// trying each candidate keypair (the caller derives one per adjacent bucket —
-/// see `pin_record::candidate_keys`). Returns the decrypted node id, or
-/// `Ok(None)` when no matching record answered within the browse window
-/// (wrong/expired PIN, or the two devices are not on the same network). The
-/// connection is then authenticated in-band with the same PIN
-/// (`crate::pin_auth`).
-pub async fn lookup_pin_record(candidates: &[Keys]) -> Result<Option<EndpointId>> {
-    swarm::lookup(candidates).await
-}
-
-/// Advertise the PIN rendezvous record for the LAN-only channel as a
-/// spec-compliant DNS-SD service instance. Unlike the swarm backend the
-/// advertised SRV/A/AAAA data is load-bearing: the joiner dials the resolved
-/// addresses directly. `addrs` must hold at least one direct socket address.
+/// Advertise the PIN rendezvous record as a spec-compliant DNS-SD service
+/// instance. The advertised SRV/A/AAAA data is load-bearing: the joiner dials
+/// the resolved addresses directly. `addrs` must hold at least one direct
+/// socket address.
 pub async fn dnssd_advertise_pin_record(
     keys: &Keys,
     node_id: &EndpointId,
     addrs: &[SocketAddr],
 ) -> Result<PinAdvert> {
-    dnssd::advertise(keys, node_id, addrs)
-        .await
-        .map(|a| PinAdvert(AdvertKind::Dnssd(a)))
+    dnssd::advertise(keys, node_id, addrs).await.map(PinAdvert)
 }
 
-/// Look up the PIN rendezvous record for the LAN-only channel over DNS-SD.
-/// Returns the decrypted node id **and** the host's direct socket addresses;
-/// `Ok(None)` when no matching record answered within the browse window.
+/// Look up the PIN rendezvous record over DNS-SD, trying each candidate keypair
+/// (the caller derives one per adjacent bucket — see
+/// `pin_record::candidate_keys`). Returns the decrypted node id **and** the
+/// host's direct socket addresses; `Ok(None)` when no matching record answered
+/// within the browse window (wrong/expired PIN, or the two devices are not on
+/// the same network). The connection is then authenticated in-band with the
+/// same PIN (`crate::pin_auth`).
 pub async fn dnssd_lookup_pin_record(candidates: &[Keys]) -> Result<Option<PinFound>> {
     dnssd::lookup(candidates).await
 }

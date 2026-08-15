@@ -1,14 +1,19 @@
 // Shared enums and row structs. The exported enums are the routing types on
 // both sides: the Rust `App` stores the generated equivalents directly.
 
-/// Which screen is showing. The two non-home screens are the two connection
-/// roles; both peers send and receive once paired — the role only decides who
-/// sets the connection up.
+/// Which screen is showing. `server`/`client` are the two connection roles;
+/// both peers send and receive once paired — the role only decides who sets the
+/// connection up. The three `lan-*` screens are the trust-bootstrap path, which
+/// never carries a connection at all.
 export enum Screen {
     /// The configure mode's wizard/hub — the primary flow.
     home,
-    /// The quick-options wizard: ad-hoc rotating-PIN pairing, nothing saved.
-    quick,
+    /// LAN setup: choose to show a PIN or to type one.
+    lan-setup,
+    /// LAN setup in progress: showing a PIN, or dialing one.
+    lan-pairing,
+    /// LAN setup finished: compare fingerprints, then import or cancel.
+    lan-confirm,
     /// Start a connection: this device hosts and shows credentials.
     server,
     /// Join a connection: this device enters credentials and dials.
@@ -27,13 +32,6 @@ export enum ConfigureStep {
     ready,
     /// The device picker, shown only after choosing Join on the hub.
     join,
-}
-
-/// The pairing mode. `nostr-key` is the configure mode (home); `pin` is the
-/// local-only quick rotating-PIN option (nothing saved).
-export enum PairMode {
-    nostr-key,
-    pin,
 }
 
 /// One row of a device list. `line` is fully composed in Rust and

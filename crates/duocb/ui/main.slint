@@ -3,16 +3,16 @@
 // side through the `UiState` global; all intents go back through `Actions`.
 
 import { UiState, Actions } from "globals.slint";
-import { Screen, ConfigureStep, PairMode, PeerRow, ClipRow, PathRow } from "types.slint";
+import { Screen, ConfigureStep, PeerRow, ClipRow, PathRow } from "types.slint";
 import { Theme } from "theme.slint";
 import { HomeScreen } from "configure.slint";
-import { QuickScreen } from "quick.slint";
+import { LanSetupScreen, LanPairingScreen, LanConfirmScreen } from "lan.slint";
 import { ServerScreen } from "server.slint";
 import { ClientScreen } from "client.slint";
 import { ResetIdentityModal, ConnPathModal } from "modals.slint";
 
 // Everything the Rust side needs by name.
-export { UiState, Actions, Screen, ConfigureStep, PairMode, PeerRow, ClipRow, PathRow }
+export { UiState, Actions, Screen, ConfigureStep, PeerRow, ClipRow, PathRow }
 
 export component MainWindow inherits Window {
     title: "duocb";
@@ -28,7 +28,7 @@ export component MainWindow inherits Window {
     /// fields count.
     out property <bool> any-field-focused:
         (UiState.screen == Screen.home && home.field-focused)
-        || (UiState.screen == Screen.quick && quick.field-focused)
+        || (UiState.screen == Screen.lan-setup && lan-setup.field-focused)
         || (UiState.screen == Screen.server && server.field-focused)
         || (UiState.screen == Screen.client && client.field-focused);
 
@@ -93,7 +93,9 @@ export component MainWindow inherits Window {
                 // Screens are all instantiated (visibility-toggled) so their
                 // `field-focused` out-properties stay referencable above.
                 home := HomeScreen { visible: UiState.screen == Screen.home; }
-                quick := QuickScreen { visible: UiState.screen == Screen.quick; }
+                lan-setup := LanSetupScreen { visible: UiState.screen == Screen.lan-setup; }
+                LanPairingScreen { visible: UiState.screen == Screen.lan-pairing; }
+                LanConfirmScreen { visible: UiState.screen == Screen.lan-confirm; }
                 server := ServerScreen { visible: UiState.screen == Screen.server; }
                 client := ClientScreen { visible: UiState.screen == Screen.client; }
             }

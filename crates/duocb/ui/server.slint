@@ -3,7 +3,6 @@
 // screen, so the not-running state is a brief teardown transient.
 
 import { UiState, Actions } from "globals.slint";
-import { PairMode } from "types.slint";
 import { Theme } from "theme.slint";
 import { Card, Body, Weak, Small, BackHeader, IdentityPairingSummary, LabeledValue } from "widgets.slint";
 import { SessionPanel } from "session.slint";
@@ -23,80 +22,15 @@ export component ServerScreen inherits ScrollView {
         BackHeader { title: "Start a connection"; }
         Body { text: "Status: " + UiState.status-text; }
 
-        if UiState.server-running && UiState.mode == PairMode.nostr-key: IdentityPairingSummary { }
-        if UiState.server-running && UiState.mode == PairMode.nostr-key: Small {
+        if UiState.server-running: IdentityPairingSummary { }
+        if UiState.server-running: Small {
             text: "Your other devices see this one as hosting — pick it in their list to join.";
-        }
-
-        if UiState.server-running && UiState.mode == PairMode.pin
-            && UiState.pin-display != "": VerticalLayout {
-            spacing: Theme.pad-xs;
-            alignment: start;
-            Body {
-                text: "Type this PIN on the other device:";
-                horizontal-alignment: center;
-            }
-            Text {
-                text: UiState.pin-display;
-                font-family: UiState.mono-font;
-                font-size: Theme.font-pin;
-                font-weight: 700;
-                horizontal-alignment: center;
-            }
-            HorizontalLayout {
-                alignment: center;
-                spacing: Theme.pad-s;
-                Button {
-                    text: UiState.copied-pin ? "✔ Copied" : "Copy PIN (" + UiState.cmd-label + "+T)";
-                    clicked => { Actions.copy-pin(); }
-                }
-                Button {
-                    text: "↻ New PIN";
-                    clicked => { Actions.refresh-pin(); }
-                }
-            }
-            Body {
-                text: UiState.pin-countdown;
-                horizontal-alignment: center;
-            }
-            // LAN-only channel: if the other device can't find this one
-            // automatically (multicast blocked), the joiner can type this IP.
-            if UiState.host-lan-ip != "": Small {
-                text: "Can't find it automatically? Enter this IP on the other device:";
-                horizontal-alignment: center;
-            }
-            if UiState.host-lan-ip != "": Text {
-                text: UiState.host-lan-ip;
-                font-family: UiState.mono-font;
-                font-size: Theme.font-body;
-                horizontal-alignment: center;
-            }
-        }
-        // Paired: the PIN is spent. Show both node ids — this device's own id
-        // and the paired peer's — so the user can eyeball that each side
-        // matches the other's displayed value.
-        if UiState.server-running && UiState.mode == PairMode.pin
-            && UiState.pin-display == "" && UiState.pin-paired
-            && UiState.node-id-short != "": LabeledValue {
-            label: "This device's id:";
-            value: UiState.node-id-short;
-        }
-        if UiState.server-running && UiState.mode == PairMode.pin
-            && UiState.pin-display == "" && UiState.pin-paired
-            && UiState.peer-node-id-short != "": LabeledValue {
-            label: "Paired with:";
-            value: UiState.peer-node-id-short;
-        }
-        if UiState.server-running && UiState.mode == PairMode.pin
-            && UiState.pin-display == "" && UiState.pin-paired
-            && UiState.node-id-short != "": Small {
-            text: "Confirm these match the other device's shown ids.";
         }
 
         if UiState.server-running: HorizontalLayout {
             alignment: start;
             Button {
-                text: "⏹ Stop";
+                text: "⏹ Stop (Esc)";
                 clicked => { Actions.go-back(); }
             }
         }

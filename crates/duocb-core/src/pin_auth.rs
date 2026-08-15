@@ -228,12 +228,10 @@ where
 /// already been read off the stream (the listener reads it to choose the auth method).
 ///
 /// `candidates` are the PIN auth keypairs for the recent rotation buckets; the dialer's proof is
-/// verified against each. Once a candidate verifies the proof, `commit` is invoked with it **before**
+/// verified against each. Once a candidate verifies the proof, `commit` is invoked **before**
 /// acceptance is sent: returning `false` (e.g. another peer won the one-pair claim first) turns this
-/// into a rejection, so a race loser is never told it was accepted. Returns `Ok(matched_key)` — the
-/// candidate key that verified the proof — when one matches and `commit` accepts it (and our proof
-/// has been sent), so the caller can retain it to re-authenticate a reconnecting peer after the PIN
-/// has rotated out of the recent cache. Otherwise sends a rejection and returns `Err`.
+/// into a rejection, so a race loser is never told it was accepted. Otherwise sends a rejection and
+/// returns `Err`.
 ///
 /// `dialer_id`/`listener_id` are the dialer's node id (the QUIC-authenticated
 /// `Connection::remote_id()`) and this listener's own id; folding them into the verified proof
@@ -248,11 +246,11 @@ pub async fn listener_handshake<W, R, F>(
     dialer_id: &str,
     listener_id: &str,
     commit: F,
-) -> Result<Keys>
+) -> Result<()>
 where
     W: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
-    F: FnOnce(&Keys) -> bool,
+    F: FnOnce() -> bool,
 {
     let nonce_l = generate_nonce();
 
@@ -279,7 +277,7 @@ where
     //    final say *before* acceptance is written, so a peer that loses the one-pair race is
     //    rejected rather than briefly told it was accepted and then dropped.
     match matched {
-        Some(keys) if commit(keys) => {
+        Some(keys) if commit() => {
             let proof_l = seal_proof(
                 keys,
                 Direction::Listener,
@@ -289,7 +287,7 @@ where
                 listener_id,
             )?;
             write_frame(send, &encode_pin_confirm(&PinConfirm::accepted(proof_l))?).await?;
-            Ok((*keys).clone())
+            Ok(())
         }
         Some(_) => {
             write_frame(
@@ -329,7 +327,7 @@ mod tests {
 
     // A valid canonical PIN (7 data chars + check digit) for tests.
     fn test_pin() -> String {
-        crate::pin::generate_pin(false)
+        crate::pin::generate_pin()
     }
 
     /// Read the opening AuthRequest and return its PIN nonce, mirroring how the runtime reads the
@@ -409,10 +407,9 @@ mod tests {
                 &nonce_d,
                 &l_id_d,
                 &l_id_l,
-                |_| true,
+                || true,
             )
             .await
-            .map(|_| ())
         };
         tokio::join!(dialer_task, listener_task)
     }
@@ -463,10 +460,9 @@ mod tests {
                 &nonce_d,
                 ID_D,
                 ID_L,
-                |_| false,
+                || false,
             )
             .await
-            .map(|_| ())
         };
         let (d, l) = tokio::join!(dialer_task, listener_task);
         // Match the explicit rejection message rather than just `is_err()`, which would also pass

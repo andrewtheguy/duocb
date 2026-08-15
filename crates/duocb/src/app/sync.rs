@@ -22,7 +22,6 @@ impl App {
         // Navigation / shared status.
         s.set_screen(self.screen);
         s.set_configure_step(self.configure_step);
-        s.set_mode(self.mode);
         s.set_status_text(self.status_text().into());
         s.set_connected(self.status == ConnStatus::Connected);
         s.set_server_running(self.server_running);
@@ -32,13 +31,11 @@ impl App {
         // Configure identity / wizard.
         s.set_display_identity(self.display_identity().into());
         s.set_has_identity(self.self_card.is_some());
-        s.set_public_key_short(
-            short_id(&self.identity.to_npub())
-                .into(),
+        s.set_own_fingerprint(
+            duocb_core::auth::key_fingerprint(&self.identity.public_key()).into(),
         );
         s.set_public_key(self.identity.to_npub().into());
         s.set_config_path(self.config_lock.path().display().to_string().into());
-        s.set_presence_conflict(SharedString::default());
         let copied = self.copied_target();
         s.set_copied_card(copied == Some(CopyTarget::Card));
         s.set_copied_private_key(copied == Some(CopyTarget::PrivateKey));
@@ -103,11 +100,15 @@ impl App {
         let rows: Vec<PeerRow> = self
             .peers
             .iter()
-            .map(|p| {
+            .enumerate()
+            .map(|(i, p)| {
                 let key = p.public_key().to_hex();
                 PeerRow {
                     public_key: key.clone().into(),
-                    line: format!("{}  · {}", p.name(), short_id(&p.npub())).into(),
+                    // The fingerprint, not a truncated npub: it is the value the
+                    // user compared at import time, so showing the same one here
+                    // lets the pairing be re-verified out of band later.
+                    line: self.peer_row_line(i).unwrap_or_default().into(),
                     note: card_expiry_note(p).into(),
                     expired: p.is_expired(),
                     selected: self.selected_peer.as_deref() == Some(key.as_str()),
@@ -121,7 +122,7 @@ impl App {
         s.set_peers_empty_text(if !self.peers.is_empty() {
             SharedString::default()
         } else {
-            "No trusted peers yet. Paste the other device's signed card on the hub.".into()
+            "No trusted peers yet. Paste the other device's signed card above, or use LAN setup to send it over the network.".into()
         });
         s.set_join_ready(self.selected_peer_card().is_some());
 
@@ -157,7 +158,14 @@ impl App {
             }
             _ => SharedString::default(),
         });
-        s.set_pin_paired(self.pin_paired);
+
+        // LAN setup confirmation: the incoming card beside this device's own
+        // identity. Blank whenever no card is pending, so a stale fingerprint
+        // can never linger on screen for the user to compare against.
+        let (incoming_name, incoming_fingerprint, incoming_expiry) = self.incoming_card_display();
+        s.set_incoming_name(incoming_name.into());
+        s.set_incoming_fingerprint(incoming_fingerprint.into());
+        s.set_incoming_expiry(incoming_expiry.into());
 
         // Client join forms. The two group fields together make the PIN.
         // Distinguish "still typing" (fewer than a full PIN's characters) from
@@ -174,22 +182,15 @@ impl App {
         });
         let canonical_pin = duocb_core::pin::normalize_pin(&combined);
         s.set_pin_invalid(pin_full && canonical_pin.is_none());
-        s.set_pin_not_local(
-            canonical_pin
-                .as_deref()
-                .is_some_and(|pin| !duocb_core::pin::pin_is_lan_only(pin)),
-        );
         // Drives the joiner's auto-advance from the first group to the second.
         s.set_pin_a_full(
             duocb_core::pin::pin_input_len(&self.in_pin_a) == duocb_core::pin::PIN_GROUP_LEN,
         );
-        // The optional host-IP entry shows only for a LAN-only PIN (its first
-        // character marks the channel — see `duocb_core::pin`). It is constrained
-        // to this device's own subnet: `join-ip-prefix` is the locked network
-        // part the user types after, `join-ip-hint` a range hint for a
-        // partial-octet subnet, and `join-ip-error` the out-of-range / malformed
-        // message. `dial_ready` (below) folds validity in via `client_dial_spec`.
-        s.set_pin_is_lan_only(duocb_core::pin::pin_is_lan_only(&combined));
+        // The optional host-IP entry is constrained to this device's own
+        // subnet: `join-ip-prefix` is the locked network part the user types
+        // after, `join-ip-hint` a range hint for a partial-octet subnet, and
+        // `join-ip-error` the out-of-range / malformed message. `dial_ready`
+        // (below) folds validity in via `lan_setup_dial_spec`.
         s.set_join_ip_prefix(self.join_ip_ctx.locked_prefix().into());
         s.set_join_ip_placeholder(self.join_ip_ctx.host_placeholder().into());
         s.set_join_ip_hint(self.join_ip_ctx.hint().into());
@@ -200,7 +201,7 @@ impl App {
             JoinIpOutcome::Malformed => "Not a valid IPv4 address".into(),
             JoinIpOutcome::Empty | JoinIpOutcome::InRange(_) => SharedString::default(),
         });
-        s.set_dial_ready(self.client_dial_spec().is_some());
+        s.set_dial_ready(self.lan_setup_dial_spec().is_some());
 
         // Session panel.
         s.set_sent_flash(self.sent_flash_active());

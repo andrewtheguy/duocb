@@ -1,0 +1,307 @@
+// LAN setup: bootstrap trust between two devices that cannot copy and paste
+// identity cards to each other. A rotating PIN authenticates a local-network
+// channel, both devices swap signed cards over it, and the user confirms the
+// fingerprint before anything is trusted. No clipboard content ever crosses a
+// LAN-setup connection — that is what the configure-mode session is for.
+
+import { UiState, Actions } from "globals.slint";
+import { Theme } from "theme.slint";
+import { Card, CardTitle, Body, Weak, Small, Mono, BigButton, WideButton, BackHeader, LabeledValue } from "widgets.slint";
+import { Button, LineEdit, ScrollView } from "std-widgets.slint";
+
+// Step one: choose a role. Show a PIN here, or type the one shown there.
+export component LanSetupScreen inherits ScrollView {
+    out property <bool> field-focused:
+        pin-a.has-focus || pin-b.has-focus || ip-entry.has-focus;
+    viewport-width: root.width;
+    viewport-height: max(root.height, content.preferred-height);
+    horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
+    mouse-drag-pan-enabled: true;
+
+    content := VerticalLayout {
+        alignment: start;
+        spacing: Theme.pad-m;
+
+        BackHeader { title: "LAN setup"; }
+        Weak {
+            text: "Trade identity cards with a nearby device over the local network — for when you can't copy and paste a card between them.";
+        }
+
+        Card {
+            CardTitle { text: "How this works"; }
+            Small {
+                text: "One device shows a PIN and the other types it. Both then show the card they received: check that the fingerprint matches the one the other device shows for itself before you import it. Afterwards the two devices are paired as usual, and you share the clipboard from the home screen.";
+            }
+        }
+
+        Card {
+            CardTitle { text: "Local network only"; }
+            Small {
+                text: "No third-party server participates: discovery uses Bonjour (DNS-SD) and traffic stays direct between the devices. If multicast is blocked, the joining device can type the IP shown while hosting. This is a discovery policy, not a packet-level subnet boundary; reflected mDNS, a VPN/overlay, or globally routed addresses can extend the direct path beyond a conventional LAN.";
+            }
+        }
+
+        Card {
+            CardTitle { text: "Show a PIN"; }
+            BigButton {
+                text: "📡 Show a PIN on this device";
+                hint: "S";
+                clicked => { Actions.host-lan-setup(); }
+            }
+            Small {
+                text: "A short PIN appears on this device. Enter it on the other device within a minute — it renews every 60 seconds until a device answers.";
+            }
+        }
+
+        // Type the PIN shown on the other device. An optional host-IP field
+        // appears once the PIN is valid — fill it only when automatic discovery
+        // (mDNS) is blocked on the network.
+        Card {
+            CardTitle { text: "Enter a PIN"; }
+
+            pin-form := VerticalLayout {
+                alignment: start;
+                spacing: Theme.pad-xs;
+                // Two four-character groups (dash as a static label,
+                // auto-advance, backspace hop); Enter in either group joins.
+                HorizontalLayout {
+                    alignment: start;
+                    spacing: Theme.pad-xs;
+                    pin-a := LineEdit {
+                        min-width: 96px;
+                        horizontal-alignment: center;
+                        font-family: UiState.mono-font;
+                        placeholder-text: "XXXX";
+                        text <=> UiState.in-pin-a;
+                        edited => {
+                            Actions.fields-edited();
+                            if UiState.pin-a-full { pin-b.focus(); }
+                        }
+                        accepted => { Actions.join-lan-setup(); }
+                    }
+                    Text {
+                        text: "-";
+                        vertical-alignment: center;
+                        font-size: Theme.font-pin;
+                    }
+                    pin-b := LineEdit {
+                        min-width: 96px;
+                        horizontal-alignment: center;
+                        font-family: UiState.mono-font;
+                        placeholder-text: "XXXX";
+                        text <=> UiState.in-pin-b;
+                        edited => { Actions.fields-edited(); }
+                        key-pressed(event) => {
+                            if event.text == Key.Backspace && self.text == "" {
+                                pin-a.focus();
+                                EventResult.accept
+                            } else {
+                                EventResult.reject
+                            }
+                        }
+                        accepted => { Actions.join-lan-setup(); }
+                    }
+                }
+                // Neutral progress while typing; a warning only once the whole
+                // PIN is in but fails its checksum.
+                if UiState.pin-incomplete != "": Weak {
+                    text: UiState.pin-incomplete;
+                }
+                if UiState.pin-invalid: Text {
+                    text: "Not a valid PIN (check for typos)";
+                    color: Theme.warn;
+                    font-size: Theme.font-body;
+                }
+            }
+
+            // Optional host-IP entry. Kept instantiated (so `ip-entry` can
+            // report focus for shortcut gating).
+            ip-col := VerticalLayout {
+                alignment: start;
+                spacing: Theme.pad-xs;
+                Small {
+                    text: "Optional — only if the other device isn't found automatically. Type the IP it shows.";
+                }
+                // The network part of this device's subnet is locked ahead of
+                // the field, so the user types only the host part (the whole
+                // address is still accepted if pasted).
+                HorizontalLayout {
+                    spacing: Theme.pad-xs;
+                    if UiState.join-ip-prefix != "": Mono {
+                        text: UiState.join-ip-prefix;
+                        vertical-alignment: center;
+                    }
+                    ip-entry := LineEdit {
+                        font-family: UiState.mono-font;
+                        placeholder-text: UiState.join-ip-prefix != "" ? UiState.join-ip-placeholder : "Host IP (optional)";
+                        text <=> UiState.in-join-ip;
+                        edited => { Actions.fields-edited(); }
+                        accepted => { Actions.join-lan-setup(); }
+                    }
+                }
+                if UiState.join-ip-hint != "": Small {
+                    text: UiState.join-ip-hint;
+                }
+                if UiState.join-ip-error != "": Text {
+                    text: UiState.join-ip-error;
+                    color: Theme.warn;
+                    font-size: Theme.font-body;
+                }
+            }
+
+            WideButton {
+                text: "🔗 Join";
+                hint: "C";
+                enabled: UiState.dial-ready;
+                clicked => { Actions.join-lan-setup(); }
+            }
+            Small {
+                text: "Type the PIN shown on the hosting device.";
+            }
+        }
+    }
+}
+
+// Step two: this device is showing a PIN, or dialing one.
+export component LanPairingScreen inherits ScrollView {
+    out property <bool> field-focused: false;
+    viewport-width: root.width;
+    viewport-height: max(root.height, content.preferred-height);
+    horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
+    mouse-drag-pan-enabled: true;
+
+    content := VerticalLayout {
+        alignment: start;
+        spacing: Theme.pad-m;
+
+        BackHeader { title: "LAN setup"; }
+        Body { text: "Status: " + UiState.status-text; }
+
+        if UiState.pin-display != "": VerticalLayout {
+            spacing: Theme.pad-xs;
+            alignment: start;
+            Body {
+                text: "Type this PIN on the other device:";
+                horizontal-alignment: center;
+            }
+            Text {
+                text: UiState.pin-display;
+                font-family: UiState.mono-font;
+                font-size: Theme.font-pin;
+                font-weight: 700;
+                horizontal-alignment: center;
+            }
+            HorizontalLayout {
+                alignment: center;
+                spacing: Theme.pad-s;
+                Button {
+                    text: UiState.copied-pin ? "✔ Copied" : "Copy PIN (" + UiState.cmd-label + "+T)";
+                    clicked => { Actions.copy-pin(); }
+                }
+                Button {
+                    text: "↻ New PIN (R)";
+                    clicked => { Actions.refresh-pin(); }
+                }
+            }
+            Body {
+                text: UiState.pin-countdown;
+                horizontal-alignment: center;
+            }
+            // If the other device can't find this one automatically (multicast
+            // blocked), the joiner can type this IP.
+            if UiState.host-lan-ip != "": Small {
+                text: "Can't find it automatically? Enter this IP on the other device:";
+                horizontal-alignment: center;
+            }
+            if UiState.host-lan-ip != "": Text {
+                text: UiState.host-lan-ip;
+                font-family: UiState.mono-font;
+                font-size: Theme.font-body;
+                horizontal-alignment: center;
+            }
+        }
+
+        HorizontalLayout {
+            alignment: start;
+            Button {
+                text: "⏹ Cancel (Esc)";
+                clicked => { Actions.go-back(); }
+            }
+        }
+    }
+}
+
+// Step three: the cards have crossed. The user compares fingerprints before
+// anything is written to the trusted list.
+export component LanConfirmScreen inherits ScrollView {
+    out property <bool> field-focused: false;
+    viewport-width: root.width;
+    viewport-height: max(root.height, content.preferred-height);
+    horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
+    mouse-drag-pan-enabled: true;
+
+    content := VerticalLayout {
+        alignment: start;
+        spacing: Theme.pad-m;
+
+        BackHeader { title: "Check the fingerprint"; }
+
+        // The instruction comes first: the whole screen is one comparison, and
+        // it only means anything if the user knows what to compare.
+        Card {
+            CardTitle { text: "Compare these two devices"; }
+            Body {
+                text: "The incoming fingerprint below must match the fingerprint the other device shows for itself. If it doesn't, press Cancel — something else answered your PIN.";
+            }
+        }
+
+        Card {
+            CardTitle { text: "This device"; }
+            LabeledValue {
+                label: "Name:";
+                value: UiState.display-identity;
+            }
+            Text {
+                text: UiState.own-fingerprint;
+                font-family: UiState.mono-font;
+                font-size: Theme.font-heading;
+                font-weight: 700;
+                wrap: word-wrap;
+            }
+        }
+
+        Card {
+            CardTitle { text: "Incoming card"; }
+            LabeledValue {
+                label: "Name:";
+                value: UiState.incoming-name;
+            }
+            Text {
+                text: UiState.incoming-fingerprint;
+                font-family: UiState.mono-font;
+                font-size: Theme.font-heading;
+                font-weight: 700;
+                wrap: word-wrap;
+            }
+            if UiState.incoming-expiry != "": Small {
+                text: UiState.incoming-expiry;
+            }
+        }
+
+        WideButton {
+            text: "✔ Fingerprint matches — import";
+            hint: "I / Enter";
+            clicked => { Actions.import-received-card(); }
+        }
+        HorizontalLayout {
+            alignment: start;
+            Button {
+                text: "Cancel (C / Esc)";
+                clicked => { Actions.cancel-received-card(); }
+            }
+        }
+        Small {
+            text: "Importing adds this device to the trusted list. Do the same on the other device, then use Start and Join on the home screen to share the clipboard.";
+        }
+    }
+}

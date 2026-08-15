@@ -35,8 +35,8 @@ export component ResetIdentityModal inherits Rectangle {
             HorizontalLayout {
                 spacing: Theme.pad-s;
                 alignment: end;
-                Button { text: "Reset identity"; clicked => { Actions.confirm-reset-identity(); } }
-                Button { text: "Cancel"; clicked => { Actions.cancel-reset-identity(); } }
+                Button { text: "Reset identity (Enter)"; clicked => { Actions.confirm-reset-identity(); } }
+                Button { text: "Cancel (Esc)"; clicked => { Actions.cancel-reset-identity(); } }
             }
         }
     }
@@ -87,8 +87,8 @@ export component ConnPathModal inherits Rectangle {
             HorizontalLayout {
                 spacing: Theme.pad-s;
                 alignment: end;
-                Button { text: "Close"; clicked => { Actions.close-conn-path(); } }
-                Button { text: "Refresh"; clicked => { Actions.query-conn-path(); } }
+                Button { text: "Close (Esc)"; clicked => { Actions.close-conn-path(); } }
+                Button { text: "Refresh (R)"; clicked => { Actions.query-conn-path(); } }
             }
         }
     }

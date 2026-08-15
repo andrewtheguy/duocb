@@ -5,10 +5,14 @@
 //! are short-lived transport identities used only to establish QUIC.
 //!
 //! An [`IdentityCard`] — the token one device hands another to be trusted —
-//! carries a mandatory expiry and lasts [`CARD_TTL_SECS`]. Cards never travel
-//! over the wire, so expiry is enforced by each side against its own stored
-//! copy: pairing is refused once that copy lapses, and the only way back is for
-//! the owner to hand over a fresh card.
+//! carries a mandatory expiry and lasts [`CARD_TTL_SECS`]. A card crosses the
+//! wire only while being handed over: either by copy-paste, or over a LAN setup
+//! session, where a PIN-authenticated local connection carries it and the user
+//! confirms its [`key_fingerprint`] before it is stored (see
+//! `crate::card_exchange`). It never travels during a clipboard session — that
+//! handshake carries raw public keys — so expiry is enforced by each side
+//! against its own stored copy: pairing is refused once that copy lapses, and
+//! the only way back is for the owner to hand over a fresh card.
 
 use anyhow::{Context, Result};
 use nostr_sdk::prelude::*;
@@ -40,6 +44,41 @@ pub const CARD_RENEW_BEFORE_SECS: u64 = 7 * 24 * 60 * 60;
 /// Seconds since the Unix epoch, the clock all card expiry is judged against.
 pub fn unix_now() -> u64 {
     Timestamp::now().as_secs()
+}
+
+/// Domain separator for [`key_fingerprint`], so the digest can never collide
+/// with any other hash this crate takes over a public key.
+const FINGERPRINT_DOMAIN: &[u8] = b"duocb:key-fingerprint:v1\0";
+/// Bytes of digest kept in a fingerprint. 80 bits: enough that forging a key
+/// with a matching fingerprint is a 2^80 second-preimage search, short enough
+/// that a human will actually read all of it off two screens.
+const FINGERPRINT_BYTES: usize = 10;
+
+/// The human-comparable fingerprint of an application public key, shown on both
+/// devices during LAN setup so the user can confirm the card they are about to
+/// import really belongs to the device in front of them.
+///
+/// Taken over the **32-byte public key**, not the card: a card's `created_at`
+/// and signature change every time its owner re-mints it, while local trust is
+/// keyed on the public key. Fingerprinting the key means the value stays put
+/// across renewals, so it can also be re-checked out of band long after pairing.
+///
+/// Deliberately *not* a hash over both peers' keys. A per-key fingerprint forces
+/// an impostor into a second preimage against a fixed target (2^80 here); a
+/// combined "pairing code" shown identically on both screens would instead let
+/// an interposer grind both of its own keypairs for a birthday collision, at
+/// half the exponent, since nothing here commits either side to a key before it
+/// learns the other's.
+pub fn key_fingerprint(key: &PublicKey) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(FINGERPRINT_DOMAIN);
+    hasher.update(key.to_bytes());
+    let digest = hasher.finalize();
+    digest[..FINGERPRINT_BYTES]
+        .chunks(2)
+        .map(|pair| format!("{:02X}{:02X}", pair[0], pair[1]))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Persisted, application-level identity. Debug output never exposes the secret.
@@ -270,6 +309,12 @@ impl IdentityCard {
             .expect("verified public key is encodable")
     }
 
+    /// This card's [`key_fingerprint`] — the value the user cross-checks against
+    /// the other device before importing.
+    pub fn fingerprint(&self) -> String {
+        key_fingerprint(&self.public_key())
+    }
+
     pub fn created_at(&self) -> u64 {
         self.event.created_at.as_secs()
     }
@@ -323,6 +368,54 @@ mod tests {
         assert_eq!(parsed.public_key(), identity.public_key());
         assert_eq!(parsed.expires_at(), parsed.created_at() + CARD_TTL_SECS);
         assert!(!parsed.is_expired());
+    }
+
+    /// The fingerprint the user cross-checks is a pure function of the public
+    /// key, so re-minting a card — which changes its `created_at` and signature,
+    /// and therefore its bytes — must leave the displayed value untouched.
+    /// Otherwise every renewal would look to the user like a different device.
+    #[test]
+    fn fingerprint_is_key_bound_and_survives_a_card_renewal() {
+        let identity = Identity::generate();
+        let early = identity
+            .card_issued_at("mac-book", "a7B2c3D4", 1_700_000_000)
+            .unwrap();
+        let renewed = identity
+            .card_issued_at("mac-book", "a7B2c3D4", 1_700_000_000 + CARD_TTL_SECS)
+            .unwrap();
+        assert_ne!(early.encode(), renewed.encode(), "a renewal is a new card");
+        assert_eq!(early.fingerprint(), renewed.fingerprint());
+        assert_eq!(early.fingerprint(), key_fingerprint(&identity.public_key()));
+
+        // A rename does not change the key, so it does not change the value the
+        // user compares either.
+        let renamed = identity.card("desktop", "a7B2c3D4").unwrap();
+        assert_eq!(renamed.fingerprint(), early.fingerprint());
+
+        // Distinct identities are distinguishable.
+        let other = Identity::generate();
+        assert_ne!(
+            key_fingerprint(&identity.public_key()),
+            key_fingerprint(&other.public_key())
+        );
+    }
+
+    /// The rendering is what a human reads off two screens: fixed width, one
+    /// case, and grouped so a mismatch in the middle is actually noticeable.
+    #[test]
+    fn fingerprint_is_grouped_uppercase_hex_of_a_fixed_width() {
+        let fp = key_fingerprint(&Identity::generate().public_key());
+        let groups: Vec<&str> = fp.split(' ').collect();
+        assert_eq!(groups.len(), FINGERPRINT_BYTES / 2);
+        assert!(groups.iter().all(|g| g.len() == 4));
+        assert!(
+            fp.chars()
+                .all(|c| c == ' ' || c.is_ascii_digit() || c.is_ascii_uppercase()),
+            "unexpected characters in {fp}"
+        );
+        assert!(fp.chars().filter(|c| *c != ' ').all(|c| c.is_ascii_hexdigit()));
+        // 80 bits shown, so an impostor faces a 2^80 second preimage.
+        assert_eq!(FINGERPRINT_BYTES * 8, 80);
     }
 
     /// A card is usable up to its expiry and dead the second after, and the

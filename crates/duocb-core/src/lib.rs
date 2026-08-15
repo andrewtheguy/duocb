@@ -7,6 +7,7 @@
 pub use iroh;
 
 pub mod auth;
+pub mod card_exchange;
 pub mod identity;
 pub mod lan;
 pub mod net;

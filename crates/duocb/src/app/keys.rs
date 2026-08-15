@@ -32,11 +32,34 @@ pub(crate) fn handle_global_key(
     let enter = plain && key == Some(char::from(Key::Return));
     let up = plain && key == Some(char::from(Key::UpArrow));
     let down = plain && key == Some(char::from(Key::DownArrow));
-    let command_enter = command && key == Some(char::from(Key::Return));
     // A plain (unmodified) letter shortcut.
     let letter = |c: char| plain && key.is_some_and(|k| k.eq_ignore_ascii_case(&c));
     // A command-modified letter shortcut.
     let command = |c: char| command && key.is_some_and(|k| k.eq_ignore_ascii_case(&c));
+
+    // A modal owns the keyboard while it is up, so Esc dismisses the modal
+    // rather than navigating the screen behind it.
+    if app.confirm_reset_identity {
+        if enter {
+            app.reset_identity();
+            app.confirm_reset_identity = false;
+        } else if esc {
+            app.confirm_reset_identity = false;
+        } else {
+            return false;
+        }
+        return true;
+    }
+    if app.conn_path.is_some() {
+        if esc {
+            app.conn_path = None;
+        } else if letter('r') {
+            app.net.send(duocb_core::net::UiCommand::QueryConnPath);
+        } else {
+            return false;
+        }
+        return true;
+    }
 
     if focus_free && app.screen != Screen::Home && esc {
         app.go_back();
@@ -45,30 +68,44 @@ pub(crate) fn handle_global_key(
 
     let handled = match app.screen {
         Screen::Home if focus_free => handle_configure_key(app, esc, enter, up, down, &letter, &command),
-        Screen::Quick if focus_free => {
-            // Quick pairing is always local-only. S hosts; C joins with the PIN
-            // and optional host IP entered on this screen.
+        Screen::LanSetup if focus_free => {
+            // S shows a PIN here; C joins with the PIN and optional host IP
+            // entered on this screen.
             if letter('s') {
-                app.begin_server();
+                app.host_lan_setup();
             } else if letter('c') {
-                app.join_quick();
+                app.join_lan_setup();
             } else {
                 return handle_session_key(app, focus_free, &command);
             }
             true
         }
-        Screen::Server => {
-            // Copy the current rotating PIN without the mouse.
-            if command('t') && app.pin_display.is_some() {
+        Screen::LanPairing => {
+            // Copy the current rotating PIN, or mint a new one, without the
+            // mouse. `t` is offered plain as well as command-modified: this
+            // screen has no text fields, so nothing can be hijacked.
+            let has_pin = app.pin_display.is_some();
+            if has_pin && (command('t') || (focus_free && letter('t'))) {
                 let pin = app.pin_display.clone().unwrap();
                 app.copy_with_flash(&pin, CopyTarget::Pin);
+                true
+            } else if has_pin && focus_free && letter('r') {
+                app.net.send(duocb_core::net::UiCommand::RefreshPin);
                 true
             } else {
                 false
             }
         }
-        Screen::Client if !app.client_active && command_enter => {
-            app.connect_client();
+        // Accept or refuse the card only from the screen that shows the
+        // fingerprints — trust is never one keystroke away from anywhere else.
+        Screen::LanConfirm if focus_free => {
+            if enter || letter('i') {
+                app.import_received_card();
+            } else if letter('c') {
+                app.cancel_received_card();
+            } else {
+                return false;
+            }
             true
         }
         _ => false,
@@ -93,9 +130,7 @@ fn handle_configure_key(
 ) -> bool {
     match app.configure_step {
         ConfigureStep::SetupChoice => {
-            if letter('q') {
-                app.open_quick();
-            } else if letter('g') {
+            if letter('g') {
                 app.begin_generate_identity();
             } else if letter('i') {
                 app.configure_step = ConfigureStep::SetupImport;
@@ -105,29 +140,45 @@ fn handle_configure_key(
             true
         }
         ConfigureStep::SetupImport => {
-            if esc {
+            if letter('u') {
+                app.use_imported_identity();
+            } else if esc {
                 app.cancel_setup();
-                true
             } else {
-                false
+                return false;
             }
+            true
         }
         ConfigureStep::SetupName => {
-            if esc && app.has_saved_identity() {
+            if enter {
+                app.save_name();
+            } else if esc && app.has_saved_identity() {
                 app.cancel_name();
-                true
             } else {
-                false
+                return false;
             }
+            true
         }
         ConfigureStep::Ready => {
+            // Every hub action is reachable from the keyboard; the labels carry
+            // the letter so a tester never has to look them up.
             if letter('q') {
-                app.open_quick();
+                app.open_lan_setup();
             } else if letter('s') {
                 app.begin_server();
             } else if letter('c') {
                 app.enter_join_picker();
-            } else if command('t') {
+            } else if letter('r') {
+                app.reset_name_field();
+                app.configure_step = ConfigureStep::SetupName;
+            } else if letter('b') {
+                let private_key = app.identity.to_nsec();
+                app.copy_with_flash(&private_key, CopyTarget::PrivateKey);
+            } else if letter('x') {
+                app.confirm_reset_identity = true;
+            } else if letter('i') {
+                app.import_peer_card();
+            } else if command('t') || letter('t') {
                 let Some(encoded) = app.self_card.as_ref().map(duocb_core::auth::IdentityCard::encode)
                 else {
                     return false;
@@ -174,6 +225,12 @@ fn handle_session_key(app: &mut App, focus_free: bool, command: &dyn Fn(char) ->
         if let Some(text) = app.inbox.first().map(|i| i.text.clone()) {
             app.copy_with_flash(&text, CopyTarget::Inbox(0));
         }
+    } else if command('o') {
+        if let Some(text) = app.outbox.as_ref().map(|i| i.text.clone()) {
+            app.copy_with_flash(&text, CopyTarget::Outbox);
+        }
+    } else if command('d') {
+        app.net.send(duocb_core::net::UiCommand::QueryConnPath);
     } else if command('l') {
         app.inbox.clear();
     } else {
@@ -182,122 +239,131 @@ fn handle_session_key(app: &mut App, focus_free: bool, command: &dyn Fn(char) ->
     true
 }
 
-#[cfg(all(test, any()))]
+/// Shortcut routing. Every CTA in the app is reachable from the keyboard, which
+/// is what lets a QA pass drive the whole flow without the mouse — so these
+/// assert the routes exist and, just as importantly, that plain letters stay
+/// inert while a text field has focus.
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::tests::test_app;
-    use crate::PairMode;
+    use crate::app::lan_setup_tests::{cleanup, configured_app, peer_card};
 
-    const ESC: &str = "\u{1b}";
-
-    /// A key with no modifiers held.
-    fn plain(app: &mut App, text: &str, field_focused: bool) -> bool {
-        handle_global_key(app, text, true, false, field_focused)
+    /// Press a plain (unmodified) key.
+    fn plain(app: &mut App, text: &str) -> bool {
+        handle_global_key(app, text, true, false, false)
     }
 
-    /// A key with exactly the command modifier held.
-    fn command(app: &mut App, text: &str, field_focused: bool) -> bool {
-        handle_global_key(app, text, false, true, field_focused)
+    /// Press a plain key while a text field has focus.
+    fn typing(app: &mut App, text: &str) -> bool {
+        handle_global_key(app, text, true, false, true)
     }
 
     #[test]
-    fn quick_screen_letters_route() {
-        let mut app = test_app();
-        app.open_quick();
-        assert_eq!(app.mode, PairMode::Pin);
-        // The former channel-selection keys no longer do anything.
-        assert!(!plain(&mut app, "p", false));
-        assert!(!plain(&mut app, "l", false));
-        assert!(!plain(&mut app, "i", false));
-        // C joins with the current entry — empty here, so it stays put.
-        assert!(plain(&mut app, "c", false));
-        assert_eq!(app.screen, Screen::Quick);
-    }
-
-    #[test]
-    fn quick_join_navigates_only_on_a_valid_entry() {
-        let mut app = test_app();
-        app.open_quick();
-        // An invalid PIN entry never leaves the quick screen.
-        app.in_pin_a = "XXXX".into();
-        app.in_pin_b = "XXXX".into();
-        app.join_quick();
-        assert_eq!(app.screen, Screen::Quick);
-        assert!(!app.client_active);
-        // A valid PIN dials and moves to the client screen.
-        let pin = duocb_core::pin::generate_pin(true);
-        let g = duocb_core::pin::PIN_GROUP_LEN;
-        app.in_pin_a = pin[..g].to_string();
-        app.in_pin_b = pin[g..].to_string();
-        app.join_quick();
-        assert_eq!(app.screen, Screen::Client);
-        assert!(app.client_active);
-    }
-
-    #[test]
-    fn letters_ignored_while_field_focused() {
-        let mut app = test_app();
-        app.open_quick();
-        // A quick-screen shortcut that would route while unfocused is ignored.
-        assert!(!plain(&mut app, "c", true));
-        assert_eq!(app.screen, Screen::Quick);
-    }
-
-    #[test]
-    fn wizard_keys_route() {
-        let mut app = test_app();
-        assert_eq!(app.configure_step, ConfigureStep::SetupChoice);
-        // Quick mode is identity-free and available before identity setup.
-        assert!(plain(&mut app, "q", false));
-        assert_eq!(app.screen, Screen::Quick);
-        app.go_back();
-        assert_eq!(app.screen, Screen::Home);
-        assert_eq!(app.configure_step, ConfigureStep::SetupChoice);
-        // Generate persists the secret and jumps straight to naming — no
-        // intermediate "save the secret" step.
-        assert!(plain(&mut app, "g", false));
-        assert_eq!(app.configure_step, ConfigureStep::SetupName);
-        assert!(app.secret.is_some());
-        // Import opens the paste step, and Esc backs out to the choice.
-        app.reset_identity();
-        assert_eq!(app.configure_step, ConfigureStep::SetupChoice);
-        assert!(plain(&mut app, "i", false));
-        assert_eq!(app.configure_step, ConfigureStep::SetupImport);
-        assert!(plain(&mut app, ESC, false));
-        assert_eq!(app.configure_step, ConfigureStep::SetupChoice);
-    }
-
-    #[test]
-    fn modified_keys_do_not_trigger_plain_shortcuts() {
-        let mut app = test_app();
-        // ⌘G on the setup choice must not start generating…
-        assert!(!command(&mut app, "g", false));
-        assert_eq!(app.configure_step, ConfigureStep::SetupChoice);
-        // …and neither may a letter with any other modifier (plain=false,
-        // command=false — e.g. Shift or Alt held).
-        assert!(!handle_global_key(&mut app, "G", false, false, false));
-        assert_eq!(app.configure_step, ConfigureStep::SetupChoice);
-        // Modified Esc must not navigate either.
-        app.open_quick();
-        assert!(!handle_global_key(&mut app, ESC, false, false, false));
-        assert_eq!(app.screen, Screen::Quick);
-        // And ⌘Enter in the join picker must not join.
-        app.screen = Screen::Home;
-        app.mode = PairMode::NostrKey;
-        app.configure_step = ConfigureStep::Join;
-        let enter = char::from(Key::Return).to_string();
-        assert!(!command(&mut app, &enter, false));
-    }
-
-    #[test]
-    fn join_picker_arrows_and_escape() {
-        let mut app = test_app();
-        app.configure_step = ConfigureStep::Join;
-        app.peers = vec![crate::app::tests::peer("a", "s1")];
-        let down = char::from(Key::DownArrow).to_string();
-        assert!(plain(&mut app, &down, false));
-        assert_eq!(app.selected_peer.as_deref(), Some("s1"));
-        assert!(plain(&mut app, ESC, false));
+    fn hub_letters_reach_every_hub_action() {
+        let (mut app, path) = configured_app();
         assert_eq!(app.configure_step, ConfigureStep::Ready);
+
+        assert!(plain(&mut app, "q"));
+        assert_eq!(app.screen, Screen::LanSetup);
+        app.go_back();
+
+        assert!(plain(&mut app, "c"));
+        assert_eq!(app.configure_step, ConfigureStep::Join);
+        app.leave_join_picker();
+
+        assert!(plain(&mut app, "r"), "R renames");
+        assert_eq!(app.configure_step, ConfigureStep::SetupName);
+        app.cancel_name();
+
+        assert!(plain(&mut app, "x"), "X asks to reset the identity");
+        assert!(app.confirm_reset_identity);
+        // Esc dismisses the modal rather than navigating behind it.
+        assert!(plain(&mut app, "\u{1b}"));
+        assert!(!app.confirm_reset_identity);
+
+        assert!(plain(&mut app, "s"));
+        assert_eq!(app.screen, Screen::Server);
+
+        cleanup(app, path);
+    }
+
+    /// The LAN-setup flow end to end on the keyboard alone.
+    #[test]
+    fn lan_setup_flow_is_fully_keyboard_driven() {
+        let (mut app, path) = configured_app();
+
+        assert!(plain(&mut app, "q"));
+        assert_eq!(app.screen, Screen::LanSetup);
+
+        assert!(plain(&mut app, "s"), "S shows a PIN");
+        assert_eq!(app.screen, Screen::LanPairing);
+
+        // Esc backs out of pairing to the LAN-setup screen.
+        assert!(plain(&mut app, "\u{1b}"));
+        assert_eq!(app.screen, Screen::LanSetup);
+
+        // A received card, then I imports it.
+        app.apply_event(duocb_core::net::NetEvent::PeerCardReceived(Box::new(
+            peer_card("laptop", 0),
+        )));
+        assert_eq!(app.screen, Screen::LanConfirm);
+        assert!(plain(&mut app, "i"), "I imports");
+        assert_eq!(app.peers.len(), 1);
+        assert_eq!(app.screen, Screen::Home);
+
+        cleanup(app, path);
+    }
+
+    /// C on the confirmation screen refuses the card, the same as Cancel.
+    #[test]
+    fn c_refuses_a_pending_card() {
+        let (mut app, path) = configured_app();
+        app.apply_event(duocb_core::net::NetEvent::PeerCardReceived(Box::new(
+            peer_card("laptop", 0),
+        )));
+
+        assert!(plain(&mut app, "c"));
+        assert!(app.peers.is_empty(), "C must not trust the card");
+        assert!(app.pending_peer_card.is_none());
+        assert_eq!(app.screen, Screen::LanSetup);
+
+        cleanup(app, path);
+    }
+
+    /// Trust is never one stray keystroke away from a screen that is not
+    /// showing the fingerprints.
+    #[test]
+    fn import_only_fires_from_the_confirmation_screen() {
+        let (mut app, path) = configured_app();
+        app.apply_event(duocb_core::net::NetEvent::PeerCardReceived(Box::new(
+            peer_card("laptop", 0),
+        )));
+        // Navigate away without deciding (the card is dropped by go_back, so
+        // re-supply it and force the screen instead).
+        app.screen = Screen::Home;
+        app.pending_peer_card = Some(peer_card("laptop", 0));
+
+        assert!(!plain(&mut app, "i") || app.peers.is_empty());
+        assert!(
+            app.peers.is_empty(),
+            "I on the hub must not import a pending card"
+        );
+
+        cleanup(app, path);
+    }
+
+    /// A focused text field swallows plain letters, so typing a device name
+    /// never triggers a shortcut.
+    #[test]
+    fn plain_letters_are_inert_while_typing() {
+        let (mut app, path) = configured_app();
+        for key in ["q", "s", "c", "r", "x", "b", "t", "i"] {
+            assert!(!typing(&mut app, key), "{key} must not fire while typing");
+        }
+        assert_eq!(app.screen, Screen::Home);
+        assert_eq!(app.configure_step, ConfigureStep::Ready);
+        assert!(!app.confirm_reset_identity);
+
+        cleanup(app, path);
     }
 }

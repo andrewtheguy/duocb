@@ -50,9 +50,10 @@ clock only where trust is acted on. A card issued implausibly far in the future
 (beyond a five-minute skew grace) is never current, which bounds how far a fast
 clock can stretch a real lifetime.
 
-Cards never travel over the wire — the handshake carries raw application public
-keys — so each side enforces expiry against **its own stored copy** and there
-is no renewal protocol. The listener refuses a dialer whose stored card has
+The clipboard handshake carries raw application public keys, never a card, so
+each side enforces expiry against **its own stored copy** and there is no
+renewal protocol. (A card does cross the wire during LAN setup, but that is the
+hand-over itself — see below — and the receiving side still judges it locally.) The listener refuses a dialer whose stored card has
 lapsed before signing anything, and closes with a dedicated code so the dialer
 can say precisely what is wrong; the dialer refuses symmetrically before
 dialing. A host also stops publishing hosting records to peers whose cards have
@@ -124,28 +125,98 @@ identity. Nonces and roles prevent replay/reflection.
 
 The server's one-peer claim stores the stable application public key in
 configure mode. A reconnect may present a new iroh node id if it proves the same
-trusted application key; the claim updates the transport id. Quick mode has no
-application identity and continues to claim the session's iroh id.
+trusted application key; the claim updates the transport id. LAN setup has no
+application identity to claim and claims the session's iroh id instead.
 
-## Quick mode
+### Key fingerprints
 
-A rotating Crockford PIN drives:
+`auth::key_fingerprint` is a domain-separated SHA-256 over a device's 32-byte
+application public key, truncated to 80 bits and rendered as five groups of four
+uppercase hex characters. It is taken over the **key**, not a card: a renewed
+card is new bytes with a new timestamp and signature, while local trust is keyed
+on the public key, so the value a user reads must not move when a card is
+re-minted. It is shown for this device on the hub, beside every trusted peer,
+and on both sides of the LAN-setup confirmation.
 
-- Argon2id-derived rendezvous keys for Nostr and/or LAN discovery;
-- a separate Argon2id-derived in-band mutual proof;
-- mDNS/DNS-SD or an optional typed-IP unicast lookup in LAN-only mode.
+## LAN setup
 
-Quick mode persists no application key, peer card, iroh key, PIN, or session.
+The trust-bootstrap path, for two devices that cannot copy and paste a card
+between them. It is not a connection mode: it produces trusted peer cards, and
+every subsequent connection is an ordinary configure-mode one.
+
+A rotating Crockford PIN drives DNS-SD (or typed-IP unicast) discovery via an
+Argon2id-derived rendezvous key, then a separate Argon2id-derived in-band mutual
+proof. On the connection that authenticates, both sides exchange cards:
+
+```text
+D→L  AuthRequest::Pin  {nonce_d}
+L→D  PinChallenge      {nonce_l}
+D→L  PinResponse       {proof_d}
+L→D  PinConfirm        {accepted, proof_l}
+D→L  CardOffer         {card_d}     # both sent at once, then each side
+L→D  CardOffer         {card_l}     # finishes its stream and reads the peer's
+```
+
+Each side finishes its send stream only *after* reading the peer's card, so
+seeing the peer's end-of-stream proves the peer already holds ours — without
+that ordering, whichever side finished first would close the connection while
+the other was still reading, and QUIC's connection close discards undelivered
+stream data.
+
+The runtime verifies each card's signature and schema and emits it as
+`NetEvent::PeerCardReceived`; it decides nothing about trust. The host app shows
+both fingerprints and stores the card only when the user confirms.
+
+The session is one-shot: it carries no clipboard traffic (the session task holds
+no clipboard channel at all) and ends as soon as the cards have crossed. One PIN
+admits one device — the pair claim refuses a second, and a device still dialing
+when the exchange finishes is answered with a BUSY close rather than left
+waiting. Nothing but the imported card is persisted: no PIN, iroh key, or
+session survives.
+
+### Why the fingerprint check is load-bearing
+
+The PIN proves possession of a short code, not an identity. It is ~35 bits and
+the construction is not a PAKE, so anyone who reads, shoulder-surfs, or guesses
+it inside its 60-second window can complete the handshake and offer a card of
+their choosing. The human fingerprint comparison is what catches that, because
+the value compared never crossed the network.
+
+- **Per-key, not combined.** The fingerprint commits to one public key, so an
+  impostor must find a key whose fingerprint equals a *given* target — a
+  second-preimage problem, 2^80 here. A "session code" hashing both devices'
+  keys would instead let an interposer vary both of its own keys and hunt for a
+  collision between two freely-grindable sets: a birthday problem at 2^40 for
+  the same displayed length. Nothing here commits either side to a key before it
+  learns the other's, so there is no commitment step to restore the full bound.
+  That asymmetry is why the digest covers one key alone.
+- **One direction suffices.** An interposer holds two separate PIN-authenticated
+  connections and offers its own card each way, so both devices see its
+  fingerprint. Comparing either device's incoming value against the other's own
+  displayed value already fails for it.
+- **Auto-exchange leaks nothing.** A card is public material its owner hands out
+  by copy-paste anyway, and carries no private key. Receiving one is not
+  trusting it; only Import writes to the trusted list.
+- **Bounded blast radius.** A LAN-setup connection carries no clipboard content,
+  so a card slipped past an inattentive user grants only what any imported card
+  grants: the ability to be dialed as a trusted peer, which still requires the
+  mutual application-key handshake and the victim choosing to Join.
 
 ## Runtime commands and events
 
-Key configure commands:
+Key commands:
 
 - `StartServer::NostrKey { KeyIdentity }`
 - `Connect::NostrKey { KeyIdentity, peer_public_key }`
+- `StartServer::LanSetup { self_card }`
+- `Connect::LanSetup { canonical_pin, self_card, target_ip }`
+
+and the LAN-setup event `NetEvent::PeerCardReceived(IdentityCard)`.
 
 The runtime never mutates caller-owned trust; the host app owns the peer list
-and passes a snapshot of it in with each command.
+and passes a snapshot of it in with each command. That still holds for LAN
+setup: the runtime only *delivers* a verified card, and the host app decides
+whether it is trusted.
 
 ## Persistence and bounds
 
@@ -160,7 +231,9 @@ wire clipboard frames are capped at 1 MiB.
 
 ## Security assumptions
 
-- Identity cards are transferred over a path the owner trusts.
+- Identity cards are transferred over a path the owner trusts: a clipboard the
+  owner controls, or a LAN-setup connection whose fingerprint the owner checked.
+  Skipping that check reduces LAN setup's security to the PIN alone.
 - Card expiry bounds how long a leaked or abandoned card stays useful, but only
   against a peer whose clock is roughly correct: expiry is enforced locally, so
   a device whose clock is set far back keeps honouring a lapsed card.
