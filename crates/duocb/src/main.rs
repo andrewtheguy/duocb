@@ -40,8 +40,7 @@ fn set_platform_fonts(ui: &MainWindow) {
     use slint::ComponentHandle;
     let (ui_font, mono_font) = if cfg!(target_os = "macos") {
         // ".SF NS" is the hidden family name of the San Francisco system
-        // font; the friendlier aliases (".AppleSystemUIFont", "SF Pro") do
-        // not resolve through Skia's CoreText matching.
+        // font and resolves reliably through the platform font database.
         (".SF NS", "Menlo")
     } else if cfg!(target_os = "windows") {
         ("Segoe UI", "Consolas")
