@@ -122,7 +122,7 @@ impl App {
         s.set_peers_empty_text(if !self.peers.is_empty() {
             SharedString::default()
         } else {
-            "No trusted peers yet. Paste the other device's signed card above, or use LAN setup to send it over the network.".into()
+            "No trusted peers yet. Paste the other device's signed card above, or use Trade cards to send it over the network.".into()
         });
         s.set_join_ready(self.selected_peer_card().is_some());
 
@@ -159,7 +159,7 @@ impl App {
             _ => SharedString::default(),
         });
 
-        // LAN setup confirmation: the incoming card beside this device's own
+        // Card-setup confirmation: the incoming card beside this device's own
         // identity. Blank whenever no card is pending, so a stale fingerprint
         // can never linger on screen for the user to compare against.
         let (incoming_name, incoming_fingerprint, incoming_expiry) = self.incoming_card_display();
@@ -190,7 +190,7 @@ impl App {
         // subnet: `join-ip-prefix` is the locked network part the user types
         // after, `join-ip-hint` a range hint for a partial-octet subnet, and
         // `join-ip-error` the out-of-range / malformed message. `dial_ready`
-        // (below) folds validity in via `lan_setup_dial_spec`.
+        // (below) folds validity in via `card_setup_dial_spec`.
         s.set_join_ip_prefix(self.join_ip_ctx.locked_prefix().into());
         s.set_join_ip_placeholder(self.join_ip_ctx.host_placeholder().into());
         s.set_join_ip_hint(self.join_ip_ctx.hint().into());
@@ -201,7 +201,15 @@ impl App {
             JoinIpOutcome::Malformed => "Not a valid IPv4 address".into(),
             JoinIpOutcome::Empty | JoinIpOutcome::InRange(_) => SharedString::default(),
         });
-        s.set_dial_ready(self.lan_setup_dial_spec().is_some());
+        s.set_dial_ready(self.card_setup_dial_spec().is_some());
+
+        // Card setup's channel: what the screen tells the user about how the
+        // devices find each other, and whether the manual host-IP path (which
+        // only exists on the local-network channel) is offered at all.
+        let (channel_title, channel_note) = self.setup_channel_text();
+        s.set_setup_channel_title(channel_title.into());
+        s.set_setup_channel_note(channel_note.into());
+        s.set_setup_lan_enabled(self.setup_channel.lan());
 
         // Session panel.
         s.set_sent_flash(self.sent_flash_active());

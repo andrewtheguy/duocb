@@ -95,20 +95,21 @@ fn create_endpoint_builder(readiness: EndpointReadiness) -> Result<EndpointBuild
 /// **Transport.** Every mode uses the default iroh stack — relays
 /// (`RelayMode::Default`) plus n0 DNS/pkarr *and* mDNS discovery — so a
 /// connection can always fall back to a relay or resolve across networks. The
-/// **one exception is `LanDirect`** (quick mode's LAN-only PIN channel):
+/// **one exception is `LanDirect`** (card setup's LAN-only channel):
 /// `create_endpoint_builder` strips the endpoint to `RelayMode::Disabled` with
 /// mDNS as the *only* address lookup, so no third-party server participates and
 /// traffic is never relayed through a middle server. This does not enforce that
 /// every direct path remains within a conventional LAN subnet.
 /// Note this is orthogonal to the *rendezvous* channel: e.g. `RelayOnline`
-/// (internet-only PIN) still keeps mDNS + direct paths on the endpoint, so its
-/// connection can be local even though its PIN discovery is nostr-only.
+/// (card setup's nostr-only channel) still keeps mDNS + direct paths on the
+/// endpoint, so its connection can be local even though its PIN discovery goes
+/// through relays.
 ///
 /// **The relay is never waited on unless the mode hard-requires the internet.**
-/// The quick modes that also work offline ([`DirectAddr`](Self::DirectAddr))
-/// gate only on a first local address — milliseconds — and let the relay and
-/// n0 discovery come online in the background, ready by the time a
-/// cross-network dial actually needs them.
+/// A mode that also works offline ([`DirectAddr`](Self::DirectAddr)) gates only
+/// on a first local address — milliseconds — and lets the relay and n0
+/// discovery come online in the background, ready by the time a cross-network
+/// dial actually needs them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EndpointReadiness {
     /// Wait for the home relay (`Endpoint::online`) and fail without it. The
@@ -117,16 +118,17 @@ pub enum EndpointReadiness {
     /// transport stack.
     RelayOnline,
     /// Wait only for a first direct (IP) address — effectively instant — on
-    /// the full default transport stack. The gate for modes that work both
-    /// online and offline (the default nostr+LAN PIN channel, and manual
-    /// mode): their credentials and LAN signaling need no internet, and the
-    /// relay connects concurrently for any later cross-network dial.
+    /// the full default transport stack. The gate for card setup's default
+    /// LAN-then-nostr channel, which works both online and offline: the LAN
+    /// half of its rendezvous needs no internet, so waiting on a relay would
+    /// stall a pairing that never needs one, while the relay connects
+    /// concurrently for the nostr fallback and any cross-network dial.
     DirectAddr,
     /// Wait only for a first direct (IP) address, and build the endpoint
     /// **relay-less** with no internet-backed discovery (no n0 DNS/pkarr):
-    /// mDNS only. The gate for the LAN-only PIN channel, which must come up
-    /// promptly without a third-party service. Its traffic is direct, but the
-    /// path is not restricted by source subnet.
+    /// mDNS only. The gate for card setup's LAN-only channel, which must come
+    /// up promptly without a third-party service. Its traffic is direct, but
+    /// the path is not restricted by source subnet.
     LanDirect,
 }
 

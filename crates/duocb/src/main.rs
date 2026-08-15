@@ -14,21 +14,63 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
-fn config_override() -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
-    let mut explicit = None;
-    let mut args = std::env::args_os().skip(1);
+/// Everything the command line decides. Both settings are launch-time only:
+/// neither is persisted, so a config carries no memory of how it was started.
+struct Cli {
+    /// Explicit config path (`--config`/`-c`, else `DUOCB_CONFIG`).
+    config: Option<PathBuf>,
+    /// Which transport(s) card setup uses for its PIN rendezvous.
+    setup_channel: duocb_core::net::SetupChannel,
+}
+
+/// Parse this process's arguments, falling back to `DUOCB_CONFIG` for the
+/// config path.
+fn parse_cli() -> Result<Cli, Box<dyn std::error::Error>> {
+    let mut cli = parse_args(std::env::args_os().skip(1))?;
+    cli.config = cli
+        .config
+        .or_else(|| std::env::var_os("DUOCB_CONFIG").map(PathBuf::from));
+    Ok(cli)
+}
+
+/// Parse the arguments this binary understands. Unrecognized arguments are
+/// ignored (the windowing toolkit gets its own), but a malformed value for a
+/// flag we *do* own is an error rather than a silently different setup — a
+/// channel override that was quietly dropped would make a test look like it
+/// exercised a path it never touched.
+fn parse_args(args: impl Iterator<Item = std::ffi::OsString>) -> Result<Cli, Box<dyn std::error::Error>> {
+    use duocb_core::net::SetupChannel;
+
+    let mut config = None;
+    let (mut lan_only, mut nostr_only) = (false, false);
+    let mut args = args;
     while let Some(arg) = args.next() {
         if arg == "--config" || arg == "-c" {
             let path = args.next().ok_or("--config requires a path")?;
-            explicit = Some(PathBuf::from(path));
+            config = Some(PathBuf::from(path));
         } else if let Some(value) = arg.to_str().and_then(|s| s.strip_prefix("--config=")) {
             if value.is_empty() {
                 return Err("--config requires a path".into());
             }
-            explicit = Some(PathBuf::from(value));
+            config = Some(PathBuf::from(value));
+        } else if arg == "--lan-only" {
+            lan_only = true;
+        } else if arg == "--nostr-only" {
+            nostr_only = true;
         }
     }
-    Ok(explicit.or_else(|| std::env::var_os("DUOCB_CONFIG").map(PathBuf::from)))
+    let setup_channel = match (lan_only, nostr_only) {
+        (true, true) => {
+            return Err("--lan-only and --nostr-only cannot both be given".into());
+        }
+        (true, false) => SetupChannel::LanOnly,
+        (false, true) => SetupChannel::NostrOnly,
+        (false, false) => SetupChannel::LanThenNostr,
+    };
+    Ok(Cli {
+        config,
+        setup_channel,
+    })
 }
 
 /// Pick the platform's native UI and monospace font families. Slint's
@@ -64,7 +106,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .init();
 
-    let config_path = config::resolve_path(config_override()?)?;
+    let cli = parse_cli()?;
+    let config_path = config::resolve_path(cli.config)?;
     // The lock is held (and moved into the app) until the GUI exits. A second
     // process may run only with another explicit config path, which gives
     // same-machine E2E tests isolated state.
@@ -86,7 +129,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         move || notify.notify_one()
     })));
 
-    let app = Rc::new(RefCell::new(app::App::new(config_lock, config, net)));
+    let app = Rc::new(RefCell::new(app::App::new(
+        config_lock,
+        config,
+        net,
+        cli.setup_channel,
+    )));
     app::callbacks::wire(&app, &ui);
     app.borrow().sync(&ui);
 
@@ -132,4 +180,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     app.borrow_mut().net.shutdown();
     result?;
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use duocb_core::net::SetupChannel;
+
+    fn parse(args: &[&str]) -> Result<Cli, String> {
+        parse_args(args.iter().map(std::ffi::OsString::from)).map_err(|e| e.to_string())
+    }
+
+    /// The card-setup channel defaults to LAN-first-with-nostr-fallback, and
+    /// each override pins it to exactly one transport — that is the whole point
+    /// of the flags, so a test that forces one path really gets only that path.
+    #[test]
+    fn setup_channel_flags_pin_a_single_transport() {
+        assert_eq!(
+            parse(&[]).unwrap().setup_channel,
+            SetupChannel::LanThenNostr
+        );
+        assert_eq!(
+            parse(&["--lan-only"]).unwrap().setup_channel,
+            SetupChannel::LanOnly
+        );
+        assert_eq!(
+            parse(&["--nostr-only"]).unwrap().setup_channel,
+            SetupChannel::NostrOnly
+        );
+        // Asking for both is a contradiction, not a silent winner.
+        assert!(parse(&["--lan-only", "--nostr-only"]).is_err());
+    }
+
+    /// The channel flags sit alongside `--config`, which same-machine E2E runs
+    /// always pass, and neither form of it swallows them.
+    #[test]
+    fn config_and_channel_flags_coexist() {
+        let cli = parse(&["--config", "/tmp/peer1.json", "--nostr-only"]).unwrap();
+        assert_eq!(cli.config, Some(PathBuf::from("/tmp/peer1.json")));
+        assert_eq!(cli.setup_channel, SetupChannel::NostrOnly);
+
+        let cli = parse(&["--lan-only", "--config=/tmp/peer2.json"]).unwrap();
+        assert_eq!(cli.config, Some(PathBuf::from("/tmp/peer2.json")));
+        assert_eq!(cli.setup_channel, SetupChannel::LanOnly);
+
+        let cli = parse(&["-c", "/tmp/peer3.json"]).unwrap();
+        assert_eq!(cli.config, Some(PathBuf::from("/tmp/peer3.json")));
+
+        assert!(parse(&["--config"]).is_err(), "a path is required");
+        assert!(parse(&["--config="]).is_err(), "an empty path is not a path");
+    }
 }

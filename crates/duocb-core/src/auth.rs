@@ -6,8 +6,8 @@
 //!
 //! An [`IdentityCard`] — the token one device hands another to be trusted —
 //! carries a mandatory expiry and lasts [`CARD_TTL_SECS`]. A card crosses the
-//! wire only while being handed over: either by copy-paste, or over a LAN setup
-//! session, where a PIN-authenticated local connection carries it and the user
+//! wire only while being handed over: either by copy-paste, or over a card-setup
+//! session, where a PIN-authenticated connection carries it and the user
 //! confirms its [`key_fingerprint`] before it is stored (see
 //! `crate::card_exchange`). It never travels during a clipboard session — that
 //! handshake carries raw public keys — so expiry is enforced by each side
@@ -55,7 +55,7 @@ const FINGERPRINT_DOMAIN: &[u8] = b"duocb:key-fingerprint:v1\0";
 const FINGERPRINT_BYTES: usize = 10;
 
 /// The human-comparable fingerprint of an application public key, shown on both
-/// devices during LAN setup so the user can confirm the card they are about to
+/// devices during card setup so the user can confirm the card they are about to
 /// import really belongs to the device in front of them.
 ///
 /// Taken over the **32-byte public key**, not the card: a card's `created_at`

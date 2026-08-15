@@ -56,7 +56,7 @@ pub(crate) fn wire(app: &Rc<RefCell<App>>, ui: &MainWindow) {
 
     // Navigation.
     nav!(on_go_back, |app| app.go_back());
-    nav!(on_open_lan_setup, |app| app.open_lan_setup());
+    nav!(on_open_card_setup, |app| app.open_card_setup());
     act!(on_dismiss_error, |app| app.error = None);
 
     // Configure wizard.
@@ -120,9 +120,9 @@ pub(crate) fn wire(app: &Rc<RefCell<App>>, ui: &MainWindow) {
         }
     });
 
-    // LAN setup.
-    nav!(on_host_lan_setup, |app| app.host_lan_setup());
-    nav!(on_join_lan_setup, |app| app.join_lan_setup());
+    // Card setup.
+    nav!(on_host_card_setup, |app| app.host_card_setup());
+    nav!(on_join_card_setup, |app| app.join_card_setup());
     nav!(on_import_received_card, |app| app.import_received_card());
     nav!(on_cancel_received_card, |app| app.cancel_received_card());
     nav!(on_disconnect, |app| {

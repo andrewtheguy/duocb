@@ -153,10 +153,10 @@ component HubStep inherits VerticalLayout {
             value: UiState.public-key;
         }
         if UiState.has-identity: Small {
-            text: "Paste this device's signed card into each device that should trust it, or use LAN setup below to send it over the network. Cards expire after 30 days — to renew, copy this card again and import it on every device that should keep trusting this one.";
+            text: "Paste this device's signed card into each device that should trust it, or use Trade cards below to send it over the network. Cards expire after 30 days — to renew, copy this card again and import it on every device that should keep trusting this one.";
         }
         if UiState.has-identity: Small {
-            text: "The fingerprint identifies this device's key. It is what the other device shows you to check during LAN setup, and it does not change when a card is renewed.";
+            text: "The fingerprint identifies this device's key. It is what the other device shows you to check when you trade cards, and it does not change when a card is renewed.";
         }
         if UiState.has-identity: HorizontalLayout {
             spacing: Theme.pad-s;
@@ -311,16 +311,16 @@ export component HomeScreen inherits ScrollView {
 
         Rectangle { vertical-stretch: 1; }
 
-        // LAN setup hands over this device's signed card, so it needs an
+        // Card setup hands over this device's signed card, so it needs an
         // identity to exist first — unlike the old quick pairing, it is offered
         // only from the configured hub.
         if UiState.configure-step == ConfigureStep.ready: WideButton {
-            text: "🔗 LAN setup — trade cards over the network";
+            text: "🔗 Trade cards over the network";
             hint: "Q";
-            clicked => { Actions.open-lan-setup(); }
+            clicked => { Actions.open-card-setup(); }
         }
         if UiState.configure-step == ConfigureStep.ready: Small {
-            text: "Use this when you can't copy and paste identity cards between the two devices. They find each other on the local network with a short PIN, then you check fingerprints before trusting.";
+            text: "Use this when you can't copy and paste identity cards between the two devices. They find each other with a short PIN — on the local network first, then through relays — and you check fingerprints before trusting.";
             horizontal-alignment: center;
         }
         if UiState.configure-step == ConfigureStep.setup-choice || UiState.configure-step == ConfigureStep.ready: Small {

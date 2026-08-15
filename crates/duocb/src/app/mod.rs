@@ -15,7 +15,7 @@ use crate::clipboard::SystemClipboard;
 use crate::{ConfigureStep, Screen};
 use duocb_core::net::endpoint::ConnPath;
 use duocb_core::auth::{Identity, IdentityCard};
-use duocb_core::net::{ConnStatus, KeyIdentity, NetEvent, NetHandle, UiCommand};
+use duocb_core::net::{ConnStatus, KeyIdentity, NetEvent, NetHandle, SetupChannel, UiCommand};
 use item::ClipItem;
 
 /// How long the "sent ✓" / "✔ Copied" flashes stay visible.
@@ -36,6 +36,13 @@ pub(crate) struct App {
     // Shared status.
     pub(crate) status: ConnStatus,
     pub(crate) error: Option<String>,
+
+    /// Which transport(s) card setup uses to trade the PIN rendezvous record.
+    /// Defaults to LAN-first-then-nostr; the `--lan-only` / `--nostr-only` CLI
+    /// flags pin it to a single channel so a test can exercise one path without
+    /// the other quietly covering for it. Fixed for the process — it is a
+    /// launch-time choice, not persisted state.
+    pub(crate) setup_channel: SetupChannel,
 
     // Configure-mode standing state (the primary mode).
     pub(crate) identity: Identity,
@@ -61,11 +68,11 @@ pub(crate) struct App {
     pub(crate) pin_display: Option<String>,
     pub(crate) pin_deadline: Option<Instant>,
 
-    /// LAN setup: the peer's signed card, received over the PIN-authenticated
+    /// Card setup: the peer's signed card, received over the PIN-authenticated
     /// connection and waiting on the user's fingerprint check.
     ///
     /// Deliberately survives the session teardown that immediately follows it —
-    /// the runtime ends a LAN-setup session as soon as the cards cross, so the
+    /// the runtime ends a card-setup session as soon as the cards cross, so the
     /// confirmation screen always outlives the session that produced it. Cleared
     /// only by Import or Cancel.
     pub(crate) pending_peer_card: Option<IdentityCard>,
@@ -83,14 +90,14 @@ pub(crate) struct App {
     /// text field each) so grouping never edits a field's text mid-keystroke.
     pub(crate) in_pin_a: String,
     pub(crate) in_pin_b: String,
-    /// The joiner's optional host-IP entry on the LAN-setup screen. Holds
+    /// The joiner's optional host-IP entry on the card-setup screen. Holds
     /// only the *host part* typed after the locked network prefix (or a full
     /// address pasted whole); [`App::join_ip_ctx`] resolves and range-checks it.
     /// When it resolves to an in-range address it selects the unicast side
-    /// channel (see [`App::lan_setup_dial_spec`]); blank resolves via mDNS.
+    /// channel (see [`App::card_setup_dial_spec`]); blank resolves via mDNS.
     pub(crate) in_join_ip: String,
     /// The local-subnet constraint the host-IP entry is held to (this device's
-    /// own private IPv4 subnet). Detected when the LAN-setup screen opens;
+    /// own private IPv4 subnet). Detected when the card-setup screen opens;
     /// drives the locked prefix, the range hint, and out-of-range rejection.
     pub(crate) join_ip_ctx: duocb_core::subnet::JoinIpConstraint,
     /// Draft of the session panel's compose field (send typed text).
@@ -132,7 +139,12 @@ mod self_card_tests {
         let lock = crate::config::acquire_lock(&path).unwrap();
         let config = crate::config::Config::default();
         (
-            App::new(lock, config, duocb_core::net::spawn_net_runtime(None)),
+            App::new(
+                lock,
+                config,
+                duocb_core::net::spawn_net_runtime(None),
+                SetupChannel::default(),
+            ),
             path,
         )
     }
@@ -216,6 +228,7 @@ impl App {
         config_lock: crate::config::ConfigLock,
         config: crate::config::Config,
         net: NetHandle,
+        setup_channel: SetupChannel,
     ) -> Self {
         let identity = Identity::parse_nsec(&config.identity_secret)
             .expect("ConfigLock::load validated the identity key");
@@ -253,6 +266,7 @@ impl App {
             screen: Screen::Home,
             status: ConnStatus::Idle,
             error: None,
+            setup_channel,
             identity,
             saved_name: saved_name.clone(),
             device_suffix,
@@ -368,7 +382,7 @@ impl App {
                 // The exchange succeeded. Nothing is trusted yet: hold the card
                 // and put the user in front of the fingerprint comparison.
                 self.pending_peer_card = Some(*card);
-                self.screen = Screen::LanConfirm;
+                self.screen = Screen::CardConfirm;
             }
             NetEvent::Status(status) => {
                 if status == ConnStatus::Idle {
@@ -386,7 +400,7 @@ impl App {
                     self.pin_deadline = None;
                     self.peer_node_id = None;
                     // `pending_peer_card` and `screen` are deliberately NOT
-                    // reset here: a LAN-setup session goes idle the instant the
+                    // reset here: a card-setup session goes idle the instant the
                     // cards cross, so clearing them would wipe the confirmation
                     // screen out from under the user the moment it appeared.
                     self.conn_path = None;
@@ -702,7 +716,7 @@ impl App {
     /// the same key, and persist. Returns whether it was stored; on refusal the
     /// error banner says why.
     ///
-    /// The single place trust is granted, so a card arriving over LAN setup is
+    /// The single place trust is granted, so a card arriving over card setup is
     /// held to exactly the same rules as one pasted in by hand.
     fn store_peer_card(&mut self, card: IdentityCard) -> bool {
         if card.public_key() == self.identity.public_key() {
@@ -776,19 +790,19 @@ impl App {
         }
     }
 
-    /// Open the LAN-setup screen.
+    /// Open the card-setup screen.
     ///
-    /// Unlike the quick pairing this replaced, LAN setup hands over this
+    /// Unlike the quick pairing this replaced, card setup hands over this
     /// device's signed card, so it needs an identity to exist: a no-op before
     /// setup is finished, and the entry point is hidden until then.
-    pub(crate) fn open_lan_setup(&mut self) {
+    pub(crate) fn open_card_setup(&mut self) {
         if self.self_card.is_none() {
             return;
         }
         // The card we are about to hand over should have most of its life left,
         // for the same reason `copy_card` re-mints before copying.
         self.renew_self_card_if_stale();
-        self.screen = Screen::LanSetup;
+        self.screen = Screen::CardSetup;
         // Detect this device's LAN subnet so the join can lock the host IP's
         // network octets to it and reject an out-of-range address. Read once on
         // entry — a mid-session network change is rare and the field is optional
@@ -797,35 +811,35 @@ impl App {
     }
 
     /// Show a PIN on this device so the other one can type it.
-    pub(crate) fn host_lan_setup(&mut self) {
+    pub(crate) fn host_card_setup(&mut self) {
         if self.server_mode_spec().is_none() {
             return;
         }
-        self.screen = Screen::LanPairing;
+        self.screen = Screen::CardPairing;
         self.start_server();
     }
 
-    /// Join a LAN setup: dial what the entry holds (the typed PIN, plus an
+    /// Join a card setup: dial what the entry holds (the typed PIN, plus an
     /// optional host IP).
     ///
     /// Invalid input never dials, and says so. The Join *button* is disabled
     /// until the entry validates (see `dial-ready`), but the keyboard shortcut
     /// bypasses that, and a shortcut that silently does nothing reads as a
     /// broken key rather than a bad PIN.
-    pub(crate) fn join_lan_setup(&mut self) {
-        let Some(spec) = self.lan_setup_dial_spec() else {
-            self.error = Some(self.lan_setup_dial_problem());
+    pub(crate) fn join_card_setup(&mut self) {
+        let Some(spec) = self.card_setup_dial_spec() else {
+            self.error = Some(self.card_setup_dial_problem());
             return;
         };
         self.client_active = true;
         self.net.send(UiCommand::Connect { spec });
-        self.screen = Screen::LanPairing;
+        self.screen = Screen::CardPairing;
     }
 
-    /// Why [`App::lan_setup_dial_spec`] refused, phrased for the error banner.
+    /// Why [`App::card_setup_dial_spec`] refused, phrased for the error banner.
     /// Checked in the same order the spec builds, so the message names the first
     /// thing the user has to fix.
-    fn lan_setup_dial_problem(&self) -> String {
+    fn card_setup_dial_problem(&self) -> String {
         use duocb_core::subnet::JoinIpOutcome;
         if duocb_core::pin::normalize_pin(&format!("{}{}", self.in_pin_a, self.in_pin_b)).is_none() {
             return "Enter the full eight-character PIN shown on the other device".into();
@@ -838,6 +852,29 @@ impl App {
             }
             JoinIpOutcome::Malformed => "Not a valid IPv4 address".into(),
             _ => "This device has no identity card to offer yet".into(),
+        }
+    }
+
+    /// The heading and body the card-setup screen shows for how the two devices
+    /// will find each other. It is launch-fixed (`--lan-only` / `--nostr-only`),
+    /// and the difference is exactly the thing a user has to know before
+    /// trusting the screen — whether a third-party server is involved, and
+    /// whether the other device has to be on this network — so each channel
+    /// says its own piece rather than one hedged paragraph covering all three.
+    pub(crate) fn setup_channel_text(&self) -> (&'static str, &'static str) {
+        match self.setup_channel {
+            SetupChannel::LanThenNostr => (
+                "How the devices find each other",
+                "This device is looked for on the local network first (Bonjour/DNS-SD, no third-party server, traffic direct between the devices). If nothing answers there, the search falls back to public Nostr relays, which works when the two devices are on different networks. Only a PIN-encrypted record holding a temporary connection id is ever published.",
+            ),
+            SetupChannel::LanOnly => (
+                "Local network only",
+                "No third-party server participates: discovery uses Bonjour (DNS-SD) and traffic stays direct between the devices. If multicast is blocked, the joining device can type the IP shown while hosting. This is a discovery policy, not a packet-level subnet boundary; reflected mDNS, a VPN/overlay, or globally routed addresses can extend the direct path beyond a conventional LAN.",
+            ),
+            SetupChannel::NostrOnly => (
+                "Relays only",
+                "The local network is not searched at all: the PIN-encrypted record is published to public Nostr relays, so the other device can be anywhere with internet access. The record holds only a temporary connection id, and the connection still goes direct between the devices when they can reach each other.",
+            ),
         }
     }
 
@@ -874,7 +911,7 @@ impl App {
             self.screen = Screen::Home;
             self.configure_step = ConfigureStep::Ready;
         } else {
-            self.screen = Screen::LanSetup;
+            self.screen = Screen::CardSetup;
         }
     }
 
@@ -882,20 +919,20 @@ impl App {
     /// not match, or the user changed their mind.
     pub(crate) fn cancel_received_card(&mut self) {
         self.pending_peer_card = None;
-        self.screen = Screen::LanSetup;
+        self.screen = Screen::CardSetup;
     }
 
-    /// Navigate back one screen, stopping any running session. The LAN-setup
+    /// Navigate back one screen, stopping any running session. The card-setup
     /// screens step back through their own flow; everything else returns to the
     /// home hub.
     pub(crate) fn go_back(&mut self) {
         self.stop_session();
         self.screen = match self.screen {
-            Screen::LanPairing => Screen::LanSetup,
+            Screen::CardPairing => Screen::CardSetup,
             // Leaving the confirmation without importing discards the card.
-            Screen::LanConfirm => {
+            Screen::CardConfirm => {
                 self.pending_peer_card = None;
-                Screen::LanSetup
+                Screen::CardSetup
             }
             _ => Screen::Home,
         };
@@ -906,13 +943,15 @@ impl App {
     }
 
     /// Build the server mode from the current state, if it validates. Which
-    /// mode is decided by the screen the user started from: the LAN-setup
+    /// mode is decided by the screen the user started from: the card-setup
     /// screens host a card exchange, everything else hosts a clipboard session.
     pub(crate) fn server_mode_spec(&self) -> Option<duocb_core::net::ServerMode> {
         use duocb_core::net::ServerMode;
         match self.screen {
-            Screen::LanSetup | Screen::LanPairing => Some(ServerMode::LanSetup {
+            Screen::CardSetup | Screen::CardPairing => Some(ServerMode::CardSetup {
                 self_card: Box::new(self.self_card.clone()?),
+                channel: self.setup_channel,
+                relays: default_relays(),
             }),
             _ => self.key_identity().map(|identity| ServerMode::NostrKey {
                 identity: Box::new(identity),
@@ -921,7 +960,7 @@ impl App {
     }
 
     /// Build the configure-mode dial spec: exactly the peer selected in the
-    /// device picker. LAN setup dials through [`App::lan_setup_dial_spec`]
+    /// device picker. Card setup dials through [`App::card_setup_dial_spec`]
     /// instead.
     pub(crate) fn client_dial_spec(&self) -> Option<duocb_core::net::DialSpec> {
         use duocb_core::net::DialSpec;
@@ -933,18 +972,19 @@ impl App {
 
     /// The current validation outcome of the host-IP entry against the detected
     /// subnet constraint — the single source for both the displayed error
-    /// (`sync`) and the dial's `target_ip` (`lan_setup_dial_spec`).
+    /// (`sync`) and the dial's `target_ip` (`card_setup_dial_spec`).
     pub(crate) fn join_ip_outcome(&self) -> duocb_core::subnet::JoinIpOutcome {
         self.join_ip_ctx.resolve(&self.in_join_ip)
     }
 
-    /// The LAN-setup dial spec, derived from the PIN entry. The optional host-IP
-    /// entry, resolved and range-checked against this device's own subnet (see
-    /// [`App::join_ip_ctx`]), selects the unicast side channel (blank resolves
-    /// via mDNS). `None` when the PIN is incomplete or fails its checksum, when
-    /// this device has no card to offer, or when the typed host IP is malformed
-    /// or out of range — which keeps the Join button disabled.
-    pub(crate) fn lan_setup_dial_spec(&self) -> Option<duocb_core::net::DialSpec> {
+    /// The card-setup dial spec, derived from the PIN entry. The optional
+    /// host-IP entry, resolved and range-checked against this device's own
+    /// subnet (see [`App::join_ip_ctx`]), selects the unicast side channel
+    /// (blank resolves via mDNS, then the relays unless the channel says
+    /// otherwise). `None` when the PIN is incomplete or fails its checksum,
+    /// when this device has no card to offer, or when the typed host IP is
+    /// malformed or out of range — which keeps the Join button disabled.
+    pub(crate) fn card_setup_dial_spec(&self) -> Option<duocb_core::net::DialSpec> {
         use duocb_core::net::DialSpec;
         use duocb_core::subnet::JoinIpOutcome;
         let canonical_pin =
@@ -956,10 +996,12 @@ impl App {
             JoinIpOutcome::InRange(ip) => Some(std::net::IpAddr::V4(ip)),
             JoinIpOutcome::OutOfRange | JoinIpOutcome::Malformed => return None,
         };
-        Some(DialSpec::LanSetup {
+        Some(DialSpec::CardSetup {
             canonical_pin,
             self_card: Box::new(self.self_card.clone()?),
             target_ip,
+            channel: self.setup_channel,
+            relays: default_relays(),
         })
     }
 
@@ -1121,11 +1163,11 @@ pub(crate) fn short_id(id: &str) -> String {
     }
 }
 
-/// LAN setup: the screen flow and, more importantly, the trust decisions made
+/// Card setup: the screen flow and, more importantly, the trust decisions made
 /// at the end of it. These are the checks standing between "a card arrived over
 /// the network" and "this device is trusted".
 #[cfg(test)]
-pub(crate) mod lan_setup_tests {
+pub(crate) mod card_setup_tests {
     use super::*;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1135,7 +1177,7 @@ pub(crate) mod lan_setup_tests {
     pub(crate) fn configured_app() -> (App, PathBuf) {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
-            "duocb-lan-setup-{}-{}.json",
+            "duocb-card-setup-{}-{}.json",
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
@@ -1144,6 +1186,7 @@ pub(crate) mod lan_setup_tests {
             lock,
             crate::config::Config::default(),
             duocb_core::net::spawn_net_runtime(None),
+            SetupChannel::default(),
         );
         app.in_my_name = "desktop".into();
         app.save_name();
@@ -1165,13 +1208,13 @@ pub(crate) mod lan_setup_tests {
             .unwrap()
     }
 
-    /// LAN setup hands over this device's signed card, so there has to be one:
+    /// Card setup hands over this device's signed card, so there has to be one:
     /// before setup is finished the screen must not open at all.
     #[test]
-    fn lan_setup_requires_a_configured_identity() {
+    fn card_setup_requires_a_configured_identity() {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
-            "duocb-lan-unconfigured-{}-{}.json",
+            "duocb-card-unconfigured-{}-{}.json",
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
@@ -1180,13 +1223,14 @@ pub(crate) mod lan_setup_tests {
             lock,
             crate::config::Config::default(),
             duocb_core::net::spawn_net_runtime(None),
+            SetupChannel::default(),
         );
         assert!(app.self_card.is_none());
 
-        app.open_lan_setup();
-        assert_eq!(app.screen, Screen::Home, "no card to offer, so no LAN setup");
+        app.open_card_setup();
+        assert_eq!(app.screen, Screen::Home, "no card to offer, so no card setup");
         assert!(app.server_mode_spec().is_none());
-        assert!(app.lan_setup_dial_spec().is_none());
+        assert!(app.card_setup_dial_spec().is_none());
 
         cleanup(app, path);
     }
@@ -1195,15 +1239,88 @@ pub(crate) mod lan_setup_tests {
     #[test]
     fn hosting_offers_this_devices_card() {
         let (mut app, path) = configured_app();
-        app.open_lan_setup();
-        assert_eq!(app.screen, Screen::LanSetup);
+        app.open_card_setup();
+        assert_eq!(app.screen, Screen::CardSetup);
 
         match app.server_mode_spec() {
-            Some(duocb_core::net::ServerMode::LanSetup { self_card }) => {
+            Some(duocb_core::net::ServerMode::CardSetup { self_card, .. }) => {
                 assert_eq!(self_card.public_key(), app.identity.public_key());
             }
-            other => panic!("expected a LAN-setup host, got {other:?}"),
+            other => panic!("expected a card-setup host, got {other:?}"),
         }
+        cleanup(app, path);
+    }
+
+    /// The launch-time channel override reaches *both* roles. A flag that
+    /// only took effect on the side that happened to be hosting would let a
+    /// "nostr-only" test still pair over mDNS and prove nothing.
+    #[test]
+    fn the_channel_override_reaches_both_roles() {
+        use duocb_core::net::{DialSpec, ServerMode};
+
+        for channel in [
+            SetupChannel::LanThenNostr,
+            SetupChannel::LanOnly,
+            SetupChannel::NostrOnly,
+        ] {
+            let (mut app, path) = configured_app();
+            app.setup_channel = channel;
+            app.open_card_setup();
+            let pin = duocb_core::pin::generate_pin();
+            app.in_pin_a = pin[..4].to_string();
+            app.in_pin_b = pin[4..].to_string();
+
+            match app.server_mode_spec() {
+                Some(ServerMode::CardSetup {
+                    channel: hosted,
+                    relays,
+                    ..
+                }) => {
+                    assert_eq!(hosted, channel, "host channel");
+                    // The relays travel with the spec even on LAN-only (where
+                    // they go unused): the runtime, not the UI, decides.
+                    assert!(!relays.is_empty(), "a host needs relays to publish to");
+                }
+                other => panic!("expected a card-setup host, got {other:?}"),
+            }
+            match app.card_setup_dial_spec() {
+                Some(DialSpec::CardSetup {
+                    channel: dialed,
+                    relays,
+                    ..
+                }) => {
+                    assert_eq!(dialed, channel, "joiner channel");
+                    assert!(!relays.is_empty(), "a joiner needs relays to query");
+                }
+                other => panic!("expected a card-setup dial, got {other:?}"),
+            }
+            cleanup(app, path);
+        }
+    }
+
+    /// The screen explains the channel it is actually running on — the LAN-only
+    /// promise ("no third-party server") must not be shown by a build that will
+    /// fall back to public relays.
+    #[test]
+    fn the_screen_describes_the_channel_in_use() {
+        let (mut app, path) = configured_app();
+
+        app.setup_channel = SetupChannel::LanOnly;
+        let (_, lan_note) = app.setup_channel_text();
+        assert!(lan_note.contains("No third-party server"));
+
+        app.setup_channel = SetupChannel::LanThenNostr;
+        let (_, default_note) = app.setup_channel_text();
+        assert!(default_note.contains("Nostr relays"));
+        assert!(
+            !default_note.contains("No third-party server"),
+            "the default channel must not claim the LAN-only guarantee"
+        );
+
+        app.setup_channel = SetupChannel::NostrOnly;
+        let (_, nostr_note) = app.setup_channel_text();
+        assert!(nostr_note.contains("Nostr relays"));
+
         cleanup(app, path);
     }
 
@@ -1212,27 +1329,28 @@ pub(crate) mod lan_setup_tests {
     #[test]
     fn joining_needs_a_valid_pin() {
         let (mut app, path) = configured_app();
-        app.open_lan_setup();
+        app.open_card_setup();
 
-        assert!(app.lan_setup_dial_spec().is_none(), "empty entry");
+        assert!(app.card_setup_dial_spec().is_none(), "empty entry");
         app.in_pin_a = "ABCD".into();
-        assert!(app.lan_setup_dial_spec().is_none(), "half a PIN");
+        assert!(app.card_setup_dial_spec().is_none(), "half a PIN");
 
         // A generated PIN always passes its own checksum.
         let pin = duocb_core::pin::generate_pin();
         app.in_pin_a = pin[..4].to_string();
         app.in_pin_b = pin[4..].to_string();
-        match app.lan_setup_dial_spec() {
-            Some(duocb_core::net::DialSpec::LanSetup {
+        match app.card_setup_dial_spec() {
+            Some(duocb_core::net::DialSpec::CardSetup {
                 canonical_pin,
                 self_card,
                 target_ip,
+                ..
             }) => {
                 assert_eq!(canonical_pin, pin);
                 assert_eq!(self_card.public_key(), app.identity.public_key());
                 assert_eq!(target_ip, None, "blank host IP resolves via mDNS");
             }
-            other => panic!("expected a LAN-setup dial, got {other:?}"),
+            other => panic!("expected a card-setup dial, got {other:?}"),
         }
 
         // Flip one character: the check digit no longer matches.
@@ -1241,7 +1359,7 @@ pub(crate) mod lan_setup_tests {
         let typo = String::from_utf8(typo).unwrap();
         app.in_pin_a = typo[..4].to_string();
         app.in_pin_b = typo[4..].to_string();
-        assert!(app.lan_setup_dial_spec().is_none(), "a typo must not dial");
+        assert!(app.card_setup_dial_spec().is_none(), "a typo must not dial");
 
         cleanup(app, path);
     }
@@ -1252,13 +1370,13 @@ pub(crate) mod lan_setup_tests {
     #[test]
     fn joining_on_an_invalid_pin_says_why_instead_of_nothing() {
         let (mut app, path) = configured_app();
-        app.open_lan_setup();
+        app.open_card_setup();
         app.in_pin_a = "ABCD".into();
 
-        app.join_lan_setup();
+        app.join_card_setup();
 
         assert!(!app.client_active, "a bad PIN must not dial");
-        assert_eq!(app.screen, Screen::LanSetup, "and must not advance a screen");
+        assert_eq!(app.screen, Screen::CardSetup, "and must not advance a screen");
         assert!(
             app.error.as_deref().is_some_and(|e| e.contains("PIN")),
             "the banner must name the PIN, got {:?}",
@@ -1275,7 +1393,7 @@ pub(crate) mod lan_setup_tests {
 
         app.apply_event(NetEvent::PeerCardReceived(Box::new(card.clone())));
 
-        assert_eq!(app.screen, Screen::LanConfirm);
+        assert_eq!(app.screen, Screen::CardConfirm);
         assert_eq!(
             app.pending_peer_card.as_ref().map(IdentityCard::public_key),
             Some(card.public_key())
@@ -1284,7 +1402,7 @@ pub(crate) mod lan_setup_tests {
         cleanup(app, path);
     }
 
-    /// The runtime ends a LAN-setup session the instant the cards cross, so the
+    /// The runtime ends a card-setup session the instant the cards cross, so the
     /// `Idle` that follows must not wipe out the confirmation the user is
     /// looking at. This is the one ordering bug that would silently lose the
     /// card between the exchange and the screen.
@@ -1297,7 +1415,7 @@ pub(crate) mod lan_setup_tests {
         app.apply_event(NetEvent::PinCleared);
         app.apply_event(NetEvent::Status(ConnStatus::Idle));
 
-        assert_eq!(app.screen, Screen::LanConfirm, "the user is still deciding");
+        assert_eq!(app.screen, Screen::CardConfirm, "the user is still deciding");
         assert_eq!(
             app.pending_peer_card.as_ref().map(IdentityCard::public_key),
             Some(card.public_key())
@@ -1341,7 +1459,7 @@ pub(crate) mod lan_setup_tests {
 
         assert!(app.pending_peer_card.is_none());
         assert!(app.peers.is_empty());
-        assert_eq!(app.screen, Screen::LanSetup);
+        assert_eq!(app.screen, Screen::CardSetup);
         assert!(app.config_lock.load().unwrap().peers.is_empty());
         cleanup(app, path);
     }
@@ -1356,7 +1474,7 @@ pub(crate) mod lan_setup_tests {
 
         assert!(app.pending_peer_card.is_none());
         assert!(app.peers.is_empty());
-        assert_eq!(app.screen, Screen::LanSetup);
+        assert_eq!(app.screen, Screen::CardSetup);
         cleanup(app, path);
     }
 
@@ -1373,7 +1491,7 @@ pub(crate) mod lan_setup_tests {
 
         assert!(app.peers.is_empty(), "a lapsed card must not be trusted");
         assert!(app.error.is_some(), "and the user must be told why");
-        assert_eq!(app.screen, Screen::LanSetup);
+        assert_eq!(app.screen, Screen::CardSetup);
         cleanup(app, path);
     }
 
@@ -1392,7 +1510,7 @@ pub(crate) mod lan_setup_tests {
         cleanup(app, path);
     }
 
-    /// Re-running LAN setup with a device already trusted replaces its entry
+    /// Re-running card setup with a device already trusted replaces its entry
     /// rather than adding a second one for the same key — this is the renewal
     /// path once a card nears its 30-day expiry.
     #[test]

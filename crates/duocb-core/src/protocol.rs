@@ -4,7 +4,7 @@
 //! A connection uses a **single** bidirectional stream, opened by the client
 //! (dialer):
 //! 1. Auth runs first on it: mutual application-key authentication, or the PIN
-//!    challenge-response used by quick mode (see `crate::pin_auth`).
+//!    challenge-response used by card setup (see `crate::pin_auth`).
 //! 2. Once auth succeeds the same stream stays open and carries [`ClipMsg`]
 //!    frames in both directions for the life of the connection. (A clipboard
 //!    app has exactly one data stream, so no separate control channel is
@@ -229,7 +229,7 @@ impl AuthResponse {
     }
 }
 
-/// LAN setup's one payload: this device's signed identity card, offered to the
+/// Card setup's one payload: this device's signed identity card, offered to the
 /// peer so it can be imported into their trusted list.
 ///
 /// Sent by **both** sides immediately after the PIN handshake accepts, on the

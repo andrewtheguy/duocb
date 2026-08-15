@@ -12,14 +12,14 @@ explicitly copy it.
 ## How devices connect
 
 Every connection is a configure-mode connection: two devices that already trust
-each other's signed identity cards. **LAN setup** is not a second kind of
+each other's signed identity cards. **Trading cards** is not a second kind of
 connection — it is a way to get those cards onto both devices when you cannot
 copy and paste them.
 
 | | Discovery/signaling | Authentication | Saved state |
 |---|---|---|---|
 | Configure connection | Pairwise encrypted Nostr hosting records | Mutual application-key signatures | One identity key and a local trusted-peer list per installation |
-| LAN setup (trust bootstrap) | Local Bonjour/DNS-SD or a typed LAN IP | Rotating PIN challenge-response, then a human fingerprint check | The imported peer card |
+| Card setup (trust bootstrap) | Local Bonjour/DNS-SD or a typed LAN IP, falling back to Nostr relays | Rotating PIN challenge-response, then a human fingerprint check | The imported peer card |
 
 ### Configure mode
 
@@ -65,17 +65,17 @@ sign a fresh transcript containing:
 Clipboard traffic starts only after both signatures verify and both local
 trust checks pass.
 
-### LAN setup — importing a card without copy-paste
+### Trading cards — importing a card without copy-paste
 
 Two devices with no shared clipboard cannot hand each other a 2 KiB signed card,
-and cards expire every 30 days, so this is not a one-time problem. LAN setup
-carries the card over the local network instead:
+and cards expire every 30 days, so this is not a one-time problem. Card setup
+carries the card over the network instead:
 
-1. Both devices open LAN setup. It requires a configured identity — there has to
-   be a card to hand over — so it is offered only from the configured hub.
+1. Both devices open Trade cards. It requires a configured identity — there has
+   to be a card to hand over — so it is offered only from the configured hub.
 2. One device shows a rotating eight-character PIN; the other types it.
-3. The PIN locates the host on the local network and drives a mutual
-   Argon2id-backed challenge-response over the resulting direct connection.
+3. The PIN locates the host and drives a mutual Argon2id-backed
+   challenge-response over the resulting connection.
 4. Both devices send their signed identity card across that connection.
 5. Both then show the card they received, next to their own identity.
 6. **Check that the incoming fingerprint on each device matches the fingerprint
@@ -84,10 +84,26 @@ carries the card over the local network instead:
 7. Press Import on both. Each device is now a trusted peer of the other, and you
    share the clipboard from the home screen as usual.
 
-A LAN-setup connection never carries clipboard content; it exists only to hand
-over the cards, and ends as soon as they have crossed. Discovery is
-Bonjour-compatible DNS-SD. Where multicast is blocked, enter the LAN IP shown by
-the host to use the unicast side channel.
+A card-setup connection never carries clipboard content; it exists only to hand
+over the cards, and ends as soon as they have crossed.
+
+**How the two devices find each other.** By default the joining device looks on
+the local network first — Bonjour-compatible DNS-SD, no third-party server — and
+falls back to Nostr relays if nothing local answers, so two devices on different
+networks can still trade cards. The hosting device publishes on both at once,
+since it cannot know which way the other will find it. Where multicast is
+blocked, enter the LAN IP shown by the host to use the unicast side channel.
+Either way the record published is only a PIN-encrypted temporary connection id.
+
+Two flags force a single channel, mainly for testing:
+
+```sh
+cargo run -- --lan-only     # local network only; no relay is contacted at all
+cargo run -- --nostr-only   # relays only; the local network is not searched
+```
+
+They affect this trust-bootstrap step only — clipboard connections always signal
+through Nostr — and giving both at once is an error.
 
 One PIN admits one device: once a device has answered, a second device offering
 the same code is refused.
@@ -142,7 +158,7 @@ persisted.
 ## Security notes
 
 - QUIC/TLS 1.3 encrypts the transport.
-- The LAN-setup fingerprint check is what makes the PIN safe to build trust on.
+- The card-setup fingerprint check is what makes the PIN safe to build trust on.
   The PIN proves possession of a short code, not an identity: it is ~35 bits and
   its rendezvous record is offline-attackable, so anyone who reads or guesses it
   inside its 60-second window can complete the handshake and offer a card. The

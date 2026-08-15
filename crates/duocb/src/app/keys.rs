@@ -68,21 +68,21 @@ pub(crate) fn handle_global_key(
 
     let handled = match app.screen {
         Screen::Home if focus_free => handle_configure_key(app, esc, enter, up, down, &letter, &command),
-        Screen::LanSetup if focus_free => {
+        Screen::CardSetup if focus_free => {
             // S shows a PIN here; C joins with the PIN and optional host IP
             // entered on this screen.
             if letter('s') {
-                app.host_lan_setup();
+                app.host_card_setup();
                 true
             } else if letter('c') {
-                app.join_lan_setup();
+                app.join_card_setup();
                 true
             } else {
                 // Anything else falls through to the session shortcuts below.
                 false
             }
         }
-        Screen::LanPairing => {
+        Screen::CardPairing => {
             // Copy the current rotating PIN, or mint a new one, without the
             // mouse. `t` is offered plain as well as command-modified: this
             // screen has no text fields, so nothing can be hijacked.
@@ -100,7 +100,7 @@ pub(crate) fn handle_global_key(
         }
         // Accept or refuse the card only from the screen that shows the
         // fingerprints — trust is never one keystroke away from anywhere else.
-        Screen::LanConfirm if focus_free => {
+        Screen::CardConfirm if focus_free => {
             if enter || letter('i') {
                 app.import_received_card();
             } else if letter('c') {
@@ -165,7 +165,7 @@ fn handle_configure_key(
             // Every hub action is reachable from the keyboard; the labels carry
             // the letter so a tester never has to look them up.
             if letter('q') {
-                app.open_lan_setup();
+                app.open_card_setup();
             } else if letter('s') {
                 app.begin_server();
             } else if letter('c') {
@@ -248,7 +248,7 @@ fn handle_session_key(app: &mut App, focus_free: bool, command: &dyn Fn(char) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::lan_setup_tests::{cleanup, configured_app, peer_card};
+    use crate::app::card_setup_tests::{cleanup, configured_app, peer_card};
     use duocb_core::auth::IdentityCard;
 
     /// Press a plain (unmodified) key.
@@ -267,7 +267,7 @@ mod tests {
         assert_eq!(app.configure_step, ConfigureStep::Ready);
 
         assert!(plain(&mut app, "q"));
-        assert_eq!(app.screen, Screen::LanSetup);
+        assert_eq!(app.screen, Screen::CardSetup);
         app.go_back();
 
         assert!(plain(&mut app, "c"));
@@ -290,26 +290,26 @@ mod tests {
         cleanup(app, path);
     }
 
-    /// The LAN-setup flow end to end on the keyboard alone.
+    /// The card-setup flow end to end on the keyboard alone.
     #[test]
-    fn lan_setup_flow_is_fully_keyboard_driven() {
+    fn card_setup_flow_is_fully_keyboard_driven() {
         let (mut app, path) = configured_app();
 
         assert!(plain(&mut app, "q"));
-        assert_eq!(app.screen, Screen::LanSetup);
+        assert_eq!(app.screen, Screen::CardSetup);
 
         assert!(plain(&mut app, "s"), "S shows a PIN");
-        assert_eq!(app.screen, Screen::LanPairing);
+        assert_eq!(app.screen, Screen::CardPairing);
 
-        // Esc backs out of pairing to the LAN-setup screen.
+        // Esc backs out of pairing to the card-setup screen.
         assert!(plain(&mut app, "\u{1b}"));
-        assert_eq!(app.screen, Screen::LanSetup);
+        assert_eq!(app.screen, Screen::CardSetup);
 
         // A received card, then I imports it.
         app.apply_event(duocb_core::net::NetEvent::PeerCardReceived(Box::new(
             peer_card("laptop", 0),
         )));
-        assert_eq!(app.screen, Screen::LanConfirm);
+        assert_eq!(app.screen, Screen::CardConfirm);
         assert!(plain(&mut app, "i"), "I imports");
         assert_eq!(app.peers.len(), 1);
         assert_eq!(app.screen, Screen::Home);
@@ -328,7 +328,7 @@ mod tests {
         assert!(plain(&mut app, "c"));
         assert!(app.peers.is_empty(), "C must not trust the card");
         assert!(app.pending_peer_card.is_none());
-        assert_eq!(app.screen, Screen::LanSetup);
+        assert_eq!(app.screen, Screen::CardSetup);
 
         cleanup(app, path);
     }
