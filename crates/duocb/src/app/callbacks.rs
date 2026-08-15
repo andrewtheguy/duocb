@@ -56,7 +56,7 @@ pub(crate) fn wire(app: &Rc<RefCell<App>>, ui: &MainWindow) {
 
     // Navigation.
     nav!(on_go_back, |app| app.go_back());
-    nav!(on_open_quick, |app| app.open_quick());
+    nav!(on_open_lan_setup, |app| app.open_lan_setup());
     act!(on_dismiss_error, |app| app.error = None);
 
     // Configure wizard.
@@ -120,9 +120,11 @@ pub(crate) fn wire(app: &Rc<RefCell<App>>, ui: &MainWindow) {
         }
     });
 
-    // Quick options / client.
-    nav!(on_join_quick, |app| app.join_quick());
-    nav!(on_connect_client, |app| app.connect_client());
+    // LAN setup.
+    nav!(on_host_lan_setup, |app| app.host_lan_setup());
+    nav!(on_join_lan_setup, |app| app.join_lan_setup());
+    nav!(on_import_received_card, |app| app.import_received_card());
+    nav!(on_cancel_received_card, |app| app.cancel_received_card());
     nav!(on_disconnect, |app| {
         app.net.send(duocb_core::net::UiCommand::Disconnect);
     });

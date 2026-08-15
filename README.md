@@ -9,12 +9,17 @@ explicitly copy it.
 > duocb is pre-1.0 and intentionally has no backward compatibility. This
 > release rejects the former shared-secret config and wire protocol.
 
-## Pairing modes
+## How devices connect
 
-| Mode | Discovery/signaling | Authentication | Saved state |
+Every connection is a configure-mode connection: two devices that already trust
+each other's signed identity cards. **LAN setup** is not a second kind of
+connection — it is a way to get those cards onto both devices when you cannot
+copy and paste them.
+
+| | Discovery/signaling | Authentication | Saved state |
 |---|---|---|---|
-| Configure | Pairwise encrypted Nostr hosting records | Mutual application-key signatures | One identity key and a local trusted-peer list per installation |
-| Quick | Local Bonjour/DNS-SD or a typed LAN IP | Rotating PIN challenge-response | None |
+| Configure connection | Pairwise encrypted Nostr hosting records | Mutual application-key signatures | One identity key and a local trusted-peer list per installation |
+| LAN setup (trust bootstrap) | Local Bonjour/DNS-SD or a typed LAN IP | Rotating PIN challenge-response, then a human fingerprint check | The imported peer card |
 
 ### Configure mode
 
@@ -60,15 +65,36 @@ sign a fresh transcript containing:
 Clipboard traffic starts only after both signatures verify and both local
 trust checks pass.
 
-### Quick mode
+### LAN setup — importing a card without copy-paste
 
-Quick mode remains identity-free. The host displays a rotating eight-character
-PIN; the joiner enters it. The PIN locates the host and drives a mutual
-Argon2id-backed challenge-response.
+Two devices with no shared clipboard cannot hand each other a 2 KiB signed card,
+and cards expire every 30 days, so this is not a one-time problem. LAN setup
+carries the card over the local network instead:
 
-The desktop quick flow is LAN-only and uses Bonjour-compatible DNS-SD. Where
-multicast is blocked, enter the LAN IP shown by the host to use the unicast side
-channel. No saved application key or trusted peer participates.
+1. Both devices open LAN setup. It requires a configured identity — there has to
+   be a card to hand over — so it is offered only from the configured hub.
+2. One device shows a rotating eight-character PIN; the other types it.
+3. The PIN locates the host on the local network and drives a mutual
+   Argon2id-backed challenge-response over the resulting direct connection.
+4. Both devices send their signed identity card across that connection.
+5. Both then show the card they received, next to their own identity.
+6. **Check that the incoming fingerprint on each device matches the fingerprint
+   the other device shows for itself.** If it does not match, press Cancel —
+   something else answered the PIN.
+7. Press Import on both. Each device is now a trusted peer of the other, and you
+   share the clipboard from the home screen as usual.
+
+A LAN-setup connection never carries clipboard content; it exists only to hand
+over the cards, and ends as soon as they have crossed. Discovery is
+Bonjour-compatible DNS-SD. Where multicast is blocked, enter the LAN IP shown by
+the host to use the unicast side channel.
+
+One PIN admits one device: once a device has answered, a second device offering
+the same code is refused.
+
+The fingerprint is derived from a device's application public key, so it is
+stable across card renewals and is shown beside every trusted device — you can
+re-check it out of band at any time.
 
 ## Build and run
 
@@ -116,6 +142,25 @@ persisted.
 ## Security notes
 
 - QUIC/TLS 1.3 encrypts the transport.
+- The LAN-setup fingerprint check is what makes the PIN safe to build trust on.
+  The PIN proves possession of a short code, not an identity: it is ~35 bits and
+  its rendezvous record is offline-attackable, so anyone who reads or guesses it
+  inside its 60-second window can complete the handshake and offer a card. The
+  human comparison catches exactly that. The incoming fingerprint is computed
+  from the card that just arrived, so it is network-delivered and proves
+  nothing on its own; what is trustworthy is the *expected* value, which the
+  other device shows for itself and which you read off its screen. Holding the
+  two against each other is what carries the check out of band.
+- The fingerprint commits to a single public key, so an impostor needs a second
+  preimage against a fixed target. A combined "session code" mixing both devices'
+  keys would instead let an interposer vary both of its own keys and hunt for a
+  collision — far cheaper for the same number of displayed digits.
+- Checking one direction is enough. An interposer must sit in both directions at
+  once, so comparing one device's incoming fingerprint against the other's own
+  already fails for it.
+- Receiving a card is not trusting it: cards cross automatically once the PIN
+  matches, but nothing is written to the trusted list until a person presses
+  Import.
 - The application-key handshake authenticates configured peers independently
   of the iroh transport key.
 - Pairwise hosting records are encrypted to the intended trusted peer.

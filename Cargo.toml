@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "3"
 
 [workspace.package]
-version = "0.0.32"
+version = "0.0.33"
 edition = "2024"
 description = "P2P clipboard sharing between two devices over iroh"
 
@@ -26,11 +26,8 @@ arboard = "3.6.1"
 # P2P transport
 iroh = "1.0.2"
 iroh-mdns-address-lookup = "0.4.0"
-# Also the engine under iroh-mdns-address-lookup; kept on the same version so
-# the two mDNS responders share one stack.
-swarm-discovery = "0.6.3"
-# Spec-compliant DNS-SD for the LAN-only PIN channel: interoperates with other
-# Bonjour implementations on the network.
+# Spec-compliant DNS-SD for the LAN-setup PIN rendezvous: interoperates with
+# other Bonjour implementations on the network.
 mdns-sd = "0.20.1"
 # Local network-interface enumeration (address + netmask) for constraining the
 # LAN-only joiner's typed host IP to its own subnet.

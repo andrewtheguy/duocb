@@ -229,6 +229,39 @@ impl AuthResponse {
     }
 }
 
+/// LAN setup's one payload: this device's signed identity card, offered to the
+/// peer so it can be imported into their trusted list.
+///
+/// Sent by **both** sides immediately after the PIN handshake accepts, on the
+/// same stream. Each side writes its own offer and reads exactly one back; the
+/// framing is length-prefixed, so the two writes crossing on the wire is normal
+/// and needs no turn-taking.
+///
+/// The card is carried as its encoded form ([`crate::auth::IdentityCard::encode`])
+/// rather than a parsed structure: the receiver re-parses it through the usual
+/// verifying path, so a malformed or unsigned offer is rejected by exactly the
+/// same code that guards a pasted card. Nothing here grants trust — the user
+/// still has to confirm the fingerprint and import it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CardOffer {
+    pub version: u16,
+    /// The sender's signed identity card, encoded.
+    pub card: String,
+}
+
+impl CardOffer {
+    pub fn new(card: impl Into<String>) -> Self {
+        Self {
+            version: DUOCB_PROTO_VERSION,
+            card: card.into(),
+        }
+    }
+
+    fn version(&self) -> u16 {
+        self.version
+    }
+}
+
 /// A frame on the post-auth session stream, flowing in both directions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClipMsg {
@@ -445,6 +478,22 @@ pub fn decode_auth_response(data: &[u8]) -> Result<AuthResponse> {
         MAX_CONTROL_MESSAGE_SIZE,
         |r: &AuthResponse| r.version,
         "AuthResponse",
+    )
+}
+
+/// Encode a CardOffer as length-prefixed JSON bytes. A card is capped at
+/// [`crate::auth::MAX_CARD_SIZE`] (2 KiB), well inside the control-frame cap.
+pub fn encode_card_offer(msg: &CardOffer) -> Result<Vec<u8>> {
+    encode_length_prefixed(msg, MAX_CONTROL_MESSAGE_SIZE, "CardOffer")
+}
+
+/// Decode a CardOffer from length-prefixed JSON bytes.
+pub fn decode_card_offer(data: &[u8]) -> Result<CardOffer> {
+    decode_length_prefixed(
+        data,
+        MAX_CONTROL_MESSAGE_SIZE,
+        |m: &CardOffer| m.version(),
+        "CardOffer",
     )
 }
 
@@ -670,6 +719,42 @@ mod tests {
         assert_eq!(decoded.version, DUOCB_PROTO_VERSION);
         assert!(!decoded.accepted);
         assert_eq!(decoded.reason.as_deref(), Some("untrusted key"));
+    }
+
+    // ========================================================================
+    // CardOffer tests
+    // ========================================================================
+
+    #[test]
+    fn test_card_offer_roundtrip() {
+        let identity = crate::auth::Identity::generate();
+        let card = identity.card("mac-book", "a7B2c3D4").unwrap();
+        let decoded = decode_card_offer(&encode_card_offer(&CardOffer::new(card.encode())).unwrap())
+            .unwrap();
+        assert_eq!(decoded.version, DUOCB_PROTO_VERSION);
+        // The receiver re-parses through the normal verifying path.
+        let parsed = crate::auth::IdentityCard::parse(&decoded.card).unwrap();
+        assert_eq!(parsed.public_key(), identity.public_key());
+        assert_eq!(parsed.name(), "mac-book_a7B2c3D4");
+    }
+
+    /// A real card is far below the control-frame cap, so an offer never needs
+    /// the clipboard-sized budget.
+    #[test]
+    fn test_card_offer_fits_a_control_frame() {
+        let card = crate::auth::Identity::generate()
+            .card("mac-book", "a7B2c3D4")
+            .unwrap();
+        assert!(card.encode().len() <= crate::auth::MAX_CARD_SIZE);
+        let encoded = encode_card_offer(&CardOffer::new(card.encode())).unwrap();
+        assert!(encoded.len() < MAX_CONTROL_MESSAGE_SIZE);
+    }
+
+    #[test]
+    fn test_card_offer_encode_exceeds_max_size() {
+        let msg = CardOffer::new("x".repeat(MAX_CONTROL_MESSAGE_SIZE));
+        let err = encode_card_offer(&msg).unwrap_err();
+        assert!(err.to_string().contains("too large"));
     }
 
     // ========================================================================

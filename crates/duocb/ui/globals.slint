@@ -3,7 +3,7 @@
 // carries every user intent back into Rust, which mutates the `App` state and
 // re-syncs. No UI-side state beyond what lives here.
 
-import { Screen, ConfigureStep, PairMode, PeerRow, ClipRow, PathRow } from "types.slint";
+import { Screen, ConfigureStep, PeerRow, ClipRow, PathRow } from "types.slint";
 
 export global UiState {
     // Per-platform font families, set once at startup from Rust ("" = the
@@ -23,7 +23,6 @@ export global UiState {
     // Navigation / shared status.
     in property <Screen> screen;
     in property <ConfigureStep> configure-step;
-    in property <PairMode> mode;
     in property <string> status-text;
     in property <bool> connected;
     in property <bool> server-running;
@@ -35,10 +34,11 @@ export global UiState {
     // explicitly masked restore field; normal projection exposes public data.
     in property <string> display-identity;
     in property <bool> has-identity;
-    in property <string> public-key-short;
+    /// This device's key fingerprint — the value the user compares against the
+    /// other device during LAN setup, and the one shown beside each trusted peer.
+    in property <string> own-fingerprint;
     in property <string> public-key;
     in property <string> config-path;
-    in property <string> presence-conflict;
     // Per-button "✔ Copied" feedback: exactly one is true while a copy is fresh
     // (inbox/outbox rows carry their own `copied` flag in ClipRow).
     in property <bool> copied-card;
@@ -81,7 +81,6 @@ export global UiState {
     in property <string> pin-display;
     /// "refreshes in 42s", composed in Rust; "" while no PIN shows.
     in property <string> pin-countdown;
-    in property <bool> pin-paired;
 
     // Client join forms.
     /// True when the PIN entry is full-length but fails validation (a typo).
@@ -93,12 +92,6 @@ export global UiState {
     /// True once the first PIN group is full, so the entry auto-advances focus
     /// to the second group (Apple-style code entry).
     in property <bool> pin-a-full;
-    /// True when the typed PIN is LAN-only (its first character), so the join
-    /// card reveals the optional host-IP field.
-    in property <bool> pin-is-lan-only;
-    /// True when a checksum-valid PIN belongs to an internet-capable quick
-    /// channel, which the desktop's local-only quick flow does not accept.
-    in property <bool> pin-not-local;
     /// The locked network prefix of this device's subnet (e.g. "10.22.33."),
     /// shown non-editable ahead of the host-IP field so the user types only the
     /// host part. "" when no subnet was detected (free full-IP entry).
@@ -112,6 +105,15 @@ export global UiState {
     /// address"); "" when the entry is empty or valid.
     in property <string> join-ip-error;
     in property <bool> dial-ready;
+
+    // LAN setup confirmation. The user compares `incoming-fingerprint` here
+    // against `own-fingerprint` as shown on the other device; they must match
+    // before the card is worth importing.
+    in property <string> incoming-name;
+    in property <string> incoming-fingerprint;
+    /// The incoming card's expiry line ("expires 2026-09-13"), same wording as
+    /// the trusted-device rows.
+    in property <string> incoming-expiry;
 
     // Session panel.
     in property <bool> sent-flash;
@@ -141,7 +143,7 @@ export global UiState {
 export global Actions {
     // Navigation.
     callback go-back();
-    callback open-quick();
+    callback open-lan-setup();
     callback dismiss-error();
 
     // Configure wizard.
@@ -167,11 +169,17 @@ export global Actions {
     callback import-peer-card();
     callback join-selected();
 
-    // Quick options / client.
-    /// Dial what the quick screen's join entry holds (the typed PIN, plus an
-    /// optional host IP), moving to the client screen.
-    callback join-quick();
-    callback connect-client();
+    // LAN setup.
+    /// Show a PIN on this device so the other one can type it.
+    callback host-lan-setup();
+    /// Dial what the LAN-setup entry holds (the typed PIN, plus an optional
+    /// host IP).
+    callback join-lan-setup();
+    /// Trust the card that arrived — only after the user has compared
+    /// fingerprints.
+    callback import-received-card();
+    /// Discard the card that arrived and go back.
+    callback cancel-received-card();
     callback disconnect();
 
     // Server credentials.

@@ -1,7 +1,6 @@
 //! Nostr signaling: pairwise hosting records for configured peers and
 //! quick-mode PIN rendezvous.
 
-use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -11,7 +10,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::auth::{Identity, IdentityCard};
-use crate::pin;
 
 pub const DEFAULT_NOSTR_RELAYS: &[&str] = &[
     "wss://nos.lol",
@@ -159,60 +157,6 @@ pub async fn lookup_hosting(
         return Ok(None);
     }
     Ok(record.node_id.parse().ok())
-}
-
-// ============================================================================
-// Quick-mode PIN rendezvous
-// ============================================================================
-
-const PIN_KIND_U16: u16 = 9421;
-const PIN_EVENT_TTL_SECS: u64 = 3 * pin::BUCKET_SECS;
-const PIN_LOOKUP_TIMEOUT: Duration = Duration::from_secs(8);
-
-fn pin_kind() -> Kind {
-    Kind::from_u16(PIN_KIND_U16)
-}
-
-pub async fn publish_pin_record(keys: &Keys, node_id: &EndpointId, relays: &[String]) -> Result<()> {
-    let content = crate::pin_record::encrypt_pin_payload(keys, node_id)?;
-    let expiration = Timestamp::now() + PIN_EVENT_TTL_SECS;
-    let client = connect_client(relays).await?;
-    let event = EventBuilder::new(pin_kind(), content)
-        .tag(Tag::expiration(expiration))
-        .sign_with_keys(keys)
-        .context("signing PIN record")?;
-    let res = client.send_event(&event).await;
-    client.disconnect().await;
-    res.context("publishing PIN record to relays")?;
-    Ok(())
-}
-
-pub async fn lookup_pin_record(
-    candidates: &[Keys],
-    relays: &[String],
-) -> Result<Option<EndpointId>> {
-    let by_pubkey: HashMap<PublicKey, &Keys> = candidates
-        .iter()
-        .map(|keys| (keys.public_key(), keys))
-        .collect();
-    let client = connect_client(relays).await?;
-    let filter = Filter::new()
-        .kind(pin_kind())
-        .authors(by_pubkey.keys().copied());
-    let events = client.fetch_events(filter, PIN_LOOKUP_TIMEOUT).await;
-    client.disconnect().await;
-    let events = events.context("querying nostr relays for the PIN record")?;
-    let mut candidates: Vec<_> = events.iter().collect();
-    candidates.sort_by_key(|event| std::cmp::Reverse(event.created_at));
-    for event in candidates {
-        let Some(keys) = by_pubkey.get(&event.pubkey) else {
-            continue;
-        };
-        if let Some(node_id) = crate::pin_record::decrypt_pin_payload(keys, &event.content) {
-            return Ok(Some(node_id));
-        }
-    }
-    Ok(None)
 }
 
 #[cfg(test)]
