@@ -1348,6 +1348,11 @@ async fn resolve_hosting(
     })
 }
 
+/// How often [`run_hosting_publisher`] wakes to republish. Well inside the
+/// relay copy's five-minute expiry, and quoted in the log line so the interval
+/// the reader is told about cannot drift from the one actually slept.
+const HOSTING_REFRESH: Duration = Duration::from_secs(120);
+
 /// Configure-mode hosting publisher: keep this host's ephemeral node id
 /// resolvable by each trusted peer, on every enabled channel, for as long as
 /// the session listens.
@@ -1435,7 +1440,18 @@ async fn run_hosting_publisher(
                 )
                 .await
                 {
-                    Ok(()) => published = true,
+                    Ok(()) => {
+                        published = true;
+                        // Said every round, like the PIN publisher's: on a
+                        // relay-only host this is the only evidence the device
+                        // ever announced itself, and a stale last line would
+                        // otherwise be indistinguishable from a live one.
+                        log::info!(
+                            "Published pairwise hosting records to nostr for {} trusted peer(s) (refreshes in {}s)",
+                            live.len(),
+                            HOSTING_REFRESH.as_secs()
+                        );
+                    }
                     Err(e) => log::warn!("Failed to publish pairwise hosting records: {e:#}"),
                 }
             }
@@ -1453,7 +1469,7 @@ async fn run_hosting_publisher(
 
         tokio::select! {
             _ = cancel.cancelled() => return,
-            _ = tokio::time::sleep(Duration::from_secs(120)) => {}
+            _ = tokio::time::sleep(HOSTING_REFRESH) => {}
         }
     }
 }
