@@ -83,7 +83,7 @@ pub(crate) struct App {
     /// text field each) so grouping never edits a field's text mid-keystroke.
     pub(crate) in_pin_a: String,
     pub(crate) in_pin_b: String,
-    /// The joiner's optional host-IP entry, shown only for a LAN-only PIN. Holds
+    /// The joiner's optional host-IP entry on the LAN-setup screen. Holds
     /// only the *host part* typed after the locked network prefix (or a full
     /// address pasted whole); [`App::join_ip_ctx`] resolves and range-checks it.
     /// When it resolves to an in-range address it selects the unicast side
@@ -806,13 +806,38 @@ impl App {
     }
 
     /// Join a LAN setup: dial what the entry holds (the typed PIN, plus an
-    /// optional host IP). A no-op while the entry isn't a valid PIN (the Join
-    /// action is disabled then — see `dial-ready`).
+    /// optional host IP).
+    ///
+    /// Invalid input never dials, and says so. The Join *button* is disabled
+    /// until the entry validates (see `dial-ready`), but the keyboard shortcut
+    /// bypasses that, and a shortcut that silently does nothing reads as a
+    /// broken key rather than a bad PIN.
     pub(crate) fn join_lan_setup(&mut self) {
-        if let Some(spec) = self.lan_setup_dial_spec() {
-            self.client_active = true;
-            self.net.send(UiCommand::Connect { spec });
-            self.screen = Screen::LanPairing;
+        let Some(spec) = self.lan_setup_dial_spec() else {
+            self.error = Some(self.lan_setup_dial_problem());
+            return;
+        };
+        self.client_active = true;
+        self.net.send(UiCommand::Connect { spec });
+        self.screen = Screen::LanPairing;
+    }
+
+    /// Why [`App::lan_setup_dial_spec`] refused, phrased for the error banner.
+    /// Checked in the same order the spec builds, so the message names the first
+    /// thing the user has to fix.
+    fn lan_setup_dial_problem(&self) -> String {
+        use duocb_core::subnet::JoinIpOutcome;
+        if duocb_core::pin::normalize_pin(&format!("{}{}", self.in_pin_a, self.in_pin_b)).is_none() {
+            return "Enter the full eight-character PIN shown on the other device".into();
+        }
+        // Same wording as the field's inline error (see `sync`), so the banner
+        // and the field never describe one problem two ways.
+        match self.join_ip_outcome() {
+            JoinIpOutcome::OutOfRange => {
+                format!("IP out of range for {}", self.join_ip_ctx.label())
+            }
+            JoinIpOutcome::Malformed => "Not a valid IPv4 address".into(),
+            _ => "This device has no identity card to offer yet".into(),
         }
     }
 
@@ -1218,6 +1243,27 @@ pub(crate) mod lan_setup_tests {
         app.in_pin_b = typo[4..].to_string();
         assert!(app.lan_setup_dial_spec().is_none(), "a typo must not dial");
 
+        cleanup(app, path);
+    }
+
+    /// The Join button is disabled on an invalid entry, but the keyboard
+    /// shortcut is not — so joining on a bad PIN has to explain itself rather
+    /// than look like a dead key.
+    #[test]
+    fn joining_on_an_invalid_pin_says_why_instead_of_nothing() {
+        let (mut app, path) = configured_app();
+        app.open_lan_setup();
+        app.in_pin_a = "ABCD".into();
+
+        app.join_lan_setup();
+
+        assert!(!app.client_active, "a bad PIN must not dial");
+        assert_eq!(app.screen, Screen::LanSetup, "and must not advance a screen");
+        assert!(
+            app.error.as_deref().is_some_and(|e| e.contains("PIN")),
+            "the banner must name the PIN, got {:?}",
+            app.error
+        );
         cleanup(app, path);
     }
 

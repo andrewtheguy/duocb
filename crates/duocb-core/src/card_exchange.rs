@@ -10,7 +10,8 @@
 //! ```text
 //! D→L: CardOffer { card_d }     # both sent immediately after the PIN accepts,
 //! L→D: CardOffer { card_l }     # crossing on the wire — neither side waits
-//! (both finish their send stream, then read the peer's to end-of-stream)
+//! (each side then reads the peer's card, finishes its own send stream, and
+//!  waits for the peer's stream to end)
 //! ```
 //!
 //! Both offers are written before either is read, so the exchange costs one

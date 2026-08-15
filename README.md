@@ -146,8 +146,11 @@ persisted.
   The PIN proves possession of a short code, not an identity: it is ~35 bits and
   its rendezvous record is offline-attackable, so anyone who reads or guesses it
   inside its 60-second window can complete the handshake and offer a card. The
-  human comparison catches exactly that, because the value being compared never
-  crossed the network.
+  human comparison catches exactly that. The incoming fingerprint is computed
+  from the card that just arrived, so it is network-delivered and proves
+  nothing on its own; what is trustworthy is the *expected* value, which the
+  other device shows for itself and which you read off its screen. Holding the
+  two against each other is what carries the check out of band.
 - The fingerprint commits to a single public key, so an impostor needs a second
   preimage against a fixed target. A combined "session code" mixing both devices'
   keys would instead let an interposer vary both of its own keys and hunt for a

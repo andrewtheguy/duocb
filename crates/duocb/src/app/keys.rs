@@ -73,12 +73,14 @@ pub(crate) fn handle_global_key(
             // entered on this screen.
             if letter('s') {
                 app.host_lan_setup();
+                true
             } else if letter('c') {
                 app.join_lan_setup();
+                true
             } else {
-                return handle_session_key(app, focus_free, &command);
+                // Anything else falls through to the session shortcuts below.
+                false
             }
-            true
         }
         Screen::LanPairing => {
             // Copy the current rotating PIN, or mint a new one, without the
@@ -247,6 +249,7 @@ fn handle_session_key(app: &mut App, focus_free: bool, command: &dyn Fn(char) ->
 mod tests {
     use super::*;
     use crate::app::lan_setup_tests::{cleanup, configured_app, peer_card};
+    use duocb_core::auth::IdentityCard;
 
     /// Press a plain (unmodified) key.
     fn plain(app: &mut App, text: &str) -> bool {
@@ -341,12 +344,21 @@ mod tests {
         // Navigate away without deciding (the card is dropped by go_back, so
         // re-supply it and force the screen instead).
         app.screen = Screen::Home;
-        app.pending_peer_card = Some(peer_card("laptop", 0));
+        let pending = peer_card("laptop", 0);
+        app.pending_peer_card = Some(pending.clone());
 
-        assert!(!plain(&mut app, "i") || app.peers.is_empty());
+        // On the hub, I is the paste-a-card action, so it consumes the key —
+        // but it must act on the (empty) paste field, never on the card waiting
+        // behind the confirmation screen.
+        plain(&mut app, "i");
         assert!(
             app.peers.is_empty(),
             "I on the hub must not import a pending card"
+        );
+        assert_eq!(
+            app.pending_peer_card.as_ref().map(IdentityCard::public_key),
+            Some(pending.public_key()),
+            "the pending card must still be waiting on its fingerprint check"
         );
 
         cleanup(app, path);

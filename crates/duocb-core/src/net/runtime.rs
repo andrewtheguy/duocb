@@ -965,8 +965,10 @@ async fn run_lan_setup_host(
 
     // Serve dialers one at a time until one gets all the way through. A failed
     // handshake must not end the session — a mistyped PIN would otherwise kick
-    // the user back a screen — so a failure loops round and keeps listening,
-    // while a completed exchange ends the session.
+    // the user back a screen — so a pre-auth failure loops round and keeps
+    // listening. A completed exchange ends the session, and so does a failure
+    // after the PIN was accepted (see the error arm: the claim and the PIN are
+    // already spent by then).
     //
     // Strictly sequential, unlike the configure-mode host, which keeps accepting
     // during a live session so a dropped peer can resume. There is nothing to
@@ -1011,10 +1013,21 @@ async fn run_lan_setup_host(
                 break;
             }
             Err(e) => {
-                // Keep the PIN up and keep listening: the usual cause is a
-                // typo on the other device, and the user can just retype it.
-                log::warn!("LAN setup attempt from {remote_id} failed: {e:#}");
                 conn.close(AUTH_FAILED_CODE.into(), b"lan-setup-failed");
+                // How far the attempt got decides whether listening on is
+                // useful. Before the PIN is proven nothing is spent: the usual
+                // cause is a typo on the other device, and the user just
+                // retypes it. Once the claim is committed the PIN has already
+                // been withdrawn and cleared from the screen, and the claim
+                // turns away every other dialer — so looping would leave the
+                // host "waiting" on a code nobody can read and no one else
+                // could use anyway. End the session and say what happened.
+                if claim.peek().is_some_and(|c| c.node_id == Some(remote_id)) {
+                    log::warn!("LAN setup with {remote_id} failed after the PIN was accepted: {e:#}");
+                    events.error(format!("{e:#}"));
+                    break;
+                }
+                log::warn!("LAN setup attempt from {remote_id} failed: {e:#}");
                 events.status(ConnStatus::Listening);
             }
         }
@@ -1042,7 +1055,13 @@ const LATECOMER_GRACE: Duration = Duration::from_secs(3);
 async fn refuse_latecomers(endpoint: &iroh::Endpoint) {
     let deadline = tokio::time::Instant::now() + LATECOMER_GRACE;
     while let Ok(Some(incoming)) = tokio::time::timeout_at(deadline, endpoint.accept()).await {
-        match incoming.await {
+        // The handshake is bounded by the same deadline: a dialer that connects
+        // and then stalls must not hold the endpoint open past the grace.
+        let Ok(handshake) = tokio::time::timeout_at(deadline, incoming).await else {
+            log::debug!("A latecomer's handshake outlasted the grace period");
+            break;
+        };
+        match handshake {
             Ok(conn) => {
                 log::info!("Refusing {}: this LAN setup is already done", conn.remote_id());
                 conn.close(SERVER_BUSY_CODE.into(), b"busy");
@@ -2174,7 +2193,7 @@ mod tests {
         let _ = cli_session.clip_tx.send("should never arrive".to_string());
         let _ = srv_session.clip_tx.send("nor should this".to_string());
 
-        std::thread::sleep(Duration::from_secs(3));
+        tokio::time::sleep(Duration::from_secs(3)).await;
         for (label, rx) in [("host", &srv_rx), ("joiner", &cli_rx)] {
             assert!(
                 !rx.try_iter()

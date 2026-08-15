@@ -153,9 +153,13 @@ D→L  AuthRequest::Pin  {nonce_d}
 L→D  PinChallenge      {nonce_l}
 D→L  PinResponse       {proof_d}
 L→D  PinConfirm        {accepted, proof_l}
-D→L  CardOffer         {card_d}     # both sent at once, then each side
-L→D  CardOffer         {card_l}     # finishes its stream and reads the peer's
+D→L  CardOffer         {card_d}     # concurrent, independent half-streams:
+L→D  CardOffer         {card_l}     # the order shown here is illustrative only
 ```
+
+Only the four PIN frames are turn-taking. Both offers are written immediately
+once the PIN is accepted, so neither `CardOffer` waits on the other and their
+relative arrival order is not defined.
 
 Each side finishes its send stream only *after* reading the peer's card, so
 seeing the peer's end-of-stream proves the peer already holds ours — without

@@ -154,9 +154,11 @@ pub enum NetEvent {
     /// the host app's call, and it must not be made without the user comparing
     /// the sender's fingerprint against the value shown on the other device.
     ///
-    /// Emitted **before** [`NetEvent::PinCleared`] and the closing
-    /// [`ConnStatus::Idle`] on the same channel, so a host app is guaranteed to
-    /// see the card before it processes session teardown.
+    /// Emitted **before** the closing [`ConnStatus::Idle`] on the same channel,
+    /// so a host app is guaranteed to see the card before it processes session
+    /// teardown. It carries no ordering against [`NetEvent::PinCleared`], which
+    /// a separate publisher task emits as soon as the pair claim is committed —
+    /// that is, before the cards have even crossed.
     PeerCardReceived(Box<crate::auth::IdentityCard>),
     PeerDisconnected,
     /// Answer to [`UiCommand::QueryConnPath`]: a point-in-time snapshot of the
