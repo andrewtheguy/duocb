@@ -47,6 +47,12 @@ fn parse_args(args: impl Iterator<Item = std::ffi::OsString>) -> Result<Cli, Box
     while let Some(arg) = args.next() {
         if arg == "--config" || arg == "-c" {
             let path = args.next().ok_or("--config requires a path")?;
+            // An empty value is rejected in both forms: `config::resolve_path`
+            // would otherwise take "" as an explicit override and fail deeper
+            // in, or silently target the process's own directory.
+            if path.is_empty() {
+                return Err("--config requires a path".into());
+            }
             config = Some(PathBuf::from(path));
         } else if let Some(value) = arg.to_str().and_then(|s| s.strip_prefix("--config=")) {
             if value.is_empty() {
@@ -228,6 +234,9 @@ mod cli_tests {
         assert_eq!(cli.config, Some(PathBuf::from("/tmp/peer3.json")));
 
         assert!(parse(&["--config"]).is_err(), "a path is required");
-        assert!(parse(&["--config="]).is_err(), "an empty path is not a path");
+        // An empty path is not a path in either form.
+        assert!(parse(&["--config="]).is_err());
+        assert!(parse(&["--config", ""]).is_err());
+        assert!(parse(&["-c", ""]).is_err());
     }
 }

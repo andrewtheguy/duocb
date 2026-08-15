@@ -1341,8 +1341,10 @@ async fn resolve_card_setup(
     let candidates = crate::pin_record::candidate_keys(canonical_pin).await?;
 
     // Errors are held, not raised: with both channels enabled either one can
-    // fail while the other still finds the host. Only a run that found nothing
-    // *anywhere* reports, and then a real error beats the generic miss.
+    // fail while the other still finds the host. An error is reported only when
+    // no enabled channel managed to look at all — a channel that looked and
+    // cleanly found nothing answers the question, so it clears a held error and
+    // the generic miss (which names what the user can fix) surfaces instead.
     let mut first_error: Option<anyhow::Error> = None;
 
     if channel.lan() {
@@ -1369,7 +1371,14 @@ async fn resolve_card_setup(
         }
         match crate::nostr::lookup_pin_record(&candidates, relays).await {
             Ok(Some(id)) => return Ok(EndpointAddr::new(id)),
-            Ok(None) => log::info!("No card-setup record for that PIN on the relays"),
+            Ok(None) => {
+                log::info!("No card-setup record for that PIN on the relays");
+                // The relays looked and found nothing: that is the answer, and
+                // it is the one the user can act on. A LAN failure held from the
+                // first half is a detail of how the search went (already logged
+                // as a warning) and must not displace the channel's miss.
+                first_error = None;
+            }
             Err(e) => {
                 let e = e.context("nostr PIN lookup failed");
                 log::warn!("{e:#}");

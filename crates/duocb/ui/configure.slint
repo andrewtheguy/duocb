@@ -320,7 +320,11 @@ export component HomeScreen inherits ScrollView {
             clicked => { Actions.open-card-setup(); }
         }
         if UiState.configure-step == ConfigureStep.ready: Small {
-            text: "Use this when you can't copy and paste identity cards between the two devices. They find each other with a short PIN — on the local network first, then through relays — and you check fingerprints before trusting.";
+            // No channel detail here: how the devices find each other is a
+            // launch-time choice, and the card-setup screen states the one
+            // actually in use (`setup-channel-note`). Naming it twice is how
+            // one copy goes stale on a --lan-only or --nostr-only run.
+            text: "Use this when you can't copy and paste identity cards between the two devices. They find each other over the network with a short PIN, and you check fingerprints before trusting.";
             horizontal-alignment: center;
         }
         if UiState.configure-step == ConfigureStep.setup-choice || UiState.configure-step == ConfigureStep.ready: Small {

@@ -865,7 +865,7 @@ impl App {
         match self.setup_channel {
             SetupChannel::LanThenNostr => (
                 "How the devices find each other",
-                "This device is looked for on the local network first (Bonjour/DNS-SD, no third-party server, traffic direct between the devices). If nothing answers there, the search falls back to public Nostr relays, which works when the two devices are on different networks. Only a PIN-encrypted record holding a temporary connection id is ever published.",
+                "This device is looked for on the local network first (Bonjour/DNS-SD, with traffic direct between the devices and no relay involved). If nothing answers there, the search falls back to public Nostr relays, which works when the two devices are on different networks. Only a PIN-encrypted record holding a temporary connection id is ever published.",
             ),
             SetupChannel::LanOnly => (
                 "Local network only",
@@ -1305,15 +1305,20 @@ pub(crate) mod card_setup_tests {
     fn the_screen_describes_the_channel_in_use() {
         let (mut app, path) = configured_app();
 
+        // One canonical phrase, matched case-insensitively, so the positive and
+        // negative checks are genuinely complementary: comparing two different
+        // spellings would let the negative one pass on capitalisation alone.
+        const LAN_PROMISE: &str = "no third-party server";
+
         app.setup_channel = SetupChannel::LanOnly;
         let (_, lan_note) = app.setup_channel_text();
-        assert!(lan_note.contains("No third-party server"));
+        assert!(lan_note.to_lowercase().contains(LAN_PROMISE));
 
         app.setup_channel = SetupChannel::LanThenNostr;
         let (_, default_note) = app.setup_channel_text();
         assert!(default_note.contains("Nostr relays"));
         assert!(
-            !default_note.contains("No third-party server"),
+            !default_note.to_lowercase().contains(LAN_PROMISE),
             "the default channel must not claim the LAN-only guarantee"
         );
 
