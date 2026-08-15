@@ -361,6 +361,11 @@ mod ios {
     /// How long to keep collecting A/AAAA answers for the winning instance
     /// after the first arrives, so the second address family can land too.
     const ADDR_GRACE: Duration = Duration::from_millis(700);
+    /// Slice of `LOOKUP_TIMEOUT` held back from browsing so the address lookup
+    /// that follows always has time to run. A browse that hit at the very end
+    /// of the window would otherwise resolve a record it can produce no address
+    /// for, which reads as "nothing on this network" rather than "too slow".
+    const ADDR_RESERVE: Duration = Duration::from_millis(1500);
 
     /// `super`'s service types are full DNS-SD names (`_duocb-pin._udp.local.`),
     /// but the dns_sd.h calls take the registration type and the domain as
@@ -677,6 +682,9 @@ mod ios {
         decode: impl Fn(&str, &str) -> Option<EndpointId>,
     ) -> Result<Option<LanFound>> {
         let deadline = Instant::now() + LOOKUP_TIMEOUT;
+        // The browse stops early so `resolve_addresses` below still has a window
+        // to work in; both phases share the one LOOKUP_TIMEOUT budget.
+        let browse_deadline = deadline - ADDR_RESERVE;
         let owned_type = service_type.to_string();
         let mut browse = tokio::task::spawn_blocking(move || Browse::start(&owned_type))
             .await
@@ -684,7 +692,7 @@ mod ios {
 
         let hit = loop {
             let (returned, answers) = tokio::task::spawn_blocking(move || {
-                let answers = browse.pump(deadline);
+                let answers = browse.pump(browse_deadline);
                 (browse, answers)
             })
             .await
@@ -844,7 +852,11 @@ mod ios {
         context: *mut c_void,
     ) {
         let outcome = unsafe { &mut *context.cast::<AddrOutcome>() };
-        if err == 0 && !address.is_null() {
+        // Only additions are addresses to dial. GetAddrInfo reports expiry the
+        // same way the browse reports a vanished instance — a callback with
+        // FLAG_ADD clear — and collecting those would hand back an address the
+        // daemon has just said is gone.
+        if err == 0 && !address.is_null() && flags & FLAG_ADD != 0 {
             match unsafe { (*address).sa_family } as i32 {
                 libc::AF_INET => {
                     let sa = unsafe { &*address.cast::<libc::sockaddr_in>() };
@@ -1052,6 +1064,13 @@ mod ios {
     /// Resolve an SRV target's A/AAAA records through the daemon. Answers arrive
     /// one record at a time, so a short grace after the first lets the second
     /// address family land too.
+    ///
+    /// The grace is measured from the *first address*, not from entry: the
+    /// daemon may take longer than [`ADDR_GRACE`] to produce anything at all
+    /// (a cold cache, a host still being probed), and starting the clock here
+    /// would abandon the resolve before the first record ever landed and report
+    /// a record with no dialable address. Until then the shared `deadline` is
+    /// the only bound.
     fn resolve_addresses(host: &CStr, deadline: Instant) -> Result<Vec<IpAddr>> {
         let mut outcome = Box::new(AddrOutcome::default());
         let mut sd_ref: DNSServiceRef = ptr::null_mut();
@@ -1068,8 +1087,14 @@ mod ios {
         };
         ensure!(err == 0, "DNSServiceGetAddrInfo failed: {err}");
         let op = Op(sd_ref);
-        let grace = deadline.min(Instant::now() + ADDR_GRACE);
-        while !(outcome.done && !outcome.ips.is_empty()) && poll_and_process(&[op.0], grace)? {}
+        let mut window = deadline;
+        while !(outcome.done && !outcome.ips.is_empty()) && poll_and_process(&[op.0], window)? {
+            if !outcome.ips.is_empty() {
+                // Pinned by the first address: `min` keeps the earlier bound, so
+                // later rounds cannot push the window out again.
+                window = window.min(Instant::now() + ADDR_GRACE);
+            }
+        }
         drop(op);
         Ok(std::mem::take(&mut outcome.ips))
     }

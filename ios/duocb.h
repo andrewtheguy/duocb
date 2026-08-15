@@ -111,6 +111,10 @@ typedef struct DuocbHandle DuocbHandle;
 #define DUOCB_IDENTITY_CARD_BUF_LEN 4096
 #define DUOCB_IDENTITY_CARD_INFO_BUF_LEN 1024
 #define DUOCB_JOIN_IP_BUF_LEN 256
+/* duocb_pin_progress's JSON object. */
+#define DUOCB_PIN_PROGRESS_BUF_LEN 128
+/* duocb_resolve_join_ip's single dotted-quad answer. */
+#define DUOCB_JOIN_IP_ADDR_BUF_LEN 32
 
 void duocb_init_logging(void);
 
@@ -189,12 +193,13 @@ int duocb_resolve_join_ip(const char *entry, char *out_buf, size_t out_len);
 DuocbHandle *duocb_start(const char *config_json,
                          char *err_buf,
                          size_t err_len);
-/* 1 = event written, 0 = none pending, -1 = NULL handle,
+/* 1 = event written, 0 = none pending, -1 = NULL handle or out_buf,
  * -2 = buffer too small (the event is retained; retry with a larger buffer). */
 int duocb_next_event(const DuocbHandle *handle, char *out_buf, size_t out_len);
 
 /* Fire-and-forget commands; outcomes arrive as events.
  * 0 = requested, -1 = NULL handle. */
+/* -1 also when text is NULL or not valid UTF-8. */
 int duocb_send_clipboard(const DuocbHandle *handle, const char *text);
 int duocb_query_conn_path(const DuocbHandle *handle);
 /* card_host only: mint a fresh PIN now, invalidating every earlier one. */
@@ -211,7 +216,9 @@ int duocb_is_running(const DuocbHandle *handle);
  * 0 = requested, -1 = NULL handle, -2 = runtime unavailable (stop and restart). */
 int duocb_reconnect(const DuocbHandle *handle);
 /* Graceful shutdown and free. NULL is a safe no-op; the handle must not be
- * used afterwards. */
+ * used afterwards.
+ * BLOCKS until the runtime ends or a 5s timeout expires — usually immediate,
+ * but a live session waits on its peer. Call it off the main thread. */
 void duocb_stop(DuocbHandle *handle);
 
 #ifdef __cplusplus

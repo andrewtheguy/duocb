@@ -59,11 +59,17 @@ XCFRAMEWORK="$DIST/libduocb.xcframework"
 mkdir -p "$DIST"
 cp "ios/duocb.h" "$DIST/duocb.h"
 
+# Where cargo actually put the archives. CARGO_TARGET_DIR relocates the whole
+# target/ tree, and a build machine that sets it (a shared build cache, say)
+# would otherwise leave this looking for libduocb.a where nothing was written.
+# A relative value is relative to the cwd, which is SCRIPT_DIR by now.
+TARGET_DIR="${CARGO_TARGET_DIR:-$SCRIPT_DIR/target}"
+
 echo "Creating libduocb.xcframework ..."
 rm -rf "$XCFRAMEWORK"
 xcodebuild -create-xcframework \
-  -library "target/${DEVICE_TARGET}/${OUT_SUBDIR}/libduocb.a" -headers "ios" \
-  -library "target/${SIM_TARGET}/${OUT_SUBDIR}/libduocb.a"    -headers "ios" \
+  -library "${TARGET_DIR}/${DEVICE_TARGET}/${OUT_SUBDIR}/libduocb.a" -headers "ios" \
+  -library "${TARGET_DIR}/${SIM_TARGET}/${OUT_SUBDIR}/libduocb.a"    -headers "ios" \
   -output "$XCFRAMEWORK"
 
 echo "Staged: $XCFRAMEWORK"

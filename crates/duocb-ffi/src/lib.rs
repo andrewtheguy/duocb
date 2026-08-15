@@ -715,25 +715,22 @@ fn build_start_plan(cfg: FfiConfig) -> Result<StartPlan, String> {
     let self_card = IdentityCard::parse(cfg.self_card.as_deref().ok_or("self_card is required")?)
         .map_err(|error| format!("invalid self_card: {error:#}"))?;
 
+    // One authoritative rule per field, each stated once: card setup is the
+    // identity-less half of the protocol, and the PIN and its side-channel IP
+    // belong to the one role that dials a PIN.
     let card_setup = matches!(cfg.role, Role::CardHost | Role::CardJoin);
     if card_setup && (cfg.identity_secret.is_some() || !cfg.peers.is_empty()) {
         return Err("card setup accepts only role, self_card, pin, ip, channel and relays".into());
     }
-    if !card_setup && (cfg.pin.is_some() || cfg.ip.is_some()) {
+    if cfg.role != Role::CardJoin && (cfg.pin.is_some() || cfg.ip.is_some()) {
         return Err("pin and ip are only valid for the card_join role".into());
     }
     if cfg.role != Role::Join && cfg.peer_public_key.is_some() {
         return Err("peer_public_key is only valid for the join role".into());
     }
-    if cfg.role != Role::CardJoin && cfg.pin.is_some() {
-        return Err("pin is only valid for the card_join role".into());
-    }
 
     match cfg.role {
         Role::CardHost => {
-            if cfg.ip.is_some() {
-                return Err("ip is only valid for the card_join role".into());
-            }
             return Ok(StartPlan::host(UiCommand::StartServer {
                 mode: ServerMode::CardSetup {
                     self_card: Box::new(self_card),
@@ -837,7 +834,7 @@ fn build_start_plan(cfg: FfiConfig) -> Result<StartPlan, String> {
 }
 
 /// Drain one pending event as a NUL-terminated JSON string.
-/// Returns 1 = event written; 0 = none pending; -1 = NULL handle;
+/// Returns 1 = event written; 0 = none pending; -1 = NULL handle or `out_buf`;
 /// -2 = `out_buf` too small (the event is retained — retry with a larger buffer).
 /// # Safety
 /// `handle` must be NULL or a handle returned by [`duocb_start`] that has not
@@ -849,7 +846,10 @@ pub unsafe extern "C" fn duocb_next_event(
     out_buf: *mut c_char,
     out_len: usize,
 ) -> c_int {
-    if handle.is_null() {
+    // Checked before anything is taken from the queue. A NULL buffer is a
+    // caller bug, not a sizing problem, and reporting it as -2 would invite the
+    // documented remedy — retry with a bigger buffer — which can never succeed.
+    if handle.is_null() || out_buf.is_null() {
         return -1;
     }
     let handle = unsafe { &*handle };
@@ -983,6 +983,11 @@ pub unsafe extern "C" fn duocb_reconnect(handle: *const DuocbHandle) -> c_int {
 
 /// Stop the session (graceful shutdown, bounded wait) and free the handle.
 /// NULL is a safe no-op. The handle must not be used afterwards.
+///
+/// **Blocks** until the runtime task ends or a 5-second timeout expires —
+/// normally immediate, but a live session takes as long as its peer needs to
+/// wind down. Call it off the iOS main thread; on it, the UI freezes for the
+/// duration and the watchdog can kill the app outright.
 /// # Safety
 /// `handle` must be NULL or a handle returned by [`duocb_start`]; it is freed
 /// here and must not be used again afterwards.
@@ -1347,8 +1352,18 @@ mod tests {
         let json = serde_json::json!({
             "role": "start",
             "identity_secret": nsec,
-            "self_card": card,
+            "self_card": card.clone(),
             "pin": "K7P29QXM",
+        })
+        .to_string();
+        assert!(build(&json).unwrap_err().contains("only valid for the card_join role"));
+
+        // The same rule covers card_host, which has neither a PIN nor a
+        // side-channel IP of its own: it *shows* a PIN rather than dialling one.
+        let json = serde_json::json!({
+            "role": "card_host",
+            "self_card": card,
+            "ip": "192.168.1.9",
         })
         .to_string();
         assert!(build(&json).unwrap_err().contains("only valid for the card_join role"));
@@ -1401,7 +1416,7 @@ mod tests {
 
     #[test]
     fn write_cstr_truncates_on_utf8_boundaries() {
-        let mut buf = [0i8; 8];
+        let mut buf = [0 as c_char; 8];
         assert!(write_cstr(buf.as_mut_ptr(), buf.len(), "abc"));
         assert_eq!(
             unsafe { CStr::from_ptr(buf.as_ptr()) }.to_str().unwrap(),
@@ -1410,7 +1425,7 @@ mod tests {
 
         // "é" is two bytes; a buffer that can hold only part of it must drop it
         // whole rather than write half a character.
-        let mut buf = [0i8; 3];
+        let mut buf = [0 as c_char; 3];
         assert!(!write_cstr(buf.as_mut_ptr(), buf.len(), "aéb"));
         assert_eq!(
             unsafe { CStr::from_ptr(buf.as_ptr()) }.to_str().unwrap(),
