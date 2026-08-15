@@ -13,7 +13,7 @@
 //! candidate-label match. The served record carries the same NIP-44 ciphertext the
 //! DNS-SD `e` TXT attribute holds, plus the host's direct socket addresses (which
 //! DNS-SD instead conveys via SRV/A/AAAA), so the joiner ends up with the identical
-//! [`PinFound`] and dials iroh exactly as the DNS-SD path does.
+//! [`LanFound`] and dials iroh exactly as the DNS-SD path does.
 //!
 //! Cross-platform (plain tokio TCP).
 
@@ -29,7 +29,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
-use super::{PinFound, LOOKUP_TIMEOUT};
+use super::{LanFound, LOOKUP_TIMEOUT};
 use crate::pin_record;
 
 /// Cap on the record a joiner will read (and a host will serve): the JSON is a
@@ -48,7 +48,7 @@ struct UnicastRecord {
 }
 
 /// A live unicast side-channel listener. Dropping it aborts the accept loop and
-/// frees the port — withdrawing the side channel, like dropping a `PinAdvert`.
+/// frees the port — withdrawing the side channel, like dropping a `LanAdvert`.
 pub struct UnicastListener {
     task: JoinHandle<()>,
 }
@@ -119,10 +119,10 @@ async fn serve_one(stream: &mut TcpStream, body: &[u8]) -> std::io::Result<()> {
 /// Each candidate bucket key derives its own port; the host listens on the one for
 /// the bucket it minted the PIN in, so the ports are probed concurrently and the
 /// first that returns a decryptable record wins. Returns the decrypted node id plus
-/// the host's direct socket addresses ([`PinFound`]), or `Ok(None)` when no reachable
+/// the host's direct socket addresses ([`LanFound`]), or `Ok(None)` when no reachable
 /// port answered or none decrypted (wrong or expired PIN) — the same "no record"
 /// outcome the DNS-SD browse window reports. Bounded overall by [`LOOKUP_TIMEOUT`].
-pub async fn lookup(ip: IpAddr, candidates: &[Keys]) -> Result<Option<PinFound>> {
+pub async fn lookup(ip: IpAddr, candidates: &[Keys]) -> Result<Option<LanFound>> {
     if candidates.is_empty() {
         return Ok(None);
     }
@@ -148,7 +148,7 @@ pub async fn lookup(ip: IpAddr, candidates: &[Keys]) -> Result<Option<PinFound>>
 /// candidate key. `None` on any failure (unreachable/reset, oversize, unparseable,
 /// or no candidate key decrypts) so a probe of a closed port simply drops out of
 /// the race.
-async fn fetch_and_decrypt(addr: SocketAddr, candidates: &[Keys]) -> Option<PinFound> {
+async fn fetch_and_decrypt(addr: SocketAddr, candidates: &[Keys]) -> Option<LanFound> {
     let buf = match fetch(addr).await {
         Ok(buf) => buf,
         Err(e) => {
@@ -169,7 +169,7 @@ async fn fetch_and_decrypt(addr: SocketAddr, candidates: &[Keys]) -> Option<PinF
         }
     };
     candidates.iter().find_map(|keys| {
-        pin_record::decrypt_pin_payload(keys, &record.e).map(|node_id| PinFound {
+        pin_record::decrypt_pin_payload(keys, &record.e).map(|node_id| LanFound {
             node_id,
             addrs: record.addrs.clone(),
         })

@@ -2,9 +2,10 @@
 // identity cards to each other. A rotating PIN authenticates a short-lived
 // connection, both devices swap signed cards over it, and the user confirms the
 // fingerprint before anything is trusted. How the two devices find each other
-// (local network, relays, or local-then-relays) is chosen at launch and
-// described by `setup-channel-note`. No clipboard content ever crosses a
-// card-setup connection — that is what the configure-mode session is for.
+// (local network, relays, or local-then-relays) is chosen at launch, governs
+// clipboard sessions too, and is described by `signal-channel-note`. No
+// clipboard content ever crosses a card-setup connection — that is what the
+// configure-mode session is for.
 
 import { UiState, Actions } from "globals.slint";
 import { Theme } from "theme.slint";
@@ -37,9 +38,9 @@ export component CardSetupScreen inherits ScrollView {
         }
 
         Card {
-            CardTitle { text: UiState.setup-channel-title; }
+            CardTitle { text: UiState.signal-channel-title; }
             Small {
-                text: UiState.setup-channel-note;
+                text: UiState.signal-channel-note;
             }
         }
 
@@ -123,13 +124,13 @@ export component CardSetupScreen inherits ScrollView {
             ip-col := VerticalLayout {
                 alignment: start;
                 spacing: Theme.pad-xs;
-                visible: UiState.setup-lan-enabled;
+                visible: UiState.signal-lan-enabled;
                 // `visible` alone still reserves the layout space, which would
                 // leave a hole where the field was, so the height is pinned to
                 // zero as well. Both bounds are needed: the column's min-height
                 // comes from its children and would otherwise win over the cap.
-                min-height: UiState.setup-lan-enabled ? ip-col.preferred-height : 0px;
-                max-height: UiState.setup-lan-enabled ? ip-col.preferred-height : 0px;
+                min-height: UiState.signal-lan-enabled ? ip-col.preferred-height : 0px;
+                max-height: UiState.signal-lan-enabled ? ip-col.preferred-height : 0px;
                 Small {
                     text: "Optional — only if the other device isn't found automatically. Type the IP it shows.";
                 }

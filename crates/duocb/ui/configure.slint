@@ -226,6 +226,17 @@ component HubStep inherits VerticalLayout {
         text: "Start makes this device host the connection — the other device joins it. Join shows your other devices and connects to the one that started.";
         horizontal-alignment: center;
     }
+    // Only shown when a launch flag moved this process off the default channel
+    // (see `signal-channel-badge`): the flag decides whether Start and Join can
+    // reach a device that is not on this network, which is not otherwise
+    // visible from the hub.
+    if UiState.signal-channel-badge != "": Text {
+        text: UiState.signal-channel-badge;
+        color: Theme.warn;
+        font-size: Theme.font-small;
+        horizontal-alignment: center;
+        wrap: word-wrap;
+    }
 }
 
 component JoinStep inherits VerticalLayout {

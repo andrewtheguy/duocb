@@ -107,14 +107,19 @@ export global UiState {
     in property <string> join-ip-error;
     in property <bool> dial-ready;
 
-    // Card setup.
+    // The signaling channel this process was launched with. It governs both
+    // trading cards and clipboard sessions, so these read "how the two devices
+    // find each other", not "how card setup works".
     /// Whether the local-network rendezvous is in use, so the screens offer the
     /// manual host-IP path (which only exists on that channel).
-    in property <bool> setup-lan-enabled;
-    /// The heading and body describing how the two devices will find each other
-    /// on the channel this process was launched with, composed in Rust.
-    in property <string> setup-channel-title;
-    in property <string> setup-channel-note;
+    in property <bool> signal-lan-enabled;
+    /// The heading and body describing how the two devices will find each other,
+    /// composed in Rust.
+    in property <string> signal-channel-title;
+    in property <string> signal-channel-note;
+    /// A one-line hub banner naming a non-default channel; "" on the default,
+    /// where the card-setup screen's note is the only place it is spelled out.
+    in property <string> signal-channel-badge;
 
     // Card-setup confirmation. The user compares `incoming-fingerprint` here
     // against `own-fingerprint` as shown on the other device; they must match

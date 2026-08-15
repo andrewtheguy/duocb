@@ -15,7 +15,7 @@ use crate::clipboard::SystemClipboard;
 use crate::{ConfigureStep, Screen};
 use duocb_core::net::endpoint::ConnPath;
 use duocb_core::auth::{Identity, IdentityCard};
-use duocb_core::net::{ConnStatus, KeyIdentity, NetEvent, NetHandle, SetupChannel, UiCommand};
+use duocb_core::net::{ConnStatus, KeyIdentity, NetEvent, NetHandle, SignalChannel, UiCommand};
 use item::ClipItem;
 
 /// How long the "sent ✓" / "✔ Copied" flashes stay visible.
@@ -42,7 +42,7 @@ pub(crate) struct App {
     /// flags pin it to a single channel so a test can exercise one path without
     /// the other quietly covering for it. Fixed for the process — it is a
     /// launch-time choice, not persisted state.
-    pub(crate) setup_channel: SetupChannel,
+    pub(crate) signal_channel: SignalChannel,
 
     // Configure-mode standing state (the primary mode).
     pub(crate) identity: Identity,
@@ -143,7 +143,7 @@ mod self_card_tests {
                 lock,
                 config,
                 duocb_core::net::spawn_net_runtime(None),
-                SetupChannel::default(),
+                SignalChannel::default(),
             ),
             path,
         )
@@ -228,7 +228,7 @@ impl App {
         config_lock: crate::config::ConfigLock,
         config: crate::config::Config,
         net: NetHandle,
-        setup_channel: SetupChannel,
+        signal_channel: SignalChannel,
     ) -> Self {
         let identity = Identity::parse_nsec(&config.identity_secret)
             .expect("ConfigLock::load validated the identity key");
@@ -266,7 +266,7 @@ impl App {
             screen: Screen::Home,
             status: ConnStatus::Idle,
             error: None,
-            setup_channel,
+            signal_channel,
             identity,
             saved_name: saved_name.clone(),
             device_suffix,
@@ -855,26 +855,46 @@ impl App {
         }
     }
 
-    /// The heading and body the card-setup screen shows for how the two devices
-    /// will find each other. It is launch-fixed (`--lan-only` / `--nostr-only`),
-    /// and the difference is exactly the thing a user has to know before
-    /// trusting the screen — whether a third-party server is involved, and
-    /// whether the other device has to be on this network — so each channel
-    /// says its own piece rather than one hedged paragraph covering all three.
-    pub(crate) fn setup_channel_text(&self) -> (&'static str, &'static str) {
-        match self.setup_channel {
-            SetupChannel::LanThenNostr => (
+    /// The heading and body shown for how this device and the other one find
+    /// each other. It is launch-fixed (`--lan-only` / `--nostr-only`) and covers
+    /// **both** flows — trading cards and every clipboard session after it —
+    /// because one launch choice governs both. The difference is exactly the
+    /// thing a user has to know before trusting the screen (whether a
+    /// third-party server is involved, and whether the other device has to be on
+    /// this network), so each channel says its own piece rather than one hedged
+    /// paragraph covering all three.
+    pub(crate) fn signal_channel_text(&self) -> (&'static str, &'static str) {
+        match self.signal_channel {
+            SignalChannel::LanThenNostr => (
                 "How the devices find each other",
-                "This device is looked for on the local network first (Bonjour/DNS-SD, with traffic direct between the devices and no relay involved). If nothing answers there, the search falls back to public Nostr relays, which works when the two devices are on different networks. Only a PIN-encrypted record holding a temporary connection id is ever published.",
+                "The other device is looked for on the local network first (Bonjour/DNS-SD, with traffic direct between the devices and no relay involved). If nothing answers there, the search falls back to public Nostr relays, which works when the two devices are on different networks. Only an encrypted record holding a temporary connection id is ever published, and this applies to trading cards and to clipboard sessions alike.",
             ),
-            SetupChannel::LanOnly => (
+            SignalChannel::LanOnly => (
                 "Local network only",
-                "No third-party server participates: discovery uses Bonjour (DNS-SD) and traffic stays direct between the devices. If multicast is blocked, the joining device can type the IP shown while hosting. This is a discovery policy, not a packet-level subnet boundary; reflected mDNS, a VPN/overlay, or globally routed addresses can extend the direct path beyond a conventional LAN.",
+                "No third-party server participates, for trading cards or for clipboard sessions: discovery uses Bonjour (DNS-SD) and traffic stays direct between the devices. If multicast is blocked, trading cards still works by typing the IP shown while hosting, but a clipboard session has no fallback and the two devices will not find each other. This is a discovery policy, not a packet-level subnet boundary; reflected mDNS, a VPN/overlay, or globally routed addresses can extend the direct path beyond a conventional LAN.",
             ),
-            SetupChannel::NostrOnly => (
+            SignalChannel::NostrOnly => (
                 "Relays only",
-                "The local network is not searched at all: the PIN-encrypted record is published to public Nostr relays, so the other device can be anywhere with internet access. The record holds only a temporary connection id, and the connection still goes direct between the devices when they can reach each other.",
+                "The local network is not searched at all, for trading cards or for clipboard sessions: the encrypted record is published to public Nostr relays, so the other device can be anywhere with internet access. The record holds only a temporary connection id, and the connection still goes direct between the devices when they can reach each other.",
             ),
+        }
+    }
+
+    /// A one-line banner for the hub, shown only when the launch flags moved the
+    /// app off its default channel. Empty for the default: the hub would
+    /// otherwise carry a second copy of the card-setup screen's explanation, and
+    /// the copy nobody edits is the one that goes stale. An override is worth
+    /// naming, because it silently changes whether Start and Join can reach a
+    /// device that is not on this network.
+    pub(crate) fn signal_channel_badge(&self) -> &'static str {
+        match self.signal_channel {
+            SignalChannel::LanThenNostr => "",
+            SignalChannel::LanOnly => {
+                "Started with --lan-only: devices find each other on this network only."
+            }
+            SignalChannel::NostrOnly => {
+                "Started with --nostr-only: devices find each other through relays only."
+            }
         }
     }
 
@@ -950,11 +970,12 @@ impl App {
         match self.screen {
             Screen::CardSetup | Screen::CardPairing => Some(ServerMode::CardSetup {
                 self_card: Box::new(self.self_card.clone()?),
-                channel: self.setup_channel,
+                channel: self.signal_channel,
                 relays: default_relays(),
             }),
-            _ => self.key_identity().map(|identity| ServerMode::NostrKey {
+            _ => self.key_identity().map(|identity| ServerMode::Key {
                 identity: Box::new(identity),
+                channel: self.signal_channel,
             }),
         }
     }
@@ -964,9 +985,10 @@ impl App {
     /// instead.
     pub(crate) fn client_dial_spec(&self) -> Option<duocb_core::net::DialSpec> {
         use duocb_core::net::DialSpec;
-        Some(DialSpec::NostrKey {
+        Some(DialSpec::Key {
             identity: Box::new(self.key_identity()?),
             peer_public_key: self.selected_peer_card()?.public_key(),
+            channel: self.signal_channel,
         })
     }
 
@@ -1000,7 +1022,7 @@ impl App {
             canonical_pin,
             self_card: Box::new(self.self_card.clone()?),
             target_ip,
-            channel: self.setup_channel,
+            channel: self.signal_channel,
             relays: default_relays(),
         })
     }
@@ -1027,7 +1049,7 @@ impl App {
     /// Start the client session if the state validates.
     pub(crate) fn connect_client(&mut self) {
         if let Some(spec) = self.client_dial_spec() {
-            if let duocb_core::net::DialSpec::NostrKey {
+            if let duocb_core::net::DialSpec::Key {
                 peer_public_key, ..
             } = &spec {
                 let peer = self
@@ -1186,7 +1208,7 @@ pub(crate) mod card_setup_tests {
             lock,
             crate::config::Config::default(),
             duocb_core::net::spawn_net_runtime(None),
-            SetupChannel::default(),
+            SignalChannel::default(),
         );
         app.in_my_name = "desktop".into();
         app.save_name();
@@ -1223,7 +1245,7 @@ pub(crate) mod card_setup_tests {
             lock,
             crate::config::Config::default(),
             duocb_core::net::spawn_net_runtime(None),
-            SetupChannel::default(),
+            SignalChannel::default(),
         );
         assert!(app.self_card.is_none());
 
@@ -1259,12 +1281,12 @@ pub(crate) mod card_setup_tests {
         use duocb_core::net::{DialSpec, ServerMode};
 
         for channel in [
-            SetupChannel::LanThenNostr,
-            SetupChannel::LanOnly,
-            SetupChannel::NostrOnly,
+            SignalChannel::LanThenNostr,
+            SignalChannel::LanOnly,
+            SignalChannel::NostrOnly,
         ] {
             let (mut app, path) = configured_app();
-            app.setup_channel = channel;
+            app.signal_channel = channel;
             app.open_card_setup();
             let pin = duocb_core::pin::generate_pin();
             app.in_pin_a = pin[..4].to_string();
@@ -1294,6 +1316,42 @@ pub(crate) mod card_setup_tests {
                 }
                 other => panic!("expected a card-setup dial, got {other:?}"),
             }
+
+            // The same flag governs clipboard sessions, whose signaling is the
+            // pairwise hosting record. Both roles again: a host that ignored the
+            // override would keep announcing itself on a channel the test meant
+            // to rule out.
+            app.go_back();
+            let peer = peer_card("peer", 0);
+            assert!(app.store_peer_card(peer.clone()));
+            app.toggle_peer(&peer.public_key().to_hex());
+            match app.server_mode_spec() {
+                Some(ServerMode::Key {
+                    channel: hosted,
+                    identity,
+                }) => {
+                    assert_eq!(hosted, channel, "clipboard host channel");
+                    assert!(
+                        !identity.relays.is_empty(),
+                        "a host needs relays to publish to"
+                    );
+                }
+                other => panic!("expected a clipboard host, got {other:?}"),
+            }
+            match app.client_dial_spec() {
+                Some(DialSpec::Key {
+                    channel: dialed,
+                    identity,
+                    ..
+                }) => {
+                    assert_eq!(dialed, channel, "clipboard joiner channel");
+                    assert!(
+                        !identity.relays.is_empty(),
+                        "a joiner needs relays to query"
+                    );
+                }
+                other => panic!("expected a clipboard dial, got {other:?}"),
+            }
             cleanup(app, path);
         }
     }
@@ -1310,20 +1368,20 @@ pub(crate) mod card_setup_tests {
         // spellings would let the negative one pass on capitalisation alone.
         const LAN_PROMISE: &str = "no third-party server";
 
-        app.setup_channel = SetupChannel::LanOnly;
-        let (_, lan_note) = app.setup_channel_text();
+        app.signal_channel = SignalChannel::LanOnly;
+        let (_, lan_note) = app.signal_channel_text();
         assert!(lan_note.to_lowercase().contains(LAN_PROMISE));
 
-        app.setup_channel = SetupChannel::LanThenNostr;
-        let (_, default_note) = app.setup_channel_text();
+        app.signal_channel = SignalChannel::LanThenNostr;
+        let (_, default_note) = app.signal_channel_text();
         assert!(default_note.contains("Nostr relays"));
         assert!(
             !default_note.to_lowercase().contains(LAN_PROMISE),
             "the default channel must not claim the LAN-only guarantee"
         );
 
-        app.setup_channel = SetupChannel::NostrOnly;
-        let (_, nostr_note) = app.setup_channel_text();
+        app.signal_channel = SignalChannel::NostrOnly;
+        let (_, nostr_note) = app.signal_channel_text();
         assert!(nostr_note.contains("Nostr relays"));
 
         cleanup(app, path);

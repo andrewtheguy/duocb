@@ -1,5 +1,8 @@
-//! Nostr signaling: pairwise hosting records for configured peers and the
-//! card-setup PIN rendezvous.
+//! Nostr signaling: the relay transport for pairwise hosting records
+//! (`crate::hosting_record`) and for the card-setup PIN rendezvous
+//! (`crate::pin_record`). Both records also travel over the local network — see
+//! `crate::lan` — and this module carries the copy that reaches a peer on
+//! another network.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -7,10 +10,9 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use iroh::EndpointId;
 use nostr_sdk::prelude::*;
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::auth::{Identity, IdentityCard};
+use crate::hosting_record;
 
 pub const DEFAULT_NOSTR_RELAYS: &[&str] = &[
     "wss://nos.lol",
@@ -20,8 +22,6 @@ pub const DEFAULT_NOSTR_RELAYS: &[&str] = &[
 ];
 
 const HOSTING_KIND_U16: u16 = 30385;
-const HOSTING_VERSION: u32 = 1;
-const PAIR_TAG_DOMAIN: &[u8] = b"duocb:pairwise-hosting:v1";
 const HOSTING_EVENT_TTL_SECS: u64 = 300;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(15);
@@ -59,28 +59,9 @@ async fn connect_client(relays: &[String]) -> Result<Client> {
     Ok(client)
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-fn pair_dtag(host: PublicKey, peer: PublicKey) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(PAIR_TAG_DOMAIN);
-    hasher.update(host.as_bytes());
-    hasher.update(peer.as_bytes());
-    format!("duocb:hosting:v1:{}", sha256_hex(&hasher.finalize()))
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct HostingRecord {
-    version: u32,
-    node_id: String,
-}
-
 /// Publish the host's ephemeral iroh endpoint separately and privately for each
-/// trusted application identity.
+/// trusted application identity — the relay copy of the record `crate::lan`
+/// advertises over DNS-SD.
 pub async fn publish_hosting(
     identity: &Identity,
     peers: &[IdentityCard],
@@ -90,25 +71,17 @@ pub async fn publish_hosting(
     if peers.is_empty() {
         return Ok(());
     }
-    let payload = serde_json::to_string(&HostingRecord {
-        version: HOSTING_VERSION,
-        node_id: node_id.to_string(),
-    })
-    .context("serializing hosting record")?;
     let expiration = Timestamp::now() + HOSTING_EVENT_TTL_SECS;
     let client = connect_client(relays).await?;
     let mut first_error = None;
     for peer in peers {
-        let content = nip44::encrypt(
-            identity.keys().secret_key(),
-            &peer.public_key(),
-            &payload,
-            nip44::Version::V2,
-        )
-        .context("encrypting pairwise hosting record")?;
+        let content = hosting_record::encrypt(identity, peer.public_key(), node_id)?;
         let event = EventBuilder::new(hosting_kind(), content)
             .tags([
-                Tag::identifier(pair_dtag(identity.public_key(), peer.public_key())),
+                Tag::identifier(hosting_record::nostr_dtag(
+                    identity.public_key(),
+                    peer.public_key(),
+                )),
                 Tag::public_key(peer.public_key()),
                 Tag::expiration(expiration),
             ])
@@ -128,6 +101,11 @@ pub async fn publish_hosting(
 }
 
 /// Resolve a selected trusted peer's current ephemeral iroh endpoint.
+///
+/// A record that is present but unreadable — bad signature, addressed to
+/// someone else, malformed — is reported as `Ok(None)`, the same as no record
+/// at all: either way this device has nothing it can dial, and a relay must not
+/// be able to turn a lookup into a hard error.
 pub async fn lookup_hosting(
     identity: &Identity,
     peer: PublicKey,
@@ -137,7 +115,7 @@ pub async fn lookup_hosting(
     let filter = Filter::new()
         .kind(hosting_kind())
         .author(peer)
-        .identifier(pair_dtag(peer, identity.public_key()))
+        .identifier(hosting_record::nostr_dtag(peer, identity.public_key()))
         .limit(1);
     let events = client.fetch_events(filter, LOOKUP_TIMEOUT).await;
     client.disconnect().await;
@@ -145,19 +123,11 @@ pub async fn lookup_hosting(
     let Some(event) = events.iter().max_by_key(|event| event.created_at) else {
         return Ok(None);
     };
-    event.verify().context("hosting record signature is invalid")?;
-    let plaintext = nip44::decrypt(
-        identity.keys().secret_key(),
-        &peer,
-        &event.content,
-    )
-    .context("decrypting pairwise hosting record")?;
-    let record: HostingRecord =
-        serde_json::from_str(&plaintext).context("hosting record payload is invalid")?;
-    if record.version != HOSTING_VERSION {
+    if let Err(error) = event.verify() {
+        log::warn!("Ignoring a pairwise hosting record with an invalid signature: {error}");
         return Ok(None);
     }
-    Ok(record.node_id.parse().ok())
+    Ok(hosting_record::decrypt(identity, peer, &event.content))
 }
 
 // ============================================================================
@@ -239,21 +209,3 @@ pub async fn lookup_pin_record(
     Ok(None)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn pair_tags_are_ordered_and_transport_independent() {
-        let a = Identity::generate();
-        let b = Identity::generate();
-        assert_eq!(
-            pair_dtag(a.public_key(), b.public_key()),
-            pair_dtag(a.public_key(), b.public_key())
-        );
-        assert_ne!(
-            pair_dtag(a.public_key(), b.public_key()),
-            pair_dtag(b.public_key(), a.public_key())
-        );
-    }
-}

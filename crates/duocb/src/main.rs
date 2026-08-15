@@ -19,8 +19,9 @@ use std::sync::Arc;
 struct Cli {
     /// Explicit config path (`--config`/`-c`, else `DUOCB_CONFIG`).
     config: Option<PathBuf>,
-    /// Which transport(s) card setup uses for its PIN rendezvous.
-    setup_channel: duocb_core::net::SetupChannel,
+    /// Which transport(s) carry signaling — both the card-setup PIN rendezvous
+    /// and the hosting records a clipboard session is found through.
+    signal_channel: duocb_core::net::SignalChannel,
 }
 
 /// Parse this process's arguments, falling back to `DUOCB_CONFIG` for the
@@ -39,7 +40,7 @@ fn parse_cli() -> Result<Cli, Box<dyn std::error::Error>> {
 /// channel override that was quietly dropped would make a test look like it
 /// exercised a path it never touched.
 fn parse_args(args: impl Iterator<Item = std::ffi::OsString>) -> Result<Cli, Box<dyn std::error::Error>> {
-    use duocb_core::net::SetupChannel;
+    use duocb_core::net::SignalChannel;
 
     let mut config = None;
     let (mut lan_only, mut nostr_only) = (false, false);
@@ -65,17 +66,17 @@ fn parse_args(args: impl Iterator<Item = std::ffi::OsString>) -> Result<Cli, Box
             nostr_only = true;
         }
     }
-    let setup_channel = match (lan_only, nostr_only) {
+    let signal_channel = match (lan_only, nostr_only) {
         (true, true) => {
             return Err("--lan-only and --nostr-only cannot both be given".into());
         }
-        (true, false) => SetupChannel::LanOnly,
-        (false, true) => SetupChannel::NostrOnly,
-        (false, false) => SetupChannel::LanThenNostr,
+        (true, false) => SignalChannel::LanOnly,
+        (false, true) => SignalChannel::NostrOnly,
+        (false, false) => SignalChannel::LanThenNostr,
     };
     Ok(Cli {
         config,
-        setup_channel,
+        signal_channel,
     })
 }
 
@@ -139,7 +140,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config_lock,
         config,
         net,
-        cli.setup_channel,
+        cli.signal_channel,
     )));
     app::callbacks::wire(&app, &ui);
     app.borrow().sync(&ui);
@@ -191,28 +192,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod cli_tests {
     use super::*;
-    use duocb_core::net::SetupChannel;
+    use duocb_core::net::SignalChannel;
 
     fn parse(args: &[&str]) -> Result<Cli, String> {
         parse_args(args.iter().map(std::ffi::OsString::from)).map_err(|e| e.to_string())
     }
 
-    /// The card-setup channel defaults to LAN-first-with-nostr-fallback, and
-    /// each override pins it to exactly one transport — that is the whole point
-    /// of the flags, so a test that forces one path really gets only that path.
+    /// Signaling defaults to LAN-first-with-nostr-fallback, and each override
+    /// pins it to exactly one transport — that is the whole point of the flags,
+    /// so a test that forces one path really gets only that path.
     #[test]
-    fn setup_channel_flags_pin_a_single_transport() {
+    fn signal_channel_flags_pin_a_single_transport() {
         assert_eq!(
-            parse(&[]).unwrap().setup_channel,
-            SetupChannel::LanThenNostr
+            parse(&[]).unwrap().signal_channel,
+            SignalChannel::LanThenNostr
         );
         assert_eq!(
-            parse(&["--lan-only"]).unwrap().setup_channel,
-            SetupChannel::LanOnly
+            parse(&["--lan-only"]).unwrap().signal_channel,
+            SignalChannel::LanOnly
         );
         assert_eq!(
-            parse(&["--nostr-only"]).unwrap().setup_channel,
-            SetupChannel::NostrOnly
+            parse(&["--nostr-only"]).unwrap().signal_channel,
+            SignalChannel::NostrOnly
         );
         // Asking for both is a contradiction, not a silent winner.
         assert!(parse(&["--lan-only", "--nostr-only"]).is_err());
@@ -224,11 +225,11 @@ mod cli_tests {
     fn config_and_channel_flags_coexist() {
         let cli = parse(&["--config", "/tmp/peer1.json", "--nostr-only"]).unwrap();
         assert_eq!(cli.config, Some(PathBuf::from("/tmp/peer1.json")));
-        assert_eq!(cli.setup_channel, SetupChannel::NostrOnly);
+        assert_eq!(cli.signal_channel, SignalChannel::NostrOnly);
 
         let cli = parse(&["--lan-only", "--config=/tmp/peer2.json"]).unwrap();
         assert_eq!(cli.config, Some(PathBuf::from("/tmp/peer2.json")));
-        assert_eq!(cli.setup_channel, SetupChannel::LanOnly);
+        assert_eq!(cli.signal_channel, SignalChannel::LanOnly);
 
         let cli = parse(&["-c", "/tmp/peer3.json"]).unwrap();
         assert_eq!(cli.config, Some(PathBuf::from("/tmp/peer3.json")));
