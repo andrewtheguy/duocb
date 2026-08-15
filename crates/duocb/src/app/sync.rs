@@ -203,13 +203,15 @@ impl App {
         });
         s.set_dial_ready(self.card_setup_dial_spec().is_some());
 
-        // Card setup's channel: what the screen tells the user about how the
-        // devices find each other, and whether the manual host-IP path (which
-        // only exists on the local-network channel) is offered at all.
-        let (channel_title, channel_note) = self.setup_channel_text();
-        s.set_setup_channel_title(channel_title.into());
-        s.set_setup_channel_note(channel_note.into());
-        s.set_setup_lan_enabled(self.setup_channel.lan());
+        // The signaling channel: what the screens tell the user about how the
+        // devices find each other (for trading cards and clipboard sessions
+        // alike), and whether the manual host-IP path (which only exists on the
+        // local-network channel) is offered at all.
+        let (channel_title, channel_note) = self.signal_channel_text();
+        s.set_signal_channel_title(channel_title.into());
+        s.set_signal_channel_note(channel_note.into());
+        s.set_signal_channel_badge(self.signal_channel_badge().into());
+        s.set_signal_lan_enabled(self.signal_channel.lan());
 
         // Session panel.
         s.set_sent_flash(self.sent_flash_active());

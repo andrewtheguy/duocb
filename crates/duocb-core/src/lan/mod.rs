@@ -1,20 +1,25 @@
-//! LAN transports for the encrypted PIN rendezvous record that bootstraps a
-//! card-setup session. Both backends carry the same record (see `crate::pin_record`):
-//! the NIP-44 ciphertext of the host's ephemeral node id, under a service
-//! instance label derived from the `(pin, bucket)` public key — so a record is
-//! found by deriving its key from the typed PIN, never by naming a device.
+//! LAN transports for duocb's two encrypted rendezvous records — the
+//! card-setup PIN record (`crate::pin_record`) and the pairwise hosting record
+//! that points a trusted peer at a live clipboard session
+//! (`crate::hosting_record`). Both are the NIP-44 ciphertext of the host's
+//! ephemeral node id under a service instance label the looking device derives
+//! for itself, so a record is found by deriving its label — from the typed PIN,
+//! or from the pair of application keys — and never by naming a device.
 //!
-//! Two wire backends, used together:
+//! The two records differ only in what their label and key are derived from,
+//! which is why they share one DNS-SD backend under separate service types:
 //!
-//! - **dnssd** ([`dnssd_advertise_pin_record`] / [`dnssd_lookup_pin_record`])
-//!   — the multicast path. Spec-compliant DNS-SD (RFC 6762/6763) via the
-//!   mdns-sd responder, so it interoperates with Bonjour. DNS-SD records carry
-//!   real SRV/A/AAAA data, so the lookup returns the host's direct socket
-//!   addresses ([`PinFound`]) and the joiner dials them explicitly.
+//! - **dnssd** ([`dnssd_advertise_pin_record`] / [`dnssd_lookup_pin_record`],
+//!   [`dnssd_advertise_hosting`] / [`dnssd_lookup_hosting`]) — the multicast
+//!   path. Spec-compliant DNS-SD (RFC 6762/6763) via the mdns-sd responder, so
+//!   it interoperates with Bonjour. DNS-SD records carry real SRV/A/AAAA data,
+//!   so a lookup returns the host's direct socket addresses ([`LanFound`]) and
+//!   the dialer uses them explicitly.
 //! - **unicast** ([`unicast_advertise_pin_record`] / [`unicast_lookup_pin_record`])
-//!   — the fallback for networks that block multicast. The host serves the same
-//!   record on a PIN-derived TCP port and the joiner reaches it by typing the
-//!   host's LAN IP, so no port is ever typed.
+//!   — the fallback for networks that block multicast, and **PIN-only**: it
+//!   works by having the user type the host's LAN IP, and only card setup has a
+//!   screen showing that IP and a field to type it into. A clipboard session on
+//!   a multicast-blocked network falls back to the relays instead.
 //!
 //! Session traffic remains direct between devices either way, but there is no
 //! packet-level on-link subnet filter.
@@ -27,13 +32,20 @@ use std::time::Duration;
 
 use anyhow::Result;
 use iroh::{EndpointAddr, EndpointId};
-use nostr_sdk::prelude::Keys;
+use nostr_sdk::prelude::{Keys, PublicKey};
 use sha2::{Digest, Sha256};
+
+use crate::auth::Identity;
+use crate::hosting_record;
 
 pub use unicast::UnicastListener;
 
-/// The DNS-SD service type PIN records are advertised under.
-const DNSSD_SERVICE_TYPE: &str = "_duocb-pin._udp.local.";
+/// The DNS-SD service type card-setup PIN records are advertised under.
+const PIN_SERVICE_TYPE: &str = "_duocb-pin._udp.local.";
+/// The DNS-SD service type pairwise hosting records are advertised under. A
+/// separate type from the PIN one so a browse only ever sees the record kind it
+/// is looking for.
+const HOSTING_SERVICE_TYPE: &str = "_duocb-host._udp.local.";
 /// TXT attribute key carrying the encrypted record content.
 const TXT_KEY: &str = "e";
 /// TXT attribute key carrying the v6 port when it differs from the SRV port
@@ -48,7 +60,7 @@ const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 /// chars of the derived public key. The full 64-hex key would exceed the
 /// 63-byte DNS label limit; 128 bits keeps accidental collisions negligible,
 /// and the payload decrypt is the real verification anyway.
-fn instance_name(keys: &Keys) -> String {
+fn pin_instance_name(keys: &Keys) -> String {
     keys.public_key().to_hex()[..32].to_string()
 }
 
@@ -80,12 +92,12 @@ fn side_channel_port(keys: &Keys) -> u16 {
 /// A resolved LAN rendezvous hit: the decrypted node id plus the direct socket
 /// addresses reassembled from the DNS-SD records (A/AAAA + SRV port, `p6` TXT
 /// override for the v6 socket).
-pub struct PinFound {
+pub struct LanFound {
     pub node_id: EndpointId,
     pub addrs: Vec<SocketAddr>,
 }
 
-impl PinFound {
+impl LanFound {
     /// The dial target: the node id with every resolved direct address
     /// attached, so the connect needs no LAN address lookup.
     pub fn endpoint_addr(&self) -> EndpointAddr {
@@ -97,9 +109,9 @@ impl PinFound {
     }
 }
 
-/// A live LAN advertisement of one bucket's PIN record; dropping it withdraws
-/// the record from the network.
-pub struct PinAdvert(#[expect(dead_code, reason = "held for Drop")] dnssd::Advert);
+/// A live LAN advertisement of one record; dropping it withdraws the record
+/// from the network.
+pub struct LanAdvert(#[expect(dead_code, reason = "held for Drop")] dnssd::Advert);
 
 /// Advertise the PIN rendezvous record as a spec-compliant DNS-SD service
 /// instance. The advertised SRV/A/AAAA data is load-bearing: the joiner dials
@@ -109,8 +121,16 @@ pub async fn dnssd_advertise_pin_record(
     keys: &Keys,
     node_id: &EndpointId,
     addrs: &[SocketAddr],
-) -> Result<PinAdvert> {
-    dnssd::advertise(keys, node_id, addrs).await.map(PinAdvert)
+) -> Result<LanAdvert> {
+    let content = crate::pin_record::encrypt_pin_payload(keys, node_id)?;
+    dnssd::advertise(
+        PIN_SERVICE_TYPE,
+        &pin_instance_name(keys),
+        content,
+        addrs,
+    )
+    .await
+    .map(LanAdvert)
 }
 
 /// Look up the PIN rendezvous record over DNS-SD, trying each candidate keypair
@@ -120,8 +140,53 @@ pub async fn dnssd_advertise_pin_record(
 /// within the browse window (wrong/expired PIN, or the two devices are not on
 /// the same network). The connection is then authenticated in-band with the
 /// same PIN (`crate::pin_auth`).
-pub async fn dnssd_lookup_pin_record(candidates: &[Keys]) -> Result<Option<PinFound>> {
-    dnssd::lookup(candidates).await
+pub async fn dnssd_lookup_pin_record(candidates: &[Keys]) -> Result<Option<LanFound>> {
+    let by_instance: std::collections::HashMap<String, &Keys> = candidates
+        .iter()
+        .map(|keys| (pin_instance_name(keys), keys))
+        .collect();
+    dnssd::lookup(PIN_SERVICE_TYPE, |instance, content| {
+        let keys = by_instance.get(instance)?;
+        crate::pin_record::decrypt_pin_payload(keys, content)
+    })
+    .await
+}
+
+/// Advertise this host's ephemeral node id on the local network for exactly one
+/// trusted peer, so that peer can find a live clipboard session without any
+/// relay. A host with several trusted peers holds several of these — the label
+/// and the ciphertext are both pair-specific, so no peer learns about another.
+pub async fn dnssd_advertise_hosting(
+    identity: &Identity,
+    peer: PublicKey,
+    node_id: &EndpointId,
+    addrs: &[SocketAddr],
+) -> Result<LanAdvert> {
+    let content = hosting_record::encrypt(identity, peer, node_id)?;
+    dnssd::advertise(
+        HOSTING_SERVICE_TYPE,
+        &hosting_record::lan_instance(identity.public_key(), peer),
+        content,
+        addrs,
+    )
+    .await
+    .map(LanAdvert)
+}
+
+/// Look for `host`'s hosting record on the local network, addressed to this
+/// identity. Returns the decrypted node id **and** the host's direct socket
+/// addresses; `Ok(None)` when nothing answered within the browse window — the
+/// peer is not hosting, or the two devices are not on the same network. The
+/// connection is still authenticated by the mutual application-key handshake.
+pub async fn dnssd_lookup_hosting(
+    identity: &Identity,
+    host: PublicKey,
+) -> Result<Option<LanFound>> {
+    let wanted = hosting_record::lan_instance(host, identity.public_key());
+    dnssd::lookup(HOSTING_SERVICE_TYPE, |instance, content| {
+        (instance == wanted).then(|| hosting_record::decrypt(identity, host, content))?
+    })
+    .await
 }
 
 /// Start the unicast side channel: a listener on the port
@@ -145,7 +210,7 @@ pub async fn unicast_advertise_pin_record(
 pub async fn unicast_lookup_pin_record(
     ip: IpAddr,
     candidates: &[Keys],
-) -> Result<Option<PinFound>> {
+) -> Result<Option<LanFound>> {
     unicast::lookup(ip, candidates).await
 }
 
@@ -200,15 +265,15 @@ mod tests {
     use crate::pin_record;
 
     #[test]
-    fn instance_name_is_deterministic_and_a_valid_label() {
+    fn pin_instance_name_is_deterministic_and_a_valid_label() {
         let keys = Keys::generate();
-        let a = instance_name(&keys);
-        assert_eq!(a, instance_name(&keys));
+        let a = pin_instance_name(&keys);
+        assert_eq!(a, pin_instance_name(&keys));
         assert_eq!(a.len(), 32);
         assert!(a.len() <= 63, "must fit a DNS label");
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
         // Different keys, different label.
-        assert_ne!(a, instance_name(&Keys::generate()));
+        assert_ne!(a, pin_instance_name(&Keys::generate()));
     }
 
     #[test]

@@ -18,8 +18,8 @@ copy and paste them.
 
 | | Discovery/signaling | Authentication | Saved state |
 |---|---|---|---|
-| Configure connection | Pairwise encrypted Nostr hosting records | Mutual application-key signatures | One identity key and a local trusted-peer list per installation |
-| Card setup (trust bootstrap) | Local Bonjour/DNS-SD or a typed LAN IP, falling back to Nostr relays | Rotating PIN challenge-response, then a human fingerprint check | The imported peer card |
+| Configure connection | Pairwise encrypted hosting records, on the local network first and Nostr relays as fallback | Mutual application-key signatures | One identity key and a local trusted-peer list per installation |
+| Card setup (trust bootstrap) | Pairwise PIN-encrypted rendezvous records, same channels, plus a typed LAN IP | Rotating PIN challenge-response, then a human fingerprint check | The imported peer card |
 
 ### Configure mode
 
@@ -52,9 +52,13 @@ renewed or removed deliberately. A device re-signs its own card automatically
 as it nears expiry, so the card it offers always has most of its life left.
 
 When a trusted device starts a connection, it publishes a separate NIP-44
-encrypted hosting record for each trusted peer. The record carries only the
-current ephemeral iroh node id. A joining device resolves the selected
-application public key, establishes the iroh connection, and then both sides
+encrypted hosting record for each trusted peer — advertised on the local
+network over Bonjour/DNS-SD *and* published to Nostr relays, since the host
+cannot know which way the other device will look. The record carries only the
+current ephemeral iroh node id. A joining device looks on the local network
+first and falls back to the relays if nothing answers there, so two devices in
+one room never involve a third-party server, and two on different networks
+still find each other. It then establishes the iroh connection, and both sides
 sign a fresh transcript containing:
 
 - both application public keys;
@@ -87,12 +91,14 @@ carries the card over the network instead:
 A card-setup connection never carries clipboard content; it exists only to hand
 over the cards, and ends as soon as they have crossed.
 
-**How the two devices find each other.** By default the joining device looks on
-the local network first — Bonjour-compatible DNS-SD, no third-party server — and
-falls back to Nostr relays if nothing local answers, so two devices on different
-networks can still trade cards. The hosting device publishes on both at once,
-since it cannot know which way the other will find it. Where multicast is
-blocked, enter the LAN IP shown by the host to use the unicast side channel.
+**How the two devices find each other.** The same way as a clipboard session:
+the joining device looks on the local network first — Bonjour-compatible DNS-SD,
+no third-party server — and falls back to Nostr relays if nothing local answers,
+so two devices on different networks can still trade cards. The hosting device
+publishes on both at once, since it cannot know which way the other will find
+it. Where multicast is blocked, enter the LAN IP shown by the host to use the
+unicast side channel — this manual path exists for card setup only, because it
+is the only screen that shows the host's IP and offers a field to type it into.
 Either way the record published is only a PIN-encrypted temporary connection id.
 
 Two flags force a single channel, mainly for testing:
@@ -102,8 +108,9 @@ cargo run -- --lan-only     # local network only; no relay is contacted at all
 cargo run -- --nostr-only   # relays only; the local network is not searched
 ```
 
-They affect this trust-bootstrap step only — clipboard connections always signal
-through Nostr — and giving both at once is an error.
+They apply to **all** signaling — trading cards and clipboard sessions alike —
+for the life of the process, and giving both at once is an error. The hub shows
+a banner naming the flag when one is in effect.
 
 One PIN admits one device: once a device has answered, a second device offering
 the same code is refused.

@@ -8,6 +8,7 @@ pub use iroh;
 
 pub mod auth;
 pub mod card_exchange;
+mod hosting_record;
 pub mod identity;
 pub mod lan;
 pub mod net;

@@ -30,17 +30,22 @@ impl KeyIdentity {
     }
 }
 
-/// Which transport(s) carry the card-setup rendezvous record — the same
-/// encrypted node-id record either way (see `crate::pin_record`), found by
-/// deriving its key from the typed PIN.
+/// Which transport(s) carry duocb's rendezvous records: the card-setup PIN
+/// record (`crate::pin_record`) and the pairwise hosting record that points a
+/// trusted peer at a live clipboard session (`crate::hosting_record`). Both
+/// records are the same on either transport — an encrypted node id under a
+/// derived label — so this chooses only where they are put and looked for.
+///
+/// Launch-fixed for the whole process (`--lan-only` / `--nostr-only`), so both
+/// flows always agree on which channels are in play.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum SetupChannel {
+pub enum SignalChannel {
     /// The default: try the local network first (Bonjour/DNS-SD, or the typed
-    /// host IP), and fall back to nostr relays when nothing local answers.
-    /// LAN-first because it resolves in well under a second, needs no
-    /// third-party server, and is the common case — two devices in one room.
-    /// The nostr fallback is what lets two devices on *different* networks
-    /// trade cards at all.
+    /// host IP during card setup), and fall back to nostr relays when nothing
+    /// local answers. LAN-first because it resolves in well under a second,
+    /// needs no third-party server, and is the common case — two devices in one
+    /// room. The nostr fallback is what lets two devices on *different*
+    /// networks reach each other at all.
     #[default]
     LanThenNostr,
     /// Nostr relays only — the internet is required, and no mDNS query or
@@ -48,11 +53,12 @@ pub enum SetupChannel {
     NostrOnly,
     /// Local network only: mDNS discovery plus direct device-to-device traffic,
     /// with no third-party server involved. Not a packet-level subnet boundary.
-    /// Test/diagnostic override, and the choice for an offline pairing.
+    /// Test/diagnostic override, and the choice for an entirely offline pair of
+    /// devices.
     LanOnly,
 }
 
-impl SetupChannel {
+impl SignalChannel {
     /// Whether the local-network backends (DNS-SD and the unicast side channel)
     /// participate.
     pub fn lan(self) -> bool {
@@ -68,9 +74,20 @@ impl SetupChannel {
 /// How the server signals its ephemeral node id to the client.
 #[derive(Debug, Clone)]
 pub enum ServerMode {
-    /// Configure mode: publish pairwise hosting records and authenticate with
-    /// the persistent application key.
-    NostrKey { identity: Box<KeyIdentity> },
+    /// Configure mode: publish a pairwise hosting record for each trusted peer
+    /// on every enabled channel, and authenticate with the persistent
+    /// application key.
+    ///
+    /// Like [`CardSetup`](Self::CardSetup), the host publishes everywhere it can
+    /// rather than falling back — it cannot know which channel the joiner will
+    /// find it on. Only the joiner falls back (see [`DialSpec::Key`]).
+    ///
+    /// The relays published to are the ones on `identity`, as in
+    /// [`DialSpec::Key`]; they are ignored on [`SignalChannel::LanOnly`].
+    Key {
+        identity: Box<KeyIdentity>,
+        channel: SignalChannel,
+    },
     /// Card setup: show a rotating PIN, publish the rendezvous record under
     /// per-bucket PIN-derived keys on the enabled channel(s), and authenticate
     /// a joiner with the in-band PIN challenge-response. Whenever the LAN
@@ -88,8 +105,8 @@ pub enum ServerMode {
     /// have crossed.
     CardSetup {
         self_card: Box<crate::auth::IdentityCard>,
-        channel: SetupChannel,
-        /// Relays for the nostr rendezvous; ignored on [`SetupChannel::LanOnly`].
+        channel: SignalChannel,
+        /// Relays for the nostr rendezvous; ignored on [`SignalChannel::LanOnly`].
         relays: Vec<String>,
     },
 }
@@ -98,14 +115,24 @@ pub enum ServerMode {
 #[derive(Debug, Clone)]
 pub enum DialSpec {
     /// Resolve and authenticate exactly one locally trusted application key.
-    NostrKey {
+    ///
+    /// On [`SignalChannel::LanThenNostr`] the host's pairwise hosting record is
+    /// looked for on the local network first and on the relays only if that
+    /// missed — sequential, not raced, for the same reasons as
+    /// [`CardSetup`](Self::CardSetup). A LAN hit carries the host's direct
+    /// addresses, so the dial needs no further address lookup.
+    ///
+    /// The relays used are the ones on `identity`; they are ignored on
+    /// [`SignalChannel::LanOnly`].
+    Key {
         identity: Box<KeyIdentity>,
         peer_public_key: nostr_sdk::PublicKey,
+        channel: SignalChannel,
     },
     /// Resolve the host through the rotating-PIN rendezvous, prove PIN
     /// possession in-band, then swap identity cards.
     ///
-    /// On [`SetupChannel::LanThenNostr`] the lookups run in order, not in
+    /// On [`SignalChannel::LanThenNostr`] the lookups run in order, not in
     /// parallel: the local one first, and the relays only if it finds nothing.
     /// The LAN answers in well under a second when the peer is there, so the
     /// common case never touches a relay.
@@ -116,13 +143,13 @@ pub enum DialSpec {
     /// `None` browses DNS-SD. The side-channel port is derived from the PIN's
     /// rendezvous key (see `crate::lan`), so no port is ever typed. Either way
     /// it is the LAN half of the lookup, so it is ignored on
-    /// [`SetupChannel::NostrOnly`].
+    /// [`SignalChannel::NostrOnly`].
     CardSetup {
         canonical_pin: String,
         self_card: Box<crate::auth::IdentityCard>,
         target_ip: Option<std::net::IpAddr>,
-        channel: SetupChannel,
-        /// Relays for the nostr rendezvous; ignored on [`SetupChannel::LanOnly`].
+        channel: SignalChannel,
+        /// Relays for the nostr rendezvous; ignored on [`SignalChannel::LanOnly`].
         relays: Vec<String>,
     },
 }
@@ -158,8 +185,8 @@ pub enum ConnStatus {
     Starting,
     /// Server: listening, no peer yet.
     Listening,
-    /// Client: resolving the target — a peer's hosting record, or the PIN
-    /// rendezvous on whichever channel(s) card setup is using.
+    /// Client: resolving the target — a peer's hosting record or the card-setup
+    /// PIN rendezvous, on whichever channel(s) are enabled.
     Resolving,
     /// Client: dialing the resolved node id.
     Connecting,

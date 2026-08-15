@@ -25,7 +25,7 @@ use crate::net::endpoint::{
     create_server_endpoint, watch_connection_paths,
 };
 use crate::net::{
-    ConnStatus, DialSpec, EventSender, KeyIdentity, NetEvent, ServerMode, SetupChannel, UiCommand,
+    ConnStatus, DialSpec, EventSender, KeyIdentity, NetEvent, ServerMode, SignalChannel, UiCommand,
 };
 use crate::protocol::{
     AuthRequest, AuthResponse, ClipBody, ClipMsg, KeyChallenge, KeyProof,
@@ -264,18 +264,20 @@ enum SessionKey {
     /// endpoint is built with, so a session started on a different channel must
     /// not inherit an endpoint bound for the old one.
     ServerCardSetup {
-        channel: SetupChannel,
+        channel: SignalChannel,
     },
     ServerKey {
         public_key: nostr_sdk::PublicKey,
+        channel: SignalChannel,
     },
     ClientCardSetup {
         canonical_pin: String,
-        channel: SetupChannel,
+        channel: SignalChannel,
     },
     ClientKey {
         public_key: nostr_sdk::PublicKey,
         peer_public_key: nostr_sdk::PublicKey,
+        channel: SignalChannel,
     },
 }
 
@@ -284,8 +286,9 @@ fn session_key(kind: &SessionKind) -> SessionKey {
         SessionKind::Server(ServerMode::CardSetup { channel, .. }) => SessionKey::ServerCardSetup {
             channel: *channel,
         },
-        SessionKind::Server(ServerMode::NostrKey { identity }) => SessionKey::ServerKey {
+        SessionKind::Server(ServerMode::Key { identity, channel }) => SessionKey::ServerKey {
             public_key: identity.identity.public_key(),
+            channel: *channel,
         },
         SessionKind::Client(DialSpec::CardSetup {
             canonical_pin,
@@ -295,12 +298,14 @@ fn session_key(kind: &SessionKind) -> SessionKey {
             canonical_pin: canonical_pin.clone(),
             channel: *channel,
         },
-        SessionKind::Client(DialSpec::NostrKey {
+        SessionKind::Client(DialSpec::Key {
             identity,
             peer_public_key,
+            channel,
         }) => SessionKey::ClientKey {
             public_key: identity.identity.public_key(),
             peer_public_key: *peer_public_key,
+            channel: *channel,
         },
     }
 }
@@ -565,14 +570,12 @@ async fn run_server_session(
     secret: iroh::SecretKey,
     claim: PairClaim,
 ) {
-    let ServerMode::NostrKey { identity } = mode else {
+    let ServerMode::Key { identity, channel } = mode else {
         unreachable!("card-setup hosts run in run_card_setup_host");
     };
     events.status(ConnStatus::Starting);
 
-    // Configure mode hard-requires the internet: its signaling is a nostr relay
-    // record, and `online()` never resolves offline, so gate on the relay.
-    let endpoint = match create_server_endpoint(EndpointReadiness::RelayOnline, secret).await {
+    let endpoint = match create_server_endpoint(channel_readiness(channel), secret).await {
         Ok(ep) => ep,
         Err(e) => {
             events.error(format!("Failed to start: {e:#}"));
@@ -594,36 +597,13 @@ async fn run_server_session(
     events.status(ConnStatus::Listening);
 
     // Pairwise hosting-record publisher, aborted on session teardown.
-    let _publisher = PublisherGuard(tokio::spawn({
-        let cancel = cancel.clone();
-        async move {
-            loop {
-                // Re-filtered every round, so a peer whose card lapses
-                // mid-session stops being signalled to without a restart.
-                let now = unix_now();
-                let live: Vec<IdentityCard> = identity
-                    .peers
-                    .iter()
-                    .filter(|card| card.is_valid_at(now))
-                    .cloned()
-                    .collect();
-                if let Err(error) = crate::nostr::publish_hosting(
-                    &identity.identity,
-                    &live,
-                    &node_id,
-                    &identity.relays,
-                )
-                .await
-                {
-                    log::warn!("Failed to publish pairwise hosting records: {error:#}");
-                }
-                tokio::select! {
-                    _ = cancel.cancelled() => return,
-                    _ = tokio::time::sleep(Duration::from_secs(120)) => {}
-                }
-            }
-        }
-    }));
+    let _publisher = PublisherGuard(tokio::spawn(run_hosting_publisher(
+        endpoint.clone(),
+        *identity,
+        channel,
+        events.clone(),
+        cancel.clone(),
+    )));
 
     // Accept loop: duocb pairs exactly two devices, so at most one clipboard
     // session is served at a time. Crucially the accept keeps running *during*
@@ -778,13 +758,15 @@ async fn run_client_session(
 ) {
     events.status(ConnStatus::Starting);
 
-    let DialSpec::NostrKey {
+    let DialSpec::Key {
         identity,
         peer_public_key,
+        channel,
     } = &spec
     else {
         unreachable!("card-setup joiners run in run_card_setup_joiner");
     };
+    let channel = *channel;
 
     // Refuse before spending an endpoint and a relay round trip on a peer whose
     // card has lapsed. The listener enforces the same rule against its own copy;
@@ -798,8 +780,7 @@ async fn run_client_session(
         return;
     }
 
-    // Configure mode's signaling is a relay record, so gate on the relay.
-    let endpoint = match create_client_endpoint(EndpointReadiness::RelayOnline, secret).await {
+    let endpoint = match create_client_endpoint(channel_readiness(channel), secret).await {
         Ok(ep) => ep,
         Err(e) => {
             events.error(format!("Failed to start: {e:#}"));
@@ -825,13 +806,7 @@ async fn run_client_session(
         events.status(ConnStatus::Resolving);
         let resolved: Result<EndpointAddr> = tokio::select! {
             _ = cancel.cancelled() => return,
-            r = crate::nostr::lookup_hosting(&identity.identity, *peer_public_key, &identity.relays) => match r {
-                Ok(Some(id)) => Ok(EndpointAddr::new(id)),
-                Ok(None) => Err(anyhow::anyhow!(
-                    "The selected peer is not hosting a connection — press Start on that device"
-                )),
-                Err(e) => Err(e.context("nostr hosting lookup failed")),
-            },
+            r = resolve_hosting(identity, *peer_public_key, channel) => r,
         };
 
         // Self-dial guard: end the session — the target won't change.
@@ -951,7 +926,7 @@ const CARD_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
 #[allow(clippy::too_many_arguments)]
 async fn run_card_setup_host(
     self_card: IdentityCard,
-    channel: SetupChannel,
+    channel: SignalChannel,
     relays: Vec<String>,
     events: EventSender,
     cancel: CancellationToken,
@@ -961,7 +936,7 @@ async fn run_card_setup_host(
     recent_pins: RecentPins,
 ) {
     events.status(ConnStatus::Starting);
-    let endpoint = match create_server_endpoint(setup_readiness(channel), secret).await {
+    let endpoint = match create_server_endpoint(channel_readiness(channel), secret).await {
         Ok(ep) => ep,
         Err(e) => {
             events.error(format!("Failed to start: {e:#}"));
@@ -1108,14 +1083,14 @@ async fn run_card_setup_joiner(
     canonical_pin: String,
     self_card: IdentityCard,
     target_ip: Option<std::net::IpAddr>,
-    channel: SetupChannel,
+    channel: SignalChannel,
     relays: Vec<String>,
     events: EventSender,
     cancel: CancellationToken,
     secret: iroh::SecretKey,
 ) {
     events.status(ConnStatus::Starting);
-    let endpoint = match create_client_endpoint(setup_readiness(channel), secret).await {
+    let endpoint = match create_client_endpoint(channel_readiness(channel), secret).await {
         Ok(ep) => ep,
         Err(e) => {
             events.error(format!("Failed to start: {e:#}"));
@@ -1301,11 +1276,212 @@ async fn pump_clipboard(
 /// channel selection: LAN-only must not wait on — or even build — a relay,
 /// nostr-only hard-requires one, and the default prefers one but must still
 /// come up promptly and pair offline over the LAN half.
-fn setup_readiness(channel: SetupChannel) -> EndpointReadiness {
+fn channel_readiness(channel: SignalChannel) -> EndpointReadiness {
     match channel {
-        SetupChannel::LanOnly => EndpointReadiness::LanDirect,
-        SetupChannel::NostrOnly => EndpointReadiness::RelayOnline,
-        SetupChannel::LanThenNostr => EndpointReadiness::DirectAddr,
+        SignalChannel::LanOnly => EndpointReadiness::LanDirect,
+        SignalChannel::NostrOnly => EndpointReadiness::RelayOnline,
+        SignalChannel::LanThenNostr => EndpointReadiness::DirectAddr,
+    }
+}
+
+/// Resolve a trusted peer's live clipboard session: look for the pairwise
+/// hosting record it publishes for *this* device on the enabled channel(s).
+///
+/// Same asymmetry and same ordering as [`resolve_card_setup`], for the same
+/// reasons: the host publishes everywhere it can and only the dialer falls
+/// back, LAN first because it answers in well under a second when the peer is
+/// on this network, so the common case never touches a relay. A LAN error is
+/// logged and falls through like a miss, and a channel that looked and cleanly
+/// found nothing clears a held error — "not hosting" is the answer the user can
+/// act on.
+///
+/// A LAN hit carries the host's direct addresses (DNS-SD SRV/A/AAAA), so the
+/// dial needs no further address lookup; the relay record carries a bare node
+/// id, resolved by the endpoint's own discovery.
+async fn resolve_hosting(
+    identity: &KeyIdentity,
+    peer: nostr_sdk::PublicKey,
+    channel: SignalChannel,
+) -> Result<EndpointAddr> {
+    let mut first_error: Option<anyhow::Error> = None;
+
+    if channel.lan() {
+        match crate::lan::dnssd_lookup_hosting(&identity.identity, peer).await {
+            Ok(Some(found)) => return Ok(found.endpoint_addr()),
+            Ok(None) => log::info!("The selected peer is not hosting on the local network"),
+            Err(e) => {
+                let e = e.context("LAN hosting lookup failed");
+                log::warn!("{e:#}");
+                first_error = Some(e);
+            }
+        }
+    }
+
+    if channel.nostr() {
+        if channel.lan() {
+            log::info!("Falling back to the nostr hosting record for the selected peer");
+        }
+        match crate::nostr::lookup_hosting(&identity.identity, peer, &identity.relays).await {
+            Ok(Some(id)) => return Ok(EndpointAddr::new(id)),
+            Ok(None) => {
+                log::info!("The selected peer has no hosting record on the relays");
+                first_error = None;
+            }
+            Err(e) => {
+                let e = e.context("nostr hosting lookup failed");
+                log::warn!("{e:#}");
+                first_error.get_or_insert(e);
+            }
+        }
+    }
+
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+    Err(match channel {
+        SignalChannel::LanOnly => anyhow::anyhow!(
+            "The selected peer is not hosting on this network — press Start on that device, and check both devices are on the same network"
+        ),
+        SignalChannel::NostrOnly | SignalChannel::LanThenNostr => anyhow::anyhow!(
+            "The selected peer is not hosting a connection — press Start on that device"
+        ),
+    })
+}
+
+/// How often [`run_hosting_publisher`] wakes to republish. Well inside the
+/// relay copy's five-minute expiry, and quoted in the log line so the interval
+/// the reader is told about cannot drift from the one actually slept.
+const HOSTING_REFRESH: Duration = Duration::from_secs(120);
+
+/// Configure-mode hosting publisher: keep this host's ephemeral node id
+/// resolvable by each trusted peer, on every enabled channel, for as long as
+/// the session listens.
+///
+/// The peer list is re-filtered every round, so a peer whose card lapses
+/// mid-session stops being signalled to without a restart. The LAN
+/// advertisements are rebuilt only when that live set or this endpoint's direct
+/// addresses actually change — an mDNS record stays up until it is withdrawn,
+/// so re-registering on a timer would only churn goodbye/announce traffic,
+/// unlike the relay copy, which has a five-minute TTL and must be refreshed.
+async fn run_hosting_publisher(
+    endpoint: iroh::Endpoint,
+    identity: KeyIdentity,
+    channel: SignalChannel,
+    events: EventSender,
+    cancel: CancellationToken,
+) {
+    let node_id = endpoint.id();
+    let mut adverts: Vec<crate::lan::LanAdvert> = Vec::new();
+    // What `adverts` currently says, so an unchanged round is a no-op. `None`
+    // also means "retry next round" after a failure to advertise.
+    let mut advertised: Option<(Vec<nostr_sdk::PublicKey>, Vec<std::net::SocketAddr>)> = None;
+    // Only report a total failure to signal on the transition into it, so a
+    // sustained outage does not repaint the banner every round.
+    let mut reported = false;
+
+    loop {
+        let now = unix_now();
+        let live: Vec<IdentityCard> = identity
+            .peers
+            .iter()
+            .filter(|card| card.is_valid_at(now))
+            .cloned()
+            .collect();
+        // Every trusted card lapsed while the session was up: withdraw the LAN
+        // advertisements rather than leave records standing for peers that can
+        // no longer pair. Only the local channel needs saying — the relay copy
+        // just stops being refreshed and ages out of its TTL.
+        if live.is_empty() && advertised.is_some() {
+            log::info!(
+                "Withdrawing the local-network advertisement — no trusted peer's card is still valid"
+            );
+            adverts.clear();
+            advertised = None;
+        }
+        // Nothing to publish and nobody who could dial: not a failure to report.
+        if !live.is_empty() {
+            let mut published = false;
+
+            if channel.lan() {
+                let mut addrs: Vec<std::net::SocketAddr> =
+                    endpoint.addr().ip_addrs().copied().collect();
+                addrs.sort_unstable();
+                let mut keys: Vec<nostr_sdk::PublicKey> =
+                    live.iter().map(IdentityCard::public_key).collect();
+                keys.sort_unstable();
+                let want = (keys, addrs);
+                if advertised.as_ref() != Some(&want) {
+                    // Withdraw the stale set first: an advert for a peer that
+                    // just expired must not outlive this round.
+                    adverts.clear();
+                    for peer in &want.0 {
+                        match crate::lan::dnssd_advertise_hosting(
+                            &identity.identity,
+                            *peer,
+                            &node_id,
+                            &want.1,
+                        )
+                        .await
+                        {
+                            Ok(advert) => adverts.push(advert),
+                            Err(e) => log::warn!(
+                                "Failed to advertise this device on the local network: {e:#}"
+                            ),
+                        }
+                    }
+                    if adverts.is_empty() {
+                        advertised = None;
+                    } else {
+                        log::info!(
+                            "Advertising this device on the local network for {} trusted peer(s)",
+                            adverts.len()
+                        );
+                        advertised = Some(want);
+                    }
+                }
+                published |= !adverts.is_empty();
+            }
+
+            if channel.nostr() {
+                match crate::nostr::publish_hosting(
+                    &identity.identity,
+                    &live,
+                    &node_id,
+                    &identity.relays,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        published = true;
+                        // Said every round, like the PIN publisher's: on a
+                        // relay-only host this is the only evidence the device
+                        // ever announced itself, and a stale last line would
+                        // otherwise be indistinguishable from a live one.
+                        log::info!(
+                            "Published pairwise hosting records to nostr for {} trusted peer(s) (refreshes in {}s)",
+                            live.len(),
+                            HOSTING_REFRESH.as_secs()
+                        );
+                    }
+                    Err(e) => log::warn!("Failed to publish pairwise hosting records: {e:#}"),
+                }
+            }
+
+            // Listening on a node id nothing can resolve looks identical to
+            // waiting for a peer that just hasn't joined yet. Say which it is.
+            if !published && !reported {
+                events.error(
+                    "Could not announce this device on any channel — the other device will not \
+                     find it. Check this device's network connection.",
+                );
+            }
+            reported = !published;
+        }
+
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = tokio::time::sleep(HOSTING_REFRESH) => {}
+        }
     }
 }
 
@@ -1313,7 +1489,7 @@ fn setup_readiness(channel: SetupChannel) -> EndpointReadiness {
 /// (see `pin_record::candidate_keys`), then look the host up on the enabled
 /// channel(s).
 ///
-/// On [`SetupChannel::LanThenNostr`] the local lookup runs first and the relays
+/// On [`SignalChannel::LanThenNostr`] the local lookup runs first and the relays
 /// are queried only if it found nothing — sequential, not raced. The LAN browse
 /// is bounded by its own short window, and it is the channel that answers in
 /// well under a second when the other device is right there, so the ordering
@@ -1326,7 +1502,7 @@ fn setup_readiness(channel: SetupChannel) -> EndpointReadiness {
 /// carry the host's direct addresses, so they ride along and the dial needs no
 /// further address lookup. The nostr record carries only a node id, which the
 /// endpoint's own discovery resolves (which is why that channel is not built
-/// relay-less; see [`setup_readiness`]).
+/// relay-less; see [`channel_readiness`]).
 ///
 /// `Some(target_ip)` fetches the record from the host's unicast side channel at
 /// that IP — the manual-IP path that works where multicast is blocked — instead
@@ -1335,7 +1511,7 @@ fn setup_readiness(channel: SetupChannel) -> EndpointReadiness {
 async fn resolve_card_setup(
     canonical_pin: &str,
     target_ip: Option<std::net::IpAddr>,
-    channel: SetupChannel,
+    channel: SignalChannel,
     relays: &[String],
 ) -> Result<EndpointAddr> {
     let candidates = crate::pin_record::candidate_keys(canonical_pin).await?;
@@ -1393,16 +1569,16 @@ async fn resolve_card_setup(
     // Nothing was found anywhere and every enabled channel answered cleanly —
     // phrase the miss for what the user can actually fix on this channel.
     Err(match channel {
-        SetupChannel::LanOnly if target_ip.is_some() => anyhow::anyhow!(
+        SignalChannel::LanOnly if target_ip.is_some() => anyhow::anyhow!(
             "no device answered for that PIN at that IP — check the address shown on the other device and that the code (it refreshes every 60s) matches"
         ),
-        SetupChannel::LanOnly => anyhow::anyhow!(
+        SignalChannel::LanOnly => anyhow::anyhow!(
             "no device found for that PIN on this network — both devices must be on the same network, and the code refreshes every 60s"
         ),
-        SetupChannel::NostrOnly => anyhow::anyhow!(
+        SignalChannel::NostrOnly => anyhow::anyhow!(
             "no device found for that PIN on the relays — check the current code on the other device (it refreshes every 60s)"
         ),
-        SetupChannel::LanThenNostr => anyhow::anyhow!(
+        SignalChannel::LanThenNostr => anyhow::anyhow!(
             "no device found for that PIN, on this network or through the relays — check the current code on the other device (it refreshes every 60s)"
         ),
     })
@@ -1434,7 +1610,7 @@ async fn resolve_card_setup(
 async fn run_card_setup_publisher(
     endpoint: iroh::Endpoint,
     recent: RecentPins,
-    channel: SetupChannel,
+    channel: SignalChannel,
     relays: Vec<String>,
     events: EventSender,
     cancel: CancellationToken,
@@ -1442,7 +1618,7 @@ async fn run_card_setup_publisher(
     refresh: Arc<tokio::sync::Notify>,
 ) {
     let node_id = endpoint.id();
-    let mut adverts: VecDeque<crate::lan::PinAdvert> = VecDeque::new();
+    let mut adverts: VecDeque<crate::lan::LanAdvert> = VecDeque::new();
     // Unicast side-channel listeners, kept with the same one-period look-back
     // as `adverts`: the port is PIN-derived, so it rotates with the PIN, and a
     // joiner who typed the just-rotated code still reaches the previous
@@ -1934,41 +2110,62 @@ mod tests {
     /// the LAN half is not blocked by a relay it may never need.
     #[test]
     fn each_channel_enables_its_backends_and_endpoint_gate() {
-        assert!(SetupChannel::LanThenNostr.lan() && SetupChannel::LanThenNostr.nostr());
-        assert!(SetupChannel::LanOnly.lan() && !SetupChannel::LanOnly.nostr());
-        assert!(!SetupChannel::NostrOnly.lan() && SetupChannel::NostrOnly.nostr());
+        assert!(SignalChannel::LanThenNostr.lan() && SignalChannel::LanThenNostr.nostr());
+        assert!(SignalChannel::LanOnly.lan() && !SignalChannel::LanOnly.nostr());
+        assert!(!SignalChannel::NostrOnly.lan() && SignalChannel::NostrOnly.nostr());
 
         assert_eq!(
-            setup_readiness(SetupChannel::LanOnly),
+            channel_readiness(SignalChannel::LanOnly),
             EndpointReadiness::LanDirect
         );
         assert_eq!(
-            setup_readiness(SetupChannel::NostrOnly),
+            channel_readiness(SignalChannel::NostrOnly),
             EndpointReadiness::RelayOnline
         );
         assert_eq!(
-            setup_readiness(SetupChannel::LanThenNostr),
+            channel_readiness(SignalChannel::LanThenNostr),
             EndpointReadiness::DirectAddr
         );
         // The default is the one a plain launch gets.
-        assert_eq!(SetupChannel::default(), SetupChannel::LanThenNostr);
+        assert_eq!(SignalChannel::default(), SignalChannel::LanThenNostr);
     }
 
     /// With every enabled channel reachable but empty, the joiner reports a miss
     /// naming what the user can check — and the wording follows the channel, so
-    /// a nostr-only run is never told to put both devices on one network.
+    /// a nostr-only run is never told to put both devices on one network. Both
+    /// rendezvous kinds answer the same way, since one launch flag governs both.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_lan_only_miss_reports_the_local_network() {
-        // No host is advertising this PIN, and LAN-only touches no relay, so
-        // this exercises the real miss path rather than a stubbed one.
+        // Nothing is advertising this PIN or hosting for this identity, and
+        // LAN-only touches no relay, so these exercise the real miss paths
+        // rather than stubbed ones.
         let pin = crate::pin::generate_pin();
-        let error = resolve_card_setup(&pin, None, SetupChannel::LanOnly, &[])
+        let error = resolve_card_setup(&pin, None, SignalChannel::LanOnly, &[])
             .await
             .expect_err("nothing is advertising that PIN");
         let error = format!("{error:#}");
         assert!(
             error.contains("this network"),
-            "a LAN-only miss should point at the network: {error}"
+            "a LAN-only card-setup miss should point at the network: {error}"
+        );
+
+        let identity = Identity::generate();
+        let peer = Identity::generate();
+        let key_identity = KeyIdentity {
+            self_card: identity.card("me", "a7B2c3D4").unwrap(),
+            identity,
+            peers: Vec::new(),
+            // Empty: a LAN-only resolve must not reach for a relay at all, so
+            // touching one would fail here rather than silently succeed.
+            relays: Vec::new(),
+        };
+        let error = resolve_hosting(&key_identity, peer.public_key(), SignalChannel::LanOnly)
+            .await
+            .expect_err("nobody is hosting for this identity");
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("this network") && error.contains("Start"),
+            "a LAN-only hosting miss should name the network and the fix: {error}"
         );
     }
 
@@ -2211,9 +2408,10 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let events = EventSender::new(tx, None);
         let session = start_test_session(
-            SessionKind::Client(DialSpec::NostrKey {
+            SessionKind::Client(DialSpec::Key {
                 identity: Box::new(key_identity),
                 peer_public_key: peer_identity.public_key(),
+                channel: SignalChannel::LanOnly,
             }),
             events,
         );
@@ -2248,7 +2446,7 @@ mod tests {
         let session = start_test_session(
             SessionKind::Server(ServerMode::CardSetup {
                 self_card: Box::new(Identity::generate().card("host", "a7B2c3D4").unwrap()),
-                channel: SetupChannel::LanOnly,
+                channel: SignalChannel::LanOnly,
                 relays: Vec::new(),
             }),
             events,
@@ -2297,7 +2495,7 @@ mod tests {
         let srv_session = start_test_session(
             SessionKind::Server(ServerMode::CardSetup {
                 self_card: Box::new(host_card.clone()),
-                channel: SetupChannel::LanOnly,
+                channel: SignalChannel::LanOnly,
                 relays: Vec::new(),
             }),
             EventSender::new(srv_tx, None),
@@ -2311,7 +2509,7 @@ mod tests {
                 canonical_pin,
                 self_card: Box::new(join_card.clone()),
                 target_ip: None,
-                channel: SetupChannel::LanOnly,
+                channel: SignalChannel::LanOnly,
                 relays: Vec::new(),
             }),
             EventSender::new(cli_tx, None),
@@ -2353,6 +2551,90 @@ mod tests {
         stop_session(&mut srv).await;
     }
 
+    /// The clipboard session's own rendezvous, end to end and relay-less: a host
+    /// with one trusted peer advertises its ephemeral node id on the local
+    /// network, that peer resolves the pairwise record — direct addresses
+    /// included — dials it, both authenticate with their application keys, and a
+    /// clipboard item crosses.
+    ///
+    /// Nothing here can reach a relay: the relay lists are empty and `LanOnly`
+    /// builds a relay-less endpoint, so a pass is proof the local-network half of
+    /// the clipboard signaling stands on its own.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_clipboard_session_signals_over_the_local_network() {
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        let host_identity = Identity::generate();
+        let join_identity = Identity::generate();
+        let host_card = host_identity.card("host", "a7B2c3D4").unwrap();
+        let join_card = join_identity.card("joiner", "x9Y8z7W6").unwrap();
+
+        let (srv_tx, srv_rx) = std::sync::mpsc::channel();
+        let srv_session = start_test_session(
+            SessionKind::Server(ServerMode::Key {
+                identity: Box::new(KeyIdentity {
+                    identity: host_identity.clone(),
+                    self_card: host_card.clone(),
+                    peers: vec![join_card.clone()],
+                    relays: Vec::new(),
+                }),
+                channel: SignalChannel::LanOnly,
+            }),
+            EventSender::new(srv_tx, None),
+        );
+        // The joiner's first browse may still beat the advertisement; its retry
+        // loop covers that, and waiting for Listening keeps the common case to
+        // one attempt.
+        wait_for_event(&srv_rx, Duration::from_secs(30), |ev| {
+            matches!(ev, NetEvent::Status(ConnStatus::Listening)).then_some(())
+        });
+
+        let (cli_tx, cli_rx) = std::sync::mpsc::channel();
+        let cli_session = start_test_session(
+            SessionKind::Client(DialSpec::Key {
+                identity: Box::new(KeyIdentity {
+                    identity: join_identity.clone(),
+                    self_card: join_card,
+                    peers: vec![host_card],
+                    relays: Vec::new(),
+                }),
+                peer_public_key: host_identity.public_key(),
+                channel: SignalChannel::LanOnly,
+            }),
+            EventSender::new(cli_tx, None),
+        );
+
+        // Both sides pair, and each names the other's *application* key — the
+        // record only pointed at a node id, so this is the handshake talking.
+        let paired = |ev: &NetEvent| match ev {
+            NetEvent::PeerPaired {
+                peer_public_key, ..
+            } => peer_public_key.clone(),
+            _ => None,
+        };
+        assert_eq!(
+            wait_for_event(&cli_rx, Duration::from_secs(120), paired),
+            host_identity.public_key().to_hex()
+        );
+        assert_eq!(
+            wait_for_event(&srv_rx, Duration::from_secs(30), paired),
+            join_identity.public_key().to_hex()
+        );
+
+        // The link is real: an item sent from the host arrives at the joiner.
+        srv_session.clip_tx.send("over the LAN".to_string()).unwrap();
+        let text = wait_for_event(&cli_rx, Duration::from_secs(30), |ev| match ev {
+            NetEvent::ItemReceived { text, .. } => Some(text.clone()),
+            _ => None,
+        });
+        assert_eq!(text, "over the LAN");
+
+        let mut cli = Some(cli_session);
+        let mut srv = Some(srv_session);
+        stop_session(&mut cli).await;
+        stop_session(&mut srv).await;
+    }
+
     /// A card-setup session must never move clipboard content. Sending on
     /// either side's clip channel produces nothing on the peer — the session
     /// task drops the receiver outright, so there is no path for content to
@@ -2368,7 +2650,7 @@ mod tests {
         let srv_session = start_test_session(
             SessionKind::Server(ServerMode::CardSetup {
                 self_card: Box::new(host_card),
-                channel: SetupChannel::LanOnly,
+                channel: SignalChannel::LanOnly,
                 relays: Vec::new(),
             }),
             EventSender::new(srv_tx, None),
@@ -2381,7 +2663,7 @@ mod tests {
                 canonical_pin,
                 self_card: Box::new(join_card),
                 target_ip: None,
-                channel: SetupChannel::LanOnly,
+                channel: SignalChannel::LanOnly,
                 relays: Vec::new(),
             }),
             EventSender::new(cli_tx, None),
@@ -2427,7 +2709,7 @@ mod tests {
         let srv_session = start_test_session(
             SessionKind::Server(ServerMode::CardSetup {
                 self_card: Box::new(host_card),
-                channel: SetupChannel::LanOnly,
+                channel: SignalChannel::LanOnly,
                 relays: Vec::new(),
             }),
             EventSender::new(srv_tx, None),
@@ -2442,7 +2724,7 @@ mod tests {
                 // The host serves the unicast side channel on all interfaces, so
                 // loopback reaches it on the same machine.
                 target_ip: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
-                channel: SetupChannel::LanOnly,
+                channel: SignalChannel::LanOnly,
                 relays: Vec::new(),
             }),
             EventSender::new(cli_tx, None),
@@ -2650,7 +2932,7 @@ mod tests {
         let srv_session = start_test_session(
             SessionKind::Server(ServerMode::CardSetup {
                 self_card: Box::new(Identity::generate().card("host", "a7B2c3D4").unwrap()),
-                channel: SetupChannel::LanOnly,
+                channel: SignalChannel::LanOnly,
                 relays: Vec::new(),
             }),
             EventSender::new(srv_tx, None),
@@ -2660,7 +2942,7 @@ mod tests {
             canonical_pin: canonical_pin.clone(),
             self_card: Box::new(Identity::generate().card("joiner", "x9Y8z7W6").unwrap()),
             target_ip: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
-            channel: SetupChannel::LanOnly,
+            channel: SignalChannel::LanOnly,
             relays: Vec::new(),
         };
 

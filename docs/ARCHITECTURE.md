@@ -75,19 +75,33 @@ added by explicitly importing a signed card.
 ## Configure-mode signaling
 
 Starting a configure-mode server creates an iroh endpoint with a fresh
-session-scoped key. For each locally trusted card, the host publishes a kind
-`30385` parameterized replaceable event:
+session-scoped key. For each locally trusted card, the host publishes one
+pairwise hosting record (`hosting_record`): NIP-44 ciphertext of
+`{version, node_id}` from the host's application key to exactly that peer's,
+under a label that is a SHA-256 over a domain plus the **ordered** host/peer
+public keys. Only a device holding both keys can derive the label, and only the
+addressed peer can read the content.
 
-- author: host application key;
-- `p` recipient: exactly one trusted application key;
-- `d`: SHA-256 over a domain plus ordered host/peer public keys;
-- content: NIP-44 encrypted `{version, node_id}`;
-- NIP-40 expiry: five minutes.
+The record is carried on two transports, which differ only in how the label is
+expressed and how long a copy survives:
 
-The host refreshes these pairwise records while listening. A joiner queries the
-selected trusted author and pair-specific identifier, decrypts with its
-application key, and obtains the ephemeral iroh node id. No shared group
-presence key or broadcast list exists.
+| | Label | Payload | Lifetime |
+|---|---|---|---|
+| Nostr relays | `d` tag of a kind `30385` parameterized replaceable event, plus a `p` recipient tag | event content | NIP-40 expiry, five minutes; refreshed every 120 s while listening |
+| Local network | DNS-SD instance under `_duocb-host._udp.local.` | `e` TXT attribute, with real SRV/A/AAAA data alongside | until withdrawn; re-registered only when the live peer set or the endpoint's direct addresses change |
+
+The two labels use different domain separators, so one pairing produces
+unrelated identifiers on the two transports and neither a relay operator nor a
+LAN neighbour can link a device across them. The LAN copy additionally carries
+dialable addresses, so a local hit needs no further address lookup; the relay
+copy is a bare node id the endpoint's own discovery resolves.
+
+Which transports are in play is the launch-time `SignalChannel` choice — the
+same one card setup uses, and the same table of channels and endpoint gates
+([below](#rendezvous-channels)). The roles are asymmetric in the same way: the
+host publishes on every enabled channel because it cannot know where the joiner
+will look, and only the joiner falls back, sequentially, LAN first. A host also
+stops publishing to peers whose cards have lapsed, on both transports.
 
 This signaling only answers “where is the selected application identity
 hosting now?” The subsequent wire handshake proves who is on the connection.
@@ -180,31 +194,42 @@ session survives.
 
 ### Rendezvous channels
 
-The rendezvous record itself — NIP-44 ciphertext of the host's ephemeral node
-id, keyed by the `(pin, bucket)` public key — is the same on every transport
-(`pin_record`). What differs is where it is put and looked for, chosen at launch
-by `SetupChannel`:
+Both of duocb's rendezvous records — the card-setup PIN record (`pin_record`,
+keyed by the `(pin, bucket)` public key) and the pairwise hosting record
+(`hosting_record`, keyed by a pair of application keys) — are the same NIP-44
+ciphertext of the host's ephemeral node id wherever they travel. What differs is
+where they are put and looked for, chosen once at launch by `SignalChannel` and
+applied to **both** flows, so the two can never disagree about which transports
+exist:
 
-| Channel | Host publishes | Joiner looks | Endpoint gate |
+| Channel | Host publishes | Dialer looks | Endpoint gate |
 |---|---|---|---|
-| `LanThenNostr` (default) | DNS-SD + unicast side channel **and** relays | local network, then relays if that missed | `DirectAddr` |
-| `LanOnly` (`--lan-only`) | DNS-SD + unicast side channel | local network only | `LanDirect` (relay-less) |
+| `LanThenNostr` (default) | DNS-SD (+ the PIN unicast side channel) **and** relays | local network, then relays if that missed | `DirectAddr` |
+| `LanOnly` (`--lan-only`) | DNS-SD (+ the PIN unicast side channel) | local network only | `LanDirect` (relay-less) |
 | `NostrOnly` (`--nostr-only`) | relays | relays only | `RelayOnline` |
 
+The unicast side channel is PIN-only. It works by having the user type the
+host's LAN IP, and card setup is the only flow with a screen that shows that IP
+and a field to type it into; a clipboard session on a multicast-blocked network
+falls back to the relays instead, or fails on `--lan-only`.
+
 The two roles are deliberately asymmetric. The host publishes on *every* enabled
-channel — it cannot know which one the joiner will reach it on, and a record
-only helps if it is already in place. The joiner is the one that falls back, and
+channel — it cannot know which one the dialer will reach it on, and a record
+only helps if it is already in place. The dialer is the one that falls back, and
 it does so sequentially rather than racing: the local lookup answers in well
 under a second when the other device is there, so the common case never touches
 a relay. A LAN error is logged and treated like a miss; an error surfaces only
 when nothing was found on any enabled channel.
 
 Only the default channel needs both stacks, which is why it gates on
-`DirectAddr` — waiting for a relay would stall a pairing that may never need
+`DirectAddr` — waiting for a relay would stall a session that may never need
 one, while the relay connects in the background for the fallback. `LanOnly`
 builds a relay-less endpoint (no third-party server at all); `NostrOnly`
 requires the relay before it can publish, and its record carries no direct
 addresses, so the dialer's own discovery resolves the node id.
+
+The channel is part of a session's identity key, so switching it mints a fresh
+endpoint rather than reusing one bound for the old transport stack.
 
 Publishing to public relays widens who can *fetch* a record, so it rests
 entirely on the PIN: the lookup key is Argon2id-derived, the payload is only an
@@ -243,8 +268,8 @@ the value compared never crossed the network.
 
 Key commands:
 
-- `StartServer::NostrKey { KeyIdentity }`
-- `Connect::NostrKey { KeyIdentity, peer_public_key }`
+- `StartServer::Key { KeyIdentity, channel }`
+- `Connect::Key { KeyIdentity, peer_public_key, channel }`
 - `StartServer::CardSetup { self_card, channel, relays }`
 - `Connect::CardSetup { canonical_pin, self_card, target_ip, channel, relays }`
 
@@ -276,8 +301,13 @@ wire clipboard frames are capped at 1 MiB.
   a device whose clock is set far back keeps honouring a lapsed card.
 - Possession of an application private key permits impersonating that
   installation and decrypting pairwise records addressed to it.
-- Nostr relays may omit, retain, reorder, or replay events. A stale or replayed
-  hosting record can only misdirect a dial; the wire handshake still has to
-  prove the trusted application key, so a wrong target fails closed.
+- Nostr relays may omit, retain, reorder, or replay events, and anything on the
+  local network can answer an mDNS browse. A stale, replayed, or forged hosting
+  record can only misdirect a dial; the wire handshake still has to prove the
+  trusted application key, so a wrong target fails closed.
+- A hosting record's label is stable for the life of a pairing, so an observer
+  on either transport can see *that* two devices pair repeatedly, and roughly
+  when. It reveals neither device's identity, and the two transports use
+  separate labels for the same pair.
 - iroh and relay infrastructure can observe connection/event metadata even
   though payloads are encrypted.

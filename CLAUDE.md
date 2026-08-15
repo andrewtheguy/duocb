@@ -5,7 +5,7 @@
 
 # Workspace layout
 
-- `crates/duocb-core` — portable core (persistent per-installation application identity and signed cards in `auth.rs`, mutual key wire authentication, pairwise Nostr signaling, the card-setup PIN rendezvous over LAN and/or Nostr plus the card exchange itself, and the headless tokio net runtime). Application identities and ephemeral iroh transport keys are separate. No GUI/clipboard/config-file deps.
+- `crates/duocb-core` — portable core (persistent per-installation application identity and signed cards in `auth.rs`, mutual key wire authentication, pairwise hosting signaling and the card-setup PIN rendezvous — both over LAN and/or Nostr — plus the card exchange itself, and the headless tokio net runtime). Application identities and ephemeral iroh transport keys are separate. No GUI/clipboard/config-file deps.
 - `crates/duocb` — desktop Slint app (binary `duocb`); owns config.rs, clipboard.rs, src/app/ (state + logic), and ui/*.slint (markup, compiled by build.rs; fluent style, Skia renderer, per-platform fonts set in main.rs).
 - Version bumps: edit the single `[workspace.package] version` in the root Cargo.toml.
 - Desktop-only. iOS support (the `duocb-ffi` staticlib, `ios/duocb.h`, `build-ios.sh`, and the release workflow's xcframework job) was removed while the core is being refactored; do not re-add it or reintroduce `target_os = "ios"` branches.
@@ -23,6 +23,6 @@ cargo run -- --config /tmp/duocb-peer1.json   # or DUOCB_CONFIG=/tmp/duocb-peer1
 cargo run -- --config /tmp/duocb-peer2.json   # or DUOCB_CONFIG=/tmp/duocb-peer2.json
 ```
 
-`--lan-only` and `--nostr-only` pin the card-setup rendezvous to one transport (the default tries the local network first and falls back to Nostr relays). They apply to that trust-bootstrap step only, and both at once is an error. Forcing them on the two instances *differently* — e.g. a `--nostr-only` host and a default joiner — is what exercises the fallback: the joiner misses on mDNS and then resolves through the relays.
+`--lan-only` and `--nostr-only` pin all signaling to one transport for the life of the process — both the card-setup PIN rendezvous and the pairwise hosting records a clipboard session is found through (the default tries the local network first and falls back to Nostr relays). Both at once is an error, and the hub shows a banner naming whichever is in effect. Forcing them on the two instances *differently* — e.g. a `--nostr-only` host and a default joiner — is what exercises the fallback: the joiner misses on mDNS and then resolves through the relays. `--lan-only` on both is the way to run a fully offline pair.
 
 `-c` is an alias for `--config`; the CLI flag wins over `DUOCB_CONFIG`. Without an override, both processes resolve to the same default location (see README) and collide. Joining is by choosing Join on the home hub, which opens the local trusted-device picker, and selecting the peer there. Card setup ("Trade cards") is a separate flow reached from the hub: it only trades identity cards and never carries clipboard traffic. The join retries at a fixed interval for up to 10 attempts, so press Join again if the host starts later. Configs are per-installation. There is no peer-list backup: a saved private key restores the identity only, and the trusted-peer list is rebuilt by re-importing each peer's card.
