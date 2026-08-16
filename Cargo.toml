@@ -1,5 +1,9 @@
 [workspace]
 members = ["crates/*"]
+# duocb-ffi is an iOS staticlib: it only builds for the Apple targets and is
+# produced by ./build-ios.sh, never by a plain host build. Excluding it here
+# keeps `cargo build`/`clippy`/`test` at the workspace root desktop-only.
+default-members = ["crates/duocb", "crates/duocb-core"]
 resolver = "3"
 
 [workspace.package]
@@ -25,10 +29,15 @@ arboard = { version = "3.6.1", default-features = false }
 
 # P2P transport
 iroh = "1.0.3"
+# Both open multicast sockets in-process, so both are pulled in only on
+# non-iOS targets (see crates/duocb-core/Cargo.toml for why).
 iroh-mdns-address-lookup = "0.4.0"
-# Spec-compliant DNS-SD for the LAN-setup PIN rendezvous: interoperates with
-# other Bonjour implementations on the network.
+# Spec-compliant DNS-SD for the rendezvous records: interoperates with other
+# Bonjour implementations on the network. iOS uses the system mDNSResponder
+# daemon over dns_sd.h instead.
 mdns-sd = "0.20.1"
+# iOS only: poll(2) and the sockaddr layouts for the dns_sd.h callbacks.
+libc = "0.2"
 # Local network-interface enumeration (address + netmask) for constraining the
 # LAN-only joiner's typed host IP to its own subnet.
 netdev = "0.45"

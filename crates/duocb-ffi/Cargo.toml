@@ -1,0 +1,19 @@
+[package]
+name = "duocb-ffi"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+
+# `name = "duocb"` so the static archive is `libduocb.a`, the name the iOS
+# Xcode project (../duocb-ios) links against.
+[lib]
+name = "duocb"
+crate-type = ["staticlib"]
+
+[dependencies]
+duocb-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+log.workspace = true
+env_logger.workspace = true

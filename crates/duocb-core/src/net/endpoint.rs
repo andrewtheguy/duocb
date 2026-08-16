@@ -14,6 +14,7 @@ use iroh::{
     address_lookup::{DnsAddressLookup, PkarrPublisher},
     endpoint::{Builder as EndpointBuilder, PathList, QuicTransportConfig, presets},
 };
+#[cfg(not(target_os = "ios"))]
 use iroh_mdns_address_lookup::MdnsAddressLookup;
 use log::{debug, info};
 use std::sync::Arc;
@@ -45,16 +46,37 @@ pub const QUIC_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 /// clipboard link, unlike a long-idle tunnel, wants prompt dead-peer reaping.
 pub const QUIC_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Attach iroh's own mDNS address lookup, which resolves a bare node id to
+/// direct addresses on the local network.
+///
+/// **Omitted on iOS.** It runs an in-process multicast responder
+/// (swarm-discovery), and iOS gates raw multicast behind
+/// `com.apple.developer.networking.multicast`, an entitlement Apple grants only
+/// by exception. Nothing else is lost there: iOS still does regular mDNS, via
+/// the system mDNSResponder daemon in `crate::lan::dnssd` — see
+/// [`EndpointReadiness::LanDirect`] for why dropping this lookup does not break
+/// the LAN-only path.
+#[cfg(not(target_os = "ios"))]
+fn with_mdns_lookup(builder: EndpointBuilder) -> EndpointBuilder {
+    builder.address_lookup(MdnsAddressLookup::builder())
+}
+
+#[cfg(target_os = "ios")]
+fn with_mdns_lookup(builder: EndpointBuilder) -> EndpointBuilder {
+    builder
+}
+
 /// Create a base endpoint builder with common configuration: keep-alive/idle
 /// transport tuning plus discovery, tuned to `readiness`.
 ///
-/// Every mode enables mDNS (local-network discovery — the offline path). Modes
-/// other than LAN-only additionally use the default relays and n0 DNS/pkarr, so
-/// peers stay reachable across networks. **LAN-only involves no third-party
-/// server**: the relay is disabled and n0 DNS/pkarr publish+lookup are omitted,
-/// leaving mDNS discovery plus direct device-to-device paths. This is not a
-/// packet-level subnet boundary; direct addresses and inbound source paths are
-/// not filtered to on-link IPs.
+/// Every mode enables mDNS (local-network discovery — the offline path), except
+/// on iOS where iroh's mDNS lookup is compiled out (see [`with_mdns_lookup`]).
+/// Modes other than LAN-only additionally use the default relays and n0
+/// DNS/pkarr, so peers stay reachable across networks. **LAN-only involves no
+/// third-party server**: the relay is disabled and n0 DNS/pkarr publish+lookup
+/// are omitted, leaving mDNS discovery plus direct device-to-device paths. This
+/// is not a packet-level subnet boundary; direct addresses and inbound source
+/// paths are not filtered to on-link IPs.
 fn create_endpoint_builder(readiness: EndpointReadiness) -> Result<EndpointBuilder> {
     let mut transport_config = QuicTransportConfig::builder();
     let idle_timeout = QUIC_IDLE_TIMEOUT
@@ -75,15 +97,14 @@ fn create_endpoint_builder(readiness: EndpointReadiness) -> Result<EndpointBuild
 
     let builder = if readiness == EndpointReadiness::LanDirect {
         // LAN-only: no relay, no internet-backed discovery — mDNS + direct only.
-        builder
-            .relay_mode(RelayMode::Disabled)
-            .address_lookup(MdnsAddressLookup::builder())
+        with_mdns_lookup(builder.relay_mode(RelayMode::Disabled))
     } else {
-        builder
-            .relay_mode(RelayMode::Default)
-            .address_lookup(PkarrPublisher::n0_dns())
-            .address_lookup(DnsAddressLookup::n0_dns())
-            .address_lookup(MdnsAddressLookup::builder())
+        with_mdns_lookup(
+            builder
+                .relay_mode(RelayMode::Default)
+                .address_lookup(PkarrPublisher::n0_dns())
+                .address_lookup(DnsAddressLookup::n0_dns()),
+        )
     };
 
     Ok(builder)
@@ -129,6 +150,16 @@ pub enum EndpointReadiness {
     /// mDNS only. The gate for card setup's LAN-only channel, which must come
     /// up promptly without a third-party service. Its traffic is direct, but
     /// the path is not restricted by source subnet.
+    ///
+    /// **On iOS this mode has no address lookup at all** — iroh's mDNS lookup
+    /// is compiled out (see [`with_mdns_lookup`]) and it is the only one this
+    /// mode would have had. That is survivable because nothing here ever dials
+    /// a bare node id: both LAN rendezvous backends return the host's direct
+    /// socket addresses alongside the node id, and
+    /// `crate::lan::LanFound::endpoint_addr` attaches them to the dial target,
+    /// so the connect has explicit addresses and needs no lookup to resolve.
+    /// Any change that makes a LAN-only dial rely on node-id resolution alone
+    /// will work everywhere except iOS.
     LanDirect,
 }
 
