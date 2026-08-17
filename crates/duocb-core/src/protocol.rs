@@ -3,8 +3,8 @@
 //!
 //! A connection uses a **single** bidirectional stream, opened by the client
 //! (dialer):
-//! 1. Auth runs first on it: mutual application-key authentication, or the PIN
-//!    challenge-response used by card setup (see `crate::pin_auth`).
+//! 1. Auth runs first on it: mutual application-key authentication, or the
+//!    SPAKE2 PIN handshake used by card setup (see `crate::pin_auth`).
 //! 2. Once auth succeeds the same stream stays open and carries [`ClipMsg`]
 //!    frames in both directions for the life of the connection. (A clipboard
 //!    app has exactly one data stream, so no separate control channel is
@@ -13,8 +13,9 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-/// v3 replaces configure-mode token auth with mutual application-key proofs.
-pub const DUOCB_PROTO_VERSION: u16 = 3;
+/// v4: mutual application-key proofs (configure mode) and a SPAKE2 PAKE for
+/// the card-setup PIN (see `crate::pin_auth`).
+pub const DUOCB_PROTO_VERSION: u16 = 4;
 
 /// Cap for control frames (auth/pin). Small request/response messages only.
 pub const MAX_CONTROL_MESSAGE_SIZE: usize = 16 * 1024;
@@ -44,10 +45,10 @@ fn truncate_reason(reason: String, max_len: usize) -> String {
 /// on the first bidirectional stream it opens. The `method` tag selects the auth path
 /// the server runs:
 /// - `Key` — the persistent application identity (configure mode).
-/// - `Pin` — PIN/session-secret challenge-response used by PIN quick pair and
-///   manual mode: `nonce` is the dialer's random nonce and the exchange continues
-///   with [`PinChallenge`] / [`PinResponse`] / [`PinConfirm`] on the same stream
-///   (see `crate::pin_auth`). No token crosses the wire.
+/// - `Pin` — the card-setup SPAKE2 PAKE: `pakes` are the dialer's per-slot PAKE
+///   messages (base64url) and the exchange continues with [`PinChallenge`] /
+///   [`PinResponse`] / [`PinConfirm`] on the same stream (see `crate::pin_auth`).
+///   Nothing offline-testable crosses the wire.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method")]
 pub enum AuthRequest {
@@ -60,8 +61,8 @@ pub enum AuthRequest {
     },
     Pin {
         version: u16,
-        /// The dialer's random challenge nonce (base64url), bound into the proofs.
-        nonce: String,
+        /// The dialer's SPAKE2 messages, one per PAKE slot (base64url).
+        pakes: Vec<String>,
     },
 }
 
@@ -74,11 +75,11 @@ impl AuthRequest {
         }
     }
 
-    /// PIN-method request carrying the dialer's challenge nonce.
-    pub fn pin(nonce: impl Into<String>) -> Self {
+    /// PIN-method request carrying the dialer's per-slot SPAKE2 messages.
+    pub fn pin(pakes: Vec<String>) -> Self {
         Self::Pin {
             version: DUOCB_PROTO_VERSION,
-            nonce: nonce.into(),
+            pakes,
         }
     }
 
@@ -129,60 +130,67 @@ impl KeyProof {
     }
 }
 
-/// Listener's reply to a PIN [`AuthRequest`], carrying its own challenge nonce. The dialer
-/// answers with a [`PinResponse`].
+/// Listener's reply to a PIN [`AuthRequest`]: its own SPAKE2 message for each slot, aligned
+/// index-for-index with the request's `pakes`. The dialer answers with a [`PinResponse`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PinChallenge {
     pub version: u16,
-    /// The listener's random challenge nonce (base64url).
-    pub nonce: String,
+    /// The listener's SPAKE2 messages, one per PAKE slot (base64url).
+    pub pakes: Vec<String>,
 }
 
 impl PinChallenge {
-    pub fn new(nonce: impl Into<String>) -> Self {
+    pub fn new(pakes: Vec<String>) -> Self {
         Self {
             version: DUOCB_PROTO_VERSION,
-            nonce: nonce.into(),
+            pakes,
         }
     }
 }
 
-/// Dialer's proof of PIN possession, in reply to a [`PinChallenge`].
+/// Dialer's key-confirmation MACs, one per PAKE slot, in reply to a [`PinChallenge`]. The
+/// listener accepts if any slot's MAC matches a PIN it is still honoring.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PinResponse {
     pub version: u16,
-    /// NIP-44 sealed proof over the two nonces under the PIN-derived key.
-    pub proof: String,
+    /// Per-slot HMAC-SHA256 confirmations under that slot's PAKE key (base64url).
+    pub confirms: Vec<String>,
 }
 
 impl PinResponse {
-    pub fn new(proof: impl Into<String>) -> Self {
+    pub fn new(confirms: Vec<String>) -> Self {
         Self {
             version: DUOCB_PROTO_VERSION,
-            proof: proof.into(),
+            confirms,
         }
     }
 }
 
-/// Listener's final PIN-auth verdict. On success it carries the listener's own proof so the
-/// dialer can confirm the listener also holds the PIN (mutual authentication).
+/// Listener's final PIN-auth verdict. On success it names the slot that matched and carries
+/// the listener's own key confirmation for it, so the dialer can confirm the listener also
+/// holds the PIN (mutual authentication).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PinConfirm {
     pub version: u16,
     pub accepted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// The PAKE slot whose confirmation verified (accepted only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub proof: Option<String>,
+    pub slot: Option<usize>,
+    /// The listener's HMAC-SHA256 confirmation under that slot's PAKE key (accepted only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm: Option<String>,
 }
 
 impl PinConfirm {
-    pub fn accepted(proof: impl Into<String>) -> Self {
+    pub fn accepted(slot: usize, confirm: impl Into<String>) -> Self {
         Self {
             version: DUOCB_PROTO_VERSION,
             accepted: true,
             reason: None,
-            proof: Some(proof.into()),
+            slot: Some(slot),
+            confirm: Some(confirm.into()),
         }
     }
 
@@ -193,7 +201,8 @@ impl PinConfirm {
             version: DUOCB_PROTO_VERSION,
             accepted: false,
             reason: Some(truncate_reason(reason.into(), MAX_REJECT_REASON_LENGTH)),
-            proof: None,
+            slot: None,
+            confirm: None,
         }
     }
 }
@@ -651,12 +660,12 @@ mod tests {
 
     #[test]
     fn test_auth_request_pin_roundtrip() {
-        let req = AuthRequest::pin("bm9uY2U");
+        let req = AuthRequest::pin(vec!["cGFrZS1h".into(), "cGFrZS1i".into()]);
         let decoded = decode_auth_request(&encode_auth_request(&req).unwrap()).unwrap();
         match decoded {
-            AuthRequest::Pin { version, nonce } => {
+            AuthRequest::Pin { version, pakes } => {
                 assert_eq!(version, DUOCB_PROTO_VERSION);
-                assert_eq!(nonce, "bm9uY2U");
+                assert_eq!(pakes, vec!["cGFrZS1h", "cGFrZS1i"]);
             }
             other => panic!("expected Pin, got {other:?}"),
         }
@@ -665,7 +674,7 @@ mod tests {
     #[test]
     fn test_auth_request_wrong_version_rejected() {
         // Hand-craft a Pin request with a bad version; decode must reject it.
-        let json = br#"{"method":"Pin","version":99,"nonce":"x"}"#;
+        let json = br#"{"method":"Pin","version":99,"pakes":["x"]}"#;
         let len = (json.len() as u32).to_be_bytes();
         let mut buf = Vec::from(len);
         buf.extend_from_slice(json);
@@ -675,30 +684,32 @@ mod tests {
 
     #[test]
     fn test_pin_challenge_response_roundtrip() {
-        let challenge = PinChallenge::new("listener-nonce");
+        let challenge = PinChallenge::new(vec!["bXNnLWIw".into(), "bXNnLWIx".into()]);
         let decoded = decode_pin_challenge(&encode_pin_challenge(&challenge).unwrap()).unwrap();
         assert_eq!(decoded.version, DUOCB_PROTO_VERSION);
-        assert_eq!(decoded.nonce, "listener-nonce");
+        assert_eq!(decoded.pakes, vec!["bXNnLWIw", "bXNnLWIx"]);
 
-        let response = PinResponse::new("sealed-proof");
+        let response = PinResponse::new(vec!["bWFjMA".into(), "bWFjMQ".into()]);
         let decoded = decode_pin_response(&encode_pin_response(&response).unwrap()).unwrap();
         assert_eq!(decoded.version, DUOCB_PROTO_VERSION);
-        assert_eq!(decoded.proof, "sealed-proof");
+        assert_eq!(decoded.confirms, vec!["bWFjMA", "bWFjMQ"]);
     }
 
     #[test]
     fn test_pin_confirm_roundtrip() {
-        let ok = PinConfirm::accepted("listener-proof");
+        let ok = PinConfirm::accepted(1, "listener-mac");
         let decoded = decode_pin_confirm(&encode_pin_confirm(&ok).unwrap()).unwrap();
         assert!(decoded.accepted);
-        assert_eq!(decoded.proof.as_deref(), Some("listener-proof"));
+        assert_eq!(decoded.slot, Some(1));
+        assert_eq!(decoded.confirm.as_deref(), Some("listener-mac"));
         assert!(decoded.reason.is_none());
 
         let rej = PinConfirm::rejected("no matching pin");
         let decoded = decode_pin_confirm(&encode_pin_confirm(&rej).unwrap()).unwrap();
         assert!(!decoded.accepted);
         assert_eq!(decoded.reason.as_deref(), Some("no matching pin"));
-        assert!(decoded.proof.is_none());
+        assert!(decoded.slot.is_none());
+        assert!(decoded.confirm.is_none());
     }
 
     #[test]

@@ -25,19 +25,19 @@
 //!
 //! The PIN authenticates the *connection*, never an identity. It is deliberately not
 //! sufficient to become a trusted device: the cards that cross a card-setup connection
-//! are only imported after the user compares fingerprints (see `crate::card_exchange`).
+//! are only imported after the user compares the pairing code (see `crate::card_exchange`).
 //!
 //! Two independent keys are derived from a PIN, both with the same Argon2id work factor but
 //! **domain-separated** salts (see [`derive_key_material`] and [`derive_auth_key_material`]):
 //! - the *rendezvous* key ([`derive_key_material`], bucketed) locates & decrypts the relay
 //!   record carrying the server's ephemeral node id, and
-//! - the *auth* key ([`derive_auth_key_material`], **not** bucketed) proves mutual PIN
-//!   possession in-band over the established connection (see `crate::pin_auth`).
+//! - the *auth* password ([`derive_auth_key_material`], **not** bucketed) is the SPAKE2
+//!   password for the in-band mutual PAKE (see `crate::pin_auth`).
 //!
-//! The auth key is deliberately bucket-independent: the client types one PIN and must derive
-//! the same auth key regardless of which rotation bucket the server published under, so it
-//! never has to guess the bucket. The server instead remembers the current and previous buckets'
-//! PINs.
+//! The auth password is deliberately bucket-independent: the client types one PIN and must
+//! derive the same password regardless of which rotation bucket the server published under, so
+//! it never has to guess the bucket. The server instead remembers the current and previous
+//! buckets' PINs.
 
 use anyhow::{Context, Result};
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -252,9 +252,10 @@ pub fn derive_key_material(canonical_pin: &str, bucket: u64) -> Result<[u8; 32]>
 
 /// Derive 32 bytes of *auth* key material from a canonical PIN via Argon2id, **without** a time
 /// bucket. Both peers run this on the same PIN string and get identical output, which
-/// `crate::pin_auth` turns into the keypair that proves mutual PIN possession in-band. Being
-/// bucket-independent lets the client derive the right key without knowing which rotation
-/// bucket the server published under.
+/// `crate::pin_auth` feeds SPAKE2 as the PAKE password — so testing a PIN guess against the
+/// handshake costs the guesser a full Argon2id run per guess. Being bucket-independent lets the
+/// client derive the right password without knowing which rotation bucket the server published
+/// under.
 pub fn derive_auth_key_material(canonical_pin: &str) -> Result<[u8; 32]> {
     argon2_key(canonical_pin, AUTH_KDF_SALT)
 }

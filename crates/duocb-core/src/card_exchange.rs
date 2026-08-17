@@ -31,9 +31,11 @@
 //! then the *user* has to check that the pairing code — derived from both keys
 //! and rendered identically by both devices ([`crate::auth::pairing_code`]) —
 //! matches across the two screens before importing it. That human check is what
-//! catches an interposer: the PIN is only ~35 bits and its rendezvous record is
-//! offline-attackable (see `crate::pin_auth`), so possession of the PIN alone
-//! must never be enough to become a trusted device.
+//! catches an interposer: the PIN is only ~35 bits, and while the in-band PAKE
+//! (`crate::pin_auth`) limits a stranger to a few online guesses, anyone who
+//! reads, shoulder-surfs, or grinds it out of the public rendezvous record
+//! (see `crate::pin_record`) can complete the handshake — so possession of the
+//! PIN alone must never be enough to become a trusted device.
 //!
 //! Because the offers cross unconditionally, anyone who holds the PIN learns the
 //! card of whoever is showing it. A card is public-by-design — it is the thing

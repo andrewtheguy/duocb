@@ -48,6 +48,9 @@ futures = { version = "0.3", default-features = false, features = ["std"] }
 nostr-sdk = { version = "0.44.1", features = ["nip44"] }
 sha2 = "0.10"
 argon2 = "0.5.3"
+# In-band PIN PAKE (card setup): SPAKE2 over Ed25519, confirmed with HMAC-SHA256.
+spake2 = { version = "0.4", features = ["std"] }
+hmac = "0.12"
 subtle = "2"
 base64 = "0.22"
 rand = "0.9"
