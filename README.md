@@ -19,7 +19,7 @@ copy and paste them.
 | | Discovery/signaling | Authentication | Saved state |
 |---|---|---|---|
 | Configure connection | Pairwise encrypted hosting records, on the local network first and Nostr relays as fallback | Mutual application-key signatures | One identity key and a local trusted-peer list per installation |
-| Card setup (trust bootstrap) | Pairwise PIN-encrypted rendezvous records, same channels, plus a typed LAN IP | Rotating PIN challenge-response, then a human pairing-code check | The imported peer card |
+| Card setup (trust bootstrap) | Pairwise PIN-encrypted rendezvous records, same channels, plus a typed LAN IP | Rotating-PIN PAKE (SPAKE2), then a human pairing-code check | The imported peer card |
 
 ### Configure mode
 
@@ -78,8 +78,8 @@ carries the card over the network instead:
 1. Both devices open Trade cards. It requires a configured identity — there has
    to be a card to hand over — so it is offered only from the configured hub.
 2. One device shows a rotating eight-character PIN; the other types it.
-3. The PIN locates the host and drives a mutual Argon2id-backed
-   challenge-response over the resulting connection.
+3. The PIN locates the host and drives a mutual PAKE (SPAKE2, keyed by an
+   Argon2id stretch of the PIN) over the resulting connection.
 4. Both devices send their signed identity card across that connection.
 5. Both then show one pairing code, derived from both devices' keys and rendered
    identically on the two screens.
@@ -166,13 +166,19 @@ persisted.
 ## Security notes
 
 - QUIC/TLS 1.3 encrypts the transport.
-- The card-setup pairing-code check is what makes the PIN safe to build trust
-  on. The PIN proves possession of a short code, not an identity: it is ~35 bits
-  and its rendezvous record is offline-attackable, so anyone who reads or
-  guesses it inside its 60-second window can complete the handshake and offer a
-  card. The human comparison catches exactly that: each device computes half of
-  the code from its *own* key locally, so the halves never crossed the network,
-  and an interposed card makes the two screens disagree.
+- The card-setup PIN handshake is a PAKE (SPAKE2 with an Argon2id-stretched
+  password), so nothing on the wire is offline-testable: a stranger gets a
+  couple of online guesses per connection, each costing a full Argon2id run,
+  against a ~35-bit code that rotates every 60 seconds and admits one device.
+- The pairing-code check is still what makes the PIN safe to build trust on.
+  The PIN proves possession of a short code, not an identity: its public
+  rendezvous record is offline-attackable by nature (the lookup key must be
+  derivable from the PIN), and anyone who reads, shoulder-surfs, or grinds the
+  PIN inside its window can complete the handshake and offer a card —
+  PIN-keyed cryptography is transparent to a PIN holder. The human comparison
+  catches exactly that: each device computes half of the code from its *own*
+  key locally, so the halves never crossed the network, and an interposed card
+  makes the two screens disagree.
 - The pairing code is the two per-key fingerprints laid end to end, never a hash
   over both keys. Each half commits to a single public key, so an impostor needs
   a second preimage against a fixed target for each side it fools. A combined

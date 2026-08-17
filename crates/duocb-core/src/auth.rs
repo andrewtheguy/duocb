@@ -87,13 +87,19 @@ pub fn key_fingerprint(key: &PublicKey) -> String {
 /// keypairs for a birthday collision at half the exponent, since nothing in
 /// card setup commits either side to a key before it learns the other's. (This
 /// is the same construction as Signal's safety numbers.)
-pub fn pairing_code(a: &PublicKey, b: &PublicKey) -> String {
+///
+/// Two copies of one key are refused: both halves would be the same
+/// fingerprint, so the "comparison" would match while checking nothing — the
+/// only way to be handed such a pair is a caller mistake or a peer echoing
+/// this device's own card back.
+pub fn pairing_code(a: &PublicKey, b: &PublicKey) -> Result<String> {
+    anyhow::ensure!(a != b, "a pairing code needs two distinct keys");
     let (low, high) = if a.to_bytes() <= b.to_bytes() {
         (a, b)
     } else {
         (b, a)
     };
-    format!("{} {}", key_fingerprint(low), key_fingerprint(high))
+    Ok(format!("{} {}", key_fingerprint(low), key_fingerprint(high)))
 }
 
 /// Persisted, application-level identity. Debug output never exposes the secret.
@@ -440,8 +446,11 @@ mod tests {
     fn pairing_code_is_the_same_on_both_screens() {
         let a = Identity::generate();
         let b = Identity::generate();
-        let code = pairing_code(&a.public_key(), &b.public_key());
-        assert_eq!(code, pairing_code(&b.public_key(), &a.public_key()));
+        let code = pairing_code(&a.public_key(), &b.public_key()).unwrap();
+        assert_eq!(
+            code,
+            pairing_code(&b.public_key(), &a.public_key()).unwrap()
+        );
 
         // Ten groups of four upper-hex characters: the two 80-bit per-key
         // fingerprints end to end, in the same rendering the user already
@@ -459,7 +468,7 @@ mod tests {
     fn pairing_code_is_the_two_key_fingerprints_verbatim() {
         let a = Identity::generate();
         let b = Identity::generate();
-        let code = pairing_code(&a.public_key(), &b.public_key());
+        let code = pairing_code(&a.public_key(), &b.public_key()).unwrap();
         let fp_a = key_fingerprint(&a.public_key());
         let fp_b = key_fingerprint(&b.public_key());
         assert!(code == format!("{fp_a} {fp_b}") || code == format!("{fp_b} {fp_a}"));
@@ -467,7 +476,20 @@ mod tests {
         // Swapping in a third key changes the code — the value really does
         // bind the specific pair.
         let c = Identity::generate();
-        assert_ne!(code, pairing_code(&a.public_key(), &c.public_key()));
+        assert_ne!(
+            code,
+            pairing_code(&a.public_key(), &c.public_key()).unwrap()
+        );
+    }
+
+    /// One key in both slots would render two identical halves — a comparison
+    /// that always "matches" while checking nothing — so it is an error, not a
+    /// code. The one way such a pair arises in practice is a peer echoing this
+    /// device's own card back.
+    #[test]
+    fn pairing_code_refuses_a_single_key_in_both_slots() {
+        let key = Identity::generate().public_key();
+        assert!(pairing_code(&key, &key).is_err());
     }
 
     /// A card is usable up to its expiry and dead the second after, and the

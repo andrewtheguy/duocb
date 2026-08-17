@@ -1,58 +1,64 @@
-//! Card-setup PIN mutual authentication, carried in-band over the established connection.
+//! Card-setup PIN mutual authentication: a SPAKE2 PAKE carried in-band over the established
+//! connection.
 //!
 //! In card setup the rendezvous record carries **only** the server's ephemeral node id (encrypted
-//! under the PIN rendezvous key; see `crate::nostr`). No authentication proof
-//! is ever placed on a relay.
-//! Instead, once the client has dialed that node id, both peers prove they hold the same PIN
-//! with a short challenge-response on the first bidirectional stream — the same stream the
-//! application-key handshake uses, just a different [`AuthRequest`] method.
+//! under the PIN rendezvous key; see `crate::nostr`). No authentication material is ever placed on
+//! a relay. Instead, once the client has dialed that node id, both peers run a balanced PAKE
+//! (SPAKE2 over Ed25519) on the first bidirectional stream — the same stream the application-key
+//! handshake uses, just a different [`AuthRequest`] method:
 //!
 //! ```text
-//! D→L: AuthRequest::Pin { nonce_d }          # dialer opens with a random nonce
-//! L→D: PinChallenge     { nonce_l }          # listener's random nonce
-//! D→L: PinResponse      { proof_d }          # proof_d = seal(k, "dialer"   || nonce_d || nonce_l || id_d || id_l)
-//! L→D: PinConfirm       { accepted, proof_l } # proof_l = seal(k, "listener" || nonce_d || nonce_l || id_d || id_l)
+//! D→L: AuthRequest::Pin { pakes:    [msg_a per slot] }   # dialer's SPAKE2 messages
+//! L→D: PinChallenge     { pakes:    [msg_b per slot] }   # listener's SPAKE2 messages
+//! D→L: PinResponse      { confirms: [mac_d per slot] }   # dialer's key confirmations
+//! L→D: PinConfirm       { accepted, slot, confirm }      # verdict + listener's confirmation
 //! ```
 //!
-//! `k` is a keypair derived from the **PIN string alone** ([`derive_auth_keys`], bucket-independent),
-//! and `seal`/`open` are NIP-44 self-encryption under `k` — the same authenticated primitive used
-//! for the relay record. NIP-44's MAC means a wrong PIN yields a wrong `k` and `open` fails, so an
-//! impostor cannot forge a proof. The direction strings domain-separate the two proofs (a proof for
-//! one direction can't be replayed as the other) and both nonces bind the exchange to this one
-//! handshake (no cross-handshake replay).
+//! The PAKE password is the Argon2id-stretched PIN material
+//! ([`crate::pin::derive_auth_key_material`], bucket-independent). SPAKE2's guarantee is the
+//! point: no message reveals anything offline-testable about the password.
+//! A party that does not hold the PIN learns, per handshake, only whether its **one** guess per
+//! slot was right — and each guess costs it a full Argon2id derivation. Combined with the
+//! one-claim-per-PIN rule and the 60-second rotation, a wrong-PIN counterparty is limited to a few
+//! online guesses against a ~35-bit code. (The public rendezvous *record* remains an offline
+//! surface by nature — its lookup key must be derivable from the PIN — which Argon2id and the
+//! short TTL mitigate; see `crate::pin_record`.)
 //!
-//! **Node-id binding.** Each proof also folds in both peers' node ids — `id_d` the dialer's,
-//! `id_l` the listener's. Each side knows both: the listener takes `id_d` from the
-//! QUIC/TLS-authenticated `Connection::remote_id()` and `id_l` from its own endpoint; the dialer
-//! takes `id_l` from `remote_id()` (the id it dialed) and `id_d` from its own endpoint. A proof
-//! therefore verifies only when the PIN-derived key matches *and* both peers agree on the two node
-//! ids — so the listener effectively validates that the dialer's claimed identity is the one QUIC
-//! authenticated (and vice versa). This binds each proof to that specific pair of authenticated
-//! node ids, so a proof captured on one connection cannot be forwarded or replayed onto a
-//! connection with different endpoints. That only defends against a party that does **not** hold
-//! the PIN: anyone who knows the PIN can derive `k` and mint fresh proofs for whatever node ids
-//! it presents, so the binding does not defeat a relay or intermediary that possesses the PIN.
+//! **Slots.** The listener honors the current and previous rotations' PINs (its recent-PIN cache),
+//! but a PAKE commits each side to a single password per instance, so the handshake runs
+//! [`PAKE_SLOTS`] independent instances: the dialer enters its one PIN in every slot, the listener
+//! enters its i-th most recent PIN in slot i (a random password fills slots beyond its cache, so
+//! the wire shape never reveals how many PINs are live and a dummy slot can never verify). The
+//! slot whose confirmations match on both sides is the PIN they share.
 //!
-//! Because the listener mints a fresh PIN every rotation bucket, it verifies `proof_d` against the
-//! current and previous buckets' keys (its recent-PIN cache). The dialer may additionally probe the
-//! next bucket when fetching the node id to tolerate clock skew. QUIC/TLS hides these proofs from
-//! passive network and relay observers
-//! and binds the connection to the peer's node id (its public key). This construction is not a PAKE:
-//! a party that can observe a decrypted proof transcript can test PIN guesses offline, as can anyone
-//! archiving the public PIN-derived rendezvous event. Argon2id and the short recent-PIN acceptance
-//! window mitigate that risk; they do not eliminate the offline verifier. Once the first peer has
-//! claimed the server, however, the PIN-derived proof is insufficient on its own: a reconnect must
-//! also present the claimed endpoint identity through QUIC/TLS. The PIN does not derive or reveal
-//! QUIC's independently negotiated traffic-encryption keys.
+//! **Key confirmation and node-id binding.** Each side proves it derived the same SPAKE2 key with
+//! an HMAC-SHA256 over a direction- and slot-separated transcript, so a confirmation for one
+//! direction or slot can never be accepted as another's. Both peers' node ids — `id_d` the
+//! dialer's, `id_l` the listener's, each side taking the remote one from the QUIC/TLS-authenticated
+//! `Connection::remote_id()` — are folded into the SPAKE2 identity strings *and* the confirmation
+//! transcript, so the exchange only completes when both peers agree on the two authenticated
+//! endpoints: a handshake relayed onto a connection with different endpoints derives different
+//! keys and fails. As before, that binding only defends against a party that does **not** hold the
+//! PIN; anyone who knows the PIN can run the PAKE afresh for whatever node ids it presents, which
+//! is why the human pairing-code check (`crate::card_exchange`) stays load-bearing.
+//!
+//! The dialer never has to know which rotation bucket the listener published under: the password
+//! derivation is bucket-independent, and the slot mechanism absorbs rotation races. QUIC/TLS hides
+//! the handshake from passive network and relay observers. Once the first peer has claimed the
+//! server, the PIN is insufficient on its own: a reconnect must also present the claimed endpoint
+//! identity through QUIC/TLS. The PIN does not derive or reveal QUIC's independently negotiated
+//! traffic-encryption keys.
 
 use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use nostr_sdk::prelude::*;
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+use spake2::{Ed25519Group, Identity, Password, Spake2};
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
-// `nostr_sdk::prelude` glob-imports its own (older) `rand`, so refer to our crate's rand
-// explicitly via the leading `::`.
+// `rand` is also glob-exported by nostr crates elsewhere in this crate; the leading `::` keeps
+// this bound to our workspace `rand`.
 use ::rand::RngCore;
 
 use crate::protocol::{
@@ -61,13 +67,22 @@ use crate::protocol::{
     encode_pin_challenge, encode_pin_confirm, encode_pin_response, read_length_prefixed,
 };
 
-/// Domain separator baked into every proof plaintext, versioning the construction.
-const PROOF_DOMAIN: &str = "duocb:pin-auth:v1";
-/// Length of a challenge nonce, in bytes (before base64url encoding).
-const NONCE_LEN: usize = 32;
+/// Domain separator baked into the SPAKE2 identity strings and every confirmation transcript,
+/// versioning the construction.
+const PAKE_DOMAIN: &str = "duocb:pin-pake:v1";
 
-/// Which side produced a proof. Domain-separates the two directions so a proof sealed by one side
-/// can never be accepted as the other's.
+/// Independent SPAKE2 instances per handshake — one per PIN the listener may still honor, so its
+/// recent-PIN look-back survives the PAKE's one-password-per-instance commitment. Also the number
+/// of online PIN guesses a wrong-PIN counterparty gets per connection. The listener's cache
+/// (`RECENT_PIN_CACHE`) is sized to this, so every retained PIN gets a slot.
+pub const PAKE_SLOTS: usize = 2;
+
+/// The PAKE password: 32 bytes of Argon2id-stretched PIN material
+/// ([`crate::pin::derive_auth_key_material`]). The listener's recent-PIN cache stores these.
+pub type PinPassword = [u8; 32];
+
+/// Which side produced a confirmation. Domain-separates the two directions so a MAC computed by
+/// one side can never be accepted as the other's.
 #[derive(Clone, Copy)]
 enum Direction {
     Dialer,
@@ -83,82 +98,50 @@ impl Direction {
     }
 }
 
-/// Derive the PIN auth keypair from a canonical PIN string. Both peers run this on the same PIN and
-/// get the same keypair, which seals/opens the challenge-response proofs. Bucket-independent, so the
-/// dialer never has to know which rotation bucket the listener published under.
-pub fn derive_auth_keys(canonical_pin: &str) -> Result<Keys> {
-    let material = crate::pin::derive_auth_key_material(canonical_pin)?;
-    let secret = SecretKey::from_slice(&material).context("deriving PIN auth secret key")?;
-    Ok(Keys::new(secret))
-}
-
-/// Generate a fresh random challenge nonce, base64url-encoded for JSON transport.
-pub fn generate_nonce() -> String {
-    let mut bytes = [0u8; NONCE_LEN];
-    ::rand::rng().fill_bytes(&mut bytes);
-    URL_SAFE_NO_PAD.encode(bytes)
-}
-
-/// The exact plaintext a proof authenticates: domain, direction, both nonces, and both peers' node
-/// ids (dialer then listener). Node ids are fixed-format hex, so `|` never appears inside one and
-/// the fields stay unambiguous.
-fn proof_plaintext(
-    dir: Direction,
-    nonce_d: &str,
-    nonce_l: &str,
-    id_d: &str,
-    id_l: &str,
-) -> String {
-    format!("{PROOF_DOMAIN}|{}|{nonce_d}|{nonce_l}|{id_d}|{id_l}", dir.as_str())
-}
-
-/// Seal a proof for `dir` binding both nonces and both node ids, under the PIN-derived key (NIP-44
-/// self-encryption).
-fn seal_proof(
-    keys: &Keys,
-    dir: Direction,
-    nonce_d: &str,
-    nonce_l: &str,
-    id_d: &str,
-    id_l: &str,
-) -> Result<String> {
-    nip44::encrypt(
-        keys.secret_key(),
-        &keys.public_key(),
-        proof_plaintext(dir, nonce_d, nonce_l, id_d, id_l),
-        nip44::Version::V2,
+/// The SPAKE2 identity pair for one slot: role, slot index, and that side's node id. Both peers
+/// construct the identical pair, so disagreeing on either authenticated endpoint (or the slot)
+/// derives a different key and fails confirmation. Node ids are fixed-format hex, so `|` never
+/// appears inside one and the fields stay unambiguous.
+fn pake_identities(slot: usize, id_d: &str, id_l: &str) -> (Identity, Identity) {
+    (
+        Identity::new(format!("{PAKE_DOMAIN}|dialer|{slot}|{id_d}").as_bytes()),
+        Identity::new(format!("{PAKE_DOMAIN}|listener|{slot}|{id_l}").as_bytes()),
     )
-    .context("sealing PIN auth proof")
 }
 
-/// Verify a proof for `dir`: it must decrypt under `keys` (NIP-44 MAC) *and* the plaintext must
-/// match the expected domain/direction/nonces/node-ids. Constant-time plaintext compare.
-#[allow(clippy::too_many_arguments)]
-fn verify_proof(
-    keys: &Keys,
+/// The key-confirmation MAC for `dir` at `slot`: HMAC-SHA256 under that slot's SPAKE2 key over
+/// the domain, direction, slot, and both node ids (the SPAKE2 key already commits to the password,
+/// identities, and both PAKE messages).
+fn confirm_mac(
+    key: &[u8],
     dir: Direction,
-    nonce_d: &str,
-    nonce_l: &str,
+    slot: usize,
     id_d: &str,
     id_l: &str,
-    proof: &str,
-) -> bool {
-    let Ok(plaintext) = nip44::decrypt(keys.secret_key(), &keys.public_key(), proof) else {
-        return false;
-    };
-    let expected = proof_plaintext(dir, nonce_d, nonce_l, id_d, id_l);
-    plaintext.as_bytes().ct_eq(expected.as_bytes()).into()
+) -> Result<[u8; 32]> {
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(key).context("keying the PIN confirmation MAC")?;
+    mac.update(format!("{PAKE_DOMAIN}|confirm|{}|{slot}|{id_d}|{id_l}", dir.as_str()).as_bytes());
+    Ok(mac.finalize().into_bytes().into())
+}
+
+/// Decode one base64url wire field, naming it on failure.
+fn decode_b64(value: &str, what: &str) -> Result<Vec<u8>> {
+    URL_SAFE_NO_PAD
+        .decode(value)
+        .with_context(|| format!("decoding {what}"))
 }
 
 /// Drive the dialer's half of the PIN handshake to completion on an opened bi stream.
 ///
-/// Writes the initial [`AuthRequest::Pin`], answers the listener's challenge, and verifies the
-/// listener's proof. Returns `Ok(())` only when the listener both accepted our proof and proved it
-/// holds the same PIN. Imposes no timeout — the caller wraps the whole exchange.
+/// Starts a SPAKE2 instance per slot (all with the typed PIN), confirms every slot's key, and
+/// verifies the listener's confirmation for whichever slot it accepted. Returns `Ok(())` only when
+/// the listener both accepted a slot and proved it derived the same key there — i.e. holds the
+/// same PIN. Imposes no timeout — the caller wraps the whole exchange.
 ///
 /// `dialer_id`/`listener_id` are this dialer's own node id and the id it dialed (the listener's,
-/// from `Connection::remote_id()`); both are folded into every proof so the exchange is bound to
-/// the QUIC-authenticated endpoints (see the module docs).
+/// from `Connection::remote_id()`); both are folded into the PAKE so the exchange is bound to the
+/// QUIC-authenticated endpoints (see the module docs).
 pub async fn dialer_handshake<W, R>(
     send: &mut W,
     recv: &mut R,
@@ -172,53 +155,65 @@ where
 {
     // Argon2id is deliberately slow and memory-hard; run it off the async
     // executor so it cannot stall other tasks on this worker.
-    let keys = tokio::task::spawn_blocking({
+    let password = tokio::task::spawn_blocking({
         let pin = canonical_pin.to_string();
-        move || derive_auth_keys(&pin)
+        move || crate::pin::derive_auth_key_material(&pin)
     })
     .await
     .context("PIN key-derivation task failed")??;
-    let nonce_d = generate_nonce();
+    let password = Password::new(password);
 
-    // 1. Open with the PIN method + our nonce.
-    write_frame(send, &encode_auth_request(&AuthRequest::pin(&nonce_d))?).await?;
+    // 1. One SPAKE2 instance per slot, every slot on the same typed PIN — the dialer cannot know
+    //    which of the listener's recent PINs it holds.
+    let mut states = Vec::with_capacity(PAKE_SLOTS);
+    let mut msgs = Vec::with_capacity(PAKE_SLOTS);
+    for slot in 0..PAKE_SLOTS {
+        let (id_a, id_b) = pake_identities(slot, dialer_id, listener_id);
+        let (state, msg) = Spake2::<Ed25519Group>::start_a(&password, &id_a, &id_b);
+        states.push(state);
+        msgs.push(URL_SAFE_NO_PAD.encode(msg));
+    }
+    write_frame(send, &encode_auth_request(&AuthRequest::pin(msgs))?).await?;
 
-    // 2. Listener's challenge.
+    // 2. The listener's per-slot messages.
     let challenge =
         decode_pin_challenge(&read_length_prefixed(recv, MAX_CONTROL_MESSAGE_SIZE).await?)
             .context("reading PIN challenge")?;
-    let nonce_l = challenge.nonce;
+    anyhow::ensure!(
+        challenge.pakes.len() == PAKE_SLOTS,
+        "listener sent {} PAKE messages, expected {PAKE_SLOTS}",
+        challenge.pakes.len()
+    );
 
-    // 3. Prove we hold the PIN (bound to both node ids).
-    let proof_d = seal_proof(
-        &keys,
-        Direction::Dialer,
-        &nonce_d,
-        &nonce_l,
-        dialer_id,
-        listener_id,
-    )?;
-    write_frame(send, &encode_pin_response(&PinResponse::new(proof_d))?).await?;
+    // 3. Finish every slot and confirm its key.
+    let mut keys = Vec::with_capacity(PAKE_SLOTS);
+    let mut confirms = Vec::with_capacity(PAKE_SLOTS);
+    for (slot, (state, msg_b)) in states.into_iter().zip(&challenge.pakes).enumerate() {
+        let msg_b = decode_b64(msg_b, "the listener's PAKE message")?;
+        let key = state
+            .finish(&msg_b)
+            .map_err(|e| anyhow::anyhow!("finishing PAKE slot {slot}: {e}"))?;
+        let mac = confirm_mac(&key, Direction::Dialer, slot, dialer_id, listener_id)?;
+        confirms.push(URL_SAFE_NO_PAD.encode(mac));
+        keys.push(key);
+    }
+    write_frame(send, &encode_pin_response(&PinResponse::new(confirms))?).await?;
 
-    // 4. Verdict + the listener's own proof.
+    // 4. Verdict + the listener's own confirmation for the slot it matched.
     let confirm = decode_pin_confirm(&read_length_prefixed(recv, MAX_CONTROL_MESSAGE_SIZE).await?)
         .context("reading PIN confirm")?;
     if !confirm.accepted {
         let reason = confirm.reason.unwrap_or_else(|| "unknown".to_string());
         anyhow::bail!("PIN authentication rejected: {reason}");
     }
-    let proof_l = confirm
-        .proof
-        .context("listener accepted but sent no proof")?;
-    if !verify_proof(
-        &keys,
-        Direction::Listener,
-        &nonce_d,
-        &nonce_l,
-        dialer_id,
-        listener_id,
-        &proof_l,
-    ) {
+    let slot = confirm.slot.context("listener accepted but named no slot")?;
+    anyhow::ensure!(slot < PAKE_SLOTS, "listener named out-of-range slot {slot}");
+    let mac = confirm
+        .confirm
+        .context("listener accepted but sent no confirmation")?;
+    let mac = decode_b64(&mac, "the listener's confirmation")?;
+    let expected = confirm_mac(&keys[slot], Direction::Listener, slot, dialer_id, listener_id)?;
+    if !bool::from(mac.as_slice().ct_eq(&expected)) {
         anyhow::bail!("listener failed to prove PIN possession (wrong peer?)");
     }
     Ok(())
@@ -227,22 +222,23 @@ where
 /// Drive the listener's half of the PIN handshake, after the opening [`AuthRequest::Pin`] has
 /// already been read off the stream (the listener reads it to choose the auth method).
 ///
-/// `candidates` are the PIN auth keypairs for the recent rotation buckets; the dialer's proof is
-/// verified against each. Once a candidate verifies the proof, `commit` is invoked **before**
-/// acceptance is sent: returning `false` (e.g. another peer won the one-pair claim first) turns this
-/// into a rejection, so a race loser is never told it was accepted. Otherwise sends a rejection and
-/// returns `Err`.
+/// `candidates` are the recent rotations' PIN passwords, newest first; slot i runs against the
+/// i-th (a random password fills the rest, and a dummy slot never verifies). `dialer_pakes` are
+/// the request's per-slot SPAKE2 messages. Once a slot's confirmation verifies, `commit` is
+/// invoked **before** acceptance is sent: returning `false` (e.g. another peer won the one-pair
+/// claim first) turns this into a rejection, so a race loser is never told it was accepted.
+/// Otherwise sends a rejection and returns `Err`.
 ///
 /// `dialer_id`/`listener_id` are the dialer's node id (the QUIC-authenticated
-/// `Connection::remote_id()`) and this listener's own id; folding them into the verified proof
-/// means the dialer's PIN proof is accepted only if its claimed identity matches the one QUIC
-/// authenticated — the listener validating the client's node id (see the module docs).
+/// `Connection::remote_id()`) and this listener's own id; folding them into the PAKE means the
+/// exchange completes only if the dialer's claimed identity matches the one QUIC authenticated
+/// (see the module docs).
 #[allow(clippy::too_many_arguments)]
 pub async fn listener_handshake<W, R, F>(
     send: &mut W,
     recv: &mut R,
-    candidates: &[Keys],
-    nonce_d: &str,
+    candidates: &[PinPassword],
+    dialer_pakes: &[String],
     dialer_id: &str,
     listener_id: &str,
     commit: F,
@@ -252,41 +248,68 @@ where
     R: AsyncRead + Unpin,
     F: FnOnce() -> bool,
 {
-    let nonce_l = generate_nonce();
+    anyhow::ensure!(
+        dialer_pakes.len() == PAKE_SLOTS,
+        "dialer sent {} PAKE messages, expected {PAKE_SLOTS}",
+        dialer_pakes.len()
+    );
 
-    // 2. Send our challenge.
-    write_frame(send, &encode_pin_challenge(&PinChallenge::new(&nonce_l))?).await?;
+    // 2. One SPAKE2 instance per slot: the i-th most recent PIN, or an unguessable dummy so the
+    //    reply's shape never reveals how many PINs are live.
+    let mut real = [false; PAKE_SLOTS];
+    let mut keys = Vec::with_capacity(PAKE_SLOTS);
+    let mut msgs = Vec::with_capacity(PAKE_SLOTS);
+    for slot in 0..PAKE_SLOTS {
+        let password = match candidates.get(slot) {
+            Some(material) => {
+                real[slot] = true;
+                Password::new(material)
+            }
+            None => {
+                let mut dummy = [0u8; 32];
+                ::rand::rng().fill_bytes(&mut dummy);
+                Password::new(dummy)
+            }
+        };
+        let (id_a, id_b) = pake_identities(slot, dialer_id, listener_id);
+        let (state, msg_b) = Spake2::<Ed25519Group>::start_b(&password, &id_a, &id_b);
+        let msg_a = decode_b64(&dialer_pakes[slot], "the dialer's PAKE message")?;
+        let key = state
+            .finish(&msg_a)
+            .map_err(|e| anyhow::anyhow!("finishing PAKE slot {slot}: {e}"))?;
+        keys.push(key);
+        msgs.push(URL_SAFE_NO_PAD.encode(msg_b));
+    }
+    write_frame(send, &encode_pin_challenge(&PinChallenge::new(msgs))?).await?;
 
-    // 3. Read the dialer's proof and match it against each recent PIN (bound to both node ids).
+    // 3. The dialer's per-slot confirmations; a real slot whose MAC verifies is the shared PIN.
     let response =
         decode_pin_response(&read_length_prefixed(recv, MAX_CONTROL_MESSAGE_SIZE).await?)
             .context("reading PIN response")?;
-    let matched = candidates.iter().find(|k| {
-        verify_proof(
-            k,
-            Direction::Dialer,
-            nonce_d,
-            &nonce_l,
-            dialer_id,
-            listener_id,
-            &response.proof,
-        )
-    });
+    anyhow::ensure!(
+        response.confirms.len() == PAKE_SLOTS,
+        "dialer sent {} confirmations, expected {PAKE_SLOTS}",
+        response.confirms.len()
+    );
+    let mut matched = None;
+    for slot in 0..PAKE_SLOTS {
+        let expected = confirm_mac(&keys[slot], Direction::Dialer, slot, dialer_id, listener_id)?;
+        let Ok(mac) = URL_SAFE_NO_PAD.decode(&response.confirms[slot]) else {
+            continue;
+        };
+        if real[slot] && bool::from(mac.as_slice().ct_eq(&expected)) && matched.is_none() {
+            matched = Some(slot);
+        }
+    }
 
-    // 4. Confirm (with our own proof) or reject. Even once the proof verifies, `commit` has the
-    //    final say *before* acceptance is written, so a peer that loses the one-pair race is
-    //    rejected rather than briefly told it was accepted and then dropped.
+    // 4. Confirm (with our own MAC) or reject. Even once a slot verifies, `commit` has the final
+    //    say *before* acceptance is written, so a peer that loses the one-pair race is rejected
+    //    rather than briefly told it was accepted and then dropped.
     match matched {
-        Some(keys) if commit() => {
-            let proof_l = seal_proof(
-                keys,
-                Direction::Listener,
-                nonce_d,
-                &nonce_l,
-                dialer_id,
-                listener_id,
-            )?;
-            write_frame(send, &encode_pin_confirm(&PinConfirm::accepted(proof_l))?).await?;
+        Some(slot) if commit() => {
+            let mac = confirm_mac(&keys[slot], Direction::Listener, slot, dialer_id, listener_id)?;
+            let confirm = PinConfirm::accepted(slot, URL_SAFE_NO_PAD.encode(mac));
+            write_frame(send, &encode_pin_confirm(&confirm)?).await?;
             Ok(())
         }
         Some(_) => {
@@ -305,7 +328,7 @@ where
                 &encode_pin_confirm(&PinConfirm::rejected("PIN authentication failed"))?,
             )
             .await?;
-            anyhow::bail!("no recent PIN verified the dialer's proof (wrong or expired PIN)");
+            anyhow::bail!("no recent PIN matched the dialer's PAKE confirmation (wrong or expired PIN)");
         }
     }
 }
@@ -330,43 +353,31 @@ mod tests {
         crate::pin::generate_pin()
     }
 
-    /// Read the opening AuthRequest and return its PIN nonce, mirroring how the runtime reads the
-    /// request before dispatching to the listener half.
-    async fn read_pin_request<R: AsyncRead + Unpin>(recv: &mut R) -> Result<String> {
+    fn password(pin: &str) -> PinPassword {
+        crate::pin::derive_auth_key_material(pin).unwrap()
+    }
+
+    /// Read the opening AuthRequest and return its PAKE messages, mirroring how the runtime reads
+    /// the request before dispatching to the listener half.
+    async fn read_pin_request<R: AsyncRead + Unpin>(recv: &mut R) -> Result<Vec<String>> {
         match crate::protocol::decode_auth_request(
             &read_length_prefixed(recv, MAX_CONTROL_MESSAGE_SIZE).await?,
         )? {
-            AuthRequest::Pin { nonce, .. } => Ok(nonce),
+            AuthRequest::Pin { pakes, .. } => Ok(pakes),
             AuthRequest::Key { .. } => anyhow::bail!("expected a PIN auth request"),
         }
     }
 
     #[test]
-    fn proof_round_trips_and_rejects_tampering() {
-        let keys = derive_auth_keys(&test_pin()).unwrap();
-        let (nd, nl) = (generate_nonce(), generate_nonce());
-        let (id_d, id_l) = ("dialer-node-id", "listener-node-id");
-
-        let proof = seal_proof(&keys, Direction::Dialer, &nd, &nl, id_d, id_l).unwrap();
-        assert!(verify_proof(&keys, Direction::Dialer, &nd, &nl, id_d, id_l, &proof));
-
-        // Wrong direction, swapped nonces, or a different key must all fail.
-        assert!(!verify_proof(&keys, Direction::Listener, &nd, &nl, id_d, id_l, &proof));
-        assert!(!verify_proof(&keys, Direction::Dialer, &nl, &nd, id_d, id_l, &proof));
-        let other = derive_auth_keys(&test_pin()).unwrap();
-        assert!(!verify_proof(&other, Direction::Dialer, &nd, &nl, id_d, id_l, &proof));
-
-        // A different (spoofed) dialer or listener node id must fail — the proof is bound to the
-        // QUIC-authenticated identities.
-        assert!(!verify_proof(&keys, Direction::Dialer, &nd, &nl, "other-dialer", id_l, &proof));
-        assert!(!verify_proof(&keys, Direction::Dialer, &nd, &nl, id_d, "other-listener", &proof));
-    }
-
-    #[test]
-    fn different_pins_derive_different_keys() {
-        let a = derive_auth_keys("K7P29QXM").unwrap();
-        let b = derive_auth_keys("9QXMK7P2").unwrap();
-        assert_ne!(a.public_key(), b.public_key());
+    fn confirm_mac_separates_direction_slot_and_ids() {
+        let key = [7u8; 32];
+        let base = confirm_mac(&key, Direction::Dialer, 0, "id-d", "id-l").unwrap();
+        assert_eq!(base, confirm_mac(&key, Direction::Dialer, 0, "id-d", "id-l").unwrap());
+        assert_ne!(base, confirm_mac(&key, Direction::Listener, 0, "id-d", "id-l").unwrap());
+        assert_ne!(base, confirm_mac(&key, Direction::Dialer, 1, "id-d", "id-l").unwrap());
+        assert_ne!(base, confirm_mac(&key, Direction::Dialer, 0, "other", "id-l").unwrap());
+        assert_ne!(base, confirm_mac(&key, Direction::Dialer, 0, "id-d", "other").unwrap());
+        assert_ne!(base, confirm_mac(&[8u8; 32], Direction::Dialer, 0, "id-d", "id-l").unwrap());
     }
 
     // The node ids used across the handshake tests; both halves agree on them in the happy path.
@@ -375,7 +386,7 @@ mod tests {
 
     /// Run a full dialer/listener handshake over an in-memory duplex, mirroring how the runtime
     /// reads the opening request before dispatching to the listener half. `dialer_ids`/`listener_ids`
-    /// are the `(id_d, id_l)` each side folds into its proofs — equal in the happy path, unequal to
+    /// are the `(id_d, id_l)` each side folds into its PAKE — equal in the happy path, unequal to
     /// simulate a relayed/mismatched identity.
     async fn run_handshake_with_ids(
         dialer_pin: &str,
@@ -387,10 +398,7 @@ mod tests {
         let (mut a_read, mut a_write) = tokio::io::split(a);
         let (mut b_read, mut b_write) = tokio::io::split(b);
 
-        let candidates: Vec<Keys> = listener_pins
-            .iter()
-            .map(|p| derive_auth_keys(p).unwrap())
-            .collect();
+        let candidates: Vec<PinPassword> = listener_pins.iter().map(|p| password(p)).collect();
 
         let dialer = dialer_pin.to_string();
         let (d_id_d, d_id_l) = (dialer_ids.0.to_string(), dialer_ids.1.to_string());
@@ -399,12 +407,12 @@ mod tests {
         };
         let (l_id_d, l_id_l) = (listener_ids.0.to_string(), listener_ids.1.to_string());
         let listener_task = async move {
-            let nonce_d = read_pin_request(&mut b_read).await?;
+            let pakes = read_pin_request(&mut b_read).await?;
             listener_handshake(
                 &mut b_write,
                 &mut b_read,
                 &candidates,
-                &nonce_d,
+                &pakes,
                 &l_id_d,
                 &l_id_l,
                 || true,
@@ -429,7 +437,8 @@ mod tests {
 
     #[tokio::test]
     async fn handshake_succeeds_when_pin_is_a_recent_bucket() {
-        // The listener has rotated; the dialer's PIN is one of the retained recent PINs.
+        // The listener has rotated; the dialer's PIN is one of the retained recent PINs, so it
+        // matches in a later slot.
         let dialer_pin = test_pin();
         let newer = test_pin();
         let (d, l) = run_handshake(&dialer_pin, &[&newer, &dialer_pin]).await;
@@ -445,19 +454,19 @@ mod tests {
         let (a, b) = tokio::io::duplex(4096);
         let (mut a_read, mut a_write) = tokio::io::split(a);
         let (mut b_read, mut b_write) = tokio::io::split(b);
-        let candidates = vec![derive_auth_keys(&pin).unwrap()];
+        let candidates = vec![password(&pin)];
 
         let dialer = pin.clone();
         let dialer_task = async move {
             dialer_handshake(&mut a_write, &mut a_read, &dialer, ID_D, ID_L).await
         };
         let listener_task = async move {
-            let nonce_d = read_pin_request(&mut b_read).await?;
+            let pakes = read_pin_request(&mut b_read).await?;
             listener_handshake(
                 &mut b_write,
                 &mut b_read,
                 &candidates,
-                &nonce_d,
+                &pakes,
                 ID_D,
                 ID_L,
                 || false,
@@ -484,9 +493,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handshake_rejects_cleanly_with_no_candidates() {
+        // A listener with no live PINs (configure-mode, or refreshed away) runs dummy slots only
+        // and must reject in-band, never accept.
+        let pin = test_pin();
+        let (d, l) = run_handshake(&pin, &[]).await;
+        let err = d.expect_err("dialer must be rejected when no PIN is live");
+        assert!(
+            err.to_string().contains("PIN authentication rejected"),
+            "dialer must see an explicit rejection, got: {err:#}"
+        );
+        assert!(l.is_err(), "listener must reject with no candidates");
+    }
+
+    #[tokio::test]
     async fn handshake_fails_when_the_dialer_node_id_disagrees() {
         // Same PIN, but the listener saw a different dialer node id than the dialer folded in
-        // (e.g. a relay whose QUIC session terminates at another id). The proof must not verify.
+        // (e.g. a relay whose QUIC session terminates at another id). The PAKE keys diverge and
+        // no confirmation can verify.
         let pin = test_pin();
         let (d, l) = run_handshake_with_ids(
             &pin,
@@ -512,5 +536,109 @@ mod tests {
         .await;
         assert!(d.is_err(), "dialer must be rejected on a node-id mismatch");
         assert!(l.is_err(), "listener must reject on a node-id mismatch");
+    }
+
+    /// Drive a listener that plays the wire protocol correctly but holds no
+    /// PIN: every slot runs on a random password, and instead of rejecting it
+    /// claims acceptance for `claim_slot`, confirming with the MAC its own
+    /// (wrong) slot-0 key produces. The dialer's mutual-authentication check —
+    /// verifying the listener's confirmation, not just its verdict — is the
+    /// only thing standing between such a listener and a completed handshake.
+    async fn rogue_listener_claims_acceptance<W, R>(
+        send: &mut W,
+        recv: &mut R,
+        claim_slot: usize,
+    ) -> Result<()>
+    where
+        W: AsyncWrite + Unpin,
+        R: AsyncRead + Unpin,
+    {
+        let pakes = read_pin_request(recv).await?;
+        let mut keys = Vec::with_capacity(PAKE_SLOTS);
+        let mut msgs = Vec::with_capacity(PAKE_SLOTS);
+        for (slot, dialer_pake) in pakes.iter().enumerate() {
+            let mut password = [0u8; 32];
+            ::rand::rng().fill_bytes(&mut password);
+            let (id_a, id_b) = pake_identities(slot, ID_D, ID_L);
+            let (state, msg_b) =
+                Spake2::<Ed25519Group>::start_b(&Password::new(password), &id_a, &id_b);
+            let msg_a = decode_b64(dialer_pake, "the dialer's PAKE message")?;
+            let key = state
+                .finish(&msg_a)
+                .map_err(|e| anyhow::anyhow!("finishing PAKE slot {slot}: {e}"))?;
+            keys.push(key);
+            msgs.push(URL_SAFE_NO_PAD.encode(msg_b));
+        }
+        write_frame(send, &encode_pin_challenge(&PinChallenge::new(msgs))?).await?;
+
+        // Absorb the dialer's confirmations (they can never verify against the
+        // rogue's keys) and claim acceptance anyway.
+        let _ = read_length_prefixed(recv, MAX_CONTROL_MESSAGE_SIZE).await?;
+        let mac = confirm_mac(&keys[0], Direction::Listener, claim_slot, ID_D, ID_L)?;
+        let confirm = PinConfirm::accepted(claim_slot, URL_SAFE_NO_PAD.encode(mac));
+        write_frame(send, &encode_pin_confirm(&confirm)?).await?;
+        Ok(())
+    }
+
+    /// Run the dialer against [`rogue_listener_claims_acceptance`] and return
+    /// the dialer's mandatory error.
+    async fn dial_rogue_listener(claim_slot: usize) -> anyhow::Error {
+        let pin = test_pin();
+        let (a, b) = tokio::io::duplex(4096);
+        let (mut a_read, mut a_write) = tokio::io::split(a);
+        let (mut b_read, mut b_write) = tokio::io::split(b);
+        let dialer_task =
+            async move { dialer_handshake(&mut a_write, &mut a_read, &pin, ID_D, ID_L).await };
+        let rogue_task =
+            async move { rogue_listener_claims_acceptance(&mut b_write, &mut b_read, claim_slot).await };
+        let (d, r) = tokio::join!(dialer_task, rogue_task);
+        r.expect("the rogue listener's own protocol run must not fail");
+        d.expect_err("the dialer must refuse a listener that cannot prove the PIN")
+    }
+
+    #[tokio::test]
+    async fn dialer_rejects_a_listener_that_claims_acceptance_without_the_pin() {
+        // A well-formed accepted verdict whose confirmation was derived without
+        // the PIN: the dialer must fail its half of the mutual authentication,
+        // not take the verdict at its word.
+        let err = dial_rogue_listener(0).await;
+        assert!(
+            err.to_string()
+                .contains("listener failed to prove PIN possession"),
+            "got: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dialer_rejects_an_accepted_slot_out_of_range() {
+        // An accepted verdict naming slot PAKE_SLOTS: refused by the range
+        // check before any key is indexed or any MAC compared.
+        let err = dial_rogue_listener(PAKE_SLOTS).await;
+        assert!(
+            err.to_string().contains("out-of-range slot"),
+            "got: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn listener_rejects_a_wrong_slot_count() {
+        // A dialer that sends the wrong number of PAKE messages is a protocol violation, refused
+        // before any PAKE work.
+        let pin = test_pin();
+        let (_a, b) = tokio::io::duplex(4096);
+        let (mut b_read, mut b_write) = tokio::io::split(b);
+        let candidates = vec![password(&pin)];
+        let err = listener_handshake(
+            &mut b_write,
+            &mut b_read,
+            &candidates,
+            &["b25seS1vbmU".to_string()],
+            ID_D,
+            ID_L,
+            || true,
+        )
+        .await
+        .expect_err("a short PAKE vector must be refused");
+        assert!(err.to_string().contains("PAKE messages"), "got: {err:#}");
     }
 }

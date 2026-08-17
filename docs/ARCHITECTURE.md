@@ -165,17 +165,29 @@ between them. It is not a connection mode: it produces trusted peer cards, and
 every subsequent connection is an ordinary configure-mode one.
 
 A rotating Crockford PIN drives discovery via an Argon2id-derived rendezvous
-key, then a separate Argon2id-derived in-band mutual proof. On the connection
-that authenticates, both sides exchange cards:
+key, then an in-band mutual PAKE — SPAKE2 over Ed25519, whose password is a
+separate Argon2id stretch of the same PIN. A PAKE commits each side to one
+password per instance, but the host still honors the previous rotation's PIN,
+so the handshake runs two instances ("slots"): the dialer enters its typed PIN
+in both, the host enters its current and previous PINs (a random password pads
+an empty slot). Each side then proves it derived the same SPAKE2 key with an
+HMAC per slot; the slot that verifies is the shared PIN. On the connection that
+authenticates, both sides exchange cards:
 
 ```text
-D→L  AuthRequest::Pin  {nonce_d}
-L→D  PinChallenge      {nonce_l}
-D→L  PinResponse       {proof_d}
-L→D  PinConfirm        {accepted, proof_l}
+D→L  AuthRequest::Pin  {pakes:    [msg_a per slot]}
+L→D  PinChallenge      {pakes:    [msg_b per slot]}
+D→L  PinResponse       {confirms: [mac_d per slot]}
+L→D  PinConfirm        {accepted, slot, confirm}
 D→L  CardOffer         {card_d}     # concurrent, independent half-streams:
 L→D  CardOffer         {card_l}     # the order shown here is illustrative only
 ```
+
+No frame reveals anything offline-testable about the PIN: a wrong-PIN
+counterparty learns only that its one guess per slot missed, and each guess
+costs it a full Argon2id derivation. Combined with the one-claim-per-PIN rule
+and the 60-second rotation, guessing is confined to a few online tries against
+a ~35-bit code.
 
 Only the four PIN frames are turn-taking. Both offers are written immediately
 once the PIN is accepted, so neither `CardOffer` waits on the other and their
@@ -240,17 +252,23 @@ endpoint rather than reusing one bound for the old transport stack.
 
 Publishing to public relays widens who can *fetch* a record, so it rests
 entirely on the PIN: the lookup key is Argon2id-derived, the payload is only an
-ephemeral node id, dialing it still requires the in-band PIN proof, and nothing
-is trusted without the pairing-code check below.
+ephemeral node id, dialing it still requires the in-band PAKE, and nothing
+is trusted without the pairing-code check below. The record is the one
+PIN-derived artifact that is offline-attackable by nature — its lookup key must
+be derivable from the PIN alone, so an archived event lets an attacker test
+guesses at Argon2id cost. The short TTL and rotation bound that exposure, and
+a recovered PIN is useless once its window (and one claim) is gone.
 
 ### Why the pairing-code check is load-bearing
 
-The PIN proves possession of a short code, not an identity. It is ~35 bits and
-the construction is not a PAKE, so anyone who reads, shoulder-surfs, or guesses
-it inside its 60-second window can complete the handshake and offer a card of
-their choosing. The human pairing-code comparison is what catches that, because
-each device computes its half of the code from its *own* key locally — that part
-never crossed the network.
+The PIN proves possession of a short code, not an identity. The PAKE stops a
+stranger from grinding it out of the handshake, but anyone who reads,
+shoulder-surfs, or offline-grinds it from the public rendezvous record inside
+its 60-second window can complete the handshake and offer a card of their
+choosing — PIN-keyed cryptography is transparent to a PIN holder. The human
+pairing-code comparison is what catches that, because each device computes its
+half of the code from its *own* key locally — that part never crossed the
+network.
 
 - **Concatenated, never hashed together.** The pairing code is the two per-key
   fingerprints verbatim, so each half commits to exactly one key. An interposer

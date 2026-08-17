@@ -90,7 +90,7 @@ pub enum ServerMode {
     },
     /// Card setup: show a rotating PIN, publish the rendezvous record under
     /// per-bucket PIN-derived keys on the enabled channel(s), and authenticate
-    /// a joiner with the in-band PIN challenge-response. Whenever the LAN
+    /// a joiner with the in-band SPAKE2 PIN handshake. Whenever the LAN
     /// channel is enabled a unicast side-channel listener runs alongside the
     /// DNS-SD advertisement (see `crate::lan::unicast`) serving the same
     /// PIN-encrypted record, so a joiner who types this host's LAN IP can still

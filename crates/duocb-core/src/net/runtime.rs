@@ -35,9 +35,10 @@ use crate::protocol::{
     encode_key_proof, read_length_prefixed,
 };
 
-/// Retain only the PIN keys from the sender's current and previous rotation buckets for
-/// in-band authentication. The joiner may still probe an additional bucket for clock skew.
-const RECENT_PIN_CACHE: usize = 2;
+/// Retain only the PIN passwords from the sender's current and previous rotation buckets for
+/// in-band authentication. Sized to the PAKE's slot count so every retained PIN gets a slot in
+/// the handshake. The joiner may still probe an additional bucket for clock skew.
+const RECENT_PIN_CACHE: usize = crate::pin_auth::PAKE_SLOTS;
 
 /// Timeout for the authentication handshake.
 const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -134,26 +135,26 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Current and previous PIN auth keypairs (newest first), one per rotation bucket the card-setup
-/// host has published. Written by the PIN publisher, read by the listener auth path to verify a
-/// dialer's proof. Cheap to clone (shared handle).
+/// Current and previous PIN PAKE passwords (newest first), one per rotation bucket the card-setup
+/// host has published. Written by the PIN publisher, read by the listener auth path as the
+/// per-slot candidates for the SPAKE2 handshake. Cheap to clone (shared handle).
 #[derive(Clone, Default)]
-struct RecentPins(Arc<parking_lot::RwLock<VecDeque<nostr_sdk::Keys>>>);
+struct RecentPins(Arc<parking_lot::RwLock<VecDeque<crate::pin_auth::PinPassword>>>);
 
 impl RecentPins {
-    fn push(&self, keys: nostr_sdk::Keys) {
+    fn push(&self, password: crate::pin_auth::PinPassword) {
         let mut g = self.0.write();
-        g.push_front(keys);
+        g.push_front(password);
         while g.len() > RECENT_PIN_CACHE {
             g.pop_back();
         }
     }
 
-    fn snapshot(&self) -> Vec<nostr_sdk::Keys> {
+    fn snapshot(&self) -> Vec<crate::pin_auth::PinPassword> {
         self.0.read().iter().cloned().collect()
     }
 
-    /// Drop every retained key: no previously shown PIN can authenticate a
+    /// Drop every retained password: no previously shown PIN can authenticate a
     /// dialer anymore (an immediate refresh revokes, unlike natural rotation,
     /// which keeps a look-back window).
     fn clear(&self) {
@@ -1659,24 +1660,24 @@ async fn run_card_setup_publisher(
             host_lan_ip,
         });
 
-        // This bucket's PIN auth key (so an inbound dialer holding this PIN can
-        // be authenticated in-band, even after the code rotates) plus the
-        // record keypair — two Argon2id runs, off the async executor.
+        // This bucket's PIN PAKE password (so an inbound dialer holding this
+        // PIN can be authenticated in-band, even after the code rotates) plus
+        // the record keypair — two Argon2id runs, off the async executor.
         let derived = tokio::task::spawn_blocking({
             let pin = pin.clone();
             move || {
                 (
-                    crate::pin_auth::derive_auth_keys(&pin),
+                    crate::pin::derive_auth_key_material(&pin),
                     crate::pin_record::pin_keys(&pin, bucket),
                 )
             }
         })
         .await;
         let record_keys = match derived {
-            Ok((auth_keys, record_keys)) => {
-                match auth_keys {
-                    Ok(keys) => recent.push(keys),
-                    Err(e) => log::warn!("Failed to derive PIN auth key: {e:#}"),
+            Ok((auth_password, record_keys)) => {
+                match auth_password {
+                    Ok(password) => recent.push(password),
+                    Err(e) => log::warn!("Failed to derive the PIN PAKE password: {e:#}"),
                 }
                 match record_keys {
                     Ok(keys) => Some(keys),
@@ -1769,7 +1770,7 @@ async fn run_card_setup_publisher(
             _ = tokio::time::sleep_until(rotate_at) => {}
             _ = refresh.notified() => {
                 // Rotate now, and revoke everything shown so far: no retained
-                // auth key means a stale code can no longer authenticate, and
+                // password means a stale code can no longer authenticate, and
                 // dropping the advert guards withdraws the mDNS records and
                 // closes the side-channel listeners. A relay copy cannot be
                 // withdrawn, but it ages out of its TTL and, with its auth key
@@ -1926,8 +1927,8 @@ async fn auth_as_dialer_key(
     }
 }
 
-/// Authenticate as the dialer using the card-setup PIN (in-band
-/// challenge-response). The whole exchange is bounded by [`AUTH_TIMEOUT`] and
+/// Authenticate as the dialer using the card-setup PIN (in-band SPAKE2
+/// handshake). The whole exchange is bounded by [`AUTH_TIMEOUT`] and
 /// any failure is an [`AuthFailure`] — fatal for this target. On success the opened
 /// stream is returned (not finished) for the clipboard.
 async fn auth_as_dialer_pin(
@@ -1939,7 +1940,7 @@ async fn auth_as_dialer_pin(
     // stalled open_bi must not delay the point where the timeout starts.
     let handshake = async {
         let (mut send, mut recv) = conn.open_bi().await.context("opening session stream")?;
-        // Bind the PIN proof to both QUIC-authenticated node ids: our own, and
+        // Bind the PAKE to both QUIC-authenticated node ids: our own, and
         // the listener we dialed (`remote_id`, authenticated by QUIC/TLS).
         crate::pin_auth::dialer_handshake(
             &mut send,
@@ -2047,26 +2048,26 @@ async fn auth_as_listener(
                 send.write_all(&encode_auth_response(&response)?).await?;
                 Ok::<_, anyhow::Error>((send, recv, Some(client_key)))
             }
-            AuthRequest::Pin { nonce, .. } => {
-                // Verify the dialer's PIN proof against the recent-bucket keys. An empty
+            AuthRequest::Pin { pakes, .. } => {
+                // Run the SPAKE2 handshake against the recent-bucket PIN passwords. An empty
                 // candidate set — a configure-mode listener, or a peer refused by the gate —
-                // yields a clean rejection.
+                // runs dummy slots only and yields a clean rejection.
                 let candidates = if pin_claimed_by_other {
                     Vec::new()
                 } else {
                     pin_cache.map(|c| c.snapshot()).unwrap_or_default()
                 };
-                // The claim is committed inside the handshake, right after the proof verifies
-                // and *before* the acceptance frame is sent — so a race loser is rejected
-                // in-band, not accepted-then-dropped.
-                // Bind the verified proof to both QUIC-authenticated node ids: the dialer's
-                // (`remote_id`, from QUIC/TLS) and our own. A proof only verifies if the dialer
-                // folded in the same ids — so this validates the client's node id in-band.
+                // The claim is committed inside the handshake, right after a slot's key
+                // confirmation verifies and *before* the acceptance frame is sent — so a race
+                // loser is rejected in-band, not accepted-then-dropped.
+                // Bind the PAKE to both QUIC-authenticated node ids: the dialer's (`remote_id`,
+                // from QUIC/TLS) and our own. The handshake only completes if the dialer folded
+                // in the same ids — so this validates the client's node id in-band.
                 crate::pin_auth::listener_handshake(
                     &mut send,
                     &mut recv,
                     &candidates,
-                    &nonce,
+                    &pakes,
                     &remote_id.to_string(),
                     &own_id.to_string(),
                     || claim.commit_pin(remote_id),
@@ -2172,22 +2173,15 @@ mod tests {
     #[test]
     fn recent_pin_cache_keeps_only_current_and_previous() {
         let recent = RecentPins::default();
-        let expired = nostr_sdk::Keys::generate();
-        let previous = nostr_sdk::Keys::generate();
-        let current = nostr_sdk::Keys::generate();
-        let previous_pubkey = previous.public_key();
-        let current_pubkey = current.public_key();
+        let expired = [1u8; 32];
+        let previous = [2u8; 32];
+        let current = [3u8; 32];
 
         recent.push(expired);
         recent.push(previous);
         recent.push(current);
 
-        let retained: Vec<_> = recent
-            .snapshot()
-            .into_iter()
-            .map(|keys| keys.public_key())
-            .collect();
-        assert_eq!(retained, vec![current_pubkey, previous_pubkey]);
+        assert_eq!(recent.snapshot(), vec![current, previous]);
     }
 
     #[tokio::test(flavor = "multi_thread")]
