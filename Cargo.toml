@@ -7,7 +7,7 @@ default-members = ["crates/duocb", "crates/duocb-core"]
 resolver = "3"
 
 [workspace.package]
-version = "0.0.35"
+version = "0.0.36"
 edition = "2024"
 description = "P2P clipboard sharing between two devices over iroh"
 

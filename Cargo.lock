@@ -1756,7 +1756,7 @@ checksum = "edf234dd1594d6dd434a8fb8cada51ddbbc593e40e4a01556a0b31c62da2775b"
 
 [[package]]
 name = "duocb"
-version = "0.0.35"
+version = "0.0.36"
 dependencies = [
  "anyhow",
  "arboard",
@@ -1775,7 +1775,7 @@ dependencies = [
 
 [[package]]
 name = "duocb-core"
-version = "0.0.35"
+version = "0.0.36"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1805,7 +1805,7 @@ dependencies = [
 
 [[package]]
 name = "duocb-ffi"
-version = "0.0.35"
+version = "0.0.36"
 dependencies = [
  "duocb-core",
  "env_logger",
