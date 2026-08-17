@@ -442,12 +442,12 @@ pub unsafe extern "C" fn duocb_pairing_code(
     else {
         return -1;
     };
-    // A code over one key twice is a comparison with nothing on the other
-    // side; the caller passed the same card in both slots by mistake.
-    if card_a.public_key() == card_b.public_key() {
+    // The core refuses one key in both slots — a comparison with nothing on
+    // the other side; the caller passed the same card twice by mistake.
+    let Ok(code) = duocb_core::auth::pairing_code(&card_a.public_key(), &card_b.public_key())
+    else {
         return -1;
-    }
-    let code = duocb_core::auth::pairing_code(&card_a.public_key(), &card_b.public_key());
+    };
     write_result(out_buf, out_len, &code)
 }
 
@@ -1449,7 +1449,7 @@ mod tests {
         assert_eq!(forward, code(&card_b, &card_a));
         assert_eq!(
             forward,
-            duocb_core::auth::pairing_code(&a.public_key(), &b.public_key())
+            duocb_core::auth::pairing_code(&a.public_key(), &b.public_key()).unwrap()
         );
 
         let mut buf = [0 as c_char; 128];

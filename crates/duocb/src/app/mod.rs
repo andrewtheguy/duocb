@@ -382,8 +382,18 @@ impl App {
             NetEvent::PeerCardReceived(card) => {
                 // The exchange succeeded. Nothing is trusted yet: hold the card
                 // and put the user in front of the pairing-code comparison.
-                self.pending_peer_card = Some(*card);
-                self.screen = Screen::CardConfirm;
+                // Except an echo of this device's own card, which has no
+                // pairing code to compare (`pairing_code` refuses a single key)
+                // and could never be imported — refuse it here instead of
+                // showing a confirmation screen with nothing to confirm.
+                if card.public_key() == self.identity.public_key() {
+                    self.error =
+                        Some("The other side sent back this device's own card".into());
+                    self.screen = Screen::CardSetup;
+                } else {
+                    self.pending_peer_card = Some(*card);
+                    self.screen = Screen::CardConfirm;
+                }
             }
             NetEvent::Status(status) => {
                 if status == ConnStatus::Idle {
@@ -917,7 +927,10 @@ impl App {
         match &self.pending_peer_card {
             Some(card) => (
                 card.name().to_string(),
-                duocb_core::auth::pairing_code(&self.identity.public_key(), &card.public_key()),
+                // Empty only if the pending card carries this device's own key,
+                // which the receipt path already refuses to park.
+                duocb_core::auth::pairing_code(&self.identity.public_key(), &card.public_key())
+                    .unwrap_or_default(),
                 card_expiry_note(card),
             ),
             None => (String::new(), String::new(), String::new()),
@@ -1623,6 +1636,7 @@ pub(crate) mod card_setup_tests {
         assert_eq!(
             pairing_code,
             duocb_core::auth::pairing_code(&card.public_key(), &app.identity.public_key())
+                .unwrap()
         );
         assert!(!pairing_code.is_empty(), "the user must have something to compare");
         assert_eq!(expiry, card_expiry_note(&card));

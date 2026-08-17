@@ -538,6 +538,88 @@ mod tests {
         assert!(l.is_err(), "listener must reject on a node-id mismatch");
     }
 
+    /// Drive a listener that plays the wire protocol correctly but holds no
+    /// PIN: every slot runs on a random password, and instead of rejecting it
+    /// claims acceptance for `claim_slot`, confirming with the MAC its own
+    /// (wrong) slot-0 key produces. The dialer's mutual-authentication check —
+    /// verifying the listener's confirmation, not just its verdict — is the
+    /// only thing standing between such a listener and a completed handshake.
+    async fn rogue_listener_claims_acceptance<W, R>(
+        send: &mut W,
+        recv: &mut R,
+        claim_slot: usize,
+    ) -> Result<()>
+    where
+        W: AsyncWrite + Unpin,
+        R: AsyncRead + Unpin,
+    {
+        let pakes = read_pin_request(recv).await?;
+        let mut keys = Vec::with_capacity(PAKE_SLOTS);
+        let mut msgs = Vec::with_capacity(PAKE_SLOTS);
+        for (slot, dialer_pake) in pakes.iter().enumerate() {
+            let mut password = [0u8; 32];
+            ::rand::rng().fill_bytes(&mut password);
+            let (id_a, id_b) = pake_identities(slot, ID_D, ID_L);
+            let (state, msg_b) =
+                Spake2::<Ed25519Group>::start_b(&Password::new(password), &id_a, &id_b);
+            let msg_a = decode_b64(dialer_pake, "the dialer's PAKE message")?;
+            let key = state
+                .finish(&msg_a)
+                .map_err(|e| anyhow::anyhow!("finishing PAKE slot {slot}: {e}"))?;
+            keys.push(key);
+            msgs.push(URL_SAFE_NO_PAD.encode(msg_b));
+        }
+        write_frame(send, &encode_pin_challenge(&PinChallenge::new(msgs))?).await?;
+
+        // Absorb the dialer's confirmations (they can never verify against the
+        // rogue's keys) and claim acceptance anyway.
+        let _ = read_length_prefixed(recv, MAX_CONTROL_MESSAGE_SIZE).await?;
+        let mac = confirm_mac(&keys[0], Direction::Listener, claim_slot, ID_D, ID_L)?;
+        let confirm = PinConfirm::accepted(claim_slot, URL_SAFE_NO_PAD.encode(mac));
+        write_frame(send, &encode_pin_confirm(&confirm)?).await?;
+        Ok(())
+    }
+
+    /// Run the dialer against [`rogue_listener_claims_acceptance`] and return
+    /// the dialer's mandatory error.
+    async fn dial_rogue_listener(claim_slot: usize) -> anyhow::Error {
+        let pin = test_pin();
+        let (a, b) = tokio::io::duplex(4096);
+        let (mut a_read, mut a_write) = tokio::io::split(a);
+        let (mut b_read, mut b_write) = tokio::io::split(b);
+        let dialer_task =
+            async move { dialer_handshake(&mut a_write, &mut a_read, &pin, ID_D, ID_L).await };
+        let rogue_task =
+            async move { rogue_listener_claims_acceptance(&mut b_write, &mut b_read, claim_slot).await };
+        let (d, r) = tokio::join!(dialer_task, rogue_task);
+        r.expect("the rogue listener's own protocol run must not fail");
+        d.expect_err("the dialer must refuse a listener that cannot prove the PIN")
+    }
+
+    #[tokio::test]
+    async fn dialer_rejects_a_listener_that_claims_acceptance_without_the_pin() {
+        // A well-formed accepted verdict whose confirmation was derived without
+        // the PIN: the dialer must fail its half of the mutual authentication,
+        // not take the verdict at its word.
+        let err = dial_rogue_listener(0).await;
+        assert!(
+            err.to_string()
+                .contains("listener failed to prove PIN possession"),
+            "got: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dialer_rejects_an_accepted_slot_out_of_range() {
+        // An accepted verdict naming slot PAKE_SLOTS: refused by the range
+        // check before any key is indexed or any MAC compared.
+        let err = dial_rogue_listener(PAKE_SLOTS).await;
+        assert!(
+            err.to_string().contains("out-of-range slot"),
+            "got: {err:#}"
+        );
+    }
+
     #[tokio::test]
     async fn listener_rejects_a_wrong_slot_count() {
         // A dialer that sends the wrong number of PAKE messages is a protocol violation, refused

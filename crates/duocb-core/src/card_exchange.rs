@@ -151,10 +151,24 @@ mod tests {
 
         // Each side now derives the pairing code from its own key and the card
         // it received, and both arrive at one identical value — this is the
-        // user's cross-check.
+        // user's cross-check. Pinning both to the code over the two identity
+        // keys directly rules out a constant or key-insensitive rendering, which
+        // the two-sided equality alone would not catch.
+        let expected =
+            crate::auth::pairing_code(&a_identity.public_key(), &b_identity.public_key()).unwrap();
         assert_eq!(
-            crate::auth::pairing_code(&a_identity.public_key(), &a_got.public_key()),
-            crate::auth::pairing_code(&b_identity.public_key(), &b_got.public_key()),
+            crate::auth::pairing_code(&a_identity.public_key(), &a_got.public_key()).unwrap(),
+            expected,
+        );
+        assert_eq!(
+            crate::auth::pairing_code(&b_identity.public_key(), &b_got.public_key()).unwrap(),
+            expected,
+        );
+        let other = Identity::generate();
+        assert_ne!(
+            crate::auth::pairing_code(&a_identity.public_key(), &other.public_key()).unwrap(),
+            expected,
+            "the code must bind this specific pair of keys",
         );
     }
 
