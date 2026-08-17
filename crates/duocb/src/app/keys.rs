@@ -99,7 +99,7 @@ pub(crate) fn handle_global_key(
             }
         }
         // Accept or refuse the card only from the screen that shows the
-        // fingerprints — trust is never one keystroke away from anywhere else.
+        // pairing code — trust is never one keystroke away from anywhere else.
         Screen::CardConfirm if focus_free => {
             if enter || letter('i') {
                 app.import_received_card();
@@ -334,7 +334,7 @@ mod tests {
     }
 
     /// Trust is never one stray keystroke away from a screen that is not
-    /// showing the fingerprints.
+    /// showing the pairing code.
     #[test]
     fn import_only_fires_from_the_confirmation_screen() {
         let (mut app, path) = configured_app();
@@ -358,7 +358,7 @@ mod tests {
         assert_eq!(
             app.pending_peer_card.as_ref().map(IdentityCard::public_key),
             Some(pending.public_key()),
-            "the pending card must still be waiting on its fingerprint check"
+            "the pending card must still be waiting on its pairing-code check"
         );
 
         cleanup(app, path);

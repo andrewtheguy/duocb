@@ -34,8 +34,8 @@ export global UiState {
     // explicitly masked restore field; normal projection exposes public data.
     in property <string> display-identity;
     in property <bool> has-identity;
-    /// This device's key fingerprint — the value the user compares against the
-    /// other device during card setup, and the one shown beside each trusted peer.
+    /// This device's key fingerprint — its half of any card-setup pairing code,
+    /// shown on the hub the way each trusted peer's is shown beside its row.
     in property <string> own-fingerprint;
     in property <string> public-key;
     in property <string> config-path;
@@ -121,11 +121,12 @@ export global UiState {
     /// where the card-setup screen's note is the only place it is spelled out.
     in property <string> signal-channel-badge;
 
-    // Card-setup confirmation. The user compares `incoming-fingerprint` here
-    // against `own-fingerprint` as shown on the other device; they must match
-    // before the card is worth importing.
+    // Card-setup confirmation. Both devices compute `pairing-code` over the
+    // same pair of keys (this device's and the incoming card's), so the two
+    // screens show one identical value; it must match before the card is worth
+    // importing.
     in property <string> incoming-name;
-    in property <string> incoming-fingerprint;
+    in property <string> pairing-code;
     /// The incoming card's expiry line ("expires 2026-09-13"), same wording as
     /// the trusted-device rows.
     in property <string> incoming-expiry;

@@ -70,7 +70,7 @@ pub(crate) struct App {
     pub(crate) pin_deadline: Option<Instant>,
 
     /// Card setup: the peer's signed card, received over the PIN-authenticated
-    /// connection and waiting on the user's fingerprint check.
+    /// connection and waiting on the user's pairing-code check.
     ///
     /// Deliberately survives the session teardown that immediately follows it —
     /// the runtime ends a card-setup session as soon as the cards cross, so the
@@ -381,7 +381,7 @@ impl App {
             }
             NetEvent::PeerCardReceived(card) => {
                 // The exchange succeeded. Nothing is trusted yet: hold the card
-                // and put the user in front of the fingerprint comparison.
+                // and put the user in front of the pairing-code comparison.
                 self.pending_peer_card = Some(*card);
                 self.screen = Screen::CardConfirm;
             }
@@ -899,29 +899,32 @@ impl App {
         }
     }
 
-    /// The identity line for one trusted-device row: name plus the fingerprint
-    /// the user compared when importing it. The single source for that row, so
-    /// what a test asserts is what the user sees.
+    /// The identity line for one trusted-device row: name plus that device's
+    /// key fingerprint — the half of the import-time pairing code that device
+    /// contributed, so the pairing can be re-verified out of band. The single
+    /// source for that row, so what a test asserts is what the user sees.
     pub(crate) fn peer_row_line(&self, index: usize) -> Option<String> {
         let card = self.peers.get(index)?;
         Some(format!("{}  · {}", card.name(), card.fingerprint()))
     }
 
     /// What the confirmation screen shows for the incoming card: `(name,
-    /// fingerprint, expiry)`, all empty when no card is pending. The single
+    /// pairing code, expiry)`, all empty when no card is pending. The single
     /// source for that panel, so what a test asserts is what the user sees.
+    /// The pairing code spans this device's key and the incoming card's, so
+    /// both devices render the identical value and the user compares one code.
     pub(crate) fn incoming_card_display(&self) -> (String, String, String) {
         match &self.pending_peer_card {
             Some(card) => (
                 card.name().to_string(),
-                card.fingerprint(),
+                duocb_core::auth::pairing_code(&self.identity.public_key(), &card.public_key()),
                 card_expiry_note(card),
             ),
             None => (String::new(), String::new(), String::new()),
         }
     }
 
-    /// Trust the card that arrived, after the user has compared fingerprints.
+    /// Trust the card that arrived, after the user has compared pairing codes.
     /// Returns to the hub on success; on refusal (own card, expired, list full)
     /// the error banner explains why.
     pub(crate) fn import_received_card(&mut self) {
@@ -936,7 +939,7 @@ impl App {
         }
     }
 
-    /// Discard the card that arrived without trusting it — the fingerprint did
+    /// Discard the card that arrived without trusting it — the pairing code did
     /// not match, or the user changed their mind.
     pub(crate) fn cancel_received_card(&mut self) {
         self.pending_peer_card = None;
@@ -1513,7 +1516,7 @@ pub(crate) mod card_setup_tests {
         cleanup(app, path);
     }
 
-    /// Cancelling — the fingerprints did not match — must leave no trace.
+    /// Cancelling — the pairing codes did not match — must leave no trace.
     #[test]
     fn cancelling_discards_the_card_without_trusting_it() {
         let (mut app, path) = configured_app();
@@ -1612,13 +1615,19 @@ pub(crate) mod card_setup_tests {
         let card = peer_card("laptop", 0);
         app.apply_event(NetEvent::PeerCardReceived(Box::new(card.clone())));
 
-        let (name, fingerprint, expiry) = app.incoming_card_display();
+        let (name, pairing_code, expiry) = app.incoming_card_display();
         assert_eq!(name, card.name());
-        assert_eq!(fingerprint, card.fingerprint());
-        assert!(!fingerprint.is_empty(), "the user must have something to compare");
+        // The code spans both keys and is order-normalized, so the other
+        // device — which computes it from the mirrored pair — shows the
+        // identical value.
+        assert_eq!(
+            pairing_code,
+            duocb_core::auth::pairing_code(&card.public_key(), &app.identity.public_key())
+        );
+        assert!(!pairing_code.is_empty(), "the user must have something to compare");
         assert_eq!(expiry, card_expiry_note(&card));
 
-        // And it clears once the card is dealt with, so a stale fingerprint
+        // And it clears once the card is dealt with, so a stale pairing code
         // cannot linger on screen.
         app.cancel_received_card();
         assert_eq!(
@@ -1648,10 +1657,10 @@ pub(crate) mod card_setup_tests {
         cleanup(app, path);
     }
 
-    /// The trusted-device row carries the same fingerprint the user compared at
-    /// import time, so the pairing can be re-verified out of band later — a
-    /// truncated npub there would be a different value with no relationship to
-    /// what the other device displays.
+    /// The trusted-device row carries the peer's key fingerprint — the half of
+    /// the pairing code that device contributed at import time — so the pairing
+    /// can be re-verified out of band later. A truncated npub there would be a
+    /// different value with no relationship to what the other device displays.
     #[test]
     fn trusted_rows_show_the_comparable_fingerprint() {
         let (mut app, path) = configured_app();

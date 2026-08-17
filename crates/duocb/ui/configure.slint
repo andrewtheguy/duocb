@@ -156,7 +156,7 @@ component HubStep inherits VerticalLayout {
             text: "Paste this device's signed card into each device that should trust it, or use Trade cards below to send it over the network. Cards expire after 30 days — to renew, copy this card again and import it on every device that should keep trusting this one.";
         }
         if UiState.has-identity: Small {
-            text: "The fingerprint identifies this device's key. It is what the other device shows you to check when you trade cards, and it does not change when a card is renewed.";
+            text: "The fingerprint identifies this device's key: it is this device's half of the pairing code shown when you trade cards, and it does not change when a card is renewed.";
         }
         if UiState.has-identity: HorizontalLayout {
             spacing: Theme.pad-s;
@@ -335,7 +335,7 @@ export component HomeScreen inherits ScrollView {
             // launch-time choice, and the card-setup screen states the one
             // actually in use (`setup-channel-note`). Naming it twice is how
             // one copy goes stale on a --lan-only or --nostr-only run.
-            text: "Use this when you can't copy and paste identity cards between the two devices. They find each other over the network with a short PIN, and you check fingerprints before trusting.";
+            text: "Use this when you can't copy and paste identity cards between the two devices. They find each other over the network with a short PIN, and you check one pairing code before trusting.";
             horizontal-alignment: center;
         }
         if UiState.configure-step == ConfigureStep.setup-choice || UiState.configure-step == ConfigureStep.ready: Small {

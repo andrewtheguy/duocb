@@ -159,12 +159,13 @@ impl App {
             _ => SharedString::default(),
         });
 
-        // Card-setup confirmation: the incoming card beside this device's own
-        // identity. Blank whenever no card is pending, so a stale fingerprint
-        // can never linger on screen for the user to compare against.
-        let (incoming_name, incoming_fingerprint, incoming_expiry) = self.incoming_card_display();
+        // Card-setup confirmation: the incoming card plus the pairing code
+        // spanning it and this device's own key. Blank whenever no card is
+        // pending, so a stale code can never linger on screen for the user to
+        // compare against.
+        let (incoming_name, pairing_code, incoming_expiry) = self.incoming_card_display();
         s.set_incoming_name(incoming_name.into());
-        s.set_incoming_fingerprint(incoming_fingerprint.into());
+        s.set_pairing_code(pairing_code.into());
         s.set_incoming_expiry(incoming_expiry.into());
 
         // Client join forms. The two group fields together make the PIN.
