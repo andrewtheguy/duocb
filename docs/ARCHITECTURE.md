@@ -142,15 +142,21 @@ configure mode. A reconnect may present a new iroh node id if it proves the same
 trusted application key; the claim updates the transport id. Card setup has no
 application identity to claim and claims the session's iroh id instead.
 
-### Key fingerprints
+### Key fingerprints and the pairing code
 
 `auth::key_fingerprint` is a domain-separated SHA-256 over a device's 32-byte
 application public key, truncated to 80 bits and rendered as five groups of four
 uppercase hex characters. It is taken over the **key**, not a card: a renewed
 card is new bytes with a new timestamp and signature, while local trust is keyed
 on the public key, so the value a user reads must not move when a card is
-re-minted. It is shown for this device on the hub, beside every trusted peer,
-and on both sides of the card-setup confirmation.
+re-minted. It is shown for this device on the hub and beside every trusted peer.
+
+`auth::pairing_code` is what the card-setup confirmation shows: the two keys'
+fingerprints laid end to end, lower key first. Order-normalizing makes it a pure
+function of the *pair*, so both devices render the identical ten groups and the
+user compares one value across the two screens instead of cross-checking two
+per-device fingerprints. It is deliberately a concatenation, never a hash over
+both keys — see the security bullet below.
 
 ## Card setup
 
@@ -183,7 +189,8 @@ stream data.
 
 The runtime verifies each card's signature and schema and emits it as
 `NetEvent::PeerCardReceived`; it decides nothing about trust. The host app shows
-both fingerprints and stores the card only when the user confirms.
+the pairing code over its own key and the received card's, and stores the card
+only when the user confirms the other device shows the identical code.
 
 The session is one-shot: it carries no clipboard traffic (the session task holds
 no clipboard channel at all) and ends as soon as the cards have crossed. One PIN
@@ -234,28 +241,33 @@ endpoint rather than reusing one bound for the old transport stack.
 Publishing to public relays widens who can *fetch* a record, so it rests
 entirely on the PIN: the lookup key is Argon2id-derived, the payload is only an
 ephemeral node id, dialing it still requires the in-band PIN proof, and nothing
-is trusted without the fingerprint check below.
+is trusted without the pairing-code check below.
 
-### Why the fingerprint check is load-bearing
+### Why the pairing-code check is load-bearing
 
 The PIN proves possession of a short code, not an identity. It is ~35 bits and
 the construction is not a PAKE, so anyone who reads, shoulder-surfs, or guesses
 it inside its 60-second window can complete the handshake and offer a card of
-their choosing. The human fingerprint comparison is what catches that, because
-the value compared never crossed the network.
+their choosing. The human pairing-code comparison is what catches that, because
+each device computes its half of the code from its *own* key locally — that part
+never crossed the network.
 
-- **Per-key, not combined.** The fingerprint commits to one public key, so an
-  impostor must find a key whose fingerprint equals a *given* target — a
-  second-preimage problem, 2^80 here. A "session code" hashing both devices'
-  keys would instead let an interposer vary both of its own keys and hunt for a
-  collision between two freely-grindable sets: a birthday problem at 2^40 for
-  the same displayed length. Nothing here commits either side to a key before it
-  learns the other's, so there is no commitment step to restore the full bound.
-  That asymmetry is why the digest covers one key alone.
-- **One direction suffices.** An interposer holds two separate PIN-authenticated
-  connections and offers its own card each way, so both devices see its
-  fingerprint. Comparing either device's incoming value against the other's own
-  displayed value already fails for it.
+- **Concatenated, never hashed together.** The pairing code is the two per-key
+  fingerprints verbatim, so each half commits to exactly one key. An interposer
+  holds two separate PIN-authenticated connections and offers its own card each
+  way; device A then renders `sort(fp(A), fp(X₁))` while device B renders
+  `sort(fp(B), fp(X₂))`. Making those screens agree requires `fp(X₁) = fp(B)`
+  and `fp(X₂) = fp(A)` — two second preimages against fixed 2^80 targets. A
+  "session code" *hashing* both devices' keys would instead let the interposer
+  vary both of its own keys and hunt for a collision between two
+  freely-grindable sets: a birthday problem at 2^40 for the same displayed
+  length. Nothing here commits either side to a key before it learns the
+  other's, so there is no commitment step that would make a combined digest
+  safe — concatenation is what keeps a single shared code at full strength.
+  (Signal's safety numbers use the same construction.)
+- **One comparison suffices.** The check is symmetric by construction: the two
+  screens either render the identical code or they do not, and a mismatch
+  anywhere in the ten groups exposes the interposer on both sides at once.
 - **Auto-exchange leaks nothing.** A card is public material its owner hands out
   by copy-paste anyway, and carries no private key. Receiving one is not
   trusting it; only Import writes to the trusted list.
@@ -294,8 +306,8 @@ wire clipboard frames are capped at 1 MiB.
 ## Security assumptions
 
 - Identity cards are transferred over a path the owner trusts: a clipboard the
-  owner controls, or a card-setup connection whose fingerprint the owner checked.
-  Skipping that check reduces card setup's security to the PIN alone.
+  owner controls, or a card-setup connection whose pairing code the owner
+  checked. Skipping that check reduces card setup's security to the PIN alone.
 - Card expiry bounds how long a leaked or abandoned card stays useful, but only
   against a peer whose clock is roughly correct: expiry is enforced locally, so
   a device whose clock is set far back keeps honouring a lapsed card.

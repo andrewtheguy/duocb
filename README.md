@@ -19,7 +19,7 @@ copy and paste them.
 | | Discovery/signaling | Authentication | Saved state |
 |---|---|---|---|
 | Configure connection | Pairwise encrypted hosting records, on the local network first and Nostr relays as fallback | Mutual application-key signatures | One identity key and a local trusted-peer list per installation |
-| Card setup (trust bootstrap) | Pairwise PIN-encrypted rendezvous records, same channels, plus a typed LAN IP | Rotating PIN challenge-response, then a human fingerprint check | The imported peer card |
+| Card setup (trust bootstrap) | Pairwise PIN-encrypted rendezvous records, same channels, plus a typed LAN IP | Rotating PIN challenge-response, then a human pairing-code check | The imported peer card |
 
 ### Configure mode
 
@@ -81,10 +81,10 @@ carries the card over the network instead:
 3. The PIN locates the host and drives a mutual Argon2id-backed
    challenge-response over the resulting connection.
 4. Both devices send their signed identity card across that connection.
-5. Both then show the card they received, next to their own identity.
-6. **Check that the incoming fingerprint on each device matches the fingerprint
-   the other device shows for itself.** If it does not match, press Cancel —
-   something else answered the PIN.
+5. Both then show one pairing code, derived from both devices' keys and rendered
+   identically on the two screens.
+6. **Check that the pairing code is identical on both devices.** If it differs
+   anywhere, press Cancel — something else answered the PIN.
 7. Press Import on both. Each device is now a trusted peer of the other, and you
    share the clipboard from the home screen as usual.
 
@@ -115,9 +115,10 @@ a banner naming the flag when one is in effect.
 One PIN admits one device: once a device has answered, a second device offering
 the same code is refused.
 
-The fingerprint is derived from a device's application public key, so it is
+The pairing code is the two devices' key fingerprints laid end to end. Each
+fingerprint is derived from that device's application public key, so it is
 stable across card renewals and is shown beside every trusted device — you can
-re-check it out of band at any time.
+re-check either half out of band at any time.
 
 ## Build and run
 
@@ -165,22 +166,23 @@ persisted.
 ## Security notes
 
 - QUIC/TLS 1.3 encrypts the transport.
-- The card-setup fingerprint check is what makes the PIN safe to build trust on.
-  The PIN proves possession of a short code, not an identity: it is ~35 bits and
-  its rendezvous record is offline-attackable, so anyone who reads or guesses it
-  inside its 60-second window can complete the handshake and offer a card. The
-  human comparison catches exactly that. The incoming fingerprint is computed
-  from the card that just arrived, so it is network-delivered and proves
-  nothing on its own; what is trustworthy is the *expected* value, which the
-  other device shows for itself and which you read off its screen. Holding the
-  two against each other is what carries the check out of band.
-- The fingerprint commits to a single public key, so an impostor needs a second
-  preimage against a fixed target. A combined "session code" mixing both devices'
-  keys would instead let an interposer vary both of its own keys and hunt for a
-  collision — far cheaper for the same number of displayed digits.
-- Checking one direction is enough. An interposer must sit in both directions at
-  once, so comparing one device's incoming fingerprint against the other's own
-  already fails for it.
+- The card-setup pairing-code check is what makes the PIN safe to build trust
+  on. The PIN proves possession of a short code, not an identity: it is ~35 bits
+  and its rendezvous record is offline-attackable, so anyone who reads or
+  guesses it inside its 60-second window can complete the handshake and offer a
+  card. The human comparison catches exactly that: each device computes half of
+  the code from its *own* key locally, so the halves never crossed the network,
+  and an interposed card makes the two screens disagree.
+- The pairing code is the two per-key fingerprints laid end to end, never a hash
+  over both keys. Each half commits to a single public key, so an impostor needs
+  a second preimage against a fixed target for each side it fools. A combined
+  digest mixing both devices' keys would instead let an interposer vary both of
+  its own keys and hunt for a collision — far cheaper for the same number of
+  displayed digits. Concatenation is what keeps one shared code at full
+  strength; it is the same construction as Signal's safety numbers.
+- One comparison covers both directions: an interposer must sit in the middle of
+  both connections at once, and the identical-or-not check of a single code
+  exposes it on both screens simultaneously.
 - Receiving a card is not trusting it: cards cross automatically once the PIN
   matches, but nothing is written to the trusted list until a person presses
   Import.

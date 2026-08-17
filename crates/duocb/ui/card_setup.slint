@@ -1,7 +1,8 @@
 // Card setup: bootstrap trust between two devices that cannot copy and paste
 // identity cards to each other. A rotating PIN authenticates a short-lived
 // connection, both devices swap signed cards over it, and the user confirms the
-// fingerprint before anything is trusted. How the two devices find each other
+// pairing code — one value derived from both keys, shown identically on both
+// screens — before anything is trusted. How the two devices find each other
 // (local network, relays, or local-then-relays) is chosen at launch, governs
 // clipboard sessions too, and is described by `signal-channel-note`. No
 // clipboard content ever crosses a card-setup connection — that is what the
@@ -33,7 +34,7 @@ export component CardSetupScreen inherits ScrollView {
         Card {
             CardTitle { text: "How this works"; }
             Small {
-                text: "One device shows a PIN and the other types it. Both then show the card they received: check that the fingerprint matches the one the other device shows for itself before you import it. Afterwards the two devices are paired as usual, and you share the clipboard from the home screen.";
+                text: "One device shows a PIN and the other types it. Both then show one pairing code: check that the two screens display the identical code before you import. Afterwards the two devices are paired as usual, and you share the clipboard from the home screen.";
             }
         }
 
@@ -243,8 +244,9 @@ export component CardPairingScreen inherits ScrollView {
     }
 }
 
-// Step three: the cards have crossed. The user compares fingerprints before
-// anything is written to the trusted list.
+// Step three: the cards have crossed. Both devices now derive one pairing code
+// from the same pair of keys and the user checks the two screens show the
+// identical value before anything is written to the trusted list.
 export component CardConfirmScreen inherits ScrollView {
     out property <bool> field-focused: false;
     viewport-width: root.width;
@@ -256,44 +258,33 @@ export component CardConfirmScreen inherits ScrollView {
         alignment: start;
         spacing: Theme.pad-m;
 
-        BackHeader { title: "Check the fingerprint"; }
+        BackHeader { title: "Check the pairing code"; }
 
         // The instruction comes first: the whole screen is one comparison, and
         // it only means anything if the user knows what to compare.
         Card {
-            CardTitle { text: "Compare these two devices"; }
+            CardTitle { text: "Compare the pairing code"; }
             Body {
-                text: "The incoming fingerprint below must match the fingerprint the other device shows for itself. If it doesn't, press Cancel — something else answered your PIN.";
+                text: "Both devices now show a pairing code built from both keys. The code below must be identical on the two screens. If it differs anywhere, press Cancel — something else answered your PIN.";
             }
         }
 
         Card {
-            CardTitle { text: "This device"; }
+            CardTitle { text: "Pairing code"; }
+            Text {
+                text: UiState.pairing-code;
+                font-family: UiState.mono-font;
+                font-size: Theme.font-heading;
+                font-weight: 700;
+                wrap: word-wrap;
+            }
             LabeledValue {
-                label: "Name:";
+                label: "This device:";
                 value: UiState.display-identity;
             }
-            Text {
-                text: UiState.own-fingerprint;
-                font-family: UiState.mono-font;
-                font-size: Theme.font-heading;
-                font-weight: 700;
-                wrap: word-wrap;
-            }
-        }
-
-        Card {
-            CardTitle { text: "Incoming card"; }
             LabeledValue {
-                label: "Name:";
+                label: "Incoming card:";
                 value: UiState.incoming-name;
-            }
-            Text {
-                text: UiState.incoming-fingerprint;
-                font-family: UiState.mono-font;
-                font-size: Theme.font-heading;
-                font-weight: 700;
-                wrap: word-wrap;
             }
             if UiState.incoming-expiry != "": Small {
                 text: UiState.incoming-expiry;
@@ -301,7 +292,7 @@ export component CardConfirmScreen inherits ScrollView {
         }
 
         WideButton {
-            text: "✔ Fingerprint matches — import";
+            text: "✔ Codes match — import";
             hint: "I / Enter";
             clicked => { Actions.import-received-card(); }
         }

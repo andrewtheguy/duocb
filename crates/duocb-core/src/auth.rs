@@ -8,7 +8,7 @@
 //! carries a mandatory expiry and lasts [`CARD_TTL_SECS`]. A card crosses the
 //! wire only while being handed over: either by copy-paste, or over a card-setup
 //! session, where a PIN-authenticated connection carries it and the user
-//! confirms its [`key_fingerprint`] before it is stored (see
+//! confirms the [`pairing_code`] over both keys before it is stored (see
 //! `crate::card_exchange`). It never travels during a clipboard session — that
 //! handshake carries raw public keys — so expiry is enforced by each side
 //! against its own stored copy: pairing is refused once that copy lapses, and
@@ -54,21 +54,14 @@ const FINGERPRINT_DOMAIN: &[u8] = b"duocb:key-fingerprint:v1\0";
 /// that a human will actually read all of it off two screens.
 const FINGERPRINT_BYTES: usize = 10;
 
-/// The human-comparable fingerprint of an application public key, shown on both
-/// devices during card setup so the user can confirm the card they are about to
-/// import really belongs to the device in front of them.
+/// The human-comparable fingerprint of an application public key: what the
+/// trusted-peer rows show, and one half of the [`pairing_code`] compared
+/// during card setup.
 ///
 /// Taken over the **32-byte public key**, not the card: a card's `created_at`
 /// and signature change every time its owner re-mints it, while local trust is
 /// keyed on the public key. Fingerprinting the key means the value stays put
 /// across renewals, so it can also be re-checked out of band long after pairing.
-///
-/// Deliberately *not* a hash over both peers' keys. A per-key fingerprint forces
-/// an impostor into a second preimage against a fixed target (2^80 here); a
-/// combined "pairing code" shown identically on both screens would instead let
-/// an interposer grind both of its own keypairs for a birthday collision, at
-/// half the exponent, since nothing here commits either side to a key before it
-/// learns the other's.
 pub fn key_fingerprint(key: &PublicKey) -> String {
     let mut hasher = Sha256::new();
     hasher.update(FINGERPRINT_DOMAIN);
@@ -79,6 +72,28 @@ pub fn key_fingerprint(key: &PublicKey) -> String {
         .map(|pair| format!("{:02X}{:02X}", pair[0], pair[1]))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// The single pairing code both devices show during card setup: the two keys'
+/// [`key_fingerprint`]s laid end to end, lower key first. Order-normalizing
+/// makes the rendering a pure function of the *pair*, so both screens show the
+/// same ten groups and the user compares one value instead of cross-checking
+/// two per-device fingerprints.
+///
+/// Deliberately a **concatenation** of per-key fingerprints, never a hash over
+/// both keys. Each half depends on exactly one key, so an interposer that sits
+/// in the middle must forge a second preimage against each side's fixed 2^80
+/// target separately. A combined digest would instead let it grind its own two
+/// keypairs for a birthday collision at half the exponent, since nothing in
+/// card setup commits either side to a key before it learns the other's. (This
+/// is the same construction as Signal's safety numbers.)
+pub fn pairing_code(a: &PublicKey, b: &PublicKey) -> String {
+    let (low, high) = if a.to_bytes() <= b.to_bytes() {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    format!("{} {}", key_fingerprint(low), key_fingerprint(high))
 }
 
 /// Persisted, application-level identity. Debug output never exposes the secret.
@@ -416,6 +431,43 @@ mod tests {
         assert!(fp.chars().filter(|c| *c != ' ').all(|c| c.is_ascii_hexdigit()));
         // 80 bits shown, so an impostor faces a 2^80 second preimage.
         assert_eq!(FINGERPRINT_BYTES * 8, 80);
+    }
+
+    /// Both devices compute the code over the same pair of keys, so the two
+    /// renderings must be byte-identical regardless of which side is "self" —
+    /// that identity is the whole point of showing one value.
+    #[test]
+    fn pairing_code_is_the_same_on_both_screens() {
+        let a = Identity::generate();
+        let b = Identity::generate();
+        let code = pairing_code(&a.public_key(), &b.public_key());
+        assert_eq!(code, pairing_code(&b.public_key(), &a.public_key()));
+
+        // Ten groups of four upper-hex characters: the two 80-bit per-key
+        // fingerprints end to end, in the same rendering the user already
+        // reads off the trusted-peer rows.
+        let groups: Vec<&str> = code.split(' ').collect();
+        assert_eq!(groups.len(), 2 * (FINGERPRINT_BYTES / 2));
+        assert!(groups.iter().all(|g| g.len() == 4 && g.chars().all(|c| c.is_ascii_hexdigit())));
+    }
+
+    /// The code is a concatenation of the per-key fingerprints, not a fresh
+    /// digest over the pair: an impostor's key changes its own half but can
+    /// never perturb the half belonging to the honest key, which is what keeps
+    /// the forgery a fixed-target second preimage instead of a birthday search.
+    #[test]
+    fn pairing_code_is_the_two_key_fingerprints_verbatim() {
+        let a = Identity::generate();
+        let b = Identity::generate();
+        let code = pairing_code(&a.public_key(), &b.public_key());
+        let fp_a = key_fingerprint(&a.public_key());
+        let fp_b = key_fingerprint(&b.public_key());
+        assert!(code == format!("{fp_a} {fp_b}") || code == format!("{fp_b} {fp_a}"));
+
+        // Swapping in a third key changes the code — the value really does
+        // bind the specific pair.
+        let c = Identity::generate();
+        assert_ne!(code, pairing_code(&a.public_key(), &c.public_key()));
     }
 
     /// A card is usable up to its expiry and dead the second after, and the

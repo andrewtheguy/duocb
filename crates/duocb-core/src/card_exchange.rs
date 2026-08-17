@@ -28,8 +28,9 @@
 //! **This transfer grants no trust.** It hands the peer a card; it does not
 //! install one. The receiver re-parses the offer through
 //! [`IdentityCard::parse`], the same verifying path a pasted card takes, and
-//! then the *user* has to compare the sender's fingerprint against the value
-//! shown on the other device before importing it. That human check is what
+//! then the *user* has to check that the pairing code — derived from both keys
+//! and rendered identically by both devices ([`crate::auth::pairing_code`]) —
+//! matches across the two screens before importing it. That human check is what
 //! catches an interposer: the PIN is only ~35 bits and its rendezvous record is
 //! offline-attackable (see `crate::pin_auth`), so possession of the PIN alone
 //! must never be enough to become a trusted device.
@@ -146,10 +147,13 @@ mod tests {
         assert_eq!(b_got.public_key(), a_identity.public_key());
         assert_eq!(b_got.name(), "mac-book_a7B2c3D4");
 
-        // Each side now shows the other's fingerprint, and it matches the value
-        // that device displays for itself — this is the user's cross-check.
-        assert_eq!(a_got.fingerprint(), b_card.fingerprint());
-        assert_eq!(b_got.fingerprint(), a_card.fingerprint());
+        // Each side now derives the pairing code from its own key and the card
+        // it received, and both arrive at one identical value — this is the
+        // user's cross-check.
+        assert_eq!(
+            crate::auth::pairing_code(&a_identity.public_key(), &a_got.public_key()),
+            crate::auth::pairing_code(&b_identity.public_key(), &b_got.public_key()),
+        );
     }
 
     /// A peer that sends something other than a validly signed card is refused

@@ -5,8 +5,8 @@
 //! JSON, and wraps the pure helpers the setup screens need. **No policy lives
 //! here.** In particular, a card that arrives over a card-setup session is
 //! handed up verified-but-untrusted; whether to store it is the app's call, and
-//! it must not be made without the user comparing fingerprints (see
-//! `duocb_core::card_exchange`).
+//! it must not be made without the user comparing the pairing code from
+//! [`duocb_pairing_code`] across both screens (see `duocb_core::card_exchange`).
 //!
 //! The app links `libduocb.xcframework` (containing `libduocb.a` slices) and
 //! drives a session with:
@@ -255,7 +255,7 @@ pub unsafe extern "C" fn duocb_identity_public_key(
 }
 
 /// This identity's human-comparable key fingerprint — the value shown on the
-/// hub and, during card setup, compared by eye against the other device's.
+/// hub, and this device's half of any card-setup pairing code.
 ///
 /// Taken over the public key, not over a card, so it stays put when the card is
 /// re-minted and can be re-checked out of band long after pairing.
@@ -389,8 +389,9 @@ pub unsafe extern "C" fn duocb_validate_identity_card(
 ///  "expired":false,"needs_renewal":false}
 /// ```
 ///
-/// `fingerprint` is what the user compares across the two screens during card
-/// setup. `expired` drives the warning colour on a trusted-device row — a
+/// `fingerprint` is the card's half of a [`duocb_pairing_code`] and the value a
+/// trusted-device row shows for out-of-band re-checks.
+/// `expired` drives the warning colour on a trusted-device row — a
 /// lapsed card can no longer pair, and the only way back is a fresh one from
 /// its owner. `needs_renewal` is advisory and applies to the *self*-card: true
 /// once less than [`CARD_RENEW_BEFORE_SECS`] remains.
@@ -412,6 +413,42 @@ pub unsafe extern "C" fn duocb_identity_card_info(
         return -1;
     };
     write_result(out_buf, out_len, &identity_card_json(&card).to_string())
+}
+
+/// The single pairing code the card-setup confirmation screen shows: both
+/// devices call this with their own card and the one they received (either
+/// order — the code is order-normalized), render the identical value, and the
+/// user checks the two screens match before importing. Each half of the code is
+/// one card's key fingerprint, so an impostor still faces a fixed-target
+/// second-preimage per key (see `duocb_core::auth::pairing_code`).
+///
+/// Returns 1 on success, 0 if the buffer is too small, -1 for invalid input
+/// (either card fails verification, or both are the same key).
+/// # Safety
+/// `card_a` and `card_b` must be NUL-terminated UTF-8; `out_buf` must be NULL
+/// or point to at least `out_len` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn duocb_pairing_code(
+    card_a: *const c_char,
+    card_b: *const c_char,
+    out_buf: *mut c_char,
+    out_len: usize,
+) -> c_int {
+    let (Some(card_a), Some(card_b)) = (unsafe { cstr_arg(card_a) }, unsafe { cstr_arg(card_b) })
+    else {
+        return -1;
+    };
+    let (Ok(card_a), Ok(card_b)) = (IdentityCard::parse(card_a), IdentityCard::parse(card_b))
+    else {
+        return -1;
+    };
+    // A code over one key twice is a comparison with nothing on the other
+    // side; the caller passed the same card in both slots by mistake.
+    if card_a.public_key() == card_b.public_key() {
+        return -1;
+    }
+    let code = duocb_core::auth::pairing_code(&card_a.public_key(), &card_b.public_key());
+    write_result(out_buf, out_len, &code)
 }
 
 // ---------------------------------------------------------------------------
@@ -1071,8 +1108,9 @@ fn event_json(event: &NetEvent) -> String {
             "peer_public_key": peer_public_key,
         }),
         // Verified as well-formed and correctly signed, and nothing more. The
-        // app must not store this without the user comparing `info.fingerprint`
-        // against the value the other device shows for itself.
+        // app must not store this without the user comparing the pairing code
+        // (duocb_pairing_code over the self-card and `card`) across both
+        // devices' screens.
         NetEvent::PeerCardReceived(card) => json!({
             "type": "peer_card_received",
             "card": card.encode(),
@@ -1380,6 +1418,45 @@ mod tests {
         // A card is minted with the full TTL, which is well past the renewal
         // window, so a fresh one never asks to be renewed.
         assert_eq!(info["needs_renewal"], false);
+    }
+
+    /// The pairing code the confirmation screens render must be identical no
+    /// matter which side computes it, must be the one duocb-core derives from
+    /// the two keys, and must refuse a same-card call — that comparison would
+    /// always "match" while checking nothing.
+    #[test]
+    fn pairing_code_is_order_free_and_refuses_a_self_pair() {
+        let a = Identity::generate();
+        let b = Identity::generate();
+        let card_a = std::ffi::CString::new(
+            a.card("mac-book", "a7B2c3D4").unwrap().encode(),
+        )
+        .unwrap();
+        let card_b = std::ffi::CString::new(
+            b.card("pixel", "9zKtm4Qp").unwrap().encode(),
+        )
+        .unwrap();
+
+        let code = |x: &std::ffi::CString, y: &std::ffi::CString| {
+            let mut buf = [0 as c_char; 128];
+            let rc = unsafe {
+                duocb_pairing_code(x.as_ptr(), y.as_ptr(), buf.as_mut_ptr(), buf.len())
+            };
+            assert_eq!(rc, 1);
+            unsafe { CStr::from_ptr(buf.as_ptr()) }.to_str().unwrap().to_string()
+        };
+        let forward = code(&card_a, &card_b);
+        assert_eq!(forward, code(&card_b, &card_a));
+        assert_eq!(
+            forward,
+            duocb_core::auth::pairing_code(&a.public_key(), &b.public_key())
+        );
+
+        let mut buf = [0 as c_char; 128];
+        let rc = unsafe {
+            duocb_pairing_code(card_a.as_ptr(), card_a.as_ptr(), buf.as_mut_ptr(), buf.len())
+        };
+        assert_eq!(rc, -1, "one key on both sides compares nothing");
     }
 
     #[test]

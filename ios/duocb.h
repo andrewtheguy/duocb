@@ -30,9 +30,10 @@
  * The two card_* roles never carry clipboard traffic. They bootstrap trust
  * between devices that have no shared clipboard to paste a card through, and
  * end as soon as the cards have crossed. A card received that way is verified
- * as well-formed and correctly signed and NOTHING MORE — the user must compare
- * its fingerprint against the value the other device shows before it is
- * stored.
+ * as well-formed and correctly signed and NOTHING MORE — the user must check
+ * that the pairing code (duocb_pairing_code over the self-card and the received
+ * card, rendered identically by both devices) matches the other screen before
+ * it is stored.
  *
  * ── Config JSON (duocb_start) ────────────────────────────────────────────
  * {
@@ -107,6 +108,7 @@ typedef struct DuocbHandle DuocbHandle;
 #define DUOCB_NAME_BUF_LEN 64
 #define DUOCB_PUBLIC_KEY_BUF_LEN 128
 #define DUOCB_FINGERPRINT_BUF_LEN 64
+#define DUOCB_PAIRING_CODE_BUF_LEN 128
 #define DUOCB_PIN_BUF_LEN 16
 #define DUOCB_IDENTITY_CARD_BUF_LEN 4096
 #define DUOCB_IDENTITY_CARD_INFO_BUF_LEN 1024
@@ -136,7 +138,7 @@ int duocb_identity_public_key(const char *private_key,
                               char *out_buf,
                               size_t out_len);
 /* The human-comparable fingerprint of this identity's public key — shown on
- * the hub, and compared by eye against the other device during card setup.
+ * the hub, and this device's half of any card-setup pairing code.
  * Taken over the key, not a card, so it survives a re-mint. */
 int duocb_identity_fingerprint(const char *private_key,
                                char *out_buf,
@@ -158,6 +160,15 @@ int duocb_validate_identity_card(const char *card,
 /* Writes {name, short_name, suffix, public_key, npub, fingerprint, created_at,
  * expires_at, remaining_secs, expired, needs_renewal}. */
 int duocb_identity_card_info(const char *card, char *out_buf, size_t out_len);
+/* The single pairing code the card-setup confirmation screen shows: call with
+ * this device's self-card and the received card (either order — the code is
+ * order-normalized), and both devices render the identical value. Each half is
+ * one card's key fingerprint, so it is as spoof-resistant as comparing both
+ * fingerprints. -1 also when both cards carry the same key. */
+int duocb_pairing_code(const char *card_a,
+                       const char *card_b,
+                       char *out_buf,
+                       size_t out_len);
 
 /* ── Card-setup PIN entry ─────────────────────────────────────────────── */
 
