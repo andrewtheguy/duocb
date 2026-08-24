@@ -1,11 +1,11 @@
 //! iroh endpoint helpers: builders, connect, and the connection path watcher.
 //!
-//! The iroh identity is ephemeral but session-scoped: the runtime's command
-//! loop mints a secret key per logical session and passes it in here, so every
-//! endpoint bound for that session — including one bound by a restarted
-//! session task — presents the same node id, and a paired peer's reconnect is
-//! recognized. Node-id discovery is handled out-of-band (nostr or a node id
-//! embedded in a manual pairing code); no secret key is ever persisted.
+//! The iroh identity is fixed for the runtime's lifetime: the runtime is
+//! handed one secret key at startup and passes it in here for every endpoint
+//! it binds — across sessions and restarted session tasks alike — so this
+//! process always presents one node id and a paired peer's reconnect is
+//! recognized. Node-id discovery is handled out-of-band (the LAN and nostr
+//! rendezvous records); the node id is never a credential.
 
 use anyhow::{Context, Result};
 use futures::StreamExt;

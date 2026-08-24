@@ -12,6 +12,7 @@ crate-type = ["staticlib"]
 
 [dependencies]
 duocb-core.workspace = true
+hex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

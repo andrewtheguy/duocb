@@ -38,6 +38,7 @@
  * ── Config JSON (duocb_start) ────────────────────────────────────────────
  * {
  *   "role": "start" | "join" | "card_host" | "card_join",
+ *   "iroh_secret": "64 hex chars",               // every role, see below
  *   "self_card": "{ signed card JSON }",         // every role
  *   "identity_secret": "nsec1…",                 // start/join only
  *   "peers": ["{ signed peer card JSON }"],      // start/join only, max 128
@@ -50,6 +51,13 @@
  *
  * Validation is strict: a field that does not belong to the role is an error,
  * not an ignored key.
+ *
+ * "iroh_secret" is the key behind this device's iroh node id. Mint it once with
+ * duocb_generate_iroh_secret, keep it in the Keychain (this-device-only, bound
+ * to identifierForVendor) and pass the same value on every start: a persisted
+ * node id is safe here because iOS app storage cannot be cloned by accident,
+ * unlike a desktop config directory. The first duocb_start in a process pins
+ * the node id; a later start with a different iroh_secret is refused.
  *
  * "channel" chooses where the rendezvous records are put and looked for, and
  * governs card setup and clipboard sessions alike:
@@ -131,6 +139,8 @@ void duocb_init_logging(void);
 int duocb_generate_identity(char *out_buf, size_t out_len);
 /* Generate once and persist; reuse for every replacement self-card. */
 int duocb_generate_suffix(char *out_buf, size_t out_len);
+/* Generate once and persist; pass as "iroh_secret" on every duocb_start. */
+int duocb_generate_iroh_secret(char *out_buf, size_t out_len);
 int duocb_validate_identity(const char *private_key,
                             char *err_buf,
                             size_t err_len);

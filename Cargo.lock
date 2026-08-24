@@ -1809,6 +1809,7 @@ version = "0.0.36"
 dependencies = [
  "duocb-core",
  "env_logger",
+ "hex",
  "log",
  "serde",
  "serde_json",

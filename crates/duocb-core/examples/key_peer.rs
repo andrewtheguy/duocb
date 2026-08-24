@@ -53,7 +53,7 @@ fn main() {
         Ok(other) => panic!("DUOCB_CHANNEL must be lan or nostr, got {other:?}"),
     };
 
-    let net = spawn_net_runtime(None);
+    let net = spawn_net_runtime(None, duocb_core::iroh::SecretKey::generate());
     match std::env::var("DUOCB_ROLE").as_deref() {
         Ok("start") => net.send(UiCommand::StartServer {
             mode: ServerMode::Key {

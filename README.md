@@ -24,7 +24,7 @@ copy and paste them.
 ### Configure mode
 
 Every duocb installation generates its own permanent application keypair. This
-key is separate from iroh's ephemeral transport key:
+key is separate from iroh's transport key:
 
 - The application private key signs the device's portable identity card and
   authenticates the duocb wire handshake.
@@ -32,8 +32,13 @@ key is separate from iroh's ephemeral transport key:
   key, and a mandatory expiry. The final name is
   `<short-name>_<permanent-random-suffix>`; the suffix is minted once per
   installation and stays stable across renames and identity resets.
-- The iroh key creates the current QUIC endpoint and node id. It is used for
-  signaling and transport establishment, never as the saved duocb identity.
+- The iroh key creates the QUIC endpoint and node id. It is used for signaling
+  and transport establishment, never as the saved duocb identity. A running
+  app presents one node id for its whole life. The desktop mints the key fresh
+  on every launch, because a config directory can be copied between machines
+  and two live endpoints with one node id would shadow each other; iOS keeps
+  it in the Keychain (this-device-only, bound to `identifierForVendor`), where
+  it cannot be cloned by accident, so the node id also survives relaunches.
 
 Pairing is mutual. On each device:
 

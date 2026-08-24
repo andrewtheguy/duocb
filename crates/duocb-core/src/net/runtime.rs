@@ -311,21 +311,19 @@ fn session_key(kind: &SessionKind) -> SessionKey {
     }
 }
 
-/// Identity and pairing state for one logical session, owned by the command
-/// loop and lent to every session task started under the same [`SessionKey`].
-/// A session task can end while the pairing is still good — the client gives
-/// up after [`MAX_CONNECT_ATTEMPTS`], an auth exchange dies mid-handshake, a
-/// host restarts the session — and the endpoint identity is what the peer's
-/// pair claim is bound to. Keeping the secret key (and with it the node id) and
-/// the server's claim here lets the next task reconnect as the same peer
-/// instead of being refused as a stranger.
+/// Pairing state for one logical session, owned by the command loop and lent
+/// to every session task started under the same [`SessionKey`]. A session task
+/// can end while the pairing is still good — the client gives up after
+/// [`MAX_CONNECT_ATTEMPTS`], an auth exchange dies mid-handshake, a host
+/// restarts the session — and the peer's pair claim is bound to this runtime's
+/// node id, so keeping the server's claim here lets the next task reconnect as
+/// the same peer instead of being refused as a stranger.
 /// Cleared on [`UiCommand::StopServer`]/[`UiCommand::Disconnect`] — the user
 /// ending the session is the one legitimate way to unpair — and replaced when
 /// a session starts under a different key. Never persisted; a fresh process
 /// starts clean.
 struct SessionMemory {
     key: SessionKey,
-    secret: iroh::SecretKey,
     /// Server: the one-pair-per-session claim (holds the paired peer's node id).
     claim: PairClaim,
     /// Card-setup host: the recent rotation buckets' auth keys.
@@ -336,7 +334,6 @@ impl SessionMemory {
     fn new(key: SessionKey) -> Self {
         Self {
             key,
-            secret: iroh::SecretKey::generate(),
             claim: PairClaim::default(),
             recent_pins: RecentPins::default(),
         }
@@ -344,8 +341,7 @@ impl SessionMemory {
 }
 
 /// Reuse the held memory when the new session's key matches (the same logical
-/// session continuing under a new task); mint fresh identity and pairing state
-/// otherwise.
+/// session continuing under a new task); start fresh pairing state otherwise.
 fn remember(memory: &mut Option<SessionMemory>, key: SessionKey) -> &SessionMemory {
     if memory.as_ref().is_none_or(|m| m.key != key) {
         *memory = Some(SessionMemory::new(key));
@@ -383,6 +379,7 @@ struct Session {
 fn start_session(
     kind: SessionKind,
     events: EventSender,
+    secret: &iroh::SecretKey,
     memory: &SessionMemory,
 ) -> Session {
     let cancel = CancellationToken::new();
@@ -393,7 +390,7 @@ fn start_session(
     let pin_refresh = matches!(&kind, SessionKind::Server(ServerMode::CardSetup { .. }))
         .then(|| Arc::new(tokio::sync::Notify::new()));
     let task_pin_refresh = pin_refresh.clone();
-    let secret = memory.secret.clone();
+    let secret = secret.clone();
     let claim = memory.claim.clone();
     let recent_pins = memory.recent_pins.clone();
     let handle = tokio::spawn(async move {
@@ -494,7 +491,17 @@ async fn stop_session(session: &mut Option<Session>) {
 }
 
 /// The runtime's main loop. It never mutates caller-owned local trust.
-pub async fn net_main(mut cmd_rx: mpsc::UnboundedReceiver<UiCommand>, events: EventSender) {
+///
+/// `secret` is the one iroh key every endpoint this runtime binds presents, so
+/// the node id is fixed for the runtime's whole life — across sessions, roles
+/// and session-task restarts alike. The caller decides where it comes from:
+/// the desktop mints one per process, a platform that cannot have its storage
+/// cloned by accident may persist it.
+pub async fn net_main(
+    mut cmd_rx: mpsc::UnboundedReceiver<UiCommand>,
+    events: EventSender,
+    secret: iroh::SecretKey,
+) {
     let mut session: Option<Session> = None;
     let mut memory: Option<SessionMemory> = None;
 
@@ -504,13 +511,13 @@ pub async fn net_main(mut cmd_rx: mpsc::UnboundedReceiver<UiCommand>, events: Ev
                 stop_session(&mut session).await;
                 let kind = SessionKind::Server(mode);
                 let mem = remember(&mut memory, session_key(&kind));
-                session = Some(start_session(kind, events.clone(), mem));
+                session = Some(start_session(kind, events.clone(), &secret, mem));
             }
             UiCommand::Connect { spec } => {
                 stop_session(&mut session).await;
                 let kind = SessionKind::Client(spec);
                 let mem = remember(&mut memory, session_key(&kind));
-                session = Some(start_session(kind, events.clone(), mem));
+                session = Some(start_session(kind, events.clone(), &secret, mem));
             }
             UiCommand::StopServer | UiCommand::Disconnect => {
                 stop_session(&mut session).await;
@@ -2325,7 +2332,7 @@ mod tests {
     /// that don't exercise session-task restarts.
     fn start_test_session(kind: SessionKind, events: EventSender) -> Session {
         let memory = SessionMemory::new(session_key(&kind));
-        start_session(kind, events, &memory)
+        start_session(kind, events, &iroh::SecretKey::generate(), &memory)
     }
 
     /// Drain events from a std receiver until `pred` matches or the deadline
