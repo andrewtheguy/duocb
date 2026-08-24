@@ -216,7 +216,7 @@ session survives.
 Both of duocb's rendezvous records — the card-setup PIN record (`pin_record`,
 keyed by the `(pin, bucket)` public key) and the pairwise hosting record
 (`hosting_record`, keyed by a pair of application keys) — are the same NIP-44
-ciphertext of the host's ephemeral node id wherever they travel. What differs is
+ciphertext of the host's current node id wherever they travel. What differs is
 where they are put and looked for, chosen once at launch by `SignalChannel` and
 applied to **both** flows, so the two can never disagree about which transports
 exist:
@@ -251,8 +251,8 @@ The channel is part of a session's identity key, so switching it mints a fresh
 endpoint rather than reusing one bound for the old transport stack.
 
 Publishing to public relays widens who can *fetch* a record, so it rests
-entirely on the PIN: the lookup key is Argon2id-derived, the payload is only an
-ephemeral node id, dialing it still requires the in-band PAKE, and nothing
+entirely on the PIN: the lookup key is Argon2id-derived, the payload is only a
+current node id, dialing it still requires the in-band PAKE, and nothing
 is trusted without the pairing-code check below. The record is the one
 PIN-derived artifact that is offline-attackable by nature — its lookup key must
 be derivable from the PIN alone, so an archived event lets an attacker test

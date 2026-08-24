@@ -1,7 +1,7 @@
 //! The encrypted pairwise hosting record, shared by both transports that carry
 //! it: the local network (`crate::lan`, DNS-SD) and nostr relays
 //! (`crate::nostr`). It is the clipboard-session sibling of `crate::pin_record`
-//! and holds the same thing — the host's **ephemeral node id**, never a token —
+//! and holds the same thing — the host's **current node id**, never a token —
 //! but it is addressed to a standing application identity instead of a PIN.
 //!
 //! One record exists per *ordered pair* of application keys. Its lookup label is
@@ -34,7 +34,7 @@ const NOSTR_TAG_DOMAIN: &[u8] = b"duocb:pairwise-hosting:v1";
 /// LAN observer and a relay operator cannot link a device across them.
 const LAN_LABEL_DOMAIN: &[u8] = b"duocb:pairwise-hosting-lan:v1";
 
-/// The record: the host's ephemeral node id under a version stamp.
+/// The record: the host's current node id under a version stamp.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HostingRecord {

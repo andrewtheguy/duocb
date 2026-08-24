@@ -1,7 +1,7 @@
 //! Card-setup PIN mutual authentication: a SPAKE2 PAKE carried in-band over the established
 //! connection.
 //!
-//! In card setup the rendezvous record carries **only** the server's ephemeral node id (encrypted
+//! In card setup the rendezvous record carries **only** the server's current node id (encrypted
 //! under the PIN rendezvous key; see `crate::nostr`). No authentication material is ever placed on
 //! a relay. Instead, once the client has dialed that node id, both peers run a balanced PAKE
 //! (SPAKE2 over Ed25519) on the first bidirectional stream — the same stream the application-key

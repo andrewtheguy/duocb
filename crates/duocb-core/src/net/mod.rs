@@ -71,7 +71,7 @@ impl SignalChannel {
     }
 }
 
-/// How the server signals its ephemeral node id to the client.
+/// How the server signals its current node id to the client.
 #[derive(Debug, Clone)]
 pub enum ServerMode {
     /// Configure mode: publish a pairwise hosting record for each trusted peer

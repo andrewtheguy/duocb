@@ -60,7 +60,7 @@ When a trusted device starts a connection, it publishes a separate NIP-44
 encrypted hosting record for each trusted peer — advertised on the local
 network over Bonjour/DNS-SD *and* published to Nostr relays, since the host
 cannot know which way the other device will look. The record carries only the
-current ephemeral iroh node id. A joining device looks on the local network
+current iroh node id. A joining device looks on the local network
 first and falls back to the relays if nothing answers there, so two devices in
 one room never involve a third-party server, and two on different networks
 still find each other. It then establishes the iroh connection, and both sides

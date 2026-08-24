@@ -1361,7 +1361,7 @@ async fn resolve_hosting(
 /// the reader is told about cannot drift from the one actually slept.
 const HOSTING_REFRESH: Duration = Duration::from_secs(120);
 
-/// Configure-mode hosting publisher: keep this host's ephemeral node id
+/// Configure-mode hosting publisher: keep this host's current node id
 /// resolvable by each trusted peer, on every enabled channel, for as long as
 /// the session listens.
 ///
@@ -2553,7 +2553,7 @@ mod tests {
     }
 
     /// The clipboard session's own rendezvous, end to end and relay-less: a host
-    /// with one trusted peer advertises its ephemeral node id on the local
+    /// with one trusted peer advertises its current node id on the local
     /// network, that peer resolves the pairwise record — direct addresses
     /// included — dials it, both authenticate with their application keys, and a
     /// clipboard item crosses.

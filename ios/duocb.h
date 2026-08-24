@@ -6,7 +6,7 @@
  * Each installation holds one persistent application keypair. Its private key
  * authenticates duocb's wire protocol and signs a portable identity card
  * naming `<short-name>_<permanent-suffix>`. That key is unrelated to iroh's
- * ephemeral transport key. Pairing is mutual: each installation stores the
+ * transport key. Pairing is mutual: each installation stores the
  * other's verified signed card in its local trusted-peer list.
  *
  * Cards expire 30 days after they are minted and both sides refuse to pair on
