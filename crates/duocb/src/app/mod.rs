@@ -159,7 +159,7 @@ mod self_card_tests {
         app.device_suffix = "a7B2c3D4".into();
         app.self_card = Some(
             app.identity
-                .card_issued_at(
+                .card_valid_from(
                     "desktop",
                     "a7B2c3D4",
                     duocb_core::auth::unix_now() - duocb_core::auth::CARD_TTL_SECS - 1,
@@ -734,13 +734,10 @@ impl App {
             self.error = Some("That is this device's own identity card".into());
             return false;
         }
-        // Storing a lapsed card would record trust that can never pair, so
-        // refuse it here rather than at the first Join.
+        // Storing a card outside its window would record trust that cannot
+        // pair, so refuse it here rather than at the first Join.
         if card.is_expired() {
-            self.error = Some(format!(
-                "That identity card expired on {} — get a fresh one from the other device",
-                card_expiry_date(&card)
-            ));
+            self.error = Some(unusable_card_message(&card, "get a fresh one from the other device"));
             return false;
         }
         if let Some(existing) = self
@@ -1073,14 +1070,23 @@ impl App {
                     .peers
                     .iter()
                     .find(|peer| peer.public_key() == *peer_public_key);
-                // The runtime refuses an expired peer too; catching it here
-                // answers immediately instead of after an endpoint spins up.
+                // The runtime refuses a peer outside its window too; catching
+                // it here answers immediately instead of after an endpoint
+                // spins up.
                 if let Some(peer) = peer.filter(|peer| peer.is_expired()) {
-                    self.error = Some(format!(
-                        "The identity card for {} expired on {} — import a fresh card from that device",
-                        peer.name(),
-                        card_expiry_date(peer)
-                    ));
+                    self.error = Some(if peer.is_not_yet_valid() {
+                        format!(
+                            "The identity card for {} is not valid until {} — check the clock on this device and on that one",
+                            peer.name(),
+                            local_date(peer.not_before())
+                        )
+                    } else {
+                        format!(
+                            "The identity card for {} expired on {} — import a fresh card from that device",
+                            peer.name(),
+                            card_expiry_date(peer)
+                        )
+                    });
                     return;
                 }
                 self.joined_peer = peer.map(|peer| peer.name().to_string());
@@ -1105,9 +1111,17 @@ pub(crate) fn default_relays() -> Vec<String> {
 pub(crate) fn card_expiry_note(card: &IdentityCard) -> String {
     const DAY: u64 = 24 * 60 * 60;
     let date = card_expiry_date(card);
-    let remaining = card.remaining_secs_at(duocb_core::auth::unix_now());
+    let now = duocb_core::auth::unix_now();
+    let remaining = card.remaining_secs_at(now);
     // Kept short: this is appended to a list row, and the trust card's own text
     // already explains that the fix is to import a fresh card.
+    if card.is_not_yet_valid_at(now) {
+        // A fresh card would fail the same way: the clock on one of the two
+        // devices is wrong, and that is what the user has to fix.
+        // As terse as the EXPIRED form: the row has no room for a sentence,
+        // and the join/import banners spell the remedy out in full.
+        return "NOT YET VALID — check clock".to_string();
+    }
     if remaining == 0 {
         return format!("EXPIRED {date}");
     }
@@ -1121,9 +1135,29 @@ pub(crate) fn card_expiry_note(card: &IdentityCard) -> String {
     }
 }
 
+/// Why a card that failed [`IdentityCard::is_expired`] cannot be imported.
+/// `remedy` is the expired-case advice; a not-yet-valid card gets clock
+/// advice instead, since a fresh card would fail the same way.
+pub(crate) fn unusable_card_message(card: &IdentityCard, remedy: &str) -> String {
+    if card.is_not_yet_valid() {
+        return format!(
+            "That identity card is not valid until {} — check the clock on this device and on the other one",
+            local_date(card.not_before())
+        );
+    }
+    format!(
+        "That identity card expired on {} — {remedy}",
+        card_expiry_date(card)
+    )
+}
+
 /// The card's signed expiry as a local-time calendar date.
 pub(crate) fn card_expiry_date(card: &IdentityCard) -> String {
-    i64::try_from(card.expires_at())
+    local_date(card.not_after())
+}
+
+fn local_date(secs: u64) -> String {
+    i64::try_from(secs)
         .ok()
         .and_then(|secs| jiff::Timestamp::from_second(secs).ok())
         .map(|ts| {
@@ -1155,7 +1189,7 @@ mod expiry_note_tests {
         let card = Identity::generate().card("phone", "x9Y8z7W6").unwrap();
         assert_eq!(
             card_expiry_note(&card),
-            format!("expires {}", local_date(card.expires_at()))
+            format!("expires {}", local_date(card.not_after()))
         );
     }
 
@@ -1163,7 +1197,7 @@ mod expiry_note_tests {
     fn a_card_near_expiry_shows_the_date_and_a_countdown() {
         let now = duocb_core::auth::unix_now();
         let card = Identity::generate()
-            .card_issued_at(
+            .card_valid_from(
                 "phone",
                 "x9Y8z7W6",
                 now - duocb_core::auth::CARD_TTL_SECS + 2 * DAY + 60,
@@ -1171,7 +1205,7 @@ mod expiry_note_tests {
             .unwrap();
         assert_eq!(
             card_expiry_note(&card),
-            format!("expires {} (2 days)", local_date(card.expires_at()))
+            format!("expires {} (2 days)", local_date(card.not_after()))
         );
     }
 
@@ -1179,7 +1213,7 @@ mod expiry_note_tests {
     fn an_expired_card_shows_the_date_it_lapsed() {
         let now = duocb_core::auth::unix_now();
         let card = Identity::generate()
-            .card_issued_at(
+            .card_valid_from(
                 "phone",
                 "x9Y8z7W6",
                 now - duocb_core::auth::CARD_TTL_SECS - DAY,
@@ -1188,7 +1222,7 @@ mod expiry_note_tests {
         assert!(card.is_expired());
         assert_eq!(
             card_expiry_note(&card),
-            format!("EXPIRED {}", local_date(card.expires_at()))
+            format!("EXPIRED {}", local_date(card.not_after()))
         );
     }
 }
@@ -1240,10 +1274,55 @@ pub(crate) mod card_setup_tests {
         let _ = std::fs::remove_file(format!("{}.lock", path.display()));
     }
 
+    /// A not-yet-valid card: a peer whose window opens a day from now, as a
+    /// device with a clock a day slow would see every card it is handed.
+    fn future_peer_card(name: &str) -> IdentityCard {
+        let card = Identity::generate()
+            .card_valid_from(name, "x9Y8z7W6", duocb_core::auth::unix_now() + 24 * 60 * 60)
+            .unwrap();
+        assert!(card.is_not_yet_valid());
+        card
+    }
+
+    /// Joining a peer whose stored card has not started yet is refused before
+    /// the runtime is involved, with clock guidance rather than the
+    /// fetch-a-fresh-card advice, which would not help.
+    #[test]
+    fn joining_a_not_yet_valid_peer_points_at_the_clock() {
+        let (mut app, path) = configured_app();
+        let future = future_peer_card("laptop");
+        app.peers.push(future.clone());
+        app.selected_peer = Some(future.public_key().to_hex());
+
+        app.connect_client();
+
+        let error = app.error.clone().expect("the join must be refused");
+        assert!(error.contains("not valid until"), "{error}");
+        assert!(error.contains("clock"), "{error}");
+        assert!(!error.contains("fresh card"), "{error}");
+        cleanup(app, path);
+    }
+
+    /// A received card that has not started yet is refused too, and the user
+    /// is told to fix a clock instead of asking for another card.
+    #[test]
+    fn a_not_yet_valid_received_card_is_refused_with_clock_guidance() {
+        let (mut app, path) = configured_app();
+        app.apply_event(NetEvent::PeerCardReceived(Box::new(future_peer_card("laptop"))));
+
+        app.import_received_card();
+
+        assert!(app.peers.is_empty());
+        let error = app.error.clone().expect("the import must be refused");
+        assert!(error.contains("not valid until"), "{error}");
+        assert!(error.contains("clock"), "{error}");
+        cleanup(app, path);
+    }
+
     /// Some other device's card, issued `age_secs` ago.
     pub(crate) fn peer_card(name: &str, age_secs: u64) -> IdentityCard {
         Identity::generate()
-            .card_issued_at(name, "x9Y8z7W6", duocb_core::auth::unix_now() - age_secs)
+            .card_valid_from(name, "x9Y8z7W6", duocb_core::auth::unix_now() - age_secs)
             .unwrap()
     }
 
@@ -1598,7 +1677,7 @@ pub(crate) mod card_setup_tests {
         let (mut app, path) = configured_app();
         let identity = Identity::generate();
         let old = identity
-            .card_issued_at(
+            .card_valid_from(
                 "laptop",
                 "x9Y8z7W6",
                 duocb_core::auth::unix_now() - duocb_core::auth::CARD_TTL_SECS + 60,
@@ -1613,8 +1692,8 @@ pub(crate) mod card_setup_tests {
         app.import_received_card();
 
         assert_eq!(app.peers.len(), 1, "same key, same slot");
-        assert_eq!(app.peers[0].expires_at(), fresh.expires_at());
-        assert!(app.peers[0].expires_at() > old.expires_at());
+        assert_eq!(app.peers[0].not_after(), fresh.not_after());
+        assert!(app.peers[0].not_after() > old.not_after());
         cleanup(app, path);
     }
 

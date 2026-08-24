@@ -170,8 +170,13 @@ int duocb_create_identity_card(const char *private_key,
 int duocb_validate_identity_card(const char *card,
                                  char *err_buf,
                                  size_t err_len);
-/* Writes {name, short_name, suffix, public_key, npub, fingerprint, created_at,
- * expires_at, remaining_secs, expired, needs_renewal}. */
+/* Writes {name, short_name, suffix, public_key, npub, fingerprint, not_before,
+ * not_after, remaining_secs, expired, not_yet_valid, needs_renewal}. The card
+ * is usable only inside its signed [not_before, not_after) window, with five
+ * minutes of clock-skew grace on the opening edge: a card up to that far ahead
+ * of the local clock is valid and NOT flagged. `expired` is set outside the
+ * window on either side, and `not_yet_valid` singles out the early side,
+ * which means a wrong clock rather than a stale card. */
 int duocb_identity_card_info(const char *card, char *out_buf, size_t out_len);
 /* The single pairing code the card-setup confirmation screen shows: call with
  * this device's self-card and the received card (either order — the code is

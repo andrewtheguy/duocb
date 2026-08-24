@@ -28,27 +28,36 @@ The Slint event loop and tokio runtime communicate only with `UiCommand` and
 - wire/trust key: the 32-byte public key.
 
 An identity card is a signed kind `30382` Nostr event with the identifier
-`duocb:identity-card:v3` and a versioned JSON body containing the validated
+`duocb:identity-card:v4` and a versioned JSON body containing the validated
 final device name, `<short-name>_<permanent-random-suffix>`, and a mandatory
-absolute `expires_at`. The suffix is persisted separately from the application
+signed validity window, absolute `not_before` and `not_after` — the same shape
+as an X.509 certificate's notBefore/notAfter. The suffix is persisted separately from the application
 key so it remains stable across renames and identity resets; accepting a
 recovered self-card restores its suffix. Parsing checks the event signature,
 kind, identifier, schema, name and suffix rules, and 2 KiB size cap.
 
-### Card expiry
+### Card validity window
 
 Cards last 30 days; the application key has no expiry of its own, and a
-renewal is the same key signing a new card. Three of the parse checks concern expiry, and all three
-compare only signed fields, so parsing stays clock-free and deterministic:
+renewal is the same key signing a new card with a new window. Four of the
+parse checks concern the window, and all four compare only signed fields, so
+parsing stays clock-free and deterministic:
 
-- `expires_at` is after the event's `created_at`;
-- the claimed lifetime does not exceed 30 days, so an issuer cannot self-assert
+- `not_after` is after `not_before`;
+- the window does not exceed 30 days, so an issuer cannot self-assert
   unbounded trust;
-- the NIP-40 `expiration` tag equals the body's `expires_at`.
+- the event's `created_at` equals the body's `not_before`;
+- the NIP-40 `expiration` tag equals the body's `not_after`.
 
 Whether a card is *current* is a separate decision, made against the local
-clock only where trust is acted on. A card issued implausibly far in the future
-(beyond a five-minute skew grace) is never current, which bounds how far a fast
+clock only where trust is acted on, and it checks **both** edges:
+`not_before <= now < not_after`, with a five-minute skew grace on the opening
+edge only. The end alone would not do: a device whose clock is set far in the
+past never reaches any card's `not_after`, so it would honour every card ever
+issued, including ones that lapsed years ago. The signed start makes such a
+device reject the card as *not yet valid* — a state the UI reports separately
+from *expired*, since the remedy is fixing a clock, not fetching a fresh card
+that would fail the same way. The same check bounds how far a fast issuer
 clock can stretch a real lifetime.
 
 The clipboard handshake carries raw application public keys, never a card, so
@@ -327,9 +336,12 @@ wire clipboard frames are capped at 1 MiB.
 - Identity cards are transferred over a path the owner trusts: a clipboard the
   owner controls, or a card-setup connection whose pairing code the owner
   checked. Skipping that check reduces card setup's security to the PIN alone.
-- Card expiry bounds how long a leaked or abandoned card stays useful, but only
-  against a peer whose clock is roughly correct: expiry is enforced locally, so
-  a device whose clock is set far back keeps honouring a lapsed card.
+- A card's validity window bounds how long a leaked or abandoned card stays
+  useful, but only against a peer whose clock is roughly correct: the window is
+  enforced locally, so a device whose clock is wound back into a lapsed card's
+  historical window honours it again. What the signed `not_before` rules out is
+  the far cheaper mistake — a clock set before the window, which without it
+  would accept every card ever issued, and with it accepts none.
 - Possession of an application private key permits impersonating that
   installation and decrypting pairwise records addressed to it.
 - Nostr relays may omit, retain, reorder, or replay events, and anything on the

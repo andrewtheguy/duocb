@@ -5,12 +5,13 @@
 //! are short-lived transport identities used only to establish QUIC.
 //!
 //! An [`IdentityCard`] — the token one device hands another to be trusted —
-//! carries a mandatory expiry and lasts [`CARD_TTL_SECS`]. A card crosses the
+//! carries a mandatory signed validity window, `not_before` to `not_after`,
+//! spanning [`CARD_TTL_SECS`] like an X.509 certificate. A card crosses the
 //! wire only while being handed over: either by copy-paste, or over a card-setup
 //! session, where a PIN-authenticated connection carries it and the user
 //! confirms the [`pairing_code`] over both keys before it is stored (see
 //! `crate::card_exchange`). It never travels during a clipboard session — that
-//! handshake carries raw public keys — so expiry is enforced by each side
+//! handshake carries raw public keys — so the window is enforced by each side
 //! against its own stored copy: pairing is refused once that copy lapses, and
 //! the only way back is for the owner to hand over a fresh card.
 
@@ -25,23 +26,26 @@ use crate::identity::{display_identity, split_display_identity, validate_name};
 pub const MAX_TRUSTED_PEERS: usize = 128;
 pub const MAX_CARD_SIZE: usize = 2 * 1024;
 pub const IDENTITY_CARD_KIND: u16 = 30382;
-const IDENTITY_CARD_DTAG: &str = "duocb:identity-card:v3";
-const IDENTITY_CARD_VERSION: u32 = 3;
+const IDENTITY_CARD_DTAG: &str = "duocb:identity-card:v4";
+const IDENTITY_CARD_VERSION: u32 = 4;
 const AUTH_SIGNATURE_DOMAIN: &[u8] = b"duocb:key-auth:v3\0";
 
 /// How long a freshly minted card stays usable. Trust is not permanent: a
 /// pairing that nobody refreshes lapses on its own, and there is no renewal
 /// path other than the owner handing over a new card.
 pub const CARD_TTL_SECS: u64 = 30 * 24 * 60 * 60;
-/// A card issued slightly in the future — the peer's clock runs fast — is still
-/// honoured within this window. Beyond it the issue time is treated as bogus,
-/// which bounds how far a broken clock can stretch a card's real lifetime.
+/// A card whose `not_before` is slightly in the future — the peer's clock runs
+/// fast — is still honoured within this window. Beyond it the card is not yet
+/// valid: a reader whose clock is far in the past must not accept a card that,
+/// by the card's own signed window, has not started, any more than one that
+/// has ended. This also bounds how far a fast issuer clock can stretch a
+/// card's real lifetime.
 pub const CLOCK_SKEW_GRACE_SECS: u64 = 5 * 60;
 /// Re-mint the local self-card once it has less than this left, so the card the
 /// user copies always has most of its life ahead of it.
 pub const CARD_RENEW_BEFORE_SECS: u64 = 7 * 24 * 60 * 60;
 
-/// Seconds since the Unix epoch, the clock all card expiry is judged against.
+/// Seconds since the Unix epoch, the clock every card validity window is judged against.
 pub fn unix_now() -> u64 {
     Timestamp::now().as_secs()
 }
@@ -58,8 +62,8 @@ const FINGERPRINT_BYTES: usize = 10;
 /// trusted-peer rows show, and one half of the [`pairing_code`] compared
 /// during card setup.
 ///
-/// Taken over the **32-byte public key**, not the card: a card's `created_at`
-/// and signature change every time its owner re-mints it, while local trust is
+/// Taken over the **32-byte public key**, not the card: a card's validity
+/// window and signature change every time its owner re-mints it, while local trust is
 /// keyed on the public key. Fingerprinting the key means the value stays put
 /// across renewals, so it can also be re-checked out of band long after pairing.
 pub fn key_fingerprint(key: &PublicKey) -> String {
@@ -163,32 +167,34 @@ impl Identity {
 
     /// Mint a card valid for [`CARD_TTL_SECS`] from now.
     pub fn card(&self, name: &str, suffix: &str) -> Result<IdentityCard> {
-        self.card_issued_at(name, suffix, unix_now())
+        self.card_valid_from(name, suffix, unix_now())
     }
 
-    /// Mint a card with an explicit issue time. Backdating one past
-    /// [`CARD_TTL_SECS`] is how tests produce an expired card without waiting;
-    /// production code wants [`Self::card`].
-    pub fn card_issued_at(&self, name: &str, suffix: &str, issued_at: u64) -> Result<IdentityCard> {
+    /// Mint a card whose validity window opens at an explicit time. Backdating
+    /// one past [`CARD_TTL_SECS`] is how tests produce an expired card without
+    /// waiting, and post-dating one produces a not-yet-valid card; production
+    /// code wants [`Self::card`].
+    pub fn card_valid_from(&self, name: &str, suffix: &str, not_before: u64) -> Result<IdentityCard> {
         validate_name(name)?;
         let name = display_identity(name, suffix);
         split_display_identity(&name)?;
-        let expires_at = issued_at + CARD_TTL_SECS;
+        let not_after = not_before + CARD_TTL_SECS;
         let content = serde_json::to_string(&CardContent {
             version: IDENTITY_CARD_VERSION,
             name,
-            expires_at,
+            not_before,
+            not_after,
         })
         .context("serializing identity card")?;
-        // The issue time is pinned rather than left to the builder's clock so
-        // `expires_at - created_at` is exactly the TTL, which `from_event`
-        // re-checks on the other side.
+        // The event time is pinned to the start of the window rather than left
+        // to the builder's clock, so the card has exactly one signed opening
+        // time, which `from_event` re-checks on the other side.
         let event = EventBuilder::new(Kind::from_u16(IDENTITY_CARD_KIND), content)
             .tags([
                 Tag::identifier(IDENTITY_CARD_DTAG),
-                Tag::expiration(Timestamp::from_secs(expires_at)),
+                Tag::expiration(Timestamp::from_secs(not_after)),
             ])
-            .custom_created_at(Timestamp::from_secs(issued_at))
+            .custom_created_at(Timestamp::from_secs(not_before))
             .sign_with_keys(&self.keys)
             .context("signing identity card")?;
         IdentityCard::from_event(event)
@@ -229,14 +235,19 @@ pub fn verify_auth_signature(
 struct CardContent {
     version: u32,
     name: String,
-    /// Absolute Unix expiry. Mandatory: a card without one does not parse.
-    expires_at: u64,
+    /// Start of the signed validity window, absolute Unix seconds. Mandatory:
+    /// a reader must be able to tell that a card has not started, not only
+    /// that it has ended, or a clock set far in the past would accept every
+    /// card ever issued.
+    not_before: u64,
+    /// End of the signed validity window, absolute Unix seconds. Mandatory.
+    not_after: u64,
 }
 
 /// A verified portable identity card.
 ///
 /// Parsing is deliberately clock-free: it proves the card is well formed and
-/// authentic, never that it is still current. Expiry is a separate decision
+/// authentic, never that it is current. The window is a separate decision
 /// made by [`Self::is_valid_at`] at the points that act on trust, so a lapsed
 /// card still loads from disk and can be shown to the user instead of silently
 /// vanishing from the config.
@@ -244,7 +255,8 @@ struct CardContent {
 pub struct IdentityCard {
     event: Event,
     name: String,
-    expires_at: u64,
+    not_before: u64,
+    not_after: u64,
 }
 
 impl IdentityCard {
@@ -265,25 +277,29 @@ impl IdentityCard {
             );
         }
         split_display_identity(&content.name)?;
-        // Expiry checks that compare only signed fields against each other, so
+        // Window checks that compare only signed fields against each other, so
         // parsing stays deterministic and independent of the local clock.
-        let issued_at = event.created_at.as_secs();
-        if content.expires_at <= issued_at {
-            anyhow::bail!("identity card expires no later than it was issued");
+        if content.not_after <= content.not_before {
+            anyhow::bail!("identity card validity window ends no later than it starts");
         }
-        if content.expires_at - issued_at > CARD_TTL_SECS {
+        if content.not_after - content.not_before > CARD_TTL_SECS {
             anyhow::bail!("identity card claims a lifetime longer than {CARD_TTL_SECS} seconds");
         }
-        // The NIP-40 tag is redundant with the payload, but only if it agrees:
-        // a card must not read as long-lived to one reader and short-lived to
-        // another depending on which copy of the expiry it happens to trust.
-        if event.tags.expiration().map(Timestamp::as_secs) != Some(content.expires_at) {
-            anyhow::bail!("identity card expiration tag does not match its payload");
+        // The event's own timestamp and NIP-40 tag are redundant with the
+        // payload, but only if they agree: a card must not read as having one
+        // window to one reader and another to a reader that happens to trust
+        // the envelope instead of the body.
+        if event.created_at.as_secs() != content.not_before {
+            anyhow::bail!("identity card event time does not match its validity start");
+        }
+        if event.tags.expiration().map(Timestamp::as_secs) != Some(content.not_after) {
+            anyhow::bail!("identity card expiration tag does not match its validity end");
         }
         let card = Self {
             event,
             name: content.name,
-            expires_at: content.expires_at,
+            not_before: content.not_before,
+            not_after: content.not_after,
         };
         if card.encode().len() > MAX_CARD_SIZE {
             anyhow::bail!("identity card exceeds {MAX_CARD_SIZE} bytes");
@@ -336,34 +352,54 @@ impl IdentityCard {
         key_fingerprint(&self.public_key())
     }
 
-    pub fn created_at(&self) -> u64 {
-        self.event.created_at.as_secs()
+    /// Start of the signed validity window (Unix seconds).
+    pub fn not_before(&self) -> u64 {
+        self.not_before
     }
 
-    pub fn expires_at(&self) -> u64 {
-        self.expires_at
+    /// End of the signed validity window (Unix seconds); the card is unusable
+    /// from this second on.
+    pub fn not_after(&self) -> u64 {
+        self.not_after
     }
 
-    /// Whether this card may still be acted on at `now` (Unix seconds).
+    /// Whether `now` (Unix seconds) falls inside the signed validity window:
+    /// `not_before <= now < not_after`, with [`CLOCK_SKEW_GRACE_SECS`] of
+    /// tolerance on the opening edge only.
     ///
-    /// The issue-time half rejects a card stamped implausibly far in the
-    /// future: the payload check in `from_event` bounds a card's lifetime
-    /// relative to its own issue time, so without this a peer whose clock is
-    /// years fast could hand out a card that outlives the policy by exactly
-    /// that skew.
+    /// Both edges are checked against the caller's clock. A clock set far in
+    /// the past would otherwise pass every card, including ones that ended
+    /// years ago, because it never reaches their `not_after`; and a peer whose
+    /// clock is years fast could otherwise mint a card that outlives the
+    /// policy by exactly that skew, since `from_event` bounds the lifetime
+    /// only relative to the card's own `not_before`.
     pub fn is_valid_at(&self, now: u64) -> bool {
-        now < self.expires_at && self.created_at() <= now.saturating_add(CLOCK_SKEW_GRACE_SECS)
+        !self.is_not_yet_valid_at(now) && now < self.not_after
     }
 
-    /// [`Self::is_valid_at`] against the local clock.
+    /// Whether the window has not opened yet at `now`, beyond the skew grace.
+    /// Distinct from expiry so the user can be told the likely cause — a
+    /// clock that is wrong on one of the two devices — instead of being sent
+    /// to fetch a fresh card that would fail the same way.
+    pub fn is_not_yet_valid_at(&self, now: u64) -> bool {
+        self.not_before > now.saturating_add(CLOCK_SKEW_GRACE_SECS)
+    }
+
+    /// `!`[`Self::is_valid_at`] against the local clock: the card is outside
+    /// its window, on either side.
     pub fn is_expired(&self) -> bool {
         !self.is_valid_at(unix_now())
     }
 
-    /// Seconds of life left at `now`; zero once the card is unusable.
+    /// [`Self::is_not_yet_valid_at`] against the local clock.
+    pub fn is_not_yet_valid(&self) -> bool {
+        self.is_not_yet_valid_at(unix_now())
+    }
+
+    /// Seconds of life left at `now`; zero whenever the card is unusable.
     pub fn remaining_secs_at(&self, now: u64) -> u64 {
         if self.is_valid_at(now) {
-            self.expires_at - now
+            self.not_after - now
         } else {
             0
         }
@@ -387,22 +423,22 @@ mod tests {
         assert_eq!(parsed.short_name(), "mac-book");
         assert_eq!(parsed.suffix(), "a7B2c3D4");
         assert_eq!(parsed.public_key(), identity.public_key());
-        assert_eq!(parsed.expires_at(), parsed.created_at() + CARD_TTL_SECS);
+        assert_eq!(parsed.not_after(), parsed.not_before() + CARD_TTL_SECS);
         assert!(!parsed.is_expired());
     }
 
     /// The fingerprint the user cross-checks is a pure function of the public
-    /// key, so re-minting a card — which changes its `created_at` and signature,
+    /// key, so re-minting a card — which changes its window and signature,
     /// and therefore its bytes — must leave the displayed value untouched.
     /// Otherwise every renewal would look to the user like a different device.
     #[test]
     fn fingerprint_is_key_bound_and_survives_a_card_renewal() {
         let identity = Identity::generate();
         let early = identity
-            .card_issued_at("mac-book", "a7B2c3D4", 1_700_000_000)
+            .card_valid_from("mac-book", "a7B2c3D4", 1_700_000_000)
             .unwrap();
         let renewed = identity
-            .card_issued_at("mac-book", "a7B2c3D4", 1_700_000_000 + CARD_TTL_SECS)
+            .card_valid_from("mac-book", "a7B2c3D4", 1_700_000_000 + CARD_TTL_SECS)
             .unwrap();
         assert_ne!(early.encode(), renewed.encode(), "a renewal is a new card");
         assert_eq!(early.fingerprint(), renewed.fingerprint());
@@ -492,22 +528,49 @@ mod tests {
         assert!(pairing_code(&key, &key).is_err());
     }
 
-    /// A card is usable up to its expiry and dead the second after, and the
-    /// whole judgement comes from the caller's clock rather than the card.
+    /// A card is usable from the start of its window up to its end and dead
+    /// the second after, and the whole judgement comes from the caller's
+    /// clock rather than the card.
     #[test]
-    fn card_validity_is_bounded_by_its_expiry() {
-        let issued_at = 1_700_000_000;
+    fn card_validity_is_bounded_by_its_window() {
+        let not_before = 1_700_000_000;
         let card = Identity::generate()
-            .card_issued_at("desktop", "a7B2c3D4", issued_at)
+            .card_valid_from("desktop", "a7B2c3D4", not_before)
             .unwrap();
-        let expires_at = issued_at + CARD_TTL_SECS;
-        assert_eq!(card.expires_at(), expires_at);
+        let not_after = not_before + CARD_TTL_SECS;
+        assert_eq!(card.not_before(), not_before);
+        assert_eq!(card.not_after(), not_after);
 
-        assert!(card.is_valid_at(issued_at));
-        assert!(card.is_valid_at(expires_at - 1));
-        assert!(!card.is_valid_at(expires_at));
-        assert_eq!(card.remaining_secs_at(expires_at - 90), 90);
-        assert_eq!(card.remaining_secs_at(expires_at), 0);
+        assert!(card.is_valid_at(not_before));
+        assert!(card.is_valid_at(not_after - 1));
+        assert!(!card.is_valid_at(not_after));
+        assert_eq!(card.remaining_secs_at(not_after - 90), 90);
+        assert_eq!(card.remaining_secs_at(not_after), 0);
+    }
+
+    /// A reader whose clock is far in the past never reaches a card's
+    /// `not_after`, so the end check alone would accept every card ever
+    /// issued — including one that lapsed years ago. The signed start closes
+    /// that: a card is not valid before its window opens, and the state is
+    /// reported as "not yet valid" rather than "expired".
+    #[test]
+    fn cards_are_not_valid_before_their_window_on_a_slow_clock() {
+        let not_before = 1_700_000_000;
+        let card = Identity::generate()
+            .card_valid_from("desktop", "a7B2c3D4", not_before)
+            .unwrap();
+        let years_ago = not_before - 3 * 365 * 24 * 60 * 60;
+        assert!(!card.is_valid_at(years_ago));
+        assert!(card.is_not_yet_valid_at(years_ago));
+        assert_eq!(card.remaining_secs_at(years_ago), 0);
+
+        // The skew grace admits a slightly fast issuer, and no more.
+        assert!(card.is_valid_at(not_before - CLOCK_SKEW_GRACE_SECS));
+        assert!(!card.is_not_yet_valid_at(not_before - CLOCK_SKEW_GRACE_SECS));
+        assert!(!card.is_valid_at(not_before - CLOCK_SKEW_GRACE_SECS - 1));
+        assert!(card.is_not_yet_valid_at(not_before - CLOCK_SKEW_GRACE_SECS - 1));
+        // A lapsed card is expired, not "not yet valid".
+        assert!(!card.is_not_yet_valid_at(not_before + CARD_TTL_SECS));
     }
 
     /// An aged-out card must still parse — config load runs through the same
@@ -516,7 +579,7 @@ mod tests {
     fn expired_cards_still_parse_but_are_not_valid() {
         let issued_at = 1_700_000_000;
         let card = Identity::generate()
-            .card_issued_at("laptop", "a7B2c3D4", issued_at)
+            .card_valid_from("laptop", "a7B2c3D4", issued_at)
             .unwrap();
         let parsed = IdentityCard::parse(&card.encode()).unwrap();
         assert_eq!(parsed.name(), "laptop_a7B2c3D4");
@@ -529,24 +592,26 @@ mod tests {
     fn future_dated_cards_are_not_valid() {
         let now = 1_700_000_000;
         let card = Identity::generate()
-            .card_issued_at("desktop", "a7B2c3D4", now + 10 * CARD_TTL_SECS)
+            .card_valid_from("desktop", "a7B2c3D4", now + 10 * CARD_TTL_SECS)
             .unwrap();
         assert!(IdentityCard::parse(&card.encode()).is_ok());
         assert!(!card.is_valid_at(now));
         assert!(card.is_valid_at(now + 10 * CARD_TTL_SECS));
     }
 
-    /// Hand-built cards that disagree with the format's expiry rules are
-    /// rejected outright, so a peer cannot self-assert unbounded trust.
+    /// Hand-built cards that disagree with the format's window rules are
+    /// rejected outright, so a peer cannot self-assert unbounded trust or a
+    /// window that reads differently from its envelope.
     #[test]
-    fn cards_with_dishonest_expiry_are_rejected() {
+    fn cards_with_dishonest_windows_are_rejected() {
         let keys = Keys::generate();
-        let issued_at = 1_700_000_000;
-        let mint = |expires_at: u64, tag_expires_at: u64| {
+        let start = 1_700_000_000;
+        let mint = |not_before: u64, not_after: u64, created_at: u64, tag_expires_at: u64| {
             let content = serde_json::to_string(&CardContent {
                 version: IDENTITY_CARD_VERSION,
                 name: "desktop_a7B2c3D4".to_string(),
-                expires_at,
+                not_before,
+                not_after,
             })
             .unwrap();
             EventBuilder::new(Kind::from_u16(IDENTITY_CARD_KIND), content)
@@ -554,27 +619,32 @@ mod tests {
                     Tag::identifier(IDENTITY_CARD_DTAG),
                     Tag::expiration(Timestamp::from_secs(tag_expires_at)),
                 ])
-                .custom_created_at(Timestamp::from_secs(issued_at))
+                .custom_created_at(Timestamp::from_secs(created_at))
                 .sign_with_keys(&keys)
                 .unwrap()
                 .as_json()
         };
 
-        let honest = issued_at + CARD_TTL_SECS;
-        assert!(IdentityCard::parse(&mint(honest, honest)).is_ok());
+        let end = start + CARD_TTL_SECS;
+        assert!(IdentityCard::parse(&mint(start, end, start, end)).is_ok());
         // Longer than policy allows.
-        assert!(IdentityCard::parse(&mint(honest + 1, honest + 1)).is_err());
-        // Already dead when signed.
-        assert!(IdentityCard::parse(&mint(issued_at, issued_at)).is_err());
-        // Payload and NIP-40 tag disagree.
-        assert!(IdentityCard::parse(&mint(honest, honest - 60)).is_err());
+        assert!(IdentityCard::parse(&mint(start, end + 1, start, end + 1)).is_err());
+        // Ends when it starts, or before.
+        assert!(IdentityCard::parse(&mint(start, start, start, start)).is_err());
+        assert!(IdentityCard::parse(&mint(start, start - 1, start, start - 1)).is_err());
+        // Body window and event time disagree: a backdated envelope must not
+        // let a card claim an earlier start than it was signed for.
+        assert!(IdentityCard::parse(&mint(start, end, start - 60, end)).is_err());
+        assert!(IdentityCard::parse(&mint(start, end, start + 60, end)).is_err());
+        // Body and NIP-40 tag disagree.
+        assert!(IdentityCard::parse(&mint(start, end, start, end - 60)).is_err());
     }
 
-    /// The expiry is signed material, not an annotation a holder can edit.
+    /// The window is signed material, not an annotation a holder can edit.
     #[test]
-    fn extending_a_card_expiry_breaks_its_signature() {
+    fn extending_a_card_window_breaks_its_signature() {
         let card = Identity::generate()
-            .card_issued_at("desktop", "a7B2c3D4", 1_700_000_000)
+            .card_valid_from("desktop", "a7B2c3D4", 1_700_000_000)
             .unwrap();
         let stretched = card.encode().replace(
             &(1_700_000_000u64 + CARD_TTL_SECS).to_string(),

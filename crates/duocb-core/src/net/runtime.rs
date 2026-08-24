@@ -110,13 +110,21 @@ impl std::fmt::Display for ExpiredCard {
 
 impl std::error::Error for ExpiredCard {}
 
-/// The wording both roles use when their stored card for the other side has
-/// lapsed. Cards are local trust records — the clipboard handshake carries raw
-/// public keys, never a card — so each side judges its own copy, and both
-/// should say the same thing about it whether it surfaces as a listener refusal
-/// or a dialer's own pre-check. (A card does cross the wire during card setup,
-/// but that is the hand-over itself, not this handshake.)
+/// The wording both roles use when their stored card for the other side is
+/// outside its validity window. Cards are local trust records — the clipboard
+/// handshake carries raw public keys, never a card — so each side judges its
+/// own copy, and both should say the same thing about it whether it surfaces
+/// as a listener refusal or a dialer's own pre-check. (A card does cross the
+/// wire during card setup, but that is the hand-over itself, not this
+/// handshake.) A card whose window has not opened yet gets its own wording:
+/// one of the two clocks is wrong, and a fresh card would fail the same way.
 fn expired_card_message(card: &IdentityCard) -> String {
+    if card.is_not_yet_valid() {
+        return format!(
+            "The identity card for {} is not valid yet — check the clock on this device and on that one",
+            card.name()
+        );
+    }
     format!(
         "The identity card for {} expired — ask that device for a fresh card and import it again",
         card.name()
@@ -1386,6 +1394,9 @@ async fn run_hosting_publisher(
     // Only report a total failure to signal on the transition into it, so a
     // sustained outage does not repaint the banner every round.
     let mut reported = false;
+    // Peers already warned about below, so a clock that stays wrong does not
+    // repaint the banner every round.
+    let mut warned_not_yet_valid: Vec<nostr_sdk::PublicKey> = Vec::new();
 
     loop {
         let now = unix_now();
@@ -1395,6 +1406,20 @@ async fn run_hosting_publisher(
             .filter(|card| card.is_valid_at(now))
             .cloned()
             .collect();
+        // A peer whose stored card has not started yet is dropped from the
+        // records like a lapsed one, but silently dropping it would leave the
+        // other device seeing only "not hosting". The cause is a clock — most
+        // likely this device's — so say so here, where it can be fixed.
+        for card in identity.peers.iter().filter(|card| card.is_not_yet_valid_at(now)) {
+            if !warned_not_yet_valid.contains(&card.public_key()) {
+                warned_not_yet_valid.push(card.public_key());
+                log::warn!("Not hosting for {}: its card is not valid yet", card.name());
+                events.error(format!(
+                    "{} — that device cannot find this host until then",
+                    expired_card_message(card)
+                ));
+            }
+        }
         // Every trusted card lapsed while the session was up: withdraw the LAN
         // advertisements rather than leave records standing for peers that can
         // no longer pair. Only the local channel needs saying — the relay copy
@@ -2259,6 +2284,25 @@ mod tests {
         server.close().await;
     }
 
+    /// A stored card whose window has not opened yet is refused like a lapsed
+    /// one, but the message points at the clock instead of at a fresh card.
+    #[test]
+    fn a_future_peer_card_is_refused_with_clock_guidance() {
+        let future = Identity::generate()
+            .card_valid_from("client", "x9Y8z7W6", unix_now() + 24 * 60 * 60)
+            .unwrap();
+        assert!(future.is_expired() && future.is_not_yet_valid());
+        let message = expired_card_message(&future);
+        assert!(message.contains("not valid yet"), "{message}");
+        assert!(message.contains("clock"), "{message}");
+        assert!(!message.contains("fresh card"), "{message}");
+
+        let stale = Identity::generate()
+            .card_valid_from("client", "x9Y8z7W6", unix_now() - crate::auth::CARD_TTL_SECS - 1)
+            .unwrap();
+        assert!(expired_card_message(&stale).contains("expired"));
+    }
+
     /// The listener refuses a dialer whose key it trusts but whose stored card
     /// has lapsed, and refuses it before signing anything — so an expired peer
     /// cannot even harvest a proof of this device's identity. The dialer learns
@@ -2268,7 +2312,7 @@ mod tests {
         let server_identity = Identity::generate();
         let client_identity = Identity::generate();
         let stale = client_identity
-            .card_issued_at(
+            .card_valid_from(
                 "client",
                 "x9Y8z7W6",
                 unix_now() - crate::auth::CARD_TTL_SECS - 1,
@@ -2391,7 +2435,7 @@ mod tests {
         let identity = Identity::generate();
         let peer_identity = Identity::generate();
         let stale = peer_identity
-            .card_issued_at(
+            .card_valid_from(
                 "server",
                 "a7B2c3D4",
                 unix_now() - crate::auth::CARD_TTL_SECS - 1,
