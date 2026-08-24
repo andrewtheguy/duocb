@@ -71,12 +71,56 @@ impl SignalChannel {
     }
 }
 
+/// Which side of a trusted pair sets a clipboard session up. Both devices send
+/// and receive once the session is running; this only decides who listens and
+/// who dials. See [`session_role`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionRole {
+    /// Listen: publish the pairwise hosting record and accept the peer's dial
+    /// ([`ServerMode::Key`]).
+    Host,
+    /// Resolve the peer's hosting record and dial it ([`DialSpec::Key`]).
+    Dial,
+}
+
+/// Which of two trusted devices hosts the clipboard session between them.
+///
+/// One side has to listen and the other has to dial, but that is not a choice a
+/// user can make well: both people know which device they want to share with,
+/// neither knows (or should have to agree on) which one is supposed to press
+/// "start" first. So both devices pick the other from their trusted list and
+/// each calls this, which answers identically on both sides from the two
+/// application keys alone — no negotiation, no extra round trip, and nothing to
+/// get out of step when the two users act a minute apart.
+///
+/// The rule is the lower application key hosts, compared over the serialized
+/// public keys. Any total order would work; this one needs nothing but what
+/// both devices already hold, and it is stable for the life of a pairing, so
+/// the same device hosts every time and two runs of the same pair read the same
+/// way in a log.
+///
+/// `me == peer` cannot arise — a device refuses to trust its own card — and is
+/// reported as [`SessionRole::Host`] so a mistake there ends up visibly waiting
+/// rather than dialing itself.
+pub fn session_role(me: nostr_sdk::PublicKey, peer: nostr_sdk::PublicKey) -> SessionRole {
+    if me.to_bytes() <= peer.to_bytes() {
+        SessionRole::Host
+    } else {
+        SessionRole::Dial
+    }
+}
+
 /// How the server signals its current node id to the client.
 #[derive(Debug, Clone)]
 pub enum ServerMode {
-    /// Configure mode: publish a pairwise hosting record for each trusted peer
-    /// on every enabled channel, and authenticate with the persistent
-    /// application key.
+    /// Configure mode: publish the pairwise hosting record addressed to the one
+    /// peer this session is for on every enabled channel, and authenticate with
+    /// the persistent application key.
+    ///
+    /// The peer is the device the user picked, and it is the only one this
+    /// session will signal to or accept — [`session_role`] gave this device the
+    /// hosting half of *that* pairing, and a second trusted device dialing in
+    /// meanwhile would be a different session the user never asked for.
     ///
     /// Like [`CardSetup`](Self::CardSetup), the host publishes everywhere it can
     /// rather than falling back — it cannot know which channel the joiner will
@@ -86,6 +130,7 @@ pub enum ServerMode {
     /// [`DialSpec::Key`]; they are ignored on [`SignalChannel::LanOnly`].
     Key {
         identity: Box<KeyIdentity>,
+        peer_public_key: nostr_sdk::PublicKey,
         channel: SignalChannel,
     },
     /// Card setup: show a rotating PIN, publish the rendezvous record under
@@ -183,8 +228,11 @@ pub enum ConnStatus {
     Idle,
     /// Session starting (endpoint coming online).
     Starting,
-    /// Server: listening, no peer yet.
-    Listening,
+    /// Ready, but the other device is not here yet. Both roles report it: the
+    /// hosting half is listening for the dial, and the dialing half has not
+    /// found the peer's hosting record — since the two users pick each other
+    /// independently, either can be waiting on the other.
+    Waiting,
     /// Client: resolving the target — a peer's hosting record or the card-setup
     /// PIN rendezvous, on whichever channel(s) are enabled.
     Resolving,
@@ -194,8 +242,10 @@ pub enum ConnStatus {
     Authenticating,
     /// Paired and the clipboard channel is up.
     Connected,
-    /// Client: waiting to retry after a failed/dropped connection, showing the
-    /// current attempt against the give-up bound (fixed-interval retry).
+    /// Client: waiting to retry after a connection that had been established
+    /// dropped, showing the current attempt against the give-up bound
+    /// (fixed-interval retry). A dialer that has never connected reports
+    /// [`Waiting`](Self::Waiting) instead and never gives up.
     Reconnecting { attempt: u32, max: u32 },
 }
 
@@ -328,5 +378,30 @@ pub fn spawn_net_runtime(wake: Option<WakeFn>, secret: iroh::SecretKey) -> NetHa
         cmd_tx,
         events: event_rx,
         thread: Some(thread),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::Identity;
+
+    /// The rule's whole job: two devices that have never spoken, each holding
+    /// only the pair of application keys, must reach *opposite* conclusions —
+    /// and the same one every time, so a session started twice is the same
+    /// session twice.
+    #[test]
+    fn exactly_one_side_of_a_pair_hosts_and_it_never_changes() {
+        for _ in 0..64 {
+            let me = Identity::generate().public_key();
+            let peer = Identity::generate().public_key();
+
+            assert_ne!(
+                session_role(me, peer),
+                session_role(peer, me),
+                "both devices must not pick the same half"
+            );
+            assert_eq!(session_role(me, peer), session_role(me, peer));
+        }
     }
 }

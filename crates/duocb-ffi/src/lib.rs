@@ -20,7 +20,7 @@
 //!    — fire-and-forget commands whose outcomes arrive as events.
 //! 4. [`duocb_stop`] — shut the runtime down and free the handle.
 //!
-//! # The four roles
+//! # The three roles
 //!
 //! There is deliberately **no "hub" role**. The hub is pure local state — the
 //! trusted-device list is read from the app's own storage, nothing is broadcast
@@ -29,10 +29,17 @@
 //!
 //! | role | core mapping | what it does |
 //! | --- | --- | --- |
-//! | `start` | [`ServerMode::Key`] | host a clipboard session for trusted peers |
-//! | `join` | [`DialSpec::Key`] | dial exactly one trusted peer by public key |
+//! | `connect` | [`ServerMode::Key`] or [`DialSpec::Key`] | share the clipboard with one trusted peer |
 //! | `card_host` | [`ServerMode::CardSetup`] | show a rotating PIN and trade cards |
 //! | `card_join` | [`DialSpec::CardSetup`] | dial a typed PIN and trade cards |
+//!
+//! `connect` names a *device*, never a half of the connection: it takes the
+//! chosen peer's public key, and [`duocb_core::net::session_role`] decides from
+//! the two application keys whether this device hosts or dials. Both devices
+//! send the identical config and reach opposite answers, so nothing in the app
+//! has to ask the user who goes first. [`duocb_session_role`] answers the same
+//! question without starting anything, for a screen that wants to say which
+//! device is setting the link up.
 //!
 //! The two `card_*` roles never carry clipboard traffic. They exist to bootstrap
 //! trust between two devices that have no shared clipboard to paste a card
@@ -85,7 +92,8 @@ use duocb_core::auth::{CARD_RENEW_BEFORE_SECS, Identity, IdentityCard, MAX_TRUST
 use duocb_core::iroh;
 use duocb_core::net::endpoint::ConnPathKind;
 use duocb_core::net::{
-    ConnStatus, DialSpec, EventSender, KeyIdentity, NetEvent, ServerMode, SignalChannel, UiCommand,
+    ConnStatus, DialSpec, EventSender, KeyIdentity, NetEvent, ServerMode, SessionRole,
+    SignalChannel, UiCommand, session_role,
 };
 
 /// Process-global guard: at most one running session per process.
@@ -120,17 +128,18 @@ struct FfiConfig {
     /// within one process.
     #[serde(default)]
     iroh_secret: Option<String>,
-    /// `start`/`join`: this installation's NIP-19 `nsec`.
+    /// `connect`: this installation's NIP-19 `nsec`.
     #[serde(default)]
     identity_secret: Option<String>,
     /// Every role: this installation's persisted signed self-card.
     #[serde(default)]
     self_card: Option<String>,
-    /// `start`/`join`: locally trusted signed cards (max [`MAX_TRUSTED_PEERS`]).
+    /// `connect`: locally trusted signed cards (max [`MAX_TRUSTED_PEERS`]).
     #[serde(default)]
     peers: Vec<String>,
-    /// `join` only: the selected peer's hex or NIP-19 public key. Must name a
-    /// card in `peers`.
+    /// `connect` only: the chosen peer's hex or NIP-19 public key. Must name a
+    /// card in `peers`. It says which *device* to share with, not which half of
+    /// the connection to run.
     #[serde(default)]
     peer_public_key: Option<String>,
     /// `card_join` only: the PIN shown on the hosting device, in any user-typed
@@ -185,10 +194,9 @@ impl Channel {
 #[derive(Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Role {
-    /// Host a clipboard session for locally trusted peers.
-    Start,
-    /// Dial one locally trusted peer.
-    Join,
+    /// Share the clipboard with one chosen trusted peer, hosting or dialing as
+    /// [`session_role`] decides.
+    Connect,
     /// Card setup: show a rotating PIN and trade identity cards.
     CardHost,
     /// Card setup: dial a typed PIN and trade identity cards.
@@ -491,6 +499,41 @@ pub unsafe extern "C" fn duocb_pairing_code(
         return -1;
     };
     write_result(out_buf, out_len, &code)
+}
+
+/// Which half of a clipboard session this device runs with a given peer:
+/// 1 = this device hosts (it listens and publishes the hosting record),
+/// 0 = this device dials, -1 for invalid input (either card fails verification,
+/// or both carry the same key).
+///
+/// Pure: it starts nothing and touches no network. [`duocb_start`] applies the
+/// same rule to the config it is given, so this is only for telling the user
+/// which device is setting the link up — never a switch the app has to set.
+/// The peer's device runs the opposite half from the identical pair of cards.
+/// # Safety
+/// `self_card` and `peer_card` must be NUL-terminated UTF-8.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn duocb_session_role(
+    self_card: *const c_char,
+    peer_card: *const c_char,
+) -> c_int {
+    let (Some(mine), Some(theirs)) =
+        (unsafe { cstr_arg(self_card) }, unsafe { cstr_arg(peer_card) })
+    else {
+        return -1;
+    };
+    let (Ok(mine), Ok(theirs)) = (IdentityCard::parse(mine), IdentityCard::parse(theirs)) else {
+        return -1;
+    };
+    // One key in both slots is a caller mistake, not a pairing: it would report
+    // "hosting" for a session that can never have another end.
+    if mine.public_key() == theirs.public_key() {
+        return -1;
+    }
+    match session_role(mine.public_key(), theirs.public_key()) {
+        SessionRole::Host => 1,
+        SessionRole::Dial => 0,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -832,8 +875,8 @@ fn build_start_plan(cfg: FfiConfig) -> Result<StartPlan, String> {
     if cfg.role != Role::CardJoin && (cfg.pin.is_some() || cfg.ip.is_some()) {
         return Err("pin and ip are only valid for the card_join role".into());
     }
-    if cfg.role != Role::Join && cfg.peer_public_key.is_some() {
-        return Err("peer_public_key is only valid for the join role".into());
+    if cfg.role != Role::Connect && cfg.peer_public_key.is_some() {
+        return Err("peer_public_key is only valid for the connect role".into());
     }
 
     match cfg.role {
@@ -873,7 +916,7 @@ fn build_start_plan(cfg: FfiConfig) -> Result<StartPlan, String> {
                 },
             }));
         }
-        Role::Start | Role::Join => {}
+        Role::Connect => {}
     }
 
     let identity = Identity::parse_nsec(
@@ -908,36 +951,40 @@ fn build_start_plan(cfg: FfiConfig) -> Result<StartPlan, String> {
         relays,
     };
 
-    Ok(match cfg.role {
-        Role::Start => StartPlan::host(iroh_secret, UiCommand::StartServer {
-            mode: ServerMode::Key {
-                identity: Box::new(key_identity),
-                channel,
-            },
-        }),
-        Role::Join => {
-            let selected = cfg
-                .peer_public_key
-                .as_deref()
-                .map(str::trim)
-                .filter(|key| !key.is_empty())
-                .ok_or("peer_public_key is required for join")?;
-            let peer_public_key = key_identity
-                .peers
-                .iter()
-                .find(|peer| peer.public_key().to_hex() == selected || peer.npub() == selected)
-                .map(IdentityCard::public_key)
-                .ok_or("peer_public_key is not in the local trusted peer list")?;
-            StartPlan::dial(iroh_secret, UiCommand::Connect {
+    let selected = cfg
+        .peer_public_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .ok_or("peer_public_key is required for connect")?;
+    let peer_public_key = key_identity
+        .peers
+        .iter()
+        .find(|peer| peer.public_key().to_hex() == selected || peer.npub() == selected)
+        .map(IdentityCard::public_key)
+        .ok_or("peer_public_key is not in the local trusted peer list")?;
+
+    // The one place the halves part company. Both devices are given the same
+    // kind of config — "share with that device" — and this rule, computed from
+    // the two application keys, hands exactly one of them the listening half.
+    Ok(
+        match session_role(key_identity.identity.public_key(), peer_public_key) {
+            SessionRole::Host => StartPlan::host(iroh_secret, UiCommand::StartServer {
+                mode: ServerMode::Key {
+                    identity: Box::new(key_identity),
+                    peer_public_key,
+                    channel,
+                },
+            }),
+            SessionRole::Dial => StartPlan::dial(iroh_secret, UiCommand::Connect {
                 spec: DialSpec::Key {
                     identity: Box::new(key_identity),
                     peer_public_key,
                     channel,
                 },
-            })
-        }
-        Role::CardHost | Role::CardJoin => unreachable!("handled above"),
-    })
+            }),
+        },
+    )
 }
 
 /// Drain one pending event as a NUL-terminated JSON string.
@@ -1153,7 +1200,7 @@ fn event_json(event: &NetEvent) -> String {
             let state = match status {
                 ConnStatus::Idle => "idle",
                 ConnStatus::Starting => "starting",
-                ConnStatus::Listening => "listening",
+                ConnStatus::Waiting => "waiting",
                 ConnStatus::Resolving => "resolving",
                 ConnStatus::Connecting => "connecting",
                 ConnStatus::Authenticating => "authenticating",
@@ -1284,6 +1331,28 @@ mod tests {
         hex::encode(iroh::SecretKey::generate().to_bytes())
     }
 
+    /// A trusted peer that puts `me` on the named half of the session. The
+    /// halves fall out of the two keys, so a test that needs one picks a peer
+    /// for it.
+    fn peer_for_role(me: &Identity, role: SessionRole) -> Identity {
+        std::iter::repeat_with(Identity::generate)
+            .find(|peer| session_role(me.public_key(), peer.public_key()) == role)
+            .expect("keys are random, so both halves come up quickly")
+    }
+
+    /// The config an app sends for "share the clipboard with that device" —
+    /// identical on both devices bar their own keys.
+    fn connect_config(nsec: &str, card: &str, peer: &Identity) -> serde_json::Value {
+        let peer_card = peer.card("pixel", "9zKtm4Qp").unwrap();
+        serde_json::json!({
+            "role": "connect",
+            "identity_secret": nsec,
+            "self_card": card,
+            "peers": [peer_card.encode()],
+            "peer_public_key": peer.public_key().to_hex(),
+        })
+    }
+
     /// Parse and resolve a config, supplying an `iroh_secret` when the test
     /// did not set one so each test states only what it is about.
     fn build(json: &str) -> Result<StartPlan, String> {
@@ -1296,12 +1365,12 @@ mod tests {
 
     #[test]
     fn iroh_secret_is_required_and_must_be_32_hex_bytes() {
-        let (nsec, card) = identity_with_card();
-        let base = serde_json::json!({
-            "role": "start",
-            "identity_secret": nsec,
-            "self_card": card,
-        });
+        let identity = Identity::generate();
+        let (nsec, card) = (
+            identity.to_nsec(),
+            identity.card("mac-book", "a7B2c3D4").unwrap().encode(),
+        );
+        let base = connect_config(&nsec, &card, &Identity::generate());
         let without = build_start_plan(serde_json::from_value(base.clone()).unwrap());
         assert!(without.unwrap_err().contains("iroh_secret is required"));
 
@@ -1344,61 +1413,92 @@ mod tests {
         assert_eq!(slot.get().unwrap().public(), first.public());
     }
 
+    /// The app sends one kind of config — "share with that device" — and this
+    /// layer, not the app, works out which half it runs. Both halves must come
+    /// out of the identical request shape, with the matching disconnect command:
+    /// a hosting device that hung up like a dialer would leave its record
+    /// published.
     #[test]
-    fn start_maps_to_a_key_server_on_the_default_channel() {
-        let (nsec, card) = identity_with_card();
-        let json = serde_json::json!({
-            "role": "start",
-            "identity_secret": nsec,
-            "self_card": card,
-        })
-        .to_string();
-        let resolved = build(&json).expect("valid start config");
+    fn connect_picks_the_half_from_the_two_keys() {
+        let identity = Identity::generate();
+        let (nsec, card) = (
+            identity.to_nsec(),
+            identity.card("mac-book", "a7B2c3D4").unwrap().encode(),
+        );
+
+        let host_peer = peer_for_role(&identity, SessionRole::Host);
+        let resolved = build(&connect_config(&nsec, &card, &host_peer).to_string())
+            .expect("valid connect config");
         match resolved.session_cmd {
             UiCommand::StartServer {
-                mode: ServerMode::Key { channel, .. },
-            } => assert_eq!(channel, SignalChannel::LanThenNostr),
-            other => panic!("unexpected command: {other:?}"),
+                mode:
+                    ServerMode::Key {
+                        peer_public_key,
+                        channel,
+                        ..
+                    },
+            } => {
+                assert_eq!(peer_public_key, host_peer.public_key());
+                assert_eq!(channel, SignalChannel::LanThenNostr);
+            }
+            other => panic!("expected the hosting half, got: {other:?}"),
         }
         assert!(matches!(resolved.disconnect_cmd, UiCommand::StopServer));
+
+        let dial_peer = peer_for_role(&identity, SessionRole::Dial);
+        let resolved = build(&connect_config(&nsec, &card, &dial_peer).to_string())
+            .expect("valid connect config");
+        match resolved.session_cmd {
+            UiCommand::Connect {
+                spec:
+                    DialSpec::Key {
+                        peer_public_key,
+                        channel,
+                        ..
+                    },
+            } => {
+                assert_eq!(peer_public_key, dial_peer.public_key());
+                assert_eq!(channel, SignalChannel::LanThenNostr);
+            }
+            other => panic!("expected the dialing half, got: {other:?}"),
+        }
+        assert!(matches!(resolved.disconnect_cmd, UiCommand::Disconnect));
     }
 
     #[test]
-    fn join_resolves_the_selected_peer_and_rejects_a_stranger() {
+    fn connect_resolves_the_selected_peer_and_rejects_a_stranger() {
         let (nsec, card) = identity_with_card();
         let peer = Identity::generate();
         let peer_card = peer.card("pixel", "9zKtm4Qp").unwrap();
-        let base = serde_json::json!({
-            "role": "join",
-            "identity_secret": nsec,
-            "self_card": card,
-            "peers": [peer_card.encode()],
-        });
+        let base = connect_config(&nsec, &card, &peer);
 
-        let mut cfg = base.clone();
-        cfg["peer_public_key"] = serde_json::json!(peer.public_key().to_hex());
-        let resolved = build(&cfg.to_string()).expect("hex public key selects the peer");
-        match resolved.session_cmd {
-            UiCommand::Connect {
-                spec: DialSpec::Key {
-                    peer_public_key, ..
-                },
-            } => assert_eq!(peer_public_key, peer.public_key()),
-            other => panic!("unexpected command: {other:?}"),
-        }
+        assert!(
+            build(&base.to_string()).is_ok(),
+            "the hex public key selects the peer"
+        );
 
         // The npub form of the same key is accepted too.
         let mut cfg = base.clone();
         cfg["peer_public_key"] = serde_json::json!(peer_card.npub());
         assert!(build(&cfg.to_string()).is_ok(), "npub selects the peer");
 
-        // A key that is not in the local trusted list never dials.
-        let mut cfg = base;
+        // A key that is not in the local trusted list never starts a session.
+        let mut cfg = base.clone();
         cfg["peer_public_key"] = serde_json::json!(Identity::generate().public_key().to_hex());
         assert!(
             build(&cfg.to_string())
                 .unwrap_err()
                 .contains("not in the local trusted peer list")
+        );
+
+        // And a session always names the device it is for: without a peer there
+        // is no pairing, and so no half to compute.
+        let mut cfg = base;
+        cfg.as_object_mut().unwrap().remove("peer_public_key");
+        assert!(
+            build(&cfg.to_string())
+                .unwrap_err()
+                .contains("peer_public_key is required")
         );
     }
 
@@ -1406,14 +1506,10 @@ mod tests {
     fn a_self_card_signed_by_another_key_is_refused() {
         let (nsec, _) = identity_with_card();
         let other_card = Identity::generate().card("pixel", "9zKtm4Qp").unwrap();
-        let json = serde_json::json!({
-            "role": "start",
-            "identity_secret": nsec,
-            "self_card": other_card.encode(),
-        })
-        .to_string();
+        let mut cfg = connect_config(&nsec, &other_card.encode(), &Identity::generate());
+        cfg["self_card"] = serde_json::json!(other_card.encode());
         assert!(
-            build(&json)
+            build(&cfg.to_string())
                 .unwrap_err()
                 .contains("not signed by identity_secret")
         );
@@ -1523,14 +1619,13 @@ mod tests {
     #[test]
     fn cross_role_fields_are_rejected_rather_than_ignored() {
         let (nsec, card) = identity_with_card();
-        let json = serde_json::json!({
-            "role": "start",
-            "identity_secret": nsec,
-            "self_card": card.clone(),
-            "pin": "K7P29QXM",
-        })
-        .to_string();
-        assert!(build(&json).unwrap_err().contains("only valid for the card_join role"));
+        let mut cfg = connect_config(&nsec, &card, &Identity::generate());
+        cfg["pin"] = serde_json::json!("K7P29QXM");
+        assert!(
+            build(&cfg.to_string())
+                .unwrap_err()
+                .contains("only valid for the card_join role")
+        );
 
         // The same rule covers card_host, which has neither a PIN nor a
         // side-channel IP of its own: it *shows* a PIN rather than dialling one.
@@ -1569,6 +1664,28 @@ mod tests {
         assert_eq!(info["expired"], true);
         assert_eq!(info["not_yet_valid"], true);
         assert_eq!(info["remaining_secs"], 0);
+    }
+
+    /// Both devices ask this from the same two cards and must be told opposite
+    /// things — that is the whole point of not asking the user.
+    #[test]
+    fn session_role_is_opposite_on_the_two_devices() {
+        let a = Identity::generate().card("mac-book", "a7B2c3D4").unwrap();
+        let b = Identity::generate().card("pixel", "9zKtm4Qp").unwrap();
+        let card = |c: &IdentityCard| std::ffi::CString::new(c.encode()).unwrap();
+        let (card_a, card_b) = (card(&a), card(&b));
+        let role = |mine: &std::ffi::CString, theirs: &std::ffi::CString| unsafe {
+            duocb_session_role(mine.as_ptr(), theirs.as_ptr())
+        };
+
+        let mine = role(&card_a, &card_b);
+        assert!(mine == 0 || mine == 1);
+        assert_eq!(role(&card_b, &card_a), 1 - mine, "exactly one device hosts");
+
+        // The same card in both slots is not a pairing.
+        assert_eq!(role(&card_a, &card_a), -1);
+        let junk = std::ffi::CString::new("not a card").unwrap();
+        assert_eq!(role(&card_a, &junk), -1);
     }
 
     /// The pairing code the confirmation screens render must be identical no

@@ -1,7 +1,9 @@
 //! Headless application-key configure-mode peer for E2E tests.
 //!
+//! Which side hosts is not configured: both peers run this the same way and
+//! `session_role` picks the listener from the two application keys.
+//!
 //! Environment:
-//! - `DUOCB_ROLE=start|join`
 //! - `DUOCB_NSEC` persistent identity private key (generated when omitted)
 //! - `DUOCB_NAME` local name (default `headless`)
 //! - `DUOCB_SUFFIX` persistent device suffix
@@ -15,7 +17,8 @@ use std::time::Duration;
 
 use duocb_core::auth::{Identity, IdentityCard};
 use duocb_core::net::{
-    DialSpec, KeyIdentity, NetEvent, ServerMode, SignalChannel, UiCommand, spawn_net_runtime,
+    DialSpec, KeyIdentity, NetEvent, ServerMode, SessionRole, SignalChannel, UiCommand,
+    session_role, spawn_net_runtime,
 };
 
 fn main() {
@@ -54,21 +57,23 @@ fn main() {
     };
 
     let net = spawn_net_runtime(None, duocb_core::iroh::SecretKey::generate());
-    match std::env::var("DUOCB_ROLE").as_deref() {
-        Ok("start") => net.send(UiCommand::StartServer {
+    let role = session_role(identity.public_key(), peer.public_key());
+    println!("role: {role:?}");
+    match role {
+        SessionRole::Host => net.send(UiCommand::StartServer {
             mode: ServerMode::Key {
                 identity: Box::new(configured),
+                peer_public_key: peer.public_key(),
                 channel,
             },
         }),
-        Ok("join") => net.send(UiCommand::Connect {
+        SessionRole::Dial => net.send(UiCommand::Connect {
             spec: DialSpec::Key {
                 identity: Box::new(configured),
                 peer_public_key: peer.public_key(),
                 channel,
             },
         }),
-        _ => panic!("DUOCB_ROLE must be start or join"),
     }
 
     let mut pending_send = std::env::var("DUOCB_SEND").ok();

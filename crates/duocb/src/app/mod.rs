@@ -55,11 +55,20 @@ pub(crate) struct App {
     pub(crate) peers: Vec<IdentityCard>,
     /// Selected peer by hex application public key.
     pub(crate) selected_peer: Option<String>,
-    pub(crate) joined_peer: Option<String>,
+    /// The display identity of the device the running (or last) session is
+    /// with, kept after it ends so Retry knows what it would dial again.
+    pub(crate) session_peer: Option<String>,
     pub(crate) confirm_reset_identity: bool,
 
-    // Server presentation state.
-    pub(crate) server_running: bool,
+    // Session presentation state.
+    /// A session is running — a clipboard session of either half, or a card
+    /// exchange. Cleared when the runtime reports [`ConnStatus::Idle`].
+    pub(crate) session_active: bool,
+    /// Whether the running session's setup half is this device's: hosting a
+    /// clipboard session (decided by [`duocb_core::net::session_role`], not by
+    /// the user) or showing a card-setup PIN. Meaningless while
+    /// `session_active` is false.
+    pub(crate) session_hosting: bool,
     pub(crate) node_id: Option<String>,
     /// This host's LAN IPv4, surfaced so the joiner can type it for the
     /// manual-IP side channel (from [`NetEvent::PinRotated`]); `None` before an
@@ -77,9 +86,6 @@ pub(crate) struct App {
     /// confirmation screen always outlives the session that produced it. Cleared
     /// only by Import or Cancel.
     pub(crate) pending_peer_card: Option<IdentityCard>,
-
-    // Client-side session flag (a dial session exists, connected or retrying).
-    pub(crate) client_active: bool,
 
     // Form inputs (mirrors of the UI's two-way field properties, updated on
     // every edit; authoritative — sync writes them back, which is how resets
@@ -275,16 +281,16 @@ impl App {
             configure_step,
             peers,
             selected_peer: None,
-            joined_peer: None,
+            session_peer: None,
             confirm_reset_identity: false,
-            server_running: false,
+            session_active: false,
+            session_hosting: false,
             node_id: None,
             host_lan_ip: None,
             identity_public_key: None,
             pin_display: None,
             pin_deadline: None,
             pending_peer_card: None,
-            client_active: false,
             in_my_name: saved_name.unwrap_or_default(),
             in_private_key: String::new(),
             in_peer_card: String::new(),
@@ -401,8 +407,7 @@ impl App {
                     // presentation state. The inbox and outbox are kept — items
                     // are only discarded via the explicit Clear button; a
                     // never-confirmed pending send is dropped.
-                    self.server_running = false;
-                    self.client_active = false;
+                    self.session_active = false;
                     self.node_id = None;
                     self.host_lan_ip = None;
                     self.identity_public_key = None;
@@ -413,9 +418,10 @@ impl App {
                     // reset here: a card-setup session goes idle the instant the
                     // cards cross, so clearing them would wipe the confirmation
                     // screen out from under the user the moment it appeared.
-                    // `joined_peer` survives too: a join that gave up (retries
-                    // exhausted) stays on its screen, inbox and outbox intact,
-                    // and offers Retry for the same peer (see `retry_available`).
+                    // `session_peer` survives too: a session that gave up
+                    // (retries exhausted) stays on its screen, inbox and outbox
+                    // intact, and offers Retry for the same device (see
+                    // `retry_available`).
                     self.conn_path = None;
                     self.pending_outbox = None;
                 }
@@ -665,11 +671,11 @@ impl App {
             .find(|peer| peer.public_key().to_hex() == key)
     }
 
-    pub(crate) fn enter_join_picker(&mut self) {
-        self.configure_step = ConfigureStep::Join;
+    pub(crate) fn open_connect_picker(&mut self) {
+        self.configure_step = ConfigureStep::Connect;
     }
 
-    pub(crate) fn leave_join_picker(&mut self) {
+    pub(crate) fn close_connect_picker(&mut self) {
         self.configure_step = ConfigureStep::Ready;
     }
 
@@ -681,11 +687,14 @@ impl App {
         };
     }
 
-    /// Join the selected peer from the device picker.
-    pub(crate) fn join_selected_peer(&mut self) {
-        if self.client_dial_spec().is_some() {
-            self.screen = Screen::Client;
-            self.connect_client();
+    /// Connect to the selected peer from the device picker. The other device
+    /// runs this same action for this one; which of the two hosts is settled by
+    /// [`duocb_core::net::session_role`], so neither user has to go first or
+    /// pick a role.
+    pub(crate) fn connect_selected_peer(&mut self) {
+        if self.session_plan().is_some() {
+            self.screen = Screen::Session;
+            self.start_clipboard_session();
         }
     }
 
@@ -737,7 +746,7 @@ impl App {
             return false;
         }
         // Storing a card outside its window would record trust that cannot
-        // pair, so refuse it here rather than at the first Join.
+        // pair, so refuse it here rather than at the first Connect.
         if card.is_expired() {
             self.error = Some(unusable_card_message(&card, "get a fresh one from the other device"));
             return false;
@@ -775,24 +784,40 @@ impl App {
         self.sent_flash.is_some_and(|t| t.elapsed() < SENT_FLASH)
     }
 
-    /// Whether a join ended on its own (retries exhausted or refused) and can
-    /// be retried in place: the peer is still known but no session is running.
+    /// Whether a session ended on its own (retries exhausted or refused) and
+    /// can be started again in place: the peer is still known but nothing is
+    /// running.
     pub(crate) fn retry_available(&self) -> bool {
-        !self.client_active && self.joined_peer.is_some()
+        !self.session_active && self.session_peer.is_some()
     }
 
     /// Whether a clipboard session exists to show the session panel for —
-    /// running, retrying, or waiting for Retry after the joiner gave up.
+    /// running, retrying, or waiting for Retry after it gave up.
     pub(crate) fn session_live(&self) -> bool {
-        self.server_running || self.client_active || self.retry_available()
+        self.session_active || self.retry_available()
     }
 
-    /// Dial the same peer again after the join gave up. The give-up error
-    /// banner is stale the moment a new attempt starts, so it goes first.
+    /// Connect to the same peer again after the session gave up. The give-up
+    /// error banner is stale the moment a new attempt starts, so it goes first.
     pub(crate) fn retry_connection(&mut self) {
         if self.retry_available() {
             self.error = None;
-            self.connect_client();
+            self.start_clipboard_session();
+        }
+    }
+
+    /// One line naming which device is setting the link up, for the connection
+    /// screen. Empty when no session is running: the split only explains what
+    /// the status line is waiting for, and there is nothing to explain then.
+    pub(crate) fn session_role_note(&self) -> String {
+        if !self.session_active || self.screen != Screen::Session {
+            return String::new();
+        }
+        let peer = self.session_peer.as_deref().unwrap_or("the other device");
+        if self.session_hosting {
+            format!("This device is hosting the link; {peer} connects to it.")
+        } else {
+            format!("{peer} is hosting the link; this device connects to it.")
         }
     }
 
@@ -802,8 +827,11 @@ impl App {
             ConnStatus::Idle if self.retry_available() => "Disconnected".to_string(),
             ConnStatus::Idle => "Idle".to_string(),
             ConnStatus::Starting => "Starting…".to_string(),
-            ConnStatus::Listening => "Waiting for the other device…".to_string(),
-            ConnStatus::Resolving => "Looking up the peer…".to_string(),
+            ConnStatus::Waiting => match self.session_peer.as_deref() {
+                Some(peer) => format!("Waiting for {peer} to connect too…"),
+                None => "Waiting for the other device…".to_string(),
+            },
+            ConnStatus::Resolving => "Looking for the other device…".to_string(),
             ConnStatus::Connecting => "Connecting…".to_string(),
             ConnStatus::Authenticating => "Authenticating…".to_string(),
             ConnStatus::Connected => "Connected".to_string(),
@@ -815,11 +843,14 @@ impl App {
 
     /// Stop whatever session is running (used by the back actions).
     pub(crate) fn stop_session(&mut self) {
-        if self.server_running {
-            self.net.send(UiCommand::StopServer);
-        } else if self.client_active {
-            self.net.send(UiCommand::Disconnect);
+        if !self.session_active {
+            return;
         }
+        self.net.send(if self.session_hosting {
+            UiCommand::StopServer
+        } else {
+            UiCommand::Disconnect
+        });
     }
 
     /// Open the card-setup screen.
@@ -844,11 +875,13 @@ impl App {
 
     /// Show a PIN on this device so the other one can type it.
     pub(crate) fn host_card_setup(&mut self) {
-        if self.server_mode_spec().is_none() {
+        let Some(mode) = self.card_setup_host_mode() else {
             return;
-        }
+        };
         self.screen = Screen::CardPairing;
-        self.start_server();
+        self.session_active = true;
+        self.session_hosting = true;
+        self.net.send(UiCommand::StartServer { mode });
     }
 
     /// Join a card setup: dial what the entry holds (the typed PIN, plus an
@@ -863,7 +896,8 @@ impl App {
             self.error = Some(self.card_setup_dial_problem());
             return;
         };
-        self.client_active = true;
+        self.session_active = true;
+        self.session_hosting = false;
         self.net.send(UiCommand::Connect { spec });
         self.screen = Screen::CardPairing;
     }
@@ -916,7 +950,7 @@ impl App {
     /// app off its default channel. Empty for the default: the hub would
     /// otherwise carry a second copy of the card-setup screen's explanation, and
     /// the copy nobody edits is the one that goes stale. An override is worth
-    /// naming, because it silently changes whether Start and Join can reach a
+    /// naming, because it silently changes whether Connect can reach a
     /// device that is not on this network.
     pub(crate) fn signal_channel_badge(&self) -> &'static str {
         match self.signal_channel {
@@ -985,9 +1019,9 @@ impl App {
     /// home hub.
     pub(crate) fn go_back(&mut self) {
         self.stop_session();
-        // Leaving the join screen is the one thing that forgets the peer a
-        // Retry would dial.
-        self.joined_peer = None;
+        // Leaving the connection screen is the one thing that forgets the peer
+        // a Retry would connect to again.
+        self.session_peer = None;
         self.screen = match self.screen {
             Screen::CardPairing => Screen::CardSetup,
             // Leaving the confirmation without importing discards the card.
@@ -997,40 +1031,47 @@ impl App {
             }
             _ => Screen::Home,
         };
-        // Home is the hub, not the device picker a join may have started from.
-        if self.configure_step == ConfigureStep::Join {
+        // Home is the hub, not the device picker the session started from.
+        if self.configure_step == ConfigureStep::Connect {
             self.configure_step = ConfigureStep::Ready;
         }
     }
 
-    /// Build the server mode from the current state, if it validates. Which
-    /// mode is decided by the screen the user started from: the card-setup
-    /// screens host a card exchange, everything else hosts a clipboard session.
-    pub(crate) fn server_mode_spec(&self) -> Option<duocb_core::net::ServerMode> {
-        use duocb_core::net::ServerMode;
-        match self.screen {
-            Screen::CardSetup | Screen::CardPairing => Some(ServerMode::CardSetup {
-                self_card: Box::new(self.self_card.clone()?),
-                channel: self.signal_channel,
-                relays: default_relays(),
-            }),
-            _ => self.key_identity().map(|identity| ServerMode::Key {
-                identity: Box::new(identity),
-                channel: self.signal_channel,
-            }),
-        }
+    /// The card-exchange host mode, if this device has a card to hand over.
+    pub(crate) fn card_setup_host_mode(&self) -> Option<duocb_core::net::ServerMode> {
+        Some(duocb_core::net::ServerMode::CardSetup {
+            self_card: Box::new(self.self_card.clone()?),
+            channel: self.signal_channel,
+            relays: default_relays(),
+        })
     }
 
-    /// Build the configure-mode dial spec: exactly the peer selected in the
-    /// device picker. Card setup dials through [`App::card_setup_dial_spec`]
-    /// instead.
-    pub(crate) fn client_dial_spec(&self) -> Option<duocb_core::net::DialSpec> {
-        use duocb_core::net::DialSpec;
-        Some(DialSpec::Key {
-            identity: Box::new(self.key_identity()?),
-            peer_public_key: self.selected_peer_card()?.public_key(),
-            channel: self.signal_channel,
-        })
+    /// How this device joins a clipboard session with the selected peer: the
+    /// hosting half or the dialing one, decided from the two application keys
+    /// by [`duocb_core::net::session_role`] so both devices reach opposite
+    /// answers without talking first. `None` when nothing is selected or this
+    /// device is not configured.
+    ///
+    /// The user picks a *device*, never a role — this is the one place the
+    /// distinction is made, so nothing downstream has to ask again.
+    pub(crate) fn session_plan(&self) -> Option<SessionPlan> {
+        use duocb_core::net::{DialSpec, ServerMode, SessionRole, session_role};
+        let identity = self.key_identity()?;
+        let peer_public_key = self.selected_peer_card()?.public_key();
+        Some(
+            match session_role(self.identity.public_key(), peer_public_key) {
+                SessionRole::Host => SessionPlan::Host(ServerMode::Key {
+                    identity: Box::new(identity),
+                    peer_public_key,
+                    channel: self.signal_channel,
+                }),
+                SessionRole::Dial => SessionPlan::Dial(DialSpec::Key {
+                    identity: Box::new(identity),
+                    peer_public_key,
+                    channel: self.signal_channel,
+                }),
+            },
+        )
     }
 
     /// The current validation outcome of the host-IP entry against the detected
@@ -1068,60 +1109,53 @@ impl App {
         })
     }
 
-    /// Go to the start screen and launch a configure-mode host.
-    pub(crate) fn begin_server(&mut self) {
-        if self.server_mode_spec().is_none() {
+    /// Start the clipboard session with the selected peer, whichever half of it
+    /// this device drew.
+    ///
+    /// The expired-card check runs before either half: the runtime refuses a
+    /// lapsed peer too, but a host would refuse it by quietly publishing no
+    /// record at all, which reads as a network problem rather than as the one
+    /// thing the user has to go and fix.
+    pub(crate) fn start_clipboard_session(&mut self) {
+        let Some(plan) = self.session_plan() else {
+            return;
+        };
+        let Some(peer) = self.selected_peer_card() else {
+            return;
+        };
+        if peer.is_expired() {
+            self.error = Some(if peer.is_not_yet_valid() {
+                format!(
+                    "The identity card for {} is not valid until {} — check the clock on this device and on that one",
+                    peer.name(),
+                    local_date(peer.not_before())
+                )
+            } else {
+                format!(
+                    "The identity card for {} expired on {} — import a fresh card from that device",
+                    peer.name(),
+                    card_expiry_date(peer)
+                )
+            });
             return;
         }
-        self.screen = Screen::Server;
-        self.start_server();
+        self.session_peer = Some(peer.name().to_string());
+        self.session_active = true;
+        self.session_hosting = matches!(plan, SessionPlan::Host(_));
+        self.net.send(match plan {
+            SessionPlan::Host(mode) => UiCommand::StartServer { mode },
+            SessionPlan::Dial(spec) => UiCommand::Connect { spec },
+        });
     }
+}
 
-    /// Start the server session if the state validates. The configure-mode
-    /// host is the other nostr wake-up point: its presence record is how the
-    /// joiner finds this device's node id, so start the broadcast first.
-    pub(crate) fn start_server(&mut self) {
-        if let Some(mode) = self.server_mode_spec() {
-            self.server_running = true;
-            self.net.send(UiCommand::StartServer { mode });
-        }
-    }
-
-    /// Start the client session if the state validates.
-    pub(crate) fn connect_client(&mut self) {
-        if let Some(spec) = self.client_dial_spec() {
-            if let duocb_core::net::DialSpec::Key {
-                peer_public_key, ..
-            } = &spec {
-                let peer = self
-                    .peers
-                    .iter()
-                    .find(|peer| peer.public_key() == *peer_public_key);
-                // The runtime refuses a peer outside its window too; catching
-                // it here answers immediately instead of after an endpoint
-                // spins up.
-                if let Some(peer) = peer.filter(|peer| peer.is_expired()) {
-                    self.error = Some(if peer.is_not_yet_valid() {
-                        format!(
-                            "The identity card for {} is not valid until {} — check the clock on this device and on that one",
-                            peer.name(),
-                            local_date(peer.not_before())
-                        )
-                    } else {
-                        format!(
-                            "The identity card for {} expired on {} — import a fresh card from that device",
-                            peer.name(),
-                            card_expiry_date(peer)
-                        )
-                    });
-                    return;
-                }
-                self.joined_peer = peer.map(|peer| peer.name().to_string());
-            }
-            self.client_active = true;
-            self.net.send(UiCommand::Connect { spec });
-        }
-    }
+/// Which half of a clipboard session this device runs, with the spec the
+/// runtime needs for it. Built by [`App::session_plan`]; the user never chooses
+/// between these.
+#[derive(Debug)]
+pub(crate) enum SessionPlan {
+    Host(duocb_core::net::ServerMode),
+    Dial(duocb_core::net::DialSpec),
 }
 
 pub(crate) fn default_relays() -> Vec<String> {
@@ -1311,19 +1345,23 @@ pub(crate) mod card_setup_tests {
         card
     }
 
-    /// Joining a peer whose stored card has not started yet is refused before
-    /// the runtime is involved, with clock guidance rather than the
-    /// fetch-a-fresh-card advice, which would not help.
+    /// Connecting to a peer whose stored card has not started yet is refused
+    /// before the runtime is involved, with clock guidance rather than the
+    /// fetch-a-fresh-card advice, which would not help. Neither half may start:
+    /// hosting for a lapsed card publishes nothing, which reads as a network
+    /// fault instead of the one thing the user has to fix.
     #[test]
-    fn joining_a_not_yet_valid_peer_points_at_the_clock() {
+    fn connecting_to_a_not_yet_valid_peer_points_at_the_clock() {
         let (mut app, path) = configured_app();
         let future = future_peer_card("laptop");
         app.peers.push(future.clone());
         app.selected_peer = Some(future.public_key().to_hex());
 
-        app.connect_client();
+        app.start_clipboard_session();
 
-        let error = app.error.clone().expect("the join must be refused");
+        assert!(!app.session_active, "no session may start");
+
+        let error = app.error.clone().expect("the connection must be refused");
         assert!(error.contains("not valid until"), "{error}");
         assert!(error.contains("clock"), "{error}");
         assert!(!error.contains("fresh card"), "{error}");
@@ -1353,6 +1391,21 @@ pub(crate) mod card_setup_tests {
             .unwrap()
     }
 
+    /// A peer card that puts `app` on the named half of the session. Which half
+    /// a device draws falls out of the two keys, so a test that needs one has to
+    /// pick a peer for it rather than set a flag.
+    pub(crate) fn peer_card_for_role(
+        app: &App,
+        name: &str,
+        role: duocb_core::net::SessionRole,
+    ) -> IdentityCard {
+        std::iter::repeat_with(|| peer_card(name, 0))
+            .find(|card| {
+                duocb_core::net::session_role(app.identity.public_key(), card.public_key()) == role
+            })
+            .expect("keys are random, so both halves come up quickly")
+    }
+
     /// Card setup hands over this device's signed card, so there has to be one:
     /// before setup is finished the screen must not open at all.
     #[test]
@@ -1374,7 +1427,7 @@ pub(crate) mod card_setup_tests {
 
         app.open_card_setup();
         assert_eq!(app.screen, Screen::Home, "no card to offer, so no card setup");
-        assert!(app.server_mode_spec().is_none());
+        assert!(app.card_setup_host_mode().is_none());
         assert!(app.card_setup_dial_spec().is_none());
 
         cleanup(app, path);
@@ -1387,7 +1440,7 @@ pub(crate) mod card_setup_tests {
         app.open_card_setup();
         assert_eq!(app.screen, Screen::CardSetup);
 
-        match app.server_mode_spec() {
+        match app.card_setup_host_mode() {
             Some(duocb_core::net::ServerMode::CardSetup { self_card, .. }) => {
                 assert_eq!(self_card.public_key(), app.identity.public_key());
             }
@@ -1401,7 +1454,7 @@ pub(crate) mod card_setup_tests {
     /// "nostr-only" test still pair over mDNS and prove nothing.
     #[test]
     fn the_channel_override_reaches_both_roles() {
-        use duocb_core::net::{DialSpec, ServerMode};
+        use duocb_core::net::{DialSpec, ServerMode, SessionRole};
 
         for channel in [
             SignalChannel::LanThenNostr,
@@ -1415,7 +1468,7 @@ pub(crate) mod card_setup_tests {
             app.in_pin_a = pin[..4].to_string();
             app.in_pin_b = pin[4..].to_string();
 
-            match app.server_mode_spec() {
+            match app.card_setup_host_mode() {
                 Some(ServerMode::CardSetup {
                     channel: hosted,
                     relays,
@@ -1441,39 +1494,45 @@ pub(crate) mod card_setup_tests {
             }
 
             // The same flag governs clipboard sessions, whose signaling is the
-            // pairwise hosting record. Both roles again: a host that ignored the
-            // override would keep announcing itself on a channel the test meant
-            // to rule out.
+            // pairwise hosting record. Both halves again — which one this device
+            // draws is not up to the test, so pick a peer for each: a half that
+            // ignored the override would reach a device the test meant to rule
+            // out.
             app.go_back();
-            let peer = peer_card("peer", 0);
-            assert!(app.store_peer_card(peer.clone()));
-            app.toggle_peer(&peer.public_key().to_hex());
-            match app.server_mode_spec() {
-                Some(ServerMode::Key {
-                    channel: hosted,
-                    identity,
-                }) => {
-                    assert_eq!(hosted, channel, "clipboard host channel");
-                    assert!(
-                        !identity.relays.is_empty(),
-                        "a host needs relays to publish to"
-                    );
+            for role in [SessionRole::Host, SessionRole::Dial] {
+                let peer = peer_card_for_role(&app, "peer", role);
+                assert!(app.store_peer_card(peer.clone()));
+                app.toggle_peer(&peer.public_key().to_hex());
+                match (role, app.session_plan()) {
+                    (
+                        SessionRole::Host,
+                        Some(SessionPlan::Host(ServerMode::Key {
+                            channel: hosted,
+                            identity,
+                            ..
+                        })),
+                    ) => {
+                        assert_eq!(hosted, channel, "clipboard host channel");
+                        assert!(
+                            !identity.relays.is_empty(),
+                            "a host needs relays to publish to"
+                        );
+                    }
+                    (
+                        SessionRole::Dial,
+                        Some(SessionPlan::Dial(DialSpec::Key {
+                            channel: dialed,
+                            identity,
+                            ..
+                        })),
+                    ) => {
+                        assert_eq!(dialed, channel, "clipboard dialer channel");
+                        assert!(!identity.relays.is_empty(), "a dialer needs relays to query");
+                    }
+                    (role, other) => panic!("expected a clipboard {role:?}, got {other:?}"),
                 }
-                other => panic!("expected a clipboard host, got {other:?}"),
-            }
-            match app.client_dial_spec() {
-                Some(DialSpec::Key {
-                    channel: dialed,
-                    identity,
-                    ..
-                }) => {
-                    assert_eq!(dialed, channel, "clipboard joiner channel");
-                    assert!(
-                        !identity.relays.is_empty(),
-                        "a joiner needs relays to query"
-                    );
-                }
-                other => panic!("expected a clipboard dial, got {other:?}"),
+                app.toggle_peer(&peer.public_key().to_hex());
+                app.remove_peer(&peer.public_key().to_hex());
             }
             cleanup(app, path);
         }
@@ -1561,7 +1620,7 @@ pub(crate) mod card_setup_tests {
 
         app.join_card_setup();
 
-        assert!(!app.client_active, "a bad PIN must not dial");
+        assert!(!app.session_active, "a bad PIN must not dial");
         assert_eq!(app.screen, Screen::CardSetup, "and must not advance a screen");
         assert!(
             app.error.as_deref().is_some_and(|e| e.contains("PIN")),
