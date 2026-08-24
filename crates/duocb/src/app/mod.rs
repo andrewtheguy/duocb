@@ -406,7 +406,6 @@ impl App {
                     self.node_id = None;
                     self.host_lan_ip = None;
                     self.identity_public_key = None;
-                    self.joined_peer = None;
                     self.pin_display = None;
                     self.pin_deadline = None;
                     self.peer_node_id = None;
@@ -414,6 +413,9 @@ impl App {
                     // reset here: a card-setup session goes idle the instant the
                     // cards cross, so clearing them would wipe the confirmation
                     // screen out from under the user the moment it appeared.
+                    // `joined_peer` survives too: a join that gave up (retries
+                    // exhausted) stays on its screen, inbox and outbox intact,
+                    // and offers Retry for the same peer (see `retry_available`).
                     self.conn_path = None;
                     self.pending_outbox = None;
                 }
@@ -773,9 +775,31 @@ impl App {
         self.sent_flash.is_some_and(|t| t.elapsed() < SENT_FLASH)
     }
 
+    /// Whether a join ended on its own (retries exhausted or refused) and can
+    /// be retried in place: the peer is still known but no session is running.
+    pub(crate) fn retry_available(&self) -> bool {
+        !self.client_active && self.joined_peer.is_some()
+    }
+
+    /// Whether a clipboard session exists to show the session panel for —
+    /// running, retrying, or waiting for Retry after the joiner gave up.
+    pub(crate) fn session_live(&self) -> bool {
+        self.server_running || self.client_active || self.retry_available()
+    }
+
+    /// Dial the same peer again after the join gave up. The give-up error
+    /// banner is stale the moment a new attempt starts, so it goes first.
+    pub(crate) fn retry_connection(&mut self) {
+        if self.retry_available() {
+            self.error = None;
+            self.connect_client();
+        }
+    }
+
     /// Human-readable status line.
     pub(crate) fn status_text(&self) -> String {
         match &self.status {
+            ConnStatus::Idle if self.retry_available() => "Disconnected".to_string(),
             ConnStatus::Idle => "Idle".to_string(),
             ConnStatus::Starting => "Starting…".to_string(),
             ConnStatus::Listening => "Waiting for the other device…".to_string(),
@@ -961,6 +985,9 @@ impl App {
     /// home hub.
     pub(crate) fn go_back(&mut self) {
         self.stop_session();
+        // Leaving the join screen is the one thing that forgets the peer a
+        // Retry would dial.
+        self.joined_peer = None;
         self.screen = match self.screen {
             Screen::CardPairing => Screen::CardSetup,
             // Leaving the confirmation without importing discards the card.

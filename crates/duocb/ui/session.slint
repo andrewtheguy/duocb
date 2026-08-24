@@ -1,8 +1,10 @@
 // The paired session panel: send actions (the clipboard, or typed text via
 // the compose field), path info, the last-sent outbox item, and the
 // in-memory inbox. Every item supports peek (view without copying, truncated
-// when large) and per-item Copy. Embedded by both role screens; collapses to
-// nothing while not connected.
+// when large) and per-item Copy. Embedded by both role screens; stays on
+// screen for as long as a session exists — while the link is down it shows
+// the reconnect status (or a Retry once the joiner gave up) in place of the
+// send controls, and the inbox and outbox stay put.
 
 import { UiState, Actions } from "globals.slint";
 import { ClipRow } from "types.slint";
@@ -59,14 +61,35 @@ export component SessionPanel inherits Rectangle {
     /// Whether the compose field has keyboard focus (gates letter shortcuts).
     out property <bool> field-focused: compose-entry.has-focus;
 
-    height: UiState.connected ? content.preferred-height : 0px;
+    height: UiState.session-live ? content.preferred-height : 0px;
 
     content := VerticalLayout {
-        visible: UiState.connected;
+        visible: UiState.session-live;
         alignment: start;
         spacing: Theme.pad-s;
 
         Rectangle { height: 1px; background: Theme.card-border; }
+
+        // Link down on the joiner: say so where the send controls were, and
+        // offer Retry once it has given up. A host that lost its peer just
+        // keeps listening — the status line above already says so.
+        if !UiState.connected && (UiState.client-active || UiState.retry-available): HorizontalLayout {
+            spacing: Theme.pad-s;
+            alignment: start;
+            Text {
+                text: UiState.retry-available
+                    ? "Disconnected — the connection could not be restored."
+                    : UiState.status-text;
+                color: UiState.retry-available ? Theme.err : Theme.warn;
+                font-size: Theme.font-body;
+                vertical-alignment: center;
+            }
+            if UiState.retry-available: Button {
+                text: "🔁 Retry (R)";
+                primary: true;
+                clicked => { Actions.retry-connect(); }
+            }
+        }
 
         HorizontalLayout {
             spacing: Theme.pad-s;
@@ -74,10 +97,12 @@ export component SessionPanel inherits Rectangle {
             Button {
                 text: "📤 Send clipboard (" + UiState.cmd-label + "+S)";
                 primary: true;
+                enabled: UiState.connected;
                 clicked => { Actions.send-clipboard(); }
             }
             Button {
                 text: "🌐 Connection path (" + UiState.cmd-label + "+D)";
+                enabled: UiState.connected;
                 clicked => { Actions.query-conn-path(); }
             }
             if UiState.sent-flash: Text {
@@ -95,13 +120,14 @@ export component SessionPanel inherits Rectangle {
             compose-entry := LineEdit {
                 placeholder-text: "Or type text to send… (Enter)";
                 text <=> UiState.in-compose;
+                enabled: UiState.connected;
                 horizontal-stretch: 1;
                 edited => { Actions.fields-edited(); }
                 accepted => { Actions.compose-send(); }
             }
             Button {
                 text: "Send (Enter)";
-                enabled: UiState.in-compose != "";
+                enabled: UiState.connected && UiState.in-compose != "";
                 clicked => { Actions.compose-send(); }
             }
         }

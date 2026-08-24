@@ -22,14 +22,17 @@ export component ClientScreen inherits ScrollView {
         BackHeader { title: "Join a connection"; }
         Body { text: "Status: " + UiState.status-text; }
 
-        if !UiState.client-active: Weak {
+        if !UiState.session-live: Weak {
             // A join launches from the home hub with the selected peer already
             // chosen; this state is a brief transient.
             text: "Pick a device to join from the home screen.";
         }
 
-        if UiState.client-active: IdentityPairingSummary { }
-        if UiState.client-active: HorizontalLayout {
+        // The pairing summary and the way out stay put for the whole session,
+        // including while reconnecting and after the join gave up — the
+        // reconnect status and Retry live in the session panel below.
+        if UiState.session-live: IdentityPairingSummary { }
+        if UiState.session-live: HorizontalLayout {
             alignment: start;
             Button {
                 text: "✕ Disconnect (Esc)";

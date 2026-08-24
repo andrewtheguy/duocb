@@ -110,6 +110,11 @@ pub(crate) fn handle_global_key(
             }
             true
         }
+        // Retry a join that gave up, from the screen that still shows it.
+        Screen::Client if focus_free && app.retry_available() && letter('r') => {
+            app.retry_connection();
+            true
+        }
         _ => false,
     };
     if handled {
@@ -250,6 +255,7 @@ mod tests {
     use super::*;
     use crate::app::card_setup_tests::{cleanup, configured_app, peer_card};
     use duocb_core::auth::IdentityCard;
+    use duocb_core::net::NetEvent;
 
     /// Press a plain (unmodified) key.
     fn plain(app: &mut App, text: &str) -> bool {
@@ -286,6 +292,43 @@ mod tests {
 
         assert!(plain(&mut app, "s"));
         assert_eq!(app.screen, Screen::Server);
+
+        cleanup(app, path);
+    }
+
+    /// A join that gave up stays on its screen, and R dials the same peer
+    /// again from there; a join the user ended offers nothing to retry.
+    #[test]
+    fn a_join_that_gave_up_is_retried_in_place() {
+        let (mut app, path) = configured_app();
+        let peer = peer_card("laptop", 0);
+        app.peers.push(peer.clone());
+        app.selected_peer = Some(peer.public_key().to_hex());
+        app.join_selected_peer();
+        assert_eq!(app.screen, Screen::Client);
+        assert!(app.client_active);
+        assert!(!app.retry_available(), "a live session has nothing to retry");
+        assert!(!plain(&mut app, "r"), "so R does nothing");
+
+        // The runtime exhausted its attempts.
+        app.apply_event(NetEvent::Status(ConnStatus::Idle));
+        assert_eq!(app.screen, Screen::Client, "the screen must not change");
+        assert!(app.session_live(), "the session panel stays up");
+        assert!(app.retry_available());
+        assert_eq!(app.status_text(), "Disconnected");
+        app.error = Some("Could not reach the peer".into());
+
+        assert!(plain(&mut app, "r"), "R retries");
+        assert!(app.error.is_none(), "the stale give-up banner is cleared");
+        assert!(app.client_active, "the same peer is dialed again");
+        assert_eq!(app.joined_peer.as_deref(), Some("laptop_x9Y8z7W6"));
+
+        // Backing out ends it for good: nothing left to retry.
+        app.go_back();
+        app.apply_event(NetEvent::Status(ConnStatus::Idle));
+        assert_eq!(app.screen, Screen::Home);
+        assert!(!app.retry_available());
+        assert!(!app.session_live());
 
         cleanup(app, path);
     }
