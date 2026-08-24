@@ -81,14 +81,14 @@ that device alone: the host publishes one record, addressed to it, and turns
 away any other trusted device that dials in meanwhile.
 
 When a session starts, the hosting device publishes a NIP-44 encrypted hosting
-record addressed to that one peer — advertised on the local network over
-Bonjour/DNS-SD *and* published to Nostr relays, since the host cannot know which
-way the other device will look. The record carries only the current iroh node
-id. The dialing device looks on the local network first and falls back to the
-relays if nothing answers there, so two devices in one room never involve a
-third-party server, and two on different networks still find each other. It then
-establishes the iroh connection, and both sides sign a fresh transcript
-containing:
+record addressed to that one peer on every enabled channel — by default both
+the local network over Bonjour/DNS-SD *and* Nostr relays, since the host cannot
+know which way the other device will look (the flags below narrow that to one).
+The record carries only the current iroh node id. The dialing device looks on
+the local network first and falls back to the relays if nothing answers there,
+so two devices in one room never involve a third-party server, and two on
+different networks still find each other. It then establishes the iroh
+connection, and both sides sign a fresh transcript containing:
 
 - both application public keys;
 - two random nonces;

@@ -691,10 +691,13 @@ impl App {
     /// runs this same action for this one; which of the two hosts is settled by
     /// [`duocb_core::net::session_role`], so neither user has to go first or
     /// pick a role.
+    ///
+    /// The screen follows the session, never the other way round: a peer whose
+    /// card has lapsed is refused by the starter, and moving first would strand
+    /// the user on a connection screen with nothing on it.
     pub(crate) fn connect_selected_peer(&mut self) {
-        if self.session_plan().is_some() {
+        if self.start_clipboard_session() {
             self.screen = Screen::Session;
-            self.start_clipboard_session();
         }
     }
 
@@ -802,7 +805,9 @@ impl App {
     pub(crate) fn retry_connection(&mut self) {
         if self.retry_available() {
             self.error = None;
-            self.start_clipboard_session();
+            // The screen is already the connection one, so the answer only
+            // repeats what the banner a refusal raises would say.
+            let _ = self.start_clipboard_session();
         }
     }
 
@@ -1116,12 +1121,16 @@ impl App {
     /// lapsed peer too, but a host would refuse it by quietly publishing no
     /// record at all, which reads as a network problem rather than as the one
     /// thing the user has to go and fix.
-    pub(crate) fn start_clipboard_session(&mut self) {
+    ///
+    /// Returns whether a session actually started, so the caller can decide
+    /// where the user ends up (see [`App::connect_selected_peer`]); a refusal
+    /// has already raised the banner saying why.
+    pub(crate) fn start_clipboard_session(&mut self) -> bool {
         let Some(plan) = self.session_plan() else {
-            return;
+            return false;
         };
         let Some(peer) = self.selected_peer_card() else {
-            return;
+            return false;
         };
         if peer.is_expired() {
             self.error = Some(if peer.is_not_yet_valid() {
@@ -1137,7 +1146,7 @@ impl App {
                     card_expiry_date(peer)
                 )
             });
-            return;
+            return false;
         }
         self.session_peer = Some(peer.name().to_string());
         self.session_active = true;
@@ -1146,6 +1155,7 @@ impl App {
             SessionPlan::Host(mode) => UiCommand::StartServer { mode },
             SessionPlan::Dial(spec) => UiCommand::Connect { spec },
         });
+        true
     }
 }
 
@@ -1357,9 +1367,14 @@ pub(crate) mod card_setup_tests {
         app.peers.push(future.clone());
         app.selected_peer = Some(future.public_key().to_hex());
 
-        app.start_clipboard_session();
+        app.connect_selected_peer();
 
         assert!(!app.session_active, "no session may start");
+        assert_eq!(
+            app.screen,
+            Screen::Home,
+            "and the user stays where they can fix it, not on an empty connection screen"
+        );
 
         let error = app.error.clone().expect("the connection must be refused");
         assert!(error.contains("not valid until"), "{error}");
