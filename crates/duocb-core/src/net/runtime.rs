@@ -68,15 +68,28 @@ const CARD_EXPIRED_CODE: u32 = 4;
 /// Fixed delay between reconnect attempts on the dialing peer.
 const RECONNECT_DELAY: Duration = Duration::from_secs(3);
 
+/// The slower poll a dialer that has never connected drops to once the peer has
+/// not turned up in the first [`MAX_CONNECT_ATTEMPTS`] rounds. The two users
+/// pick each other independently, so the quick case is the other device coming
+/// up seconds later; past that this is an open-ended wait, and hitting the
+/// relays every [`RECONNECT_DELAY`] for an app left sitting on the screen would
+/// be pure churn.
+const WAITING_POLL: Duration = Duration::from_secs(15);
+
 /// Maximum number of *consecutive* failed connect attempts before the client
-/// gives up. The counter resets on every successful connection, so this bounds
-/// only an unbroken run of failures (an unreachable peer) — not a flaky link
-/// that keeps recovering. Applied uniformly whether or not a connection has
-/// succeeded before, so a dropped session never retries without end. Giving up
-/// ends the session task but not the pairing: the endpoint identity and pinned
-/// dial target live on in [`SessionMemory`], so pressing Join again with the
-/// same PIN/peer reconnects as the same node id instead of being refused by
-/// the server's claim.
+/// gives up on a session it had already established. The counter resets on
+/// every successful connection, so this bounds only an unbroken run of failures
+/// after a drop — not a flaky link that keeps recovering.
+///
+/// It does **not** apply before the first connection: a dialer whose peer is not
+/// hosting yet is waiting for the other user to pick this device, exactly as the
+/// hosting side waits to be dialed, and neither side gives up on that (see
+/// [`WAITING_POLL`]).
+///
+/// Giving up ends the session task but not the pairing: the endpoint identity
+/// and pinned dial target live on in [`SessionMemory`], so connecting again to
+/// the same peer reconnects as the same node id instead of being refused by the
+/// server's claim.
 const MAX_CONNECT_ATTEMPTS: u32 = 10;
 
 /// Marker error for fatal authentication failures (wrong application key/PIN, explicit
@@ -277,6 +290,10 @@ enum SessionKey {
     },
     ServerKey {
         public_key: nostr_sdk::PublicKey,
+        /// The one peer this host is hosting for: pointing a session at a
+        /// different device is a different pairing, so it must not inherit the
+        /// previous one's pair claim.
+        peer_public_key: nostr_sdk::PublicKey,
         channel: SignalChannel,
     },
     ClientCardSetup {
@@ -295,8 +312,13 @@ fn session_key(kind: &SessionKind) -> SessionKey {
         SessionKind::Server(ServerMode::CardSetup { channel, .. }) => SessionKey::ServerCardSetup {
             channel: *channel,
         },
-        SessionKind::Server(ServerMode::Key { identity, channel }) => SessionKey::ServerKey {
+        SessionKind::Server(ServerMode::Key {
+            identity,
+            peer_public_key,
+            channel,
+        }) => SessionKey::ServerKey {
             public_key: identity.identity.public_key(),
+            peer_public_key: *peer_public_key,
             channel: *channel,
         },
         SessionKind::Client(DialSpec::CardSetup {
@@ -586,7 +608,12 @@ async fn run_server_session(
     secret: iroh::SecretKey,
     claim: PairClaim,
 ) {
-    let ServerMode::Key { identity, channel } = mode else {
+    let ServerMode::Key {
+        identity,
+        peer_public_key,
+        channel,
+    } = mode
+    else {
         unreachable!("card-setup hosts run in run_card_setup_host");
     };
     events.status(ConnStatus::Starting);
@@ -610,12 +637,13 @@ async fn run_server_session(
         node_id: node_id.to_string(),
         identity_public_key: Some(identity.identity.to_npub()),
     });
-    events.status(ConnStatus::Listening);
+    events.status(ConnStatus::Waiting);
 
     // Pairwise hosting-record publisher, aborted on session teardown.
     let _publisher = PublisherGuard(tokio::spawn(run_hosting_publisher(
         endpoint.clone(),
         *identity,
+        peer_public_key,
         channel,
         events.clone(),
         cancel.clone(),
@@ -647,18 +675,29 @@ async fn run_server_session(
 
         // Auth runs on the single session stream; on success the same stream
         // stays open for clipboard frames (no separate data stream / handshake).
-        let (send, recv, peer_public_key) =
-            match auth_as_listener(&conn, Some(&key_identity), None, &claim, node_id).await {
+        let (send, recv, authenticated_key) =
+            match auth_as_listener(
+                &conn,
+                Some(KeyListener {
+                    identity: &key_identity,
+                    peer_public_key,
+                }),
+                None,
+                &claim,
+                node_id,
+            )
+            .await
+            {
                 Ok(streams) => streams,
                 Err(e) => {
                     log::warn!("Auth failed for {remote_id}: {e:#}");
-                    events.status(ConnStatus::Listening);
+                    events.status(ConnStatus::Waiting);
                     continue;
                 }
             };
         events.send(NetEvent::PeerPaired {
             peer_node_id: remote_id.to_string(),
-            peer_public_key: peer_public_key.map(|key| key.to_hex()),
+            peer_public_key: authenticated_key.map(|key| key.to_hex()),
         });
 
         // Debug-only path logging; on-demand status reads `conn_slot` directly.
@@ -698,7 +737,7 @@ async fn run_server_session(
             // The session ended on its own: back to waiting for the paired peer.
             None => {
                 events.send(NetEvent::PeerDisconnected);
-                events.status(ConnStatus::Listening);
+                events.status(ConnStatus::Waiting);
             }
         }
     }
@@ -811,15 +850,27 @@ async fn run_client_session(
     });
 
     // Consecutive failed attempts, reset to zero on every successful connection
-    // (below). Fixed-interval retry, bounded by `MAX_CONNECT_ATTEMPTS`.
+    // (below). Fixed-interval retry, bounded by `MAX_CONNECT_ATTEMPTS` — but
+    // only once `connected_before` is set: until then this side is waiting for
+    // the peer to appear, not recovering from a failure.
     let mut attempts: u32 = 0;
+    let mut connected_before = false;
 
     loop {
         // Resolve the target each attempt: the dial target lives in the peer's
         // hosting record, not a directory, so a restarted host's fresh node id
         // is found, and absent (no readable record) means the peer is not
         // currently hosting.
-        events.status(ConnStatus::Resolving);
+        //
+        // Before the first connection the whole loop is one open-ended wait for
+        // the peer to appear, so it reads as `Waiting` throughout rather than
+        // flickering between two words every few seconds; `Resolving` is for a
+        // session that had connected and is looking for its peer again.
+        events.status(if connected_before {
+            ConnStatus::Resolving
+        } else {
+            ConnStatus::Waiting
+        });
         let resolved: Result<EndpointAddr> = tokio::select! {
             _ = cancel.cancelled() => return,
             r = resolve_hosting(identity, *peer_public_key, channel) => r,
@@ -865,6 +916,7 @@ async fn run_client_session(
                         let _paths = watch_connection_paths(&conn);
                         *conn_slot.lock() = Some(conn.clone());
                         attempts = 0;
+                        connected_before = true;
 
                         match pump_clipboard(send, recv, &events, &mut clip_rx, &cancel, &last_sent)
                             .await
@@ -896,12 +948,35 @@ async fn run_client_session(
             Err(e) => log::warn!("Failed to connect to peer: {e:#}"),
         }
 
-        // This attempt failed or the session dropped: fixed-interval retry,
-        // bounded by a run of consecutive failures. The count resets to zero on
-        // any successful connection above, so an unreachable (or already-paired)
-        // peer gives up after `MAX_CONNECT_ATTEMPTS`, while a flaky link that
-        // keeps recovering never does.
+        // This attempt failed or the session dropped.
         attempts += 1;
+
+        // Nothing has connected yet, so the peer simply isn't hosting yet: both
+        // users pick each other from their own device and whoever drew the
+        // dialing half may be minutes early. Wait for it the way the hosting
+        // half waits to be dialed — indefinitely, and quietly — slowing to
+        // `WAITING_POLL` once the seconds-apart case has passed. A wrong
+        // credential still ends the session above; this only keeps looking for a
+        // device that has not started.
+        if !connected_before {
+            events.status(ConnStatus::Waiting);
+            let delay = if attempts < MAX_CONNECT_ATTEMPTS {
+                RECONNECT_DELAY
+            } else {
+                WAITING_POLL
+            };
+            tokio::select! {
+                _ = cancel.cancelled() => { endpoint.close().await; return; }
+                _ = tokio::time::sleep(delay) => {}
+            }
+            continue;
+        }
+
+        // An established session dropped: fixed-interval retry, bounded by a run
+        // of consecutive failures. The count resets to zero on any successful
+        // connection above, so an unreachable (or already-paired) peer gives up
+        // after `MAX_CONNECT_ATTEMPTS`, while a flaky link that keeps recovering
+        // never does.
         if attempts >= MAX_CONNECT_ATTEMPTS {
             events.error(format!(
                 "Could not reach the peer after {MAX_CONNECT_ATTEMPTS} attempts — press Retry to try again"
@@ -965,7 +1040,7 @@ async fn run_card_setup_host(
         node_id: node_id.to_string(),
         identity_public_key: None,
     });
-    events.status(ConnStatus::Listening);
+    events.status(ConnStatus::Waiting);
 
     let _publisher = PublisherGuard(tokio::spawn(run_card_setup_publisher(
         endpoint.clone(),
@@ -1043,7 +1118,7 @@ async fn run_card_setup_host(
                     break;
                 }
                 log::warn!("Card setup attempt from {remote_id} failed: {e:#}");
-                events.status(ConnStatus::Listening);
+                events.status(ConnStatus::Waiting);
             }
         }
     }
@@ -1370,115 +1445,108 @@ async fn resolve_hosting(
 const HOSTING_REFRESH: Duration = Duration::from_secs(120);
 
 /// Configure-mode hosting publisher: keep this host's current node id
-/// resolvable by each trusted peer, on every enabled channel, for as long as
-/// the session listens.
+/// resolvable by the one peer this session is for, on every enabled channel,
+/// for as long as the session listens.
 ///
-/// The peer list is re-filtered every round, so a peer whose card lapses
-/// mid-session stops being signalled to without a restart. The LAN
-/// advertisements are rebuilt only when that live set or this endpoint's direct
-/// addresses actually change — an mDNS record stays up until it is withdrawn,
-/// so re-registering on a timer would only churn goodbye/announce traffic,
-/// unlike the relay copy, which has a five-minute TTL and must be refreshed.
+/// That peer's card is re-checked every round, so a card that lapses mid-session
+/// stops being signalled to without a restart. The LAN advertisement is rebuilt
+/// only when this endpoint's direct addresses actually change — an mDNS record
+/// stays up until it is withdrawn, so re-registering on a timer would only churn
+/// goodbye/announce traffic, unlike the relay copy, which has a five-minute TTL
+/// and must be refreshed.
 async fn run_hosting_publisher(
     endpoint: iroh::Endpoint,
     identity: KeyIdentity,
+    peer_public_key: nostr_sdk::PublicKey,
     channel: SignalChannel,
     events: EventSender,
     cancel: CancellationToken,
 ) {
     let node_id = endpoint.id();
-    let mut adverts: Vec<crate::lan::LanAdvert> = Vec::new();
-    // What `adverts` currently says, so an unchanged round is a no-op. `None`
-    // also means "retry next round" after a failure to advertise.
-    let mut advertised: Option<(Vec<nostr_sdk::PublicKey>, Vec<std::net::SocketAddr>)> = None;
+    // Held for as long as the record should stand: dropping it withdraws the
+    // DNS-SD advertisement.
+    let mut advert: Option<crate::lan::LanAdvert> = None;
+    // The addresses `advert` currently carries, so an unchanged round is a
+    // no-op. `None` also means "retry next round" after a failure to advertise.
+    let mut advertised: Option<Vec<std::net::SocketAddr>> = None;
     // Only report a total failure to signal on the transition into it, so a
     // sustained outage does not repaint the banner every round.
     let mut reported = false;
-    // Peers already warned about below, so a clock that stays wrong does not
-    // repaint the banner every round.
-    let mut warned_not_yet_valid: Vec<nostr_sdk::PublicKey> = Vec::new();
+    // Said once, so a clock that stays wrong does not repaint the banner.
+    let mut warned_not_yet_valid = false;
 
     loop {
         let now = unix_now();
-        let live: Vec<IdentityCard> = identity
-            .peers
-            .iter()
-            .filter(|card| card.is_valid_at(now))
-            .cloned()
-            .collect();
+        let card = identity.peer(peer_public_key);
         // A peer whose stored card has not started yet is dropped from the
         // records like a lapsed one, but silently dropping it would leave the
-        // other device seeing only "not hosting". The cause is a clock — most
+        // other device seeing only "not connecting". The cause is a clock — most
         // likely this device's — so say so here, where it can be fixed.
-        for card in identity.peers.iter().filter(|card| card.is_not_yet_valid_at(now)) {
-            if !warned_not_yet_valid.contains(&card.public_key()) {
-                warned_not_yet_valid.push(card.public_key());
-                log::warn!("Not hosting for {}: its card is not valid yet", card.name());
-                events.error(format!(
-                    "{} — that device cannot find this host until then",
-                    expired_card_message(card)
-                ));
-            }
+        if !warned_not_yet_valid
+            && let Some(card) = card.filter(|card| card.is_not_yet_valid_at(now))
+        {
+            warned_not_yet_valid = true;
+            log::warn!("Not hosting for {}: its card is not valid yet", card.name());
+            events.error(format!(
+                "{} — that device cannot find this one until then",
+                expired_card_message(card)
+            ));
         }
-        // Every trusted card lapsed while the session was up: withdraw the LAN
-        // advertisements rather than leave records standing for peers that can
-        // no longer pair. Only the local channel needs saying — the relay copy
-        // just stops being refreshed and ages out of its TTL.
-        if live.is_empty() && advertised.is_some() {
+        let live = card.filter(|card| card.is_valid_at(now));
+        // The peer's card lapsed while the session was up: withdraw the LAN
+        // advertisement rather than leave a record standing for a device that
+        // can no longer pair. Only the local channel needs saying — the relay
+        // copy just stops being refreshed and ages out of its TTL.
+        if live.is_none() && advertised.is_some() {
             log::info!(
-                "Withdrawing the local-network advertisement — no trusted peer's card is still valid"
+                "Withdrawing the local-network advertisement — the peer's card is no longer valid"
             );
-            adverts.clear();
+            advert = None;
             advertised = None;
         }
-        // Nothing to publish and nobody who could dial: not a failure to report.
-        if !live.is_empty() {
+        // Nothing publishable and nobody who could dial: not a failure to report.
+        if let Some(card) = live {
             let mut published = false;
 
             if channel.lan() {
                 let mut addrs: Vec<std::net::SocketAddr> =
                     endpoint.addr().ip_addrs().copied().collect();
                 addrs.sort_unstable();
-                let mut keys: Vec<nostr_sdk::PublicKey> =
-                    live.iter().map(IdentityCard::public_key).collect();
-                keys.sort_unstable();
-                let want = (keys, addrs);
-                if advertised.as_ref() != Some(&want) {
-                    // Withdraw the stale set first: an advert for a peer that
-                    // just expired must not outlive this round.
-                    adverts.clear();
-                    for peer in &want.0 {
-                        match crate::lan::dnssd_advertise_hosting(
-                            &identity.identity,
-                            *peer,
-                            &node_id,
-                            &want.1,
-                        )
-                        .await
-                        {
-                            Ok(advert) => adverts.push(advert),
-                            Err(e) => log::warn!(
+                if advertised.as_ref() != Some(&addrs) {
+                    // Withdraw the stale advertisement first: it names addresses
+                    // this endpoint no longer answers on.
+                    advert = None;
+                    match crate::lan::dnssd_advertise_hosting(
+                        &identity.identity,
+                        peer_public_key,
+                        &node_id,
+                        &addrs,
+                    )
+                    .await
+                    {
+                        Ok(fresh) => {
+                            log::info!(
+                                "Advertising this device on the local network for {}",
+                                card.name()
+                            );
+                            advert = Some(fresh);
+                            advertised = Some(addrs);
+                        }
+                        Err(e) => {
+                            advertised = None;
+                            log::warn!(
                                 "Failed to advertise this device on the local network: {e:#}"
-                            ),
+                            );
                         }
                     }
-                    if adverts.is_empty() {
-                        advertised = None;
-                    } else {
-                        log::info!(
-                            "Advertising this device on the local network for {} trusted peer(s)",
-                            adverts.len()
-                        );
-                        advertised = Some(want);
-                    }
                 }
-                published |= !adverts.is_empty();
+                published |= advert.is_some();
             }
 
             if channel.nostr() {
                 match crate::nostr::publish_hosting(
                     &identity.identity,
-                    &live,
+                    peer_public_key,
                     &node_id,
                     &identity.relays,
                 )
@@ -1491,17 +1559,17 @@ async fn run_hosting_publisher(
                         // ever announced itself, and a stale last line would
                         // otherwise be indistinguishable from a live one.
                         log::info!(
-                            "Published pairwise hosting records to nostr for {} trusted peer(s) (refreshes in {}s)",
-                            live.len(),
+                            "Published the pairwise hosting record for {} to nostr (refreshes in {}s)",
+                            card.name(),
                             HOSTING_REFRESH.as_secs()
                         );
                     }
-                    Err(e) => log::warn!("Failed to publish pairwise hosting records: {e:#}"),
+                    Err(e) => log::warn!("Failed to publish the pairwise hosting record: {e:#}"),
                 }
             }
 
             // Listening on a node id nothing can resolve looks identical to
-            // waiting for a peer that just hasn't joined yet. Say which it is.
+            // waiting for a peer that just hasn't connected yet. Say which it is.
             if !published && !reported {
                 events.error(
                     "Could not announce this device on any channel — the other device will not \
@@ -1999,9 +2067,20 @@ async fn auth_as_dialer_pin(
     }
 }
 
+/// What a key-auth listener holds a dialer to: its own identity and trust
+/// store, plus the one peer this session was started for. A clipboard session
+/// is a pairing between two named devices — the user picked that device on this
+/// side too (see [`crate::net::session_role`]) — so another trusted device
+/// dialing in is turned away rather than quietly taking the slot.
+#[derive(Clone, Copy)]
+struct KeyListener<'a> {
+    identity: &'a KeyIdentity,
+    peer_public_key: nostr_sdk::PublicKey,
+}
+
 async fn auth_as_listener(
     conn: &iroh::endpoint::Connection,
-    key_identity: Option<&KeyIdentity>,
+    key_auth: Option<KeyListener<'_>>,
     pin_cache: Option<&RecentPins>,
     claim: &PairClaim,
     own_id: iroh::EndpointId,
@@ -2026,15 +2105,23 @@ async fn auth_as_listener(
                 nonce: client_nonce,
                 ..
             } => {
-                let identity = key_identity
-                    .ok_or_else(|| anyhow::anyhow!("listener is not in key-auth mode"))?;
+                let KeyListener {
+                    identity,
+                    peer_public_key,
+                } = key_auth.ok_or_else(|| anyhow::anyhow!("listener is not in key-auth mode"))?;
                 let client_key = nostr_sdk::PublicKey::parse(&public_key)
                     .context("dialer application key is invalid")?;
-                // Both trust checks run before this side signs anything: an
-                // untrusted or lapsed dialer never gets a proof of our identity.
+                // Every trust check runs before this side signs anything: an
+                // untrusted, lapsed or unasked-for dialer never gets a proof of
+                // our identity.
                 let Some(card) = identity.peer(client_key) else {
                     anyhow::bail!("dialer application key is not locally trusted");
                 };
+                if client_key != peer_public_key {
+                    anyhow::bail!(
+                        "dialer is not the device this session is connecting to"
+                    );
+                }
                 if !card.is_valid_at(unix_now()) {
                     return Err(expired_card_error(card));
                 }
@@ -2220,6 +2307,7 @@ mod tests {
     async fn application_keys_mutually_authenticate_over_independent_iroh_keys() {
         let server_identity = Identity::generate();
         let client_identity = Identity::generate();
+        let client_key = client_identity.public_key();
         let server_key_identity = KeyIdentity {
             identity: server_identity.clone(),
             self_card: server_identity.card("server", "a7B2c3D4").unwrap(),
@@ -2255,7 +2343,10 @@ mod tests {
                 let conn = server.accept().await.unwrap().await.unwrap();
                 auth_as_listener(
                     &conn,
-                    Some(&server_key_identity),
+                    Some(KeyListener {
+                        identity: &server_key_identity,
+                        peer_public_key: client_key,
+                    }),
                     None,
                     &claim,
                     server_id,
@@ -2319,6 +2410,7 @@ mod tests {
             )
             .unwrap();
         assert!(stale.is_expired());
+        let expected_peer = client_identity.public_key();
         let server_key_identity = KeyIdentity {
             identity: server_identity.clone(),
             self_card: server_identity.card("server", "a7B2c3D4").unwrap(),
@@ -2343,7 +2435,17 @@ mod tests {
             let claim = claim.clone();
             tokio::spawn(async move {
                 let conn = server.accept().await.unwrap().await.unwrap();
-                auth_as_listener(&conn, Some(&server_key_identity), None, &claim, server_id).await
+                auth_as_listener(
+                    &conn,
+                    Some(KeyListener {
+                        identity: &server_key_identity,
+                        peer_public_key: expected_peer,
+                    }),
+                    None,
+                    &claim,
+                    server_id,
+                )
+                .await
             })
         };
 
@@ -2366,6 +2468,76 @@ mod tests {
         assert!(
             claim.peek().is_none(),
             "a refused dialer must not claim the pairing"
+        );
+
+        client.close().await;
+        server.close().await;
+    }
+
+    /// A clipboard session is a pairing between the two devices whose users
+    /// each picked the other, so the listener refuses another *trusted* device
+    /// dialing in — that one is a session nobody asked for, and letting it take
+    /// the slot would strand the peer the user actually chose.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_trusted_device_that_was_not_chosen_is_refused() {
+        let server_identity = Identity::generate();
+        let chosen = Identity::generate();
+        let other = Identity::generate();
+        let server_key_identity = KeyIdentity {
+            identity: server_identity.clone(),
+            self_card: server_identity.card("server", "a7B2c3D4").unwrap(),
+            // Both are trusted; only one is the device this session is for.
+            peers: vec![
+                chosen.card("chosen", "x9Y8z7W6").unwrap(),
+                other.card("other", "k7M3n8P2").unwrap(),
+            ],
+            relays: Vec::new(),
+        };
+        let chosen_key = chosen.public_key();
+
+        let server =
+            create_server_endpoint(EndpointReadiness::LanDirect, iroh::SecretKey::generate())
+                .await
+                .unwrap();
+        let client =
+            create_client_endpoint(EndpointReadiness::LanDirect, iroh::SecretKey::generate())
+                .await
+                .unwrap();
+
+        let server_id = server.id();
+        let server_addr = server.addr();
+        let claim = PairClaim::default();
+        let listener = {
+            let server = server.clone();
+            let claim = claim.clone();
+            tokio::spawn(async move {
+                let conn = server.accept().await.unwrap().await.unwrap();
+                auth_as_listener(
+                    &conn,
+                    Some(KeyListener {
+                        identity: &server_key_identity,
+                        peer_public_key: chosen_key,
+                    }),
+                    None,
+                    &claim,
+                    server_id,
+                )
+                .await
+            })
+        };
+
+        let conn = connect_to_server(&client, server_addr).await.unwrap();
+        let dialer =
+            auth_as_dialer_key(&conn, &other, server_identity.public_key(), client.id()).await;
+
+        assert!(dialer.is_err(), "the unchosen device must not authenticate");
+        assert!(
+            listener.await.unwrap().is_err(),
+            "the listener must refuse it"
+        );
+        assert!(
+            claim.peek().is_none(),
+            "and it must not claim the pairing the chosen device is coming for"
         );
 
         client.close().await;
@@ -2623,6 +2795,7 @@ mod tests {
                     peers: vec![join_card.clone()],
                     relays: Vec::new(),
                 }),
+                peer_public_key: join_identity.public_key(),
                 channel: SignalChannel::LanOnly,
             }),
             EventSender::new(srv_tx, None),
@@ -2631,7 +2804,7 @@ mod tests {
         // loop covers that, and waiting for Listening keeps the common case to
         // one attempt.
         wait_for_event(&srv_rx, Duration::from_secs(30), |ev| {
-            matches!(ev, NetEvent::Status(ConnStatus::Listening)).then_some(())
+            matches!(ev, NetEvent::Status(ConnStatus::Waiting)).then_some(())
         });
 
         let (cli_tx, cli_rx) = std::sync::mpsc::channel();
@@ -2839,6 +3012,7 @@ mod tests {
             server_key_identity: &KeyIdentity,
             client_identity: &Identity,
             server_public: nostr_sdk::PublicKey,
+            client_public: nostr_sdk::PublicKey,
             claim: &PairClaim,
         ) -> (Bi, Bi, iroh::endpoint::Connection, iroh::endpoint::Connection) {
             let listener = tokio::spawn({
@@ -2847,9 +3021,18 @@ mod tests {
                 let ident = server_key_identity.clone();
                 async move {
                     let conn = server.accept().await.unwrap().await.unwrap();
-                    let (s, r, _) = auth_as_listener(&conn, Some(&ident), None, &claim, server_id)
-                        .await
-                        .unwrap();
+                    let (s, r, _) = auth_as_listener(
+                        &conn,
+                        Some(KeyListener {
+                            identity: &ident,
+                            peer_public_key: client_public,
+                        }),
+                        None,
+                        &claim,
+                        server_id,
+                    )
+                    .await
+                    .unwrap();
                     ((s, r), conn)
                 }
             });
@@ -2886,6 +3069,7 @@ mod tests {
             &server_key_identity,
             &client_identity,
             server_identity.public_key(),
+            client_identity.public_key(),
             &claim,
         )
         .await;
@@ -2929,6 +3113,7 @@ mod tests {
             &server_key_identity,
             &client_identity,
             server_identity.public_key(),
+            client_identity.public_key(),
             &claim,
         )
         .await;

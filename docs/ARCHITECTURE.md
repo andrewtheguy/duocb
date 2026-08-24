@@ -82,10 +82,31 @@ Each local peer entry is the full verified card, so the saved name is bound to
 the public key. Trust is local, capped at 128 unique public keys, and only ever
 added by explicitly importing a signed card.
 
+## Who hosts
+
+A clipboard session needs one device listening and one dialing, but neither
+user is in a position to decide that: both know which device they want to share
+with, neither knows who is supposed to press something first. So the two halves
+are not offered. Each device picks the other from its trusted list, and
+`net::session_role` answers the split from the two application keys — the lower
+key hosts — identically on both sides, with no negotiation and no round trip.
+Two users acting a minute apart still land on opposite halves, and the same
+device hosts every time for a given pairing, so a log or a capture of one pair
+reads the same way twice.
+
+Everything downstream follows from that one call: the hosting half runs
+`ServerMode::Key`, the dialing half `DialSpec::Key`, and the desktop, the FFI
+and the headless example each make the call in exactly one place.
+
+Because the device is chosen and not merely trusted, a session is *pairwise* on
+both sides: the host publishes one record — the chosen peer's — and its listener
+refuses another trusted device that dials in, which would otherwise take the
+pairing slot the chosen device is coming for.
+
 ## Configure-mode signaling
 
 Starting a configure-mode server creates an iroh endpoint with a fresh
-session-scoped key. For each locally trusted card, the host publishes one
+session-scoped key. For the peer the session is with, the host publishes one
 pairwise hosting record (`hosting_record`): NIP-44 ciphertext of
 `{version, node_id}` from the host's application key to exactly that peer's,
 under a label that is a SHA-256 over a domain plus the **ordered** host/peer
@@ -98,7 +119,7 @@ expressed and how long a copy survives:
 | | Label | Payload | Lifetime |
 |---|---|---|---|
 | Nostr relays | `d` tag of a kind `30385` parameterized replaceable event, plus a `p` recipient tag | event content | NIP-40 expiry, five minutes; refreshed every 120 s while listening |
-| Local network | DNS-SD instance under `_duocb-host._udp.local.` | `e` TXT attribute, with real SRV/A/AAAA data alongside | until withdrawn; re-registered only when the live peer set or the endpoint's direct addresses change |
+| Local network | DNS-SD instance under `_duocb-host._udp.local.` | `e` TXT attribute, with real SRV/A/AAAA data alongside | until withdrawn; re-registered only when the endpoint's direct addresses change |
 
 The two labels use different domain separators, so one pairing produces
 unrelated identifiers on the two transports and neither a relay operator nor a
@@ -111,7 +132,13 @@ same one card setup uses, and the same table of channels and endpoint gates
 ([below](#rendezvous-channels)). The roles are asymmetric in the same way: the
 host publishes on every enabled channel because it cannot know where the joiner
 will look, and only the joiner falls back, sequentially, LAN first. A host also
-stops publishing to peers whose cards have lapsed, on both transports.
+stops publishing once the peer's card lapses, on both transports.
+
+The dialing half waits as patiently as the hosting half: until it has connected
+once it never gives up, because it is waiting for the other user to pick this
+device, not recovering from a failure — it only slows its polling down after the
+first half-minute. The bounded give-up (ten consecutive attempts, then a Retry
+the user presses) applies to a session that *had* connected and dropped.
 
 This signaling only answers “where is the selected application identity
 hosting now?” The subsequent wire handshake proves who is on the connection.
@@ -308,7 +335,7 @@ network.
 
 Key commands:
 
-- `StartServer::Key { KeyIdentity, channel }`
+- `StartServer::Key { KeyIdentity, peer_public_key, channel }`
 - `Connect::Key { KeyIdentity, peer_public_key, channel }`
 - `StartServer::CardSetup { self_card, channel, relays }`
 - `Connect::CardSetup { canonical_pin, self_card, target_ip, channel, relays }`

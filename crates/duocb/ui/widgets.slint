@@ -90,7 +90,7 @@ export component BackHeader inherits HorizontalLayout {
 export component IdentityPairingSummary inherits Card {
     CardTitle { text: "Configured pairing"; }
     LabeledValue { label: "This device:"; value: UiState.display-identity; }
-    if UiState.joined-peer != "": LabeledValue { label: "Joining:"; value: UiState.joined-peer; }
+    if UiState.session-peer != "": LabeledValue { label: "With:"; value: UiState.session-peer; }
     if UiState.node-id-short != "": LabeledValue { label: "This node:"; value: UiState.node-id-short; }
     if UiState.peer-node-id-short != "": LabeledValue { label: "Paired with:"; value: UiState.peer-node-id-short; }
     if UiState.session-public-key != "": LabeledValue {

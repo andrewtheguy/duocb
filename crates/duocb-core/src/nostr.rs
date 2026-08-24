@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use iroh::EndpointId;
 use nostr_sdk::prelude::*;
 
-use crate::auth::{Identity, IdentityCard};
+use crate::auth::Identity;
 use crate::hosting_record;
 
 pub const DEFAULT_NOSTR_RELAYS: &[&str] = &[
@@ -59,44 +59,30 @@ async fn connect_client(relays: &[String]) -> Result<Client> {
     Ok(client)
 }
 
-/// Publish the host's current iroh endpoint separately and privately for each
-/// trusted application identity — the relay copy of the record `crate::lan`
+/// Publish the host's current iroh endpoint privately for the one trusted peer
+/// this session is hosting for — the relay copy of the record `crate::lan`
 /// advertises over DNS-SD.
 pub async fn publish_hosting(
     identity: &Identity,
-    peers: &[IdentityCard],
+    peer: PublicKey,
     node_id: &EndpointId,
     relays: &[String],
 ) -> Result<()> {
-    if peers.is_empty() {
-        return Ok(());
-    }
-    let expiration = Timestamp::now() + HOSTING_EVENT_TTL_SECS;
+    // Encrypted before a relay is contacted, so a bad record never costs a
+    // connection that then has to be torn down again.
+    let content = hosting_record::encrypt(identity, peer, node_id)?;
+    let event = EventBuilder::new(hosting_kind(), content)
+        .tags([
+            Tag::identifier(hosting_record::nostr_dtag(identity.public_key(), peer)),
+            Tag::public_key(peer),
+            Tag::expiration(Timestamp::now() + HOSTING_EVENT_TTL_SECS),
+        ])
+        .sign_with_keys(identity.keys())
+        .context("signing pairwise hosting record")?;
     let client = connect_client(relays).await?;
-    let mut first_error = None;
-    for peer in peers {
-        let content = hosting_record::encrypt(identity, peer.public_key(), node_id)?;
-        let event = EventBuilder::new(hosting_kind(), content)
-            .tags([
-                Tag::identifier(hosting_record::nostr_dtag(
-                    identity.public_key(),
-                    peer.public_key(),
-                )),
-                Tag::public_key(peer.public_key()),
-                Tag::expiration(expiration),
-            ])
-            .sign_with_keys(identity.keys())
-            .context("signing pairwise hosting record")?;
-        if let Err(error) = client.send_event(&event).await
-            && first_error.is_none()
-        {
-            first_error = Some(error);
-        }
-    }
+    let sent = client.send_event(&event).await;
     client.disconnect().await;
-    if let Some(error) = first_error {
-        return Err(error).context("publishing pairwise hosting record");
-    }
+    sent.context("publishing pairwise hosting record")?;
     Ok(())
 }
 

@@ -25,10 +25,16 @@
  * comes from app storage; nothing is broadcast or discovered), so no handle
  * runs while it is on screen. One handle exists per session, for one of:
  *
- *   start      host a clipboard session for locally trusted peers
- *   join       dial exactly one trusted peer, by application public key
+ *   connect    share the clipboard with one chosen trusted peer
  *   card_host  card setup: show a rotating PIN and trade identity cards
  *   card_join  card setup: dial a typed PIN and trade identity cards
+ *
+ * "connect" names a device, not a half of the connection: it carries the chosen
+ * peer's public key, and the library decides from the two application keys
+ * whether this device listens or dials. Both devices send the same shape of
+ * config and are given opposite halves, so the app never asks the user who
+ * starts. duocb_session_role answers the same question without starting
+ * anything, for a screen that wants to say which device is setting the link up.
  *
  * The two card_* roles never carry clipboard traffic. They bootstrap trust
  * between devices that have no shared clipboard to paste a card through, and
@@ -40,12 +46,12 @@
  *
  * ── Config JSON (duocb_start) ────────────────────────────────────────────
  * {
- *   "role": "start" | "join" | "card_host" | "card_join",
+ *   "role": "connect" | "card_host" | "card_join",
  *   "iroh_secret": "64 hex chars",               // every role, see below
  *   "self_card": "{ signed card JSON }",         // every role
- *   "identity_secret": "nsec1…",                 // start/join only
- *   "peers": ["{ signed peer card JSON }"],      // start/join only, max 128
- *   "peer_public_key": "hex or npub1…",          // join only; must be in peers
+ *   "identity_secret": "nsec1…",                 // connect only
+ *   "peers": ["{ signed peer card JSON }"],      // connect only, max 128
+ *   "peer_public_key": "hex or npub1…",          // connect only; must be in peers
  *   "pin": "abcd-2345",                          // card_join only
  *   "ip": "192.168.1.42",                        // card_join only, optional
  *   "channel": "lan_then_nostr",                 // optional, see below
@@ -187,6 +193,12 @@ int duocb_pairing_code(const char *card_a,
                        const char *card_b,
                        char *out_buf,
                        size_t out_len);
+/* Which half of a clipboard session this device runs with a given peer:
+ * 1 = this device hosts, 0 = this device dials, -1 = invalid input (either
+ * card fails verification, or both carry the same key). duocb_start applies
+ * the same rule to the config it is given, so this is only for telling the
+ * user which device is setting the link up — never a switch to set. */
+int duocb_session_role(const char *self_card, const char *peer_card);
 
 /* ── Card-setup PIN entry ─────────────────────────────────────────────── */
 

@@ -96,11 +96,10 @@ pub(crate) fn wire(app: &Rc<RefCell<App>>, ui: &MainWindow) {
     });
 
     // Hub / device picker.
-    nav!(on_begin_server, |app| app.begin_server());
-    nav!(on_enter_join_picker, |app| app.enter_join_picker());
-    nav!(on_leave_join_picker, |app| app.leave_join_picker());
+    nav!(on_open_connect_picker, |app| app.open_connect_picker());
+    nav!(on_close_connect_picker, |app| app.close_connect_picker());
     act!(on_import_peer_card, |app| app.import_peer_card());
-    nav!(on_join_selected, |app| app.join_selected_peer());
+    nav!(on_connect_selected, |app| app.connect_selected_peer());
     actions.on_toggle_peer({
         let app = Rc::clone(app);
         let weak = ui.as_weak();
@@ -126,11 +125,11 @@ pub(crate) fn wire(app: &Rc<RefCell<App>>, ui: &MainWindow) {
     nav!(on_import_received_card, |app| app.import_received_card());
     nav!(on_cancel_received_card, |app| app.cancel_received_card());
     // An explicit Disconnect leaves the session for good, so it is the same
-    // as backing out; Retry re-dials the peer the screen still shows.
+    // as backing out; Retry connects to the peer the screen still shows.
     nav!(on_disconnect, |app| app.go_back());
     nav!(on_retry_connect, |app| app.retry_connection());
 
-    // Server credentials.
+    // Card-setup credentials.
     act!(on_copy_pin, |app| {
         if let Some(pin) = app.pin_display.clone() {
             app.copy_with_flash(&pin, CopyTarget::Pin);

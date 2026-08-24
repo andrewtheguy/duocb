@@ -110,8 +110,8 @@ pub(crate) fn handle_global_key(
             }
             true
         }
-        // Retry a join that gave up, from the screen that still shows it.
-        Screen::Client if focus_free && app.retry_available() && letter('r') => {
+        // Retry a session that gave up, from the screen that still shows it.
+        Screen::Session if focus_free && app.retry_available() && letter('r') => {
             app.retry_connection();
             true
         }
@@ -171,10 +171,8 @@ fn handle_configure_key(
             // the letter so a tester never has to look them up.
             if letter('q') {
                 app.open_card_setup();
-            } else if letter('s') {
-                app.begin_server();
             } else if letter('c') {
-                app.enter_join_picker();
+                app.open_connect_picker();
             } else if letter('r') {
                 app.reset_name_field();
                 app.configure_step = ConfigureStep::SetupName;
@@ -196,15 +194,15 @@ fn handle_configure_key(
             }
             true
         }
-        ConfigureStep::Join => {
+        ConfigureStep::Connect => {
             if letter('c') || enter {
-                app.join_selected_peer();
+                app.connect_selected_peer();
             } else if down {
                 app.move_peer_selection(1);
             } else if up {
                 app.move_peer_selection(-1);
             } else if esc {
-                app.leave_join_picker();
+                app.close_connect_picker();
             } else {
                 return false;
             }
@@ -277,8 +275,8 @@ mod tests {
         app.go_back();
 
         assert!(plain(&mut app, "c"));
-        assert_eq!(app.configure_step, ConfigureStep::Join);
-        app.leave_join_picker();
+        assert_eq!(app.configure_step, ConfigureStep::Connect);
+        app.close_connect_picker();
 
         assert!(plain(&mut app, "r"), "R renames");
         assert_eq!(app.configure_step, ConfigureStep::SetupName);
@@ -290,29 +288,26 @@ mod tests {
         assert!(plain(&mut app, "\u{1b}"));
         assert!(!app.confirm_reset_identity);
 
-        assert!(plain(&mut app, "s"));
-        assert_eq!(app.screen, Screen::Server);
-
         cleanup(app, path);
     }
 
-    /// A join that gave up stays on its screen, and R dials the same peer
-    /// again from there; a join the user ended offers nothing to retry.
+    /// A session that gave up stays on its screen, and R connects to the same
+    /// device again from there; one the user ended offers nothing to retry.
     #[test]
-    fn a_join_that_gave_up_is_retried_in_place() {
+    fn a_session_that_gave_up_is_retried_in_place() {
         let (mut app, path) = configured_app();
         let peer = peer_card("laptop", 0);
         app.peers.push(peer.clone());
         app.selected_peer = Some(peer.public_key().to_hex());
-        app.join_selected_peer();
-        assert_eq!(app.screen, Screen::Client);
-        assert!(app.client_active);
+        app.connect_selected_peer();
+        assert_eq!(app.screen, Screen::Session);
+        assert!(app.session_active);
         assert!(!app.retry_available(), "a live session has nothing to retry");
         assert!(!plain(&mut app, "r"), "so R does nothing");
 
-        // The runtime exhausted its attempts.
+        // The runtime gave up reconnecting after the link dropped.
         app.apply_event(NetEvent::Status(ConnStatus::Idle));
-        assert_eq!(app.screen, Screen::Client, "the screen must not change");
+        assert_eq!(app.screen, Screen::Session, "the screen must not change");
         assert!(app.session_live(), "the session panel stays up");
         assert!(app.retry_available());
         assert_eq!(app.status_text(), "Disconnected");
@@ -320,8 +315,8 @@ mod tests {
 
         assert!(plain(&mut app, "r"), "R retries");
         assert!(app.error.is_none(), "the stale give-up banner is cleared");
-        assert!(app.client_active, "the same peer is dialed again");
-        assert_eq!(app.joined_peer.as_deref(), Some("laptop_x9Y8z7W6"));
+        assert!(app.session_active, "the same device is connected to again");
+        assert_eq!(app.session_peer.as_deref(), Some("laptop_x9Y8z7W6"));
 
         // Backing out ends it for good: nothing left to retry.
         app.go_back();
@@ -412,7 +407,7 @@ mod tests {
     #[test]
     fn plain_letters_are_inert_while_typing() {
         let (mut app, path) = configured_app();
-        for key in ["q", "s", "c", "r", "x", "b", "t", "i"] {
+        for key in ["q", "c", "r", "x", "b", "t", "i"] {
             assert!(!typing(&mut app, key), "{key} must not fire while typing");
         }
         assert_eq!(app.screen, Screen::Home);

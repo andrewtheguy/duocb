@@ -1,9 +1,11 @@
 # duocb
 
 End-to-end encrypted, peer-to-peer clipboard sharing between two devices you
-own. Both sides can send and receive after one device starts a connection and
-the other joins it. Received text stays in an in-memory inbox until you
-explicitly copy it.
+own. On each device you pick the other from your trusted list and press
+Connect — nobody has to go first, and neither side chooses a role: duocb works
+out which device hosts from the two identity keys. Both sides then send and
+receive. Received text stays in an in-memory inbox until you explicitly copy
+it.
 
 > [!WARNING]
 > duocb is pre-1.0 and intentionally has no backward compatibility. This
@@ -63,15 +65,30 @@ as it nears expiry — with the same key, so its public key, fingerprint and
 pairing code do not change — and the card it offers always has most of its
 life left.
 
-When a trusted device starts a connection, it publishes a separate NIP-44
-encrypted hosting record for each trusted peer — advertised on the local
-network over Bonjour/DNS-SD *and* published to Nostr relays, since the host
-cannot know which way the other device will look. The record carries only the
-current iroh node id. A joining device looks on the local network
-first and falls back to the relays if nothing answers there, so two devices in
-one room never involve a third-party server, and two on different networks
-still find each other. It then establishes the iroh connection, and both sides
-sign a fresh transcript containing:
+### Who hosts
+
+One device has to listen and the other has to dial, but that is not something a
+user is in a position to decide, and duocb does not ask. Both devices pick each
+other from their trusted lists and press Connect; the lower of the two
+application public keys hosts. Both sides compute that from keys they already
+hold, so they always reach opposite answers with nothing exchanged, whether the
+two people press Connect together or ten minutes apart. Whoever is ready first
+simply waits — the dialing side is as patient as the listening side, and neither
+gives up until you leave the screen.
+
+Because you picked a device rather than merely trusted one, the session is for
+that device alone: the host publishes one record, addressed to it, and turns
+away any other trusted device that dials in meanwhile.
+
+When a session starts, the hosting device publishes a NIP-44 encrypted hosting
+record addressed to that one peer on every enabled channel — by default both
+the local network over Bonjour/DNS-SD *and* Nostr relays, since the host cannot
+know which way the other device will look (the flags below narrow that to one).
+The record carries only the current iroh node id. The dialing device looks on
+the local network first and falls back to the relays if nothing answers there,
+so two devices in one room never involve a third-party server, and two on
+different networks still find each other. It then establishes the iroh
+connection, and both sides sign a fresh transcript containing:
 
 - both application public keys;
 - two random nonces;
@@ -98,7 +115,8 @@ carries the card over the network instead:
 6. **Check that the pairing code is identical on both devices.** If it differs
    anywhere, press Cancel — something else answered the PIN.
 7. Press Import on both. Each device is now a trusted peer of the other, and you
-   share the clipboard from the home screen as usual.
+   share the clipboard from the home screen as usual — pick the other device on
+   both and press Connect.
 
 A card-setup connection never carries clipboard content; it exists only to hand
 over the cards, and ends as soon as they have crossed.
@@ -211,7 +229,9 @@ persisted.
   config is re-paired by re-importing each peer's card.
 - Nostr relays and iroh infrastructure may observe metadata and timing.
 - Clipboard items are UTF-8 text capped at 1 MiB.
-- A server links one peer at a time. Configure mode pins the stable application
-  identity while allowing its later iroh transport id to change.
+- A session links exactly the one device you picked: the host signals to that
+  peer alone and refuses any other, even a trusted one. Configure mode pins the
+  stable application identity while allowing its later iroh transport id to
+  change.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for protocol details.

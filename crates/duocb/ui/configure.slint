@@ -1,5 +1,5 @@
 // The home screen: the configure mode's setup wizard, the configured hub, and
-// the device picker behind the Join action. All six steps are always
+// the device picker behind the Connect action. All five steps are always
 // instantiated (visibility-toggled) so the two steps with text fields can
 // expose their focus state; the container height follows the visible step.
 
@@ -213,23 +213,18 @@ component HubStep inherits VerticalLayout {
         }
     }
     BigButton {
-        text: "🚀 Start a connection";
-        hint: "S";
-        clicked => { Actions.begin-server(); }
-    }
-    WideButton {
-        text: "🔗 Join another device";
+        text: "🔗 Connect to a device";
         hint: "C";
-        clicked => { Actions.enter-join-picker(); }
+        clicked => { Actions.open-connect-picker(); }
     }
     Small {
-        text: "Start makes this device host the connection — the other device joins it. Join shows your other devices and connects to the one that started.";
+        text: "Pick the device you want to share with, and have it pick this one. Neither side has to go first or agree who hosts — duocb settles that from the two identity keys.";
         horizontal-alignment: center;
     }
     // Only shown when a launch flag moved this process off the default channel
-    // (see `signal-channel-badge`): the flag decides whether Start and Join can
-    // reach a device that is not on this network, which is not otherwise
-    // visible from the hub.
+    // (see `signal-channel-badge`): the flag decides whether Connect can reach a
+    // device that is not on this network, which is not otherwise visible from
+    // the hub.
     if UiState.signal-channel-badge != "": Text {
         text: UiState.signal-channel-badge;
         color: Theme.warn;
@@ -239,11 +234,11 @@ component HubStep inherits VerticalLayout {
     }
 }
 
-component JoinStep inherits VerticalLayout {
+component ConnectStep inherits VerticalLayout {
     alignment: start;
     spacing: Theme.pad-m;
     Card {
-        CardTitle { text: "Your devices"; }
+        CardTitle { text: "Connect to one of your devices"; }
         if UiState.peers-updated != "": Small { text: UiState.peers-updated; }
         Rectangle { height: Theme.pad-xs; }
         if UiState.peers-empty-text != "": Weak { text: UiState.peers-empty-text; }
@@ -264,20 +259,20 @@ component JoinStep inherits VerticalLayout {
         }
     }
     BigButton {
-        text: "🔗 Join the selected device";
+        text: "🔗 Connect to the selected device";
         hint: "C / Enter";
-        enabled: UiState.join-ready;
-        clicked => { Actions.join-selected(); }
+        enabled: UiState.connect-ready;
+        clicked => { Actions.connect-selected(); }
     }
     Small {
-        text: UiState.join-ready
-            ? "If it isn't hosting yet, press Start there soon — the join retries up to 10 times."
-            : "Select the device to join.";
+        text: UiState.connect-ready
+            ? "Do the same on that device — pick this one there. Whichever of you gets there first waits for the other; no one has to press anything twice."
+            : "Select the device to connect to.";
         horizontal-alignment: center;
     }
     HorizontalLayout {
         alignment: center;
-        Button { text: "Back (Esc)"; clicked => { Actions.leave-join-picker(); } }
+        Button { text: "Back (Esc)"; clicked => { Actions.close-connect-picker(); } }
     }
 }
 
@@ -311,13 +306,13 @@ export component HomeScreen inherits ScrollView {
                 : UiState.configure-step == ConfigureStep.setup-import ? import-step.preferred-height
                 : UiState.configure-step == ConfigureStep.setup-name ? name-step.preferred-height
                 : UiState.configure-step == ConfigureStep.ready ? hub-step.preferred-height
-                : join-step.preferred-height;
+                : connect-step.preferred-height;
 
             choice-step := ChoiceStep { visible: UiState.configure-step == ConfigureStep.setup-choice; }
             import-step := ImportStep { visible: UiState.configure-step == ConfigureStep.setup-import; }
             name-step := NameStep { visible: UiState.configure-step == ConfigureStep.setup-name; }
             hub-step := HubStep { visible: UiState.configure-step == ConfigureStep.ready; }
-            join-step := JoinStep { visible: UiState.configure-step == ConfigureStep.join; }
+            connect-step := ConnectStep { visible: UiState.configure-step == ConfigureStep.connect; }
         }
 
         Rectangle { vertical-stretch: 1; }

@@ -1,0 +1,58 @@
+// The clipboard-session screen — one screen for both devices. Which of them
+// hosts is decided from the two identity keys (`session_role`), not by the
+// user, so there is no role-specific form here: the session states are the
+// same on either side, and `session-role-note` is the only place the split is
+// even mentioned.
+
+import { UiState, Actions } from "globals.slint";
+import { Theme } from "theme.slint";
+import { Body, Small, BackHeader, IdentityPairingSummary } from "widgets.slint";
+import { SessionPanel } from "session.slint";
+import { Button, ScrollView } from "std-widgets.slint";
+
+export component ConnectionScreen inherits ScrollView {
+    out property <bool> field-focused: session.field-focused;
+    viewport-width: root.width;
+    viewport-height: max(root.height, content.preferred-height);
+    horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
+    mouse-drag-pan-enabled: true;
+
+    content := VerticalLayout {
+        alignment: start;
+        spacing: Theme.pad-m;
+
+        BackHeader {
+            title: UiState.session-peer != ""
+                ? "Connection to " + UiState.session-peer
+                : "Connection";
+        }
+        Body { text: "Status: " + UiState.status-text; }
+
+        // Nothing running: a brief teardown transient, since a session always
+        // starts from the hub's device picker.
+        if !UiState.session-live: Small {
+            text: "Pick a device to connect to from the home screen.";
+        }
+
+        // Said quietly and never as a control: the user picked a device, not a
+        // role, and the only reason to surface which half this device drew is
+        // that it explains what the status line is waiting for.
+        if UiState.session-live && UiState.session-role-note != "": Small {
+            text: UiState.session-role-note;
+        }
+
+        // The pairing summary and the way out stay put for the whole session,
+        // including while reconnecting and after it gave up — the reconnect
+        // status and Retry live in the session panel below.
+        if UiState.session-live: IdentityPairingSummary { }
+        if UiState.session-live: HorizontalLayout {
+            alignment: start;
+            Button {
+                text: "✕ Disconnect (Esc)";
+                clicked => { Actions.disconnect(); }
+            }
+        }
+
+        session := SessionPanel { }
+    }
+}

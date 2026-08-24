@@ -25,10 +25,17 @@ export global UiState {
     in property <ConfigureStep> configure-step;
     in property <string> status-text;
     in property <bool> connected;
-    in property <bool> server-running;
-    in property <bool> client-active;
-    /// A join gave up (or was refused) and the same peer can be dialed again
-    /// from where the user is.
+    /// A clipboard or card-setup session is running (either half of it).
+    in property <bool> session-active;
+    /// Whether this device drew the hosting half of the running session. Both
+    /// devices picked each other; the app decided this (see `session_role`), so
+    /// it is shown as information, never as something to act on.
+    in property <bool> session-hosting;
+    /// One line naming which device is setting the link up, "" when no session
+    /// is running. Composed in Rust.
+    in property <string> session-role-note;
+    /// A session that had connected gave up reconnecting (or was refused), and
+    /// the same peer can be dialed again from where the user is.
     in property <bool> retry-available;
     /// A clipboard session exists in some state — running, reconnecting, or
     /// waiting for Retry — so the session panel stays on screen.
@@ -73,10 +80,13 @@ export global UiState {
     in property <string> peers-updated;
     /// Empty-list placeholder, "" while the list has rows.
     in property <string> peers-empty-text;
-    in property <bool> join-ready;
+    /// Whether a device is selected in the picker, so Connect can fire.
+    in property <bool> connect-ready;
 
-    // Server / running-session identity.
-    in property <string> joined-peer;
+    // Running-session identity.
+    /// The display identity of the device this session is with, "" when none
+    /// has been chosen.
+    in property <string> session-peer;
     in property <string> node-id-short;
     in property <string> peer-node-id-short;
     /// The persistent application public key shown in the pairing summary.
@@ -89,7 +99,7 @@ export global UiState {
     /// "refreshes in 42s", composed in Rust; "" while no PIN shows.
     in property <string> pin-countdown;
 
-    // Client join forms.
+    // The card-setup joiner's PIN entry.
     /// True when the PIN entry is full-length but fails validation (a typo).
     in property <bool> pin-invalid;
     /// Neutral "keep typing — N of M characters" hint while the PIN entry is
@@ -183,13 +193,14 @@ export global Actions {
     callback cancel-reset-identity();
 
     // Hub / device picker.
-    callback begin-server();
-    callback enter-join-picker();
-    callback leave-join-picker();
+    callback open-connect-picker();
+    callback close-connect-picker();
     callback toggle-peer(public-key: string);
     callback remove-peer(public-key: string);
     callback import-peer-card();
-    callback join-selected();
+    /// Connect to the selected device — this side hosts or dials as the app
+    /// decides; the other device runs the identical action.
+    callback connect-selected();
 
     // Card setup.
     /// Show a PIN on this device so the other one can type it.
@@ -203,10 +214,10 @@ export global Actions {
     /// Discard the card that arrived and go back.
     callback cancel-received-card();
     callback disconnect();
-    /// Dial the same peer again after the join gave up.
+    /// Connect to the same peer again after the session gave up.
     callback retry-connect();
 
-    // Server credentials.
+    // Card-setup credentials.
     callback copy-pin();
     callback refresh-pin();
 

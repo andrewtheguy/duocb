@@ -24,8 +24,9 @@ impl App {
         s.set_configure_step(self.configure_step);
         s.set_status_text(self.status_text().into());
         s.set_connected(self.status == ConnStatus::Connected);
-        s.set_server_running(self.server_running);
-        s.set_client_active(self.client_active);
+        s.set_session_active(self.session_active);
+        s.set_session_hosting(self.session_hosting);
+        s.set_session_role_note(self.session_role_note().into());
         s.set_retry_available(self.retry_available());
         s.set_session_live(self.session_live());
         s.set_error(str_or_empty(&self.error));
@@ -123,10 +124,10 @@ impl App {
         } else {
             "No trusted peers yet. Paste the other device's signed card above, or use Trade cards to send it over the network.".into()
         });
-        s.set_join_ready(self.selected_peer_card().is_some());
+        s.set_connect_ready(self.selected_peer_card().is_some());
 
-        // Server / running-session identity.
-        s.set_joined_peer(str_or_empty(&self.joined_peer));
+        // Running-session identity.
+        s.set_session_peer(str_or_empty(&self.session_peer));
         s.set_node_id_short(
             self.node_id
                 .as_deref()
@@ -167,7 +168,7 @@ impl App {
         s.set_pairing_code(pairing_code.into());
         s.set_incoming_expiry(incoming_expiry.into());
 
-        // Client join forms. The two group fields together make the PIN.
+        // The card-setup joiner's PIN entry. The two group fields together make the PIN.
         // Distinguish "still typing" (fewer than a full PIN's characters) from
         // "full length but a typo" so the hint under the fields is a neutral
         // progress line while typing and only turns into a validation warning
