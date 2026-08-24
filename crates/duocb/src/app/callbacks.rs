@@ -125,9 +125,10 @@ pub(crate) fn wire(app: &Rc<RefCell<App>>, ui: &MainWindow) {
     nav!(on_join_card_setup, |app| app.join_card_setup());
     nav!(on_import_received_card, |app| app.import_received_card());
     nav!(on_cancel_received_card, |app| app.cancel_received_card());
-    nav!(on_disconnect, |app| {
-        app.net.send(duocb_core::net::UiCommand::Disconnect);
-    });
+    // An explicit Disconnect leaves the session for good, so it is the same
+    // as backing out; Retry re-dials the peer the screen still shows.
+    nav!(on_disconnect, |app| app.go_back());
+    nav!(on_retry_connect, |app| app.retry_connection());
 
     // Server credentials.
     act!(on_copy_pin, |app| {

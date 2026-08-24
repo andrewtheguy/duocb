@@ -26,6 +26,8 @@ impl App {
         s.set_connected(self.status == ConnStatus::Connected);
         s.set_server_running(self.server_running);
         s.set_client_active(self.client_active);
+        s.set_retry_available(self.retry_available());
+        s.set_session_live(self.session_live());
         s.set_error(str_or_empty(&self.error));
 
         // Configure identity / wizard.

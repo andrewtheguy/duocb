@@ -27,6 +27,12 @@ export global UiState {
     in property <bool> connected;
     in property <bool> server-running;
     in property <bool> client-active;
+    /// A join gave up (or was refused) and the same peer can be dialed again
+    /// from where the user is.
+    in property <bool> retry-available;
+    /// A clipboard session exists in some state — running, reconnecting, or
+    /// waiting for Retry — so the session panel stays on screen.
+    in property <bool> session-live;
     /// Error banner text; "" hides the banner.
     in property <string> error;
 
@@ -197,6 +203,8 @@ export global Actions {
     /// Discard the card that arrived and go back.
     callback cancel-received-card();
     callback disconnect();
+    /// Dial the same peer again after the join gave up.
+    callback retry-connect();
 
     // Server credentials.
     callback copy-pin();

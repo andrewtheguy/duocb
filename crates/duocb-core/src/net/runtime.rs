@@ -904,7 +904,7 @@ async fn run_client_session(
         attempts += 1;
         if attempts >= MAX_CONNECT_ATTEMPTS {
             events.error(format!(
-                "Could not reach the peer after {MAX_CONNECT_ATTEMPTS} attempts — press Join to try again"
+                "Could not reach the peer after {MAX_CONNECT_ATTEMPTS} attempts — press Retry to try again"
             ));
             events.status(ConnStatus::Idle);
             endpoint.close().await;
