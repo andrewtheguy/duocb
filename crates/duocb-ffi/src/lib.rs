@@ -44,8 +44,21 @@
 //! self-card and the trusted peer cards are all passed in on every
 //! [`duocb_start`] and never written anywhere by this library. On iOS the
 //! secrets belong in the Keychain and the cards in ordinary app storage. These
-//! application keys are deliberately unrelated to iroh's ephemeral transport
-//! identity.
+//! application keys are deliberately unrelated to iroh's transport identity.
+//!
+//! # The iroh transport key
+//!
+//! Every [`duocb_start`] also takes `iroh_secret`, the key behind this
+//! device's iroh node id. The desktop mints a fresh one per process because a
+//! desktop config directory can be copied between machines, and two live
+//! endpoints sharing a node id would shadow each other on the relays. An iOS
+//! app's storage cannot be cloned by accident — the Keychain item is
+//! this-device-only and the app binds it to `identifierForVendor` — so the app
+//! mints one with [`duocb_generate_iroh_secret`], persists it, and passes the
+//! same value on every start. Whatever the source, the node id is pinned for
+//! the process's lifetime: the first `duocb_start` fixes it, and a later start
+//! carrying a different `iroh_secret` is refused rather than letting one
+//! running app present two node ids.
 //!
 //! # Local network on iOS
 //!
@@ -62,13 +75,14 @@
 
 use std::ffi::{CStr, c_char, c_int};
 use std::ptr;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use serde::Deserialize;
 
 use duocb_core::auth::{CARD_RENEW_BEFORE_SECS, Identity, IdentityCard, MAX_TRUSTED_PEERS};
+use duocb_core::iroh;
 use duocb_core::net::endpoint::ConnPathKind;
 use duocb_core::net::{
     ConnStatus, DialSpec, EventSender, KeyIdentity, NetEvent, ServerMode, SignalChannel, UiCommand,
@@ -76,6 +90,9 @@ use duocb_core::net::{
 
 /// Process-global guard: at most one running session per process.
 static RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// The iroh key this process presents, fixed by the first [`duocb_start`].
+static IROH_SECRET: OnceLock<iroh::SecretKey> = OnceLock::new();
 
 /// Opaque handle owned by the Swift side. Freed by [`duocb_stop`].
 pub struct DuocbHandle {
@@ -98,6 +115,11 @@ pub struct DuocbHandle {
 #[serde(deny_unknown_fields)]
 struct FfiConfig {
     role: Role,
+    /// Every role: this device's persisted iroh transport key, 64 hex chars
+    /// from [`duocb_generate_iroh_secret`]. Must be the same on every start
+    /// within one process.
+    #[serde(default)]
+    iroh_secret: Option<String>,
     /// `start`/`join`: this installation's NIP-19 `nsec`.
     #[serde(default)]
     identity_secret: Option<String>,
@@ -210,6 +232,22 @@ pub unsafe extern "C" fn duocb_generate_identity(out_buf: *mut c_char, out_len: 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn duocb_generate_suffix(out_buf: *mut c_char, out_len: usize) -> c_int {
     write_result(out_buf, out_len, &duocb_core::identity::generate_suffix())
+}
+
+/// Generate this device's iroh transport key as 64 hex characters. Mint it
+/// **once**, persist it next to the application identity, and pass it as
+/// `iroh_secret` on every [`duocb_start`] — see the crate docs for why iOS
+/// persists it while the desktop does not.
+/// Returns 1 on success, 0 if the buffer is too small, -1 on a NULL buffer.
+/// # Safety
+/// `out_buf` must be NULL or point to at least `out_len` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn duocb_generate_iroh_secret(out_buf: *mut c_char, out_len: usize) -> c_int {
+    write_result(
+        out_buf,
+        out_len,
+        &hex::encode(iroh::SecretKey::generate().to_bytes()),
+    )
 }
 
 /// Validate an identity private key. Returns 1 if valid; 0 if invalid (the
@@ -683,6 +721,7 @@ fn start_inner(json: &str) -> Result<DuocbHandle, String> {
     let cfg: FfiConfig =
         serde_json::from_str(json).map_err(|e| format!("invalid config JSON: {e}"))?;
     let plan = build_start_plan(cfg)?;
+    let secret = pin_iroh_secret(&IROH_SECRET, plan.iroh_secret)?;
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -692,7 +731,7 @@ fn start_inner(json: &str) -> Result<DuocbHandle, String> {
     let (event_tx, event_rx) = std::sync::mpsc::channel();
     // No waker: Swift polls duocb_next_event on a timer.
     let events = EventSender::new(event_tx, None);
-    let task = runtime.spawn(duocb_core::net::runtime::net_main(cmd_rx, events));
+    let task = runtime.spawn(duocb_core::net::runtime::net_main(cmd_rx, events, secret));
 
     cmd_tx
         .send(plan.session_cmd.clone())
@@ -711,24 +750,50 @@ fn start_inner(json: &str) -> Result<DuocbHandle, String> {
 
 #[derive(Debug)]
 struct StartPlan {
+    iroh_secret: iroh::SecretKey,
     session_cmd: UiCommand,
     disconnect_cmd: UiCommand,
 }
 
 impl StartPlan {
-    fn host(cmd: UiCommand) -> Self {
+    fn host(iroh_secret: iroh::SecretKey, cmd: UiCommand) -> Self {
         Self {
+            iroh_secret,
             session_cmd: cmd,
             disconnect_cmd: UiCommand::StopServer,
         }
     }
 
-    fn dial(cmd: UiCommand) -> Self {
+    fn dial(iroh_secret: iroh::SecretKey, cmd: UiCommand) -> Self {
         Self {
+            iroh_secret,
             session_cmd: cmd,
             disconnect_cmd: UiCommand::Disconnect,
         }
     }
+}
+
+/// Parse the config's `iroh_secret`: exactly 32 bytes as hex.
+fn parse_iroh_secret(value: Option<&str>) -> Result<iroh::SecretKey, String> {
+    let hex = value.ok_or("iroh_secret is required")?.trim();
+    let bytes: [u8; 32] = hex::decode(hex)
+        .ok()
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or("invalid iroh_secret: expected 64 hex characters")?;
+    Ok(iroh::SecretKey::from_bytes(&bytes))
+}
+
+/// Fix the process's iroh key on the first start and hold every later start to
+/// it, so one running app never presents two node ids.
+fn pin_iroh_secret(
+    slot: &OnceLock<iroh::SecretKey>,
+    secret: iroh::SecretKey,
+) -> Result<iroh::SecretKey, String> {
+    let pinned = slot.get_or_init(|| secret.clone());
+    if pinned.to_bytes() != secret.to_bytes() {
+        return Err("iroh_secret differs from the one this process already presents".into());
+    }
+    Ok(pinned.clone())
 }
 
 /// Validate the config for its role and resolve the commands it maps to.
@@ -747,6 +812,7 @@ fn build_start_plan(cfg: FfiConfig) -> Result<StartPlan, String> {
         cfg.relays
     };
     let channel = cfg.channel.unwrap_or(Channel::LanThenNostr).to_core();
+    let iroh_secret = parse_iroh_secret(cfg.iroh_secret.as_deref())?;
 
     // Every role needs a self-card; only the key roles need the private key.
     let self_card = IdentityCard::parse(cfg.self_card.as_deref().ok_or("self_card is required")?)
@@ -757,7 +823,7 @@ fn build_start_plan(cfg: FfiConfig) -> Result<StartPlan, String> {
     // belong to the one role that dials a PIN.
     let card_setup = matches!(cfg.role, Role::CardHost | Role::CardJoin);
     if card_setup && (cfg.identity_secret.is_some() || !cfg.peers.is_empty()) {
-        return Err("card setup accepts only role, self_card, pin, ip, channel and relays".into());
+        return Err("card setup accepts only role, iroh_secret, self_card, pin, ip, channel and relays".into());
     }
     if cfg.role != Role::CardJoin && (cfg.pin.is_some() || cfg.ip.is_some()) {
         return Err("pin and ip are only valid for the card_join role".into());
@@ -768,7 +834,7 @@ fn build_start_plan(cfg: FfiConfig) -> Result<StartPlan, String> {
 
     match cfg.role {
         Role::CardHost => {
-            return Ok(StartPlan::host(UiCommand::StartServer {
+            return Ok(StartPlan::host(iroh_secret, UiCommand::StartServer {
                 mode: ServerMode::CardSetup {
                     self_card: Box::new(self_card),
                     channel,
@@ -793,7 +859,7 @@ fn build_start_plan(cfg: FfiConfig) -> Result<StartPlan, String> {
                 )?)),
                 None => None,
             };
-            return Ok(StartPlan::dial(UiCommand::Connect {
+            return Ok(StartPlan::dial(iroh_secret, UiCommand::Connect {
                 spec: DialSpec::CardSetup {
                     canonical_pin,
                     self_card: Box::new(self_card),
@@ -839,7 +905,7 @@ fn build_start_plan(cfg: FfiConfig) -> Result<StartPlan, String> {
     };
 
     Ok(match cfg.role {
-        Role::Start => StartPlan::host(UiCommand::StartServer {
+        Role::Start => StartPlan::host(iroh_secret, UiCommand::StartServer {
             mode: ServerMode::Key {
                 identity: Box::new(key_identity),
                 channel,
@@ -858,7 +924,7 @@ fn build_start_plan(cfg: FfiConfig) -> Result<StartPlan, String> {
                 .find(|peer| peer.public_key().to_hex() == selected || peer.npub() == selected)
                 .map(IdentityCard::public_key)
                 .ok_or("peer_public_key is not in the local trusted peer list")?;
-            StartPlan::dial(UiCommand::Connect {
+            StartPlan::dial(iroh_secret, UiCommand::Connect {
                 spec: DialSpec::Key {
                     identity: Box::new(key_identity),
                     peer_public_key,
@@ -1209,8 +1275,68 @@ mod tests {
         (identity.to_nsec(), card.encode())
     }
 
+    fn iroh_secret() -> String {
+        hex::encode(iroh::SecretKey::generate().to_bytes())
+    }
+
+    /// Parse and resolve a config, supplying an `iroh_secret` when the test
+    /// did not set one so each test states only what it is about.
     fn build(json: &str) -> Result<StartPlan, String> {
-        build_start_plan(serde_json::from_str(json).map_err(|e| e.to_string())?)
+        let mut cfg: serde_json::Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
+        if cfg.get("iroh_secret").is_none() {
+            cfg["iroh_secret"] = serde_json::json!(iroh_secret());
+        }
+        build_start_plan(serde_json::from_value(cfg).map_err(|e| e.to_string())?)
+    }
+
+    #[test]
+    fn iroh_secret_is_required_and_must_be_32_hex_bytes() {
+        let (nsec, card) = identity_with_card();
+        let base = serde_json::json!({
+            "role": "start",
+            "identity_secret": nsec,
+            "self_card": card,
+        });
+        let without = build_start_plan(serde_json::from_value(base.clone()).unwrap());
+        assert!(without.unwrap_err().contains("iroh_secret is required"));
+
+        for bad in ["", "abc", &"0".repeat(63), &"zz".repeat(32)] {
+            let mut cfg = base.clone();
+            cfg["iroh_secret"] = serde_json::json!(bad);
+            assert!(
+                build(&cfg.to_string())
+                    .unwrap_err()
+                    .contains("invalid iroh_secret"),
+                "{bad:?} must be rejected"
+            );
+        }
+
+        // The same hex always yields the same node id — that is the whole
+        // point of persisting it.
+        let secret = iroh_secret();
+        let mut cfg = base;
+        cfg["iroh_secret"] = serde_json::json!(secret);
+        let a = build(&cfg.to_string()).unwrap().iroh_secret;
+        let b = build(&cfg.to_string()).unwrap().iroh_secret;
+        assert_eq!(a.public(), b.public());
+        assert_eq!(hex::encode(a.to_bytes()), secret);
+    }
+
+    #[test]
+    fn a_process_presents_one_node_id() {
+        let slot = OnceLock::new();
+        let first = iroh::SecretKey::generate();
+        let pinned = pin_iroh_secret(&slot, first.clone()).unwrap();
+        assert_eq!(pinned.public(), first.public());
+        // The same key again — a stop-and-restart with the persisted value.
+        assert!(pin_iroh_secret(&slot, first.clone()).is_ok());
+        // A different key is refused instead of silently changing node id.
+        assert!(
+            pin_iroh_secret(&slot, iroh::SecretKey::generate())
+                .unwrap_err()
+                .contains("already presents")
+        );
+        assert_eq!(slot.get().unwrap().public(), first.public());
     }
 
     #[test]
@@ -1301,6 +1427,11 @@ mod tests {
                 mode: ServerMode::CardSetup { .. }
             }
         ));
+
+        // Card setup still has an endpoint, so it presents the node id too.
+        let json = serde_json::json!({ "role": "card_host", "self_card": card }).to_string();
+        let without = build_start_plan(serde_json::from_str(&json).unwrap());
+        assert!(without.unwrap_err().contains("iroh_secret is required"));
 
         // Passing the private key or a trust store to card setup is a mistake,
         // not something to silently ignore — neither is used there.

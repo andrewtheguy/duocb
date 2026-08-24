@@ -13,6 +13,7 @@ description = "P2P clipboard sharing between two devices over iroh"
 
 [workspace.dependencies]
 duocb-core = { path = "crates/duocb-core" }
+hex = "0.4"
 
 # GUI
 # FemtoVG avoids Skia's large native build while retaining GPU rendering.

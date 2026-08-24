@@ -59,7 +59,7 @@ async fn connect_client(relays: &[String]) -> Result<Client> {
     Ok(client)
 }
 
-/// Publish the host's ephemeral iroh endpoint separately and privately for each
+/// Publish the host's current iroh endpoint separately and privately for each
 /// trusted application identity — the relay copy of the record `crate::lan`
 /// advertises over DNS-SD.
 pub async fn publish_hosting(
@@ -100,7 +100,7 @@ pub async fn publish_hosting(
     Ok(())
 }
 
-/// Resolve a selected trusted peer's current ephemeral iroh endpoint.
+/// Resolve a selected trusted peer's current iroh endpoint.
 ///
 /// A record that is present but unreadable — bad signature, addressed to
 /// someone else, malformed — is reported as `Ok(None)`, the same as no record
@@ -156,7 +156,7 @@ fn pin_kind() -> Kind {
 /// This is the fallback path that lets two devices on different networks trade
 /// cards. It puts the record where anyone can fetch it, so its secrecy rests
 /// entirely on the PIN: the lookup key is Argon2id-derived, and the record only
-/// yields an ephemeral node id, which is not a credential — dialing it still
+/// yields a node id, which is not a credential — dialing it still
 /// has to pass the in-band PIN auth, and the card that crosses is not trusted
 /// until a human compares fingerprints (`crate::card_exchange`).
 pub async fn publish_pin_record(keys: &Keys, node_id: &EndpointId, relays: &[String]) -> Result<()> {

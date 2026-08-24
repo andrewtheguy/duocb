@@ -1,6 +1,6 @@
 //! The encrypted PIN rendezvous record, shared by both transports that carry
 //! it: nostr relays (`crate::nostr`, internet) and mDNS (`crate::lan`, local
-//! network). The record holds only the server's **ephemeral node id** — never a
+//! network). The record holds only the server's **current node id** — never a
 //! token — NIP-44 self-encrypted under a keypair both peers derive from the
 //! `(pin, bucket)` pair via Argon2id (see `crate::pin`). The derived public key
 //! doubles as the lookup key on either transport: only someone holding the PIN
@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::pin;
 
 /// The payload carried (NIP-44 encrypted) in a PIN rendezvous record: the
-/// server's ephemeral node id.
+/// server's current node id.
 #[derive(Serialize, Deserialize)]
 struct PinPayload {
     node_id: String,

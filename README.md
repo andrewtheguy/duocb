@@ -24,16 +24,22 @@ copy and paste them.
 ### Configure mode
 
 Every duocb installation generates its own permanent application keypair. This
-key is separate from iroh's ephemeral transport key:
+key is separate from iroh's transport key:
 
 - The application private key signs the device's portable identity card and
-  authenticates the duocb wire handshake.
+  authenticates the duocb wire handshake. It never expires: it is minted once
+  and kept until the user resets the identity.
 - The signed identity card contains the final device name, application public
   key, and a mandatory expiry. The final name is
   `<short-name>_<permanent-random-suffix>`; the suffix is minted once per
   installation and stays stable across renames and identity resets.
-- The iroh key creates the current QUIC endpoint and node id. It is used for
-  signaling and transport establishment, never as the saved duocb identity.
+- The iroh key creates the QUIC endpoint and node id. It is used for signaling
+  and transport establishment, never as the saved duocb identity. A running
+  app presents one node id for its whole life. The desktop mints the key fresh
+  on every launch, because a config directory can be copied between machines
+  and two live endpoints with one node id would shadow each other; iOS keeps
+  it in the Keychain (this-device-only, bound to `identifierForVendor`), where
+  it cannot be cloned by accident, so the node id also survives relaunches.
 
 Pairing is mutual. On each device:
 
@@ -44,18 +50,20 @@ Import verifies the signature before saving `{name, public key, signed card}`.
 A device only accepts application keys in its own local trusted list. The list
 is capped at 128 entries.
 
-Cards are valid for 30 days. There is no renewal over the wire: once a card
+Cards are valid for 30 days; the key that signs them is not what expires. There is no renewal over the wire: once a card
 expires, both devices refuse to pair on it, and the pairing is restored by
 copying a fresh card and importing it again — the same two steps as the first
 time. An expired peer stays in the trusted list, marked expired, so it can be
 renewed or removed deliberately. A device re-signs its own card automatically
-as it nears expiry, so the card it offers always has most of its life left.
+as it nears expiry — with the same key, so its public key, fingerprint and
+pairing code do not change — and the card it offers always has most of its
+life left.
 
 When a trusted device starts a connection, it publishes a separate NIP-44
 encrypted hosting record for each trusted peer — advertised on the local
 network over Bonjour/DNS-SD *and* published to Nostr relays, since the host
 cannot know which way the other device will look. The record carries only the
-current ephemeral iroh node id. A joining device looks on the local network
+current iroh node id. A joining device looks on the local network
 first and falls back to the relays if nothing answers there, so two devices in
 one room never involve a third-party server, and two on different networks
 still find each other. It then establishes the iroh connection, and both sides

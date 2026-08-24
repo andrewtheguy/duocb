@@ -153,7 +153,7 @@ component HubStep inherits VerticalLayout {
             value: UiState.public-key;
         }
         if UiState.has-identity: Small {
-            text: "Paste this device's signed card into each device that should trust it, or use Trade cards below to send it over the network. Cards expire after 30 days — to renew, copy this card again and import it on every device that should keep trusting this one.";
+            text: "Paste this device's signed card into each device that should trust it, or use Trade cards below to send it over the network. Cards expire after 30 days; your private key does not. Renewal is this device re-signing a new card with the same key — copy the card again and import it on every device that should keep trusting this one.";
         }
         if UiState.has-identity: Small {
             text: "The fingerprint identifies this device's key: it is this device's half of the pairing code shown when you trade cards, and it does not change when a card is renewed.";
@@ -172,7 +172,7 @@ component HubStep inherits VerticalLayout {
     Card {
         CardTitle { text: "Trust another device"; }
         Body {
-            text: "Paste the other device's signed identity card. Pairing is mutual, so import this device's card there too. A card is good for 30 days; once it expires neither device will pair until a fresh card is imported.";
+            text: "Paste the other device's signed identity card. Pairing is mutual, so import this device's card there too. A card is good for 30 days; once it expires neither device will pair until a fresh card is imported. The other device's key does not change — only its card is renewed.";
         }
         peer-card-entry := LineEdit {
             placeholder-text: "{ signed identity card JSON }";

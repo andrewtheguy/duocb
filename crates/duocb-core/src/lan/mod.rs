@@ -2,7 +2,7 @@
 //! card-setup PIN record (`crate::pin_record`) and the pairwise hosting record
 //! that points a trusted peer at a live clipboard session
 //! (`crate::hosting_record`). Both are the NIP-44 ciphertext of the host's
-//! ephemeral node id under a service instance label the looking device derives
+//! current node id under a service instance label the looking device derives
 //! for itself, so a record is found by deriving its label — from the typed PIN,
 //! or from the pair of application keys — and never by naming a device.
 //!
@@ -152,7 +152,7 @@ pub async fn dnssd_lookup_pin_record(candidates: &[Keys]) -> Result<Option<LanFo
     .await
 }
 
-/// Advertise this host's ephemeral node id on the local network for exactly one
+/// Advertise this host's current node id on the local network for exactly one
 /// trusted peer, so that peer can find a live clipboard session without any
 /// relay. A host with several trusted peers holds several of these — the label
 /// and the ciphertext are both pair-specific, so no peer learns about another.

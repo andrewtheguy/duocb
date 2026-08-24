@@ -131,10 +131,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Notify holds a permit, so a wake racing a finishing drain re-runs the
     // loop and no event is ever missed.
     let notify = Arc::new(tokio::sync::Notify::new());
-    let net = duocb_core::net::spawn_net_runtime(Some(Arc::new({
-        let notify = Arc::clone(&notify);
-        move || notify.notify_one()
-    })));
+    // One iroh key per process: every session this app runs presents the same
+    // node id until it exits. Never saved — a desktop config directory can be
+    // copied between machines, and two live endpoints sharing a node id would
+    // shadow each other.
+    let net = duocb_core::net::spawn_net_runtime(
+        Some(Arc::new({
+            let notify = Arc::clone(&notify);
+            move || notify.notify_one()
+        })),
+        duocb_core::iroh::SecretKey::generate(),
+    );
 
     let app = Rc::new(RefCell::new(app::App::new(
         config_lock,

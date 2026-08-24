@@ -1,6 +1,6 @@
 //! Short, human-typable PIN that authenticates a card-setup session.
 //!
-//! In card setup the host shares its ephemeral node id without any copy-paste: it
+//! In card setup the host shares its current node id without any copy-paste: it
 //! shows a short PIN that **rotates every 60 seconds**. The PIN is the only secret
 //! the joiner types; both sides turn it into a keypair (via [`derive_key_material`])
 //! that locates and decrypts a single rendezvous record carrying the node id —
@@ -30,7 +30,7 @@
 //! Two independent keys are derived from a PIN, both with the same Argon2id work factor but
 //! **domain-separated** salts (see [`derive_key_material`] and [`derive_auth_key_material`]):
 //! - the *rendezvous* key ([`derive_key_material`], bucketed) locates & decrypts the relay
-//!   record carrying the server's ephemeral node id, and
+//!   record carrying the server's current node id, and
 //! - the *auth* password ([`derive_auth_key_material`], **not** bucketed) is the SPAKE2
 //!   password for the in-band mutual PAKE (see `crate::pin_auth`).
 //!

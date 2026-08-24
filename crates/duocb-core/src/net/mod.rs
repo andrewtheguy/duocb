@@ -71,7 +71,7 @@ impl SignalChannel {
     }
 }
 
-/// How the server signals its ephemeral node id to the client.
+/// How the server signals its current node id to the client.
 #[derive(Debug, Clone)]
 pub enum ServerMode {
     /// Configure mode: publish a pairwise hosting record for each trusted peer
@@ -311,8 +311,9 @@ impl NetHandle {
 
 /// Spawn the networking runtime on a dedicated thread with its own tokio
 /// multi-thread runtime. `wake` is invoked after every event so the host UI
-/// can wake its render loop.
-pub fn spawn_net_runtime(wake: Option<WakeFn>) -> NetHandle {
+/// can wake its render loop; `secret` is the iroh key the runtime presents for
+/// its whole life (see [`runtime::net_main`]).
+pub fn spawn_net_runtime(wake: Option<WakeFn>, secret: iroh::SecretKey) -> NetHandle {
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
     let (event_tx, event_rx) = std::sync::mpsc::channel();
     let events = EventSender::new(event_tx, wake);
@@ -321,7 +322,7 @@ pub fn spawn_net_runtime(wake: Option<WakeFn>) -> NetHandle {
             .enable_all()
             .build()
             .expect("failed to build tokio runtime");
-        rt.block_on(runtime::net_main(cmd_rx, events));
+        rt.block_on(runtime::net_main(cmd_rx, events, secret));
     });
     NetHandle {
         cmd_tx,

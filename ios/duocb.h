@@ -6,11 +6,14 @@
  * Each installation holds one persistent application keypair. Its private key
  * authenticates duocb's wire protocol and signs a portable identity card
  * naming `<short-name>_<permanent-suffix>`. That key is unrelated to iroh's
- * ephemeral transport key. Pairing is mutual: each installation stores the
+ * transport key. Pairing is mutual: each installation stores the
  * other's verified signed card in its local trusted-peer list.
  *
  * Cards expire 30 days after they are minted and both sides refuse to pair on
  * a lapsed one; the only way back is for the owner to hand over a fresh card.
+ * The keypair itself never expires — a renewal is the same key signing a new
+ * card, so the public key and fingerprint are stable for the installation's
+ * life.
  * Re-mint the local self-card whenever duocb_identity_card_info reports
  * "needs_renewal".
  *
@@ -38,6 +41,7 @@
  * ── Config JSON (duocb_start) ────────────────────────────────────────────
  * {
  *   "role": "start" | "join" | "card_host" | "card_join",
+ *   "iroh_secret": "64 hex chars",               // every role, see below
  *   "self_card": "{ signed card JSON }",         // every role
  *   "identity_secret": "nsec1…",                 // start/join only
  *   "peers": ["{ signed peer card JSON }"],      // start/join only, max 128
@@ -50,6 +54,13 @@
  *
  * Validation is strict: a field that does not belong to the role is an error,
  * not an ignored key.
+ *
+ * "iroh_secret" is the key behind this device's iroh node id. Mint it once with
+ * duocb_generate_iroh_secret, keep it in the Keychain (this-device-only, bound
+ * to identifierForVendor) and pass the same value on every start: a persisted
+ * node id is safe here because iOS app storage cannot be cloned by accident,
+ * unlike a desktop config directory. The first duocb_start in a process pins
+ * the node id; a later start with a different iroh_secret is refused.
  *
  * "channel" chooses where the rendezvous records are put and looked for, and
  * governs card setup and clipboard sessions alike:
@@ -131,6 +142,8 @@ void duocb_init_logging(void);
 int duocb_generate_identity(char *out_buf, size_t out_len);
 /* Generate once and persist; reuse for every replacement self-card. */
 int duocb_generate_suffix(char *out_buf, size_t out_len);
+/* Generate once and persist; pass as "iroh_secret" on every duocb_start. */
+int duocb_generate_iroh_secret(char *out_buf, size_t out_len);
 int duocb_validate_identity(const char *private_key,
                             char *err_buf,
                             size_t err_len);

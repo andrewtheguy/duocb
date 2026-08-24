@@ -143,7 +143,7 @@ mod self_card_tests {
             App::new(
                 lock,
                 config,
-                duocb_core::net::spawn_net_runtime(None),
+                duocb_core::net::spawn_net_runtime(None, duocb_core::iroh::SecretKey::generate()),
                 SignalChannel::default(),
             ),
             path,
@@ -1224,7 +1224,7 @@ pub(crate) mod card_setup_tests {
         let mut app = App::new(
             lock,
             crate::config::Config::default(),
-            duocb_core::net::spawn_net_runtime(None),
+            duocb_core::net::spawn_net_runtime(None, duocb_core::iroh::SecretKey::generate()),
             SignalChannel::default(),
         );
         app.in_my_name = "desktop".into();
@@ -1261,7 +1261,7 @@ pub(crate) mod card_setup_tests {
         let mut app = App::new(
             lock,
             crate::config::Config::default(),
-            duocb_core::net::spawn_net_runtime(None),
+            duocb_core::net::spawn_net_runtime(None, duocb_core::iroh::SecretKey::generate()),
             SignalChannel::default(),
         );
         assert!(app.self_card.is_none());
