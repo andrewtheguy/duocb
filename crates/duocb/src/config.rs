@@ -366,7 +366,7 @@ mod tests {
         let lock = acquire_lock(&path).expect("lock");
 
         let stale = duocb_core::auth::Identity::generate()
-            .card_issued_at(
+            .card_valid_from(
                 "laptop",
                 "x9Y8z7W6",
                 duocb_core::auth::unix_now() - duocb_core::auth::CARD_TTL_SECS - 1,

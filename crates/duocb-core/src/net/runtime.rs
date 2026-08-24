@@ -2268,7 +2268,7 @@ mod tests {
         let server_identity = Identity::generate();
         let client_identity = Identity::generate();
         let stale = client_identity
-            .card_issued_at(
+            .card_valid_from(
                 "client",
                 "x9Y8z7W6",
                 unix_now() - crate::auth::CARD_TTL_SECS - 1,
@@ -2391,7 +2391,7 @@ mod tests {
         let identity = Identity::generate();
         let peer_identity = Identity::generate();
         let stale = peer_identity
-            .card_issued_at(
+            .card_valid_from(
                 "server",
                 "a7B2c3D4",
                 unix_now() - crate::auth::CARD_TTL_SECS - 1,

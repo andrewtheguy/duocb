@@ -30,7 +30,10 @@ key is separate from iroh's transport key:
   authenticates the duocb wire handshake. It never expires: it is minted once
   and kept until the user resets the identity.
 - The signed identity card contains the final device name, application public
-  key, and a mandatory expiry. The final name is
+  key, and a mandatory validity window (`not_before`/`not_after`, like an X.509
+  certificate). A device honours a card only while its own clock is inside
+  that window — a clock set far in the past does not make an old card valid
+  again; the card just reads as not yet valid. The final name is
   `<short-name>_<permanent-random-suffix>`; the suffix is minted once per
   installation and stays stable across renames and identity resets.
 - The iroh key creates the QUIC endpoint and node id. It is used for signaling

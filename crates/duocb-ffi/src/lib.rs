@@ -423,9 +423,13 @@ pub unsafe extern "C" fn duocb_validate_identity_card(
 /// ```jsonc
 /// {"name":"mac-book_a7B2c3D4","short_name":"mac-book","suffix":"a7B2c3D4",
 ///  "public_key":"<64 hex>","npub":"npub1…","fingerprint":"A1B2 C3D4 …",
-///  "created_at":1750000000,"expires_at":1752592000,"remaining_secs":1209600,
-///  "expired":false,"needs_renewal":false}
+///  "not_before":1750000000,"not_after":1752592000,"remaining_secs":1209600,
+///  "expired":false,"not_yet_valid":false,"needs_renewal":false}
 /// ```
+///
+/// `not_before`/`not_after` are the signed validity window. `expired` is true
+/// whenever the local clock is outside it, on either side; `not_yet_valid`
+/// singles out the early side, where the fix is a clock and not a fresh card.
 ///
 /// `fingerprint` is the card's half of a [`duocb_pairing_code`] and the value a
 /// trusted-device row shows for out-of-band re-checks.
@@ -1219,10 +1223,11 @@ fn identity_card_json(card: &IdentityCard) -> serde_json::Value {
         "public_key": card.public_key().to_hex(),
         "npub": card.npub(),
         "fingerprint": card.fingerprint(),
-        "created_at": card.created_at(),
-        "expires_at": card.expires_at(),
+        "not_before": card.not_before(),
+        "not_after": card.not_after(),
         "remaining_secs": remaining,
         "expired": !card.is_valid_at(now),
+        "not_yet_valid": card.is_not_yet_valid_at(now),
         "needs_renewal": remaining < CARD_RENEW_BEFORE_SECS,
     })
 }
