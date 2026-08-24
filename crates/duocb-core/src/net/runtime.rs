@@ -110,13 +110,21 @@ impl std::fmt::Display for ExpiredCard {
 
 impl std::error::Error for ExpiredCard {}
 
-/// The wording both roles use when their stored card for the other side has
-/// lapsed. Cards are local trust records — the clipboard handshake carries raw
-/// public keys, never a card — so each side judges its own copy, and both
-/// should say the same thing about it whether it surfaces as a listener refusal
-/// or a dialer's own pre-check. (A card does cross the wire during card setup,
-/// but that is the hand-over itself, not this handshake.)
+/// The wording both roles use when their stored card for the other side is
+/// outside its validity window. Cards are local trust records — the clipboard
+/// handshake carries raw public keys, never a card — so each side judges its
+/// own copy, and both should say the same thing about it whether it surfaces
+/// as a listener refusal or a dialer's own pre-check. (A card does cross the
+/// wire during card setup, but that is the hand-over itself, not this
+/// handshake.) A card whose window has not opened yet gets its own wording:
+/// one of the two clocks is wrong, and a fresh card would fail the same way.
 fn expired_card_message(card: &IdentityCard) -> String {
+    if card.is_not_yet_valid() {
+        return format!(
+            "The identity card for {} is not valid yet — check the clock on this device and on that one",
+            card.name()
+        );
+    }
     format!(
         "The identity card for {} expired — ask that device for a fresh card and import it again",
         card.name()
@@ -2257,6 +2265,25 @@ mod tests {
 
         client.close().await;
         server.close().await;
+    }
+
+    /// A stored card whose window has not opened yet is refused like a lapsed
+    /// one, but the message points at the clock instead of at a fresh card.
+    #[test]
+    fn a_future_peer_card_is_refused_with_clock_guidance() {
+        let future = Identity::generate()
+            .card_valid_from("client", "x9Y8z7W6", unix_now() + 24 * 60 * 60)
+            .unwrap();
+        assert!(future.is_expired() && future.is_not_yet_valid());
+        let message = expired_card_message(&future);
+        assert!(message.contains("not valid yet"), "{message}");
+        assert!(message.contains("clock"), "{message}");
+        assert!(!message.contains("fresh card"), "{message}");
+
+        let stale = Identity::generate()
+            .card_valid_from("client", "x9Y8z7W6", unix_now() - crate::auth::CARD_TTL_SECS - 1)
+            .unwrap();
+        assert!(expired_card_message(&stale).contains("expired"));
     }
 
     /// The listener refuses a dialer whose key it trusts but whose stored card

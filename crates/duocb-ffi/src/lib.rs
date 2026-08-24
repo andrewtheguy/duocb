@@ -1551,9 +1551,24 @@ mod tests {
         assert_eq!(info["name"], "mac-book_a7B2c3D4");
         assert_eq!(info["fingerprint"], card.fingerprint());
         assert_eq!(info["expired"], false);
+        assert_eq!(info["not_yet_valid"], false);
+        assert_eq!(info["not_before"], card.not_before());
+        assert_eq!(info["not_after"], card.not_after());
+        assert_eq!(info["not_after"], card.not_before() + duocb_core::auth::CARD_TTL_SECS);
         // A card is minted with the full TTL, which is well past the renewal
         // window, so a fresh one never asks to be renewed.
         assert_eq!(info["needs_renewal"], false);
+
+        // A card whose signed window has not opened — what a device with a slow
+        // clock sees — is unusable, and the app is told it is the clock.
+        let not_before = duocb_core::auth::unix_now() + 24 * 60 * 60;
+        let future = identity.card_valid_from("mac-book", "a7B2c3D4", not_before).unwrap();
+        let info = identity_card_json(&future);
+        assert_eq!(info["not_before"], not_before);
+        assert_eq!(info["not_after"], not_before + duocb_core::auth::CARD_TTL_SECS);
+        assert_eq!(info["expired"], true);
+        assert_eq!(info["not_yet_valid"], true);
+        assert_eq!(info["remaining_secs"], 0);
     }
 
     /// The pairing code the confirmation screens render must be identical no

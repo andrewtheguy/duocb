@@ -338,9 +338,10 @@ wire clipboard frames are capped at 1 MiB.
   checked. Skipping that check reduces card setup's security to the PIN alone.
 - A card's validity window bounds how long a leaked or abandoned card stays
   useful, but only against a peer whose clock is roughly correct: the window is
-  enforced locally, so a device whose clock is wound forward to inside a lapsed
-  card's window honours it again. A clock set far back does not help an
-  attacker: the signed `not_before` makes every card read as not yet valid.
+  enforced locally, so a device whose clock is wound back into a lapsed card's
+  historical window honours it again. What the signed `not_before` rules out is
+  the far cheaper mistake — a clock set before the window, which without it
+  would accept every card ever issued, and with it accepts none.
 - Possession of an application private key permits impersonating that
   installation and decrypting pairwise records addressed to it.
 - Nostr relays may omit, retain, reorder, or replay events, and anything on the

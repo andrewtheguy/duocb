@@ -7,7 +7,7 @@ use slint::{Color, ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use std::time::Instant;
 
 use super::{
-    App, CopyTarget, card_expiry_date, card_expiry_note, item::ClipItem, item::PEEK_LIMIT, short_id,
+    App, CopyTarget, card_expiry_note, item::ClipItem, item::PEEK_LIMIT, short_id, unusable_card_message,
 };
 use crate::{ClipRow, MainWindow, PathRow, PeerRow, UiState};
 use duocb_core::auth::IdentityCard;
@@ -84,10 +84,7 @@ impl App {
             }
             Ok(card) if card.is_expired() => (
                 false,
-                format!(
-                    "That identity card expired on {} — copy a fresh one from the other device",
-                    card_expiry_date(&card)
-                ),
+                unusable_card_message(&card, "copy a fresh one from the other device"),
             ),
             Ok(_) => (true, String::new()),
             Err(_) if self.in_peer_card.trim().is_empty() => (false, String::new()),

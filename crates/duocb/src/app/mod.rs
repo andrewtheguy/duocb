@@ -734,13 +734,10 @@ impl App {
             self.error = Some("That is this device's own identity card".into());
             return false;
         }
-        // Storing a lapsed card would record trust that can never pair, so
-        // refuse it here rather than at the first Join.
+        // Storing a card outside its window would record trust that cannot
+        // pair, so refuse it here rather than at the first Join.
         if card.is_expired() {
-            self.error = Some(format!(
-                "That identity card expired on {} — get a fresh one from the other device",
-                card_expiry_date(&card)
-            ));
+            self.error = Some(unusable_card_message(&card, "get a fresh one from the other device"));
             return false;
         }
         if let Some(existing) = self
@@ -1073,14 +1070,23 @@ impl App {
                     .peers
                     .iter()
                     .find(|peer| peer.public_key() == *peer_public_key);
-                // The runtime refuses an expired peer too; catching it here
-                // answers immediately instead of after an endpoint spins up.
+                // The runtime refuses a peer outside its window too; catching
+                // it here answers immediately instead of after an endpoint
+                // spins up.
                 if let Some(peer) = peer.filter(|peer| peer.is_expired()) {
-                    self.error = Some(format!(
-                        "The identity card for {} expired on {} — import a fresh card from that device",
-                        peer.name(),
-                        card_expiry_date(peer)
-                    ));
+                    self.error = Some(if peer.is_not_yet_valid() {
+                        format!(
+                            "The identity card for {} is not valid until {} — check the clock on this device and on that one",
+                            peer.name(),
+                            local_date(peer.not_before())
+                        )
+                    } else {
+                        format!(
+                            "The identity card for {} expired on {} — import a fresh card from that device",
+                            peer.name(),
+                            card_expiry_date(peer)
+                        )
+                    });
                     return;
                 }
                 self.joined_peer = peer.map(|peer| peer.name().to_string());
@@ -1125,6 +1131,22 @@ pub(crate) fn card_expiry_note(card: &IdentityCard) -> String {
         1 => format!("expires {date} (1 day)"),
         days => format!("expires {date} ({days} days)"),
     }
+}
+
+/// Why a card that failed [`IdentityCard::is_expired`] cannot be imported.
+/// `remedy` is the expired-case advice; a not-yet-valid card gets clock
+/// advice instead, since a fresh card would fail the same way.
+pub(crate) fn unusable_card_message(card: &IdentityCard, remedy: &str) -> String {
+    if card.is_not_yet_valid() {
+        return format!(
+            "That identity card is not valid until {} — check the clock on this device and on the other one",
+            local_date(card.not_before())
+        );
+    }
+    format!(
+        "That identity card expired on {} — {remedy}",
+        card_expiry_date(card)
+    )
 }
 
 /// The card's signed expiry as a local-time calendar date.
@@ -1248,6 +1270,51 @@ pub(crate) mod card_setup_tests {
         drop(app);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}.lock", path.display()));
+    }
+
+    /// A not-yet-valid card: a peer whose window opens a day from now, as a
+    /// device with a clock a day slow would see every card it is handed.
+    fn future_peer_card(name: &str) -> IdentityCard {
+        let card = Identity::generate()
+            .card_valid_from(name, "x9Y8z7W6", duocb_core::auth::unix_now() + 24 * 60 * 60)
+            .unwrap();
+        assert!(card.is_not_yet_valid());
+        card
+    }
+
+    /// Joining a peer whose stored card has not started yet is refused before
+    /// the runtime is involved, with clock guidance rather than the
+    /// fetch-a-fresh-card advice, which would not help.
+    #[test]
+    fn joining_a_not_yet_valid_peer_points_at_the_clock() {
+        let (mut app, path) = configured_app();
+        let future = future_peer_card("laptop");
+        app.peers.push(future.clone());
+        app.selected_peer = Some(future.public_key().to_hex());
+
+        app.connect_client();
+
+        let error = app.error.clone().expect("the join must be refused");
+        assert!(error.contains("not valid until"), "{error}");
+        assert!(error.contains("clock"), "{error}");
+        assert!(!error.contains("fresh card"), "{error}");
+        cleanup(app, path);
+    }
+
+    /// A received card that has not started yet is refused too, and the user
+    /// is told to fix a clock instead of asking for another card.
+    #[test]
+    fn a_not_yet_valid_received_card_is_refused_with_clock_guidance() {
+        let (mut app, path) = configured_app();
+        app.apply_event(NetEvent::PeerCardReceived(Box::new(future_peer_card("laptop"))));
+
+        app.import_received_card();
+
+        assert!(app.peers.is_empty());
+        let error = app.error.clone().expect("the import must be refused");
+        assert!(error.contains("not valid until"), "{error}");
+        assert!(error.contains("clock"), "{error}");
+        cleanup(app, path);
     }
 
     /// Some other device's card, issued `age_secs` ago.
