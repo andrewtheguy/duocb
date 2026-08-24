@@ -27,7 +27,8 @@ Every duocb installation generates its own permanent application keypair. This
 key is separate from iroh's transport key:
 
 - The application private key signs the device's portable identity card and
-  authenticates the duocb wire handshake.
+  authenticates the duocb wire handshake. It never expires: it is minted once
+  and kept until the user resets the identity.
 - The signed identity card contains the final device name, application public
   key, and a mandatory expiry. The final name is
   `<short-name>_<permanent-random-suffix>`; the suffix is minted once per
@@ -49,12 +50,14 @@ Import verifies the signature before saving `{name, public key, signed card}`.
 A device only accepts application keys in its own local trusted list. The list
 is capped at 128 entries.
 
-Cards are valid for 30 days. There is no renewal over the wire: once a card
+Cards are valid for 30 days; the key that signs them is not what expires. There is no renewal over the wire: once a card
 expires, both devices refuse to pair on it, and the pairing is restored by
 copying a fresh card and importing it again — the same two steps as the first
 time. An expired peer stays in the trusted list, marked expired, so it can be
 renewed or removed deliberately. A device re-signs its own card automatically
-as it nears expiry, so the card it offers always has most of its life left.
+as it nears expiry — with the same key, so its public key, fingerprint and
+pairing code do not change — and the card it offers always has most of its
+life left.
 
 When a trusted device starts a connection, it publishes a separate NIP-44
 encrypted hosting record for each trusted peer — advertised on the local

@@ -11,6 +11,9 @@
  *
  * Cards expire 30 days after they are minted and both sides refuse to pair on
  * a lapsed one; the only way back is for the owner to hand over a fresh card.
+ * The keypair itself never expires — a renewal is the same key signing a new
+ * card, so the public key and fingerprint are stable for the installation's
+ * life.
  * Re-mint the local self-card whenever duocb_identity_card_info reports
  * "needs_renewal".
  *

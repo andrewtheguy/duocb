@@ -37,7 +37,8 @@ kind, identifier, schema, name and suffix rules, and 2 KiB size cap.
 
 ### Card expiry
 
-Cards last 30 days. Three of the parse checks concern expiry, and all three
+Cards last 30 days; the application key has no expiry of its own, and a
+renewal is the same key signing a new card. Three of the parse checks concern expiry, and all three
 compare only signed fields, so parsing stays clock-free and deterministic:
 
 - `expires_at` is after the event's `created_at`;
