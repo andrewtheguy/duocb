@@ -74,6 +74,10 @@ export component MainWindow inherits Window {
                         wrap: word-wrap;
                         horizontal-stretch: 1;
                         vertical-alignment: center;
+                        // A wrapped Text's minimum is one line, so a screen
+                        // that fills the window squeezes a long message to
+                        // that and clips the rest; hold the wrapped height.
+                        min-height: self.preferred-height;
                     }
                     dismiss := TouchArea {
                         width: 24px;

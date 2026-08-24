@@ -1118,7 +1118,9 @@ pub(crate) fn card_expiry_note(card: &IdentityCard) -> String {
     if card.is_not_yet_valid_at(now) {
         // A fresh card would fail the same way: the clock on one of the two
         // devices is wrong, and that is what the user has to fix.
-        return format!("NOT YET VALID from {} — check this device's clock", local_date(card.not_before()));
+        // As terse as the EXPIRED form: the row has no room for a sentence,
+        // and the join/import banners spell the remedy out in full.
+        return "NOT YET VALID — check clock".to_string();
     }
     if remaining == 0 {
         return format!("EXPIRED {date}");

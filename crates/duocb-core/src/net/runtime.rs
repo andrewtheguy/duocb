@@ -1394,6 +1394,9 @@ async fn run_hosting_publisher(
     // Only report a total failure to signal on the transition into it, so a
     // sustained outage does not repaint the banner every round.
     let mut reported = false;
+    // Peers already warned about below, so a clock that stays wrong does not
+    // repaint the banner every round.
+    let mut warned_not_yet_valid: Vec<nostr_sdk::PublicKey> = Vec::new();
 
     loop {
         let now = unix_now();
@@ -1403,6 +1406,20 @@ async fn run_hosting_publisher(
             .filter(|card| card.is_valid_at(now))
             .cloned()
             .collect();
+        // A peer whose stored card has not started yet is dropped from the
+        // records like a lapsed one, but silently dropping it would leave the
+        // other device seeing only "not hosting". The cause is a clock — most
+        // likely this device's — so say so here, where it can be fixed.
+        for card in identity.peers.iter().filter(|card| card.is_not_yet_valid_at(now)) {
+            if !warned_not_yet_valid.contains(&card.public_key()) {
+                warned_not_yet_valid.push(card.public_key());
+                log::warn!("Not hosting for {}: its card is not valid yet", card.name());
+                events.error(format!(
+                    "{} — that device cannot find this host until then",
+                    expired_card_message(card)
+                ));
+            }
+        }
         // Every trusted card lapsed while the session was up: withdraw the LAN
         // advertisements rather than leave records standing for peers that can
         // no longer pair. Only the local channel needs saying — the relay copy
