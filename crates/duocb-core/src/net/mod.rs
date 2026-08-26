@@ -36,15 +36,17 @@ impl KeyIdentity {
 /// records are the same on either transport — an encrypted node id under a
 /// derived label — so this chooses only where they are put and looked for.
 ///
-/// Launch-fixed for the whole process (`--lan-only` / `--nostr-only`), so both
-/// flows always agree on which channels are in play.
+/// The host application chooses this for each session and must apply the same
+/// policy to both flows. The desktop fixes it for the whole process with
+/// `--lan-only` / `--nostr-only`; iOS reads its saved setting when a session
+/// starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SignalChannel {
     /// The default: try the local network first (Bonjour/DNS-SD, or the typed
     /// host IP during card setup), and fall back to nostr relays when nothing
-    /// local answers. LAN-first because it resolves in well under a second,
-    /// needs no third-party server, and is the common case — two devices in one
-    /// room. The nostr fallback is what lets two devices on *different*
+    /// local answers. The dialer's LAN lookup needs no third-party server, but
+    /// the host still publishes on every enabled channel, including the
+    /// relays. The nostr fallback is what lets two devices on *different*
     /// networks reach each other at all.
     #[default]
     LanThenNostr,
@@ -123,8 +125,8 @@ pub enum ServerMode {
     /// meanwhile would be a different session the user never asked for.
     ///
     /// Like [`CardSetup`](Self::CardSetup), the host publishes everywhere it can
-    /// rather than falling back — it cannot know which channel the joiner will
-    /// find it on. Only the joiner falls back (see [`DialSpec::Key`]).
+    /// rather than falling back — it cannot know which channel the dialer will
+    /// find it on. Only the dialer falls back (see [`DialSpec::Key`]).
     ///
     /// The relays published to are the ones on `identity`, as in
     /// [`DialSpec::Key`]; they are ignored on [`SignalChannel::LanOnly`].
@@ -179,8 +181,9 @@ pub enum DialSpec {
     ///
     /// On [`SignalChannel::LanThenNostr`] the lookups run in order, not in
     /// parallel: the local one first, and the relays only if it finds nothing.
-    /// The LAN answers in well under a second when the peer is there, so the
-    /// common case never touches a relay.
+    /// The LAN answers in well under a second when the peer is there, so a
+    /// local hit avoids a relay lookup by this dialer. A default-channel host
+    /// still publishes on LAN and relays in parallel.
     ///
     /// `Some(target_ip)` fetches the PIN-encrypted node-id record from the
     /// host's unicast side channel at that address (the joiner typed the IP the
@@ -286,7 +289,7 @@ pub enum NetEvent {
     /// The runtime decides nothing about it — the card is verified as
     /// well-formed and correctly signed, nothing more. Whether it is trusted is
     /// the host app's call, and it must not be made without the user comparing
-    /// the sender's fingerprint against the value shown on the other device.
+    /// the pairing code derived from both cards across the two screens.
     ///
     /// Emitted **before** the closing [`ConnStatus::Idle`] on the same channel,
     /// so a host app is guaranteed to see the card before it processes session

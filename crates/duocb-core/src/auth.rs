@@ -87,10 +87,11 @@ pub fn key_fingerprint(key: &PublicKey) -> String {
 /// Deliberately a **concatenation** of per-key fingerprints, never a hash over
 /// both keys. Each half depends on exactly one key, so an interposer that sits
 /// in the middle must forge a second preimage against each side's fixed 2^80
-/// target separately. A combined digest would instead let it grind its own two
-/// keypairs for a birthday collision at half the exponent, since nothing in
-/// card setup commits either side to a key before it learns the other's. (This
-/// is the same construction as Signal's safety numbers.)
+/// target separately. The total generic work is still on the order of 2^80,
+/// not 2^160: a 160-bit combined digest would also permit a collision-style
+/// search in roughly 2^80 work. Concatenation is used because it keeps each
+/// displayed half attributable to one key and reuses the fingerprints shown
+/// elsewhere, not to claim 160 bits of security.
 ///
 /// Two copies of one key are refused: both halves would be the same
 /// fingerprint, so the "comparison" would match while checking nothing — the

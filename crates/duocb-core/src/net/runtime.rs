@@ -86,10 +86,9 @@ const WAITING_POLL: Duration = Duration::from_secs(15);
 /// hosting side waits to be dialed, and neither side gives up on that (see
 /// [`WAITING_POLL`]).
 ///
-/// Giving up ends the session task but not the pairing: the endpoint identity
-/// and pinned dial target live on in [`SessionMemory`], so connecting again to
-/// the same peer reconnects as the same node id instead of being refused by the
-/// server's claim.
+/// Giving up ends the session task but not the runtime. Reissuing the same
+/// command resolves the target again while retaining the runtime's node id and
+/// any server-side claim held in [`SessionMemory`].
 const MAX_CONNECT_ATTEMPTS: u32 = 10;
 
 /// Marker error for fatal authentication failures (wrong application key/PIN, explicit
@@ -184,14 +183,13 @@ impl RecentPins {
 }
 
 /// The single peer a serve endpoint is paired with, for the lifetime of one logical session.
-/// duocb links one pair of devices at a time by design: once a client authenticates, its
-/// (QUIC/TLS-authenticated) node id claims the endpoint and any other node id is refused until
-/// the server is stopped. The claim is intentionally *not* released when the paired peer
-/// disconnects, so that peer — and only that peer — can reconnect without re-pairing (in PIN
-/// mode, without re-typing a PIN that may since have rotated). The claim lives in
-/// [`SessionMemory`], owned by the command loop, so it survives session-task restarts;
-/// explicitly stopping the server discards it, and a restarted server then holds a new
-/// endpoint id and an empty claim.
+/// duocb links one pair of devices at a time by design. Configure mode claims the authenticated
+/// application key and may accept a new transport id only after that key authenticates again;
+/// card setup has no trusted application key yet, so it claims the QUIC/TLS-authenticated node
+/// id and refuses every other one. The claim is intentionally *not* released when the paired
+/// peer disconnects. It lives in [`SessionMemory`], owned by the command loop, so it survives
+/// session-task restarts. Explicitly stopping the server discards the claim; a restarted server
+/// has an empty claim but still uses the runtime's existing iroh node id.
 #[derive(Clone, Default)]
 struct PairClaim {
     peer: Arc<parking_lot::Mutex<Option<ClaimedPeer>>>,
@@ -204,7 +202,8 @@ struct PairClaim {
 #[derive(Clone)]
 struct ClaimedPeer {
     /// Configure mode claims the stable application identity. Card setup has no
-    /// such identity and claims the session-scoped iroh id instead.
+    /// such trusted identity and claims the peer's iroh id for this logical
+    /// session instead.
     application_key: Option<nostr_sdk::PublicKey>,
     node_id: Option<EndpointId>,
 }
@@ -345,16 +344,16 @@ fn session_key(kind: &SessionKind) -> SessionKey {
 /// to every session task started under the same [`SessionKey`]. A session task
 /// can end while the pairing is still good — the client gives up after
 /// [`MAX_CONNECT_ATTEMPTS`], an auth exchange dies mid-handshake, a host
-/// restarts the session — and the peer's pair claim is bound to this runtime's
-/// node id, so keeping the server's claim here lets the next task reconnect as
-/// the same peer instead of being refused as a stranger.
+/// restarts the session — so keeping the server's claim here lets the next task
+/// recognize the same peer. Configure mode claims the application key and its
+/// latest authenticated transport id; card setup claims only the transport id.
 /// Cleared on [`UiCommand::StopServer`]/[`UiCommand::Disconnect`] — the user
 /// ending the session is the one legitimate way to unpair — and replaced when
 /// a session starts under a different key. Never persisted; a fresh process
 /// starts clean.
 struct SessionMemory {
     key: SessionKey,
-    /// Server: the one-pair-per-session claim (holds the paired peer's node id).
+    /// Server: the one-pair-per-session application/transport claim.
     claim: PairClaim,
     /// Card-setup host: the recent rotation buckets' auth keys.
     recent_pins: RecentPins,
@@ -565,7 +564,7 @@ pub async fn net_main(
                     .as_ref()
                     .is_some_and(|s| s.clip_tx.send(text).is_ok());
                 if !sent {
-                    events.error("Not connected — start or join a session first");
+                    events.error("Not connected — select each device and press Connect on both first");
                 }
             }
             UiCommand::QueryConnPath => {
@@ -651,13 +650,11 @@ async fn run_server_session(
 
     // Accept loop: duocb pairs exactly two devices, so at most one clipboard
     // session is served at a time. Crucially the accept keeps running *during*
-    // a live session (see the select below): any dialer that isn't the claimed
-    // peer is refused immediately with a BUSY close inside `accept_serveable` —
-    // the claim's node id is QUIC/TLS-authenticated, so no in-band auth is
-    // needed to turn it away — and it gives up instead of hanging until its
-    // connect times out. A fresh connection from the *paired* peer preempts the
-    // current one, so a resumed link doesn't wait on the dead connection's idle
-    // timeout to be reaped.
+    // a live session (see the select below). Between pumps, a different
+    // transport id is allowed through only to prove the already-claimed
+    // application key again. During a live pump, only the claimed transport id
+    // can preempt the current connection, so a resumed link doesn't wait on the
+    // dead connection's idle timeout to be reaped.
     //
     // `pending` carries a preempting reconnect from one loop turn to the next.
     let mut pending: Option<iroh::endpoint::Connection> = None;
@@ -746,15 +743,17 @@ async fn run_server_session(
     log::info!("Server session stopped");
 }
 
-/// Accept connections, refusing any that isn't the currently-claimed peer with
-/// a BUSY close, until a serveable one is obtained: a first-time dialer while
-/// the claim is still empty, or the claimed peer (re)connecting. Returns `None`
-/// when the session is cancelled or the endpoint closes.
+/// Accept connections until a serveable one is obtained. With an empty claim,
+/// that is any first-time dialer. A PIN claim recognizes its peer by transport
+/// id and refuses every other one. A configure-mode claim may let a new
+/// transport id reach application-key auth when
+/// `allow_new_transport_for_key_claim` is true; only the claimed application
+/// key can then commit the replacement id. Returns `None` when the session is
+/// cancelled or the endpoint closes.
 ///
 /// This runs both between sessions and *concurrently with* a live pump (see the
-/// accept loop's select). During a live session the claim is held, so the only
-/// connection it returns is a fresh one from the paired peer — every other
-/// dialer is turned away here before it ever reaches auth.
+/// accept loop's select). The live-pump call disables transport replacement,
+/// so only the already-claimed node can preempt that connection.
 async fn accept_serveable(
     endpoint: &iroh::Endpoint,
     claim: &PairClaim,
@@ -858,9 +857,9 @@ async fn run_client_session(
 
     loop {
         // Resolve the target each attempt: the dial target lives in the peer's
-        // hosting record, not a directory, so a restarted host's fresh node id
-        // is found, and absent (no readable record) means the peer is not
-        // currently hosting.
+        // hosting record, not a directory, so a restarted host's current node
+        // id is found even if it changed, and absent (no readable record) means
+        // the peer is not currently hosting.
         //
         // Before the first connection the whole loop is one open-ended wait for
         // the peer to appear, so it reads as `Waiting` throughout rather than
@@ -1381,10 +1380,10 @@ fn channel_readiness(channel: SignalChannel) -> EndpointReadiness {
 /// Same asymmetry and same ordering as [`resolve_card_setup`], for the same
 /// reasons: the host publishes everywhere it can and only the dialer falls
 /// back, LAN first because it answers in well under a second when the peer is
-/// on this network, so the common case never touches a relay. A LAN error is
-/// logged and falls through like a miss, and a channel that looked and cleanly
-/// found nothing clears a held error — "not hosting" is the answer the user can
-/// act on.
+/// on this network. A local hit avoids a relay lookup by this dialer, although
+/// the default host publishes on both channels. A LAN error is logged and falls
+/// through like a miss, and a channel that looked and cleanly found nothing
+/// clears a held error — "not hosting" is the answer the user can act on.
 ///
 /// A LAN hit carries the host's direct addresses (DNS-SD SRV/A/AAAA), so the
 /// dial needs no further address lookup; the relay record carries a bare node
@@ -1431,10 +1430,10 @@ async fn resolve_hosting(
     }
     Err(match channel {
         SignalChannel::LanOnly => anyhow::anyhow!(
-            "The selected peer is not hosting on this network — press Start on that device, and check both devices are on the same network"
+            "The selected peer is not hosting on this network — select this device and press Connect there, and check both devices are on the same network"
         ),
         SignalChannel::NostrOnly | SignalChannel::LanThenNostr => anyhow::anyhow!(
-            "The selected peer is not hosting a connection — press Start on that device"
+            "The selected peer is not hosting a connection — select this device and press Connect on it"
         ),
     })
 }
@@ -1900,7 +1899,7 @@ fn auth_close_reason(conn: &iroh::endpoint::Connection) -> Option<String> {
             if code == u64::from(AUTH_FAILED_CODE) {
                 Some(
                     "Authentication rejected by the peer — untrusted application key/wrong PIN, or it is still \
-                     paired with a previous session (Stop and Start the server to re-pair)"
+                     handling another setup. Check the trusted cards or current PIN, then start the connection again on both devices"
                         .to_string(),
                 )
             } else if code == u64::from(CARD_EXPIRED_CODE) {
@@ -1914,7 +1913,7 @@ fn auth_close_reason(conn: &iroh::endpoint::Connection) -> Option<String> {
             } else if code == u64::from(SERVER_BUSY_CODE) {
                 Some(
                     "The other device is already paired with another device — it links only \
-                     one device at a time (Stop and Start it to pair with this one instead)"
+                     one device at a time. Leave its current connection or card setup, then start again with this device"
                         .to_string(),
                 )
             } else {
@@ -2284,7 +2283,7 @@ mod tests {
             .expect_err("nobody is hosting for this identity");
         let error = format!("{error:#}");
         assert!(
-            error.contains("this network") && error.contains("Start"),
+            error.contains("this network") && error.contains("Connect"),
             "a LAN-only hosting miss should name the network and the fix: {error}"
         );
     }

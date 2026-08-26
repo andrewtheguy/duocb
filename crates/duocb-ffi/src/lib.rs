@@ -36,7 +36,7 @@
 //! `connect` names a *device*, never a half of the connection: it takes the
 //! chosen peer's public key, and [`duocb_core::net::session_role`] decides from
 //! the two application keys whether this device hosts or dials. Both devices
-//! send the identical config and reach opposite answers, so nothing in the app
+//! send mirror-image configs and reach opposite answers, so nothing in the app
 //! has to ask the user who goes first. [`duocb_session_role`] answers the same
 //! question without starting anything, for a screen that wants to say which
 //! device is setting the link up.
@@ -47,11 +47,12 @@
 //!
 //! # Persistence is the caller's job
 //!
-//! The application private key (`nsec`), the permanent name suffix, the signed
-//! self-card and the trusted peer cards are all passed in on every
-//! [`duocb_start`] and never written anywhere by this library. On iOS the
-//! secrets belong in the Keychain and the cards in ordinary app storage. These
-//! application keys are deliberately unrelated to iroh's transport identity.
+//! The application private key (`nsec`, for `connect`), signed self-card and
+//! trusted peer cards are passed to [`duocb_start`] and never written anywhere
+//! by this library. The permanent name suffix remains caller-owned and is used
+//! only when minting a self-card through the pure helper. On iOS the secrets
+//! belong in the Keychain and the cards in ordinary app storage. The
+//! application key is deliberately unrelated to iroh's transport identity.
 //!
 //! # The iroh transport key
 //!
@@ -112,8 +113,8 @@ pub struct DuocbHandle {
     pending: Mutex<Option<String>>,
     task: tokio::task::JoinHandle<()>,
     /// The session command this handle was started with, replayed by
-    /// [`duocb_reconnect`] into the still-running runtime so its session
-    /// identity and pairing memory are reused.
+    /// [`duocb_reconnect`] into the still-running runtime. Matching transient
+    /// pairing memory is reused when it has not been explicitly cleared.
     session_cmd: UiCommand,
     /// What [`duocb_disconnect`] sends: hosts stop serving, joiners hang up.
     disconnect_cmd: UiCommand,
@@ -170,9 +171,9 @@ struct FfiConfig {
 #[derive(Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Channel {
-    /// The default: local network first, nostr relays as fallback. Resolves in
-    /// well under a second for two devices in one room, and still reaches a
-    /// device on another network.
+    /// The default: the host publishes on LAN and nostr relays; the dialer
+    /// tries the local network first, then the relays. A local hit avoids the
+    /// dialer's relay lookup, not the host's relay publication.
     LanThenNostr,
     /// Local network only — no third-party server at all, so a pair of devices
     /// with no internet still works. Needs the Local Network permission.
@@ -402,7 +403,9 @@ pub unsafe extern "C" fn duocb_create_identity_card(
     write_result(out_buf, out_len, &card.encode())
 }
 
-/// Validate a signed identity card — signature, schema, name rules and expiry.
+/// Validate a signed identity card — signature, schema, name rules and signed
+/// validity-window shape. This is clock-free; use [`duocb_identity_card_info`]
+/// to learn whether the local clock is currently inside that window.
 /// Returns 1 if valid; 0 if invalid (the reason is written to `err_buf` when
 /// provided); -1 on NULL/non-UTF-8 input.
 /// # Safety
@@ -1083,8 +1086,10 @@ pub unsafe extern "C" fn duocb_query_conn_path(handle: *const DuocbHandle) -> c_
 }
 
 /// End the session without tearing the handle down: a host stops serving, a
-/// joiner hangs up. The runtime stays alive, so [`duocb_reconnect`] can resume
-/// the same pairing afterwards. Returns 0 = requested, -1 = NULL handle.
+/// joiner hangs up. This clears the logical session's transient claim/PIN
+/// memory but leaves the runtime and its iroh node id alive; a later
+/// [`duocb_reconnect`] reissues the original command as a fresh logical
+/// session. Returns 0 = requested, -1 = NULL handle.
 /// # Safety
 /// `handle` must be NULL or a live handle from [`duocb_start`].
 #[unsafe(no_mangle)]
@@ -1110,14 +1115,13 @@ pub unsafe extern "C" fn duocb_is_running(handle: *const DuocbHandle) -> c_int {
     if handle.task.is_finished() { 0 } else { 1 }
 }
 
-/// Re-issue the session command this handle was started with, on the handle's
-/// still-running runtime. The runtime keeps the session identity and pairing
-/// state (node id, the host's pair claim, the joiner's pinned dial target)
-/// until the handle is stopped, so after a session ends on its own — e.g. the
-/// joiner gave up reconnecting — this resumes the same pairing: the same node
-/// id dials the same target and the peer recognizes it, with no re-pairing and
-/// no fresh PIN. A fresh [`duocb_start`] would instead mint a new identity,
-/// which an already-paired peer refuses. Progress arrives as the usual status
+/// Re-issue the session command this handle was started with on its
+/// still-running runtime. If the session task ended on its own, this retains
+/// the runtime's node id and any matching server-side claim/PIN memory; target
+/// resolution runs again from the original command. An explicit
+/// [`duocb_disconnect`] clears that transient session memory first. A fresh
+/// [`duocb_start`] uses the caller's same `iroh_secret` but creates a new
+/// runtime with empty session memory. Progress arrives as the usual status
 /// events.
 /// Returns 0 = requested, -1 = NULL handle, -2 = runtime unavailable (it died —
 /// fall back to [`duocb_stop`] plus a fresh [`duocb_start`]).

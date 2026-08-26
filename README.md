@@ -8,8 +8,8 @@ receive. Received text stays in an in-memory inbox until you explicitly copy
 it.
 
 > [!WARNING]
-> duocb is pre-1.0 and intentionally has no backward compatibility. This
-> release rejects the former shared-secret config and wire protocol.
+> duocb is pre-1.0. Unsupported config and wire formats are rejected rather
+> than migrated.
 
 ## How devices connect
 
@@ -20,8 +20,8 @@ copy and paste them.
 
 | | Discovery/signaling | Authentication | Saved state |
 |---|---|---|---|
-| Configure connection | Pairwise encrypted hosting records, on the local network first and Nostr relays as fallback | Mutual application-key signatures | One identity key and a local trusted-peer list per installation |
-| Card setup (trust bootstrap) | Pairwise PIN-encrypted rendezvous records, same channels, plus a typed LAN IP | Rotating-PIN PAKE (SPAKE2), then a human pairing-code check | The imported peer card |
+| Configure connection | Pairwise encrypted hosting records; the host publishes on enabled channels and the dialer tries LAN before relay fallback | Mutual application-key signatures | One identity key and a local trusted-peer list per installation |
+| Card setup (trust bootstrap) | PIN-encrypted rendezvous records over the same enabled channels, plus a typed LAN IP | Rotating-PIN PAKE (SPAKE2), then a human pairing-code check | The imported peer card |
 
 ### Configure mode
 
@@ -52,18 +52,20 @@ Pairing is mutual. On each device:
 1. Copy its signed identity card.
 2. Paste and import the other device's card.
 
-Import verifies the signature before saving `{name, public key, signed card}`.
-A device only accepts application keys in its own local trusted list. The list
-is capped at 128 entries.
+Import verifies the signature before saving the signed card; its name and
+public key are derived from that verified card. A device only accepts
+application keys in its own local trusted list. The list is capped at 128
+entries.
 
-Cards are valid for 30 days; the key that signs them is not what expires. There is no renewal over the wire: once a card
-expires, both devices refuse to pair on it, and the pairing is restored by
-copying a fresh card and importing it again — the same two steps as the first
-time. An expired peer stays in the trusted list, marked expired, so it can be
-renewed or removed deliberately. A device re-signs its own card automatically
-as it nears expiry — with the same key, so its public key, fingerprint and
-pairing code do not change — and the card it offers always has most of its
-life left.
+Cards are valid for 30 days; the key that signs them is not what expires. There
+is no renewal over the wire: once a card expires, both devices refuse to pair
+on it, and the pairing is restored by copying a fresh card and importing it
+again — the same two steps as the first time. An expired peer stays in the
+trusted list, marked expired, so it can be
+renewed or removed deliberately. The apps re-sign their own cards at launch
+once fewer than seven days remain; the desktop also checks immediately before
+copying or trading its card. A renewal uses the same key, so the public key,
+fingerprint and pairing code do not change.
 
 ### Who hosts
 
@@ -86,8 +88,10 @@ the local network over Bonjour/DNS-SD *and* Nostr relays, since the host cannot
 know which way the other device will look (the flags below narrow that to one).
 The record carries only the current iroh node id. The dialing device looks on
 the local network first and falls back to the relays if nothing answers there,
-so two devices in one room never involve a third-party server, and two on
-different networks still find each other. It then establishes the iroh
+so a local hit avoids a relay lookup on the dialing side and devices on
+different networks can still find each other. The default host still publishes
+its encrypted record to the relays in parallel; use `--lan-only` when no
+third-party server may be contacted. The dialer then establishes the iroh
 connection, and both sides sign a fresh transcript containing:
 
 - both application public keys;
@@ -122,13 +126,14 @@ A card-setup connection never carries clipboard content; it exists only to hand
 over the cards, and ends as soon as they have crossed.
 
 **How the two devices find each other.** The same way as a clipboard session:
-the joining device looks on the local network first — Bonjour-compatible DNS-SD,
-no third-party server — and falls back to Nostr relays if nothing local answers,
-so two devices on different networks can still trade cards. The hosting device
-publishes on both at once, since it cannot know which way the other will find
-it. Where multicast is blocked, enter the LAN IP shown by the host to use the
-unicast side channel — this manual path exists for card setup only, because it
-is the only screen that shows the host's IP and offers a field to type it into.
+the joining device looks on the local network first using Bonjour-compatible
+DNS-SD and falls back to Nostr relays if nothing local answers, so two devices
+on different networks can still trade cards. The hosting device publishes on
+both at once, since it cannot know which way the other will find it; `--lan-only`
+is the fully local option. Where multicast is blocked, enter the LAN IP shown by
+the host to use the unicast side channel — this manual path exists for card
+setup only, because it is the only screen that shows the host's IP and offers a
+field to type it into.
 Either way the record published is only a PIN-encrypted temporary connection id.
 
 Two flags force a single channel, mainly for testing:
@@ -186,20 +191,22 @@ shape is:
 }
 ```
 
-Malformed keys, cards, duplicates, mismatched self-cards, legacy
-fields, and oversized peer lists are startup errors. An *expired* card is not:
+Malformed keys, cards, duplicates, mismatched self-cards, unexpected fields,
+and oversized peer lists are startup errors. An *expired* card is not:
 it loads and is shown as expired, so lapsed trust is visible rather than
-silently dropped. Saves use an owner-only
-temporary file and atomic rename. Clipboard text, inbox, and outbox are never
-persisted.
+silently dropped. Saves use a temporary file and atomic rename; on Unix the
+config-related files are restricted to the owner. Clipboard text, inbox, and
+outbox are never persisted.
 
 ## Security notes
 
 - QUIC/TLS 1.3 encrypts the transport.
 - The card-setup PIN handshake is a PAKE (SPAKE2 with an Argon2id-stretched
-  password), so nothing on the wire is offline-testable: a stranger gets a
-  couple of online guesses per connection, each costing a full Argon2id run,
-  against a ~35-bit code that rotates every 60 seconds and admits one device.
+  password), so nothing in that handshake is offline-testable. Each connection
+  tests one guessed PIN and costs a full Argon2id run. The code has about 35
+  bits of entropy, rotates every 60 seconds, and the host temporarily honors
+  the immediately previous code so a rotation while someone is typing does not
+  break setup. The first successful claimant consumes the setup session.
 - The pairing-code check is still what makes the PIN safe to build trust on.
   The PIN proves possession of a short code, not an identity: its public
   rendezvous record is offline-attackable by nature (the lookup key must be
@@ -211,11 +218,10 @@ persisted.
   makes the two screens disagree.
 - The pairing code is the two per-key fingerprints laid end to end, never a hash
   over both keys. Each half commits to a single public key, so an impostor needs
-  a second preimage against a fixed target for each side it fools. A combined
-  digest mixing both devices' keys would instead let an interposer vary both of
-  its own keys and hunt for a collision — far cheaper for the same number of
-  displayed digits. Concatenation is what keeps one shared code at full
-  strength; it is the same construction as Signal's safety numbers.
+  a second preimage against a fixed 80-bit target for each side it fools. The
+  overall generic work factor is still on the order of 2^80, not 2^160; the
+  benefit of concatenation is that each displayed half names one key and can be
+  re-checked against the fingerprints shown elsewhere in the apps.
 - One comparison covers both directions: an interposer must sit in the middle of
   both connections at once, and the identical-or-not check of a single code
   exposes it on both screens simultaneously.
@@ -227,7 +233,9 @@ persisted.
 - Pairwise hosting records are encrypted to the intended trusted peer.
 - Trust is local only: the trusted-peer list never leaves the device, so a lost
   config is re-paired by re-importing each peer's card.
-- Nostr relays and iroh infrastructure may observe metadata and timing.
+- Nostr hosting events expose the host and intended peer application public
+  keys as event metadata even though the node-id payload is encrypted. Relays
+  and iroh infrastructure may also observe timing and connection metadata.
 - Clipboard items are UTF-8 text capped at 1 MiB.
 - A session links exactly the one device you picked: the host signals to that
   peer alone and refuses any other, even a trusted one. Configure mode pins the

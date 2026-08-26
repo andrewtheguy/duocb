@@ -5,8 +5,8 @@
 
 # Workspace layout
 
-- `crates/duocb-core` — portable core (persistent per-installation application identity and signed cards in `auth.rs`, mutual key wire authentication, pairwise hosting signaling and the card-setup PIN rendezvous — both over LAN and/or Nostr — plus the card exchange itself, and the headless tokio net runtime). Application identities and ephemeral iroh transport keys are separate. No GUI/clipboard/config-file deps.
-- `crates/duocb` — desktop Slint app (binary `duocb`); owns config.rs, clipboard.rs, src/app/ (state + logic), and ui/*.slint (markup, compiled by build.rs; fluent style, Skia renderer, per-platform fonts set in main.rs).
+- `crates/duocb-core` — portable core (persistent per-installation application identity and signed cards in `auth.rs`, mutual key wire authentication, pairwise hosting signaling and the card-setup PIN rendezvous — both over LAN and/or Nostr — plus the card exchange itself, and the headless tokio net runtime). Application identities and iroh transport keys are separate; the desktop transport key lasts for one process, while iOS persists its device-bound key. No GUI/clipboard/config-file deps.
+- `crates/duocb` — desktop Slint app (binary `duocb`); owns config.rs, clipboard.rs, src/app/ (state + logic), and ui/*.slint (markup, compiled by build.rs; fluent style, FemtoVG renderer, per-platform fonts set in main.rs).
 - `crates/duocb-ffi` — the iOS staticlib (`libduocb.a`), a thin C shim over `duocb_core::net`: a JSON config in, JSON events out, plus the pure setup helpers. No policy — a card received over card setup is handed up verified but untrusted, and only the app (after the user compares the pairing code across both screens) decides to store it. Its C surface is the hand-maintained `ios/duocb.h`; keep the two in step. Excluded from `default-members`, so a plain `cargo build`/`clippy`/`test` at the root stays desktop-only — use `-p duocb-ffi` to reach it, and `./build-ios.sh` to produce `dist/ios/libduocb.xcframework`. The sibling app is `../duocb-ios`.
 - Version bumps: edit the single `[workspace.package] version` in the root Cargo.toml.
 

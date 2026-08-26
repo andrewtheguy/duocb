@@ -1,19 +1,20 @@
-//! Unicast side channel for the LAN-only PIN rendezvous — the multicast-free
-//! sibling of the DNS-SD backend (`super::dnssd`).
+//! Unicast side channel for the LAN half of the PIN rendezvous — the
+//! multicast-free sibling of the DNS-SD backend (`super::dnssd`).
 //!
 //! Where DNS-SD needs multicast to *discover* the host, this path has the joiner
 //! type the host's LAN IPv4 directly, then fetch the very same PIN-encrypted
-//! node-id record over a one-shot TCP request/response. The host — when hosting
-//! on the LAN-only channel — runs a small listener on a port derived from the
+//! node-id record over a one-shot TCP request/response. Whenever the LAN channel
+//! is enabled, the host runs a small listener on a port derived from the
 //! record keypair (`super::side_channel_port`, the same Argon2-derived key the
 //! DNS-SD instance label uses) that serves the record to anyone who connects; the
 //! joiner derives the same port from its PIN-derived candidate keys, so no port is
 //! ever typed. Because the key rotates per bucket, so does the port, and the
 //! joiner probes each candidate bucket's port — mirroring the DNS-SD lookup's
-//! candidate-label match. The served record carries the same NIP-44 ciphertext the
-//! DNS-SD `e` TXT attribute holds, plus the host's direct socket addresses (which
-//! DNS-SD instead conveys via SRV/A/AAAA), so the joiner ends up with the identical
-//! [`LanFound`] and dials iroh exactly as the DNS-SD path does.
+//! candidate-label match. The served record carries an independently encrypted
+//! copy of the same node-id payload as the DNS-SD `e` TXT attribute, plus the
+//! host's direct socket addresses (which DNS-SD instead conveys via SRV/A/AAAA),
+//! so the joiner ends up with the identical [`LanFound`] and dials iroh exactly
+//! as the DNS-SD path does.
 //!
 //! Cross-platform (plain tokio TCP).
 
@@ -37,10 +38,11 @@ use crate::pin_record;
 /// wrong responder on the derived port.
 const MAX_RECORD_BYTES: usize = 8 * 1024;
 
-/// The record served over the side channel: the same NIP-44 ciphertext the
-/// DNS-SD `e` TXT attribute carries (the encrypted node id), plus the host's
-/// direct socket addresses. The field name `e` mirrors the TXT attribute for
-/// wire familiarity; `SocketAddr` serializes as its string form.
+/// The record served over the side channel: a NIP-44-encrypted node id in the
+/// same format as the DNS-SD `e` TXT attribute, plus the host's direct socket
+/// addresses. The encryption is performed independently for each backend. The
+/// field name `e` mirrors the TXT attribute for wire familiarity; `SocketAddr`
+/// serializes as its string form.
 #[derive(Serialize, Deserialize)]
 struct UnicastRecord {
     e: String,

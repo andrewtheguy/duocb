@@ -5,10 +5,12 @@
 //! but it is addressed to a standing application identity instead of a PIN.
 //!
 //! One record exists per *ordered pair* of application keys. Its lookup label is
-//! a domain-separated hash of `(host, peer)`, so only a device that already
-//! knows both keys can look for it, and its content is NIP-44 encrypted from the
-//! host's application key to that one peer's — a host with several trusted peers
-//! publishes several records, and no peer can read another's.
+//! a domain-separated hash of `(host, peer)`. The label is deterministic, not
+//! secret: anyone who knows both public keys can derive it, and a Nostr relay
+//! sees those keys as the event author and public `p` tag. The content remains
+//! NIP-44 encrypted from the host's application key to that one peer's. A
+//! session publishes only the record for the device the user selected; another
+//! trusted peer derives a different label and cannot decrypt this record.
 //!
 //! Encrypting the node id is defense in depth, not the security boundary: the
 //! node id is not a credential. Dialing it still has to pass the mutual
@@ -30,8 +32,9 @@ const HOSTING_VERSION: u32 = 1;
 /// Domain separator for the nostr `d` tag.
 const NOSTR_TAG_DOMAIN: &[u8] = b"duocb:pairwise-hosting:v1";
 /// Domain separator for the DNS-SD instance label. Distinct from the nostr one
-/// so the same pairing yields unrelated identifiers on the two transports — a
-/// LAN observer and a relay operator cannot link a device across them.
+/// so the same pairing does not expose the same label string on both transports.
+/// This prevents direct string matching, not linkage by an observer that knows
+/// both application public keys and can derive both labels.
 const LAN_LABEL_DOMAIN: &[u8] = b"duocb:pairwise-hosting-lan:v1";
 
 /// The record: the host's current node id under a version stamp.

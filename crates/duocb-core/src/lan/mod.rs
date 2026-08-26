@@ -154,8 +154,8 @@ pub async fn dnssd_lookup_pin_record(candidates: &[Keys]) -> Result<Option<LanFo
 
 /// Advertise this host's current node id on the local network for exactly one
 /// trusted peer, so that peer can find a live clipboard session without any
-/// relay. A host with several trusted peers holds several of these — the label
-/// and the ciphertext are both pair-specific, so no peer learns about another.
+/// relay. The active session holds only this selected peer's advertisement; the
+/// label and ciphertext are pair-specific, so another peer cannot use it.
 pub async fn dnssd_advertise_hosting(
     identity: &Identity,
     peer: PublicKey,
@@ -190,10 +190,11 @@ pub async fn dnssd_lookup_hosting(
 }
 
 /// Start the unicast side channel: a listener on the port
-/// derived from the record keypair ([`side_channel_port`]) serving the same
-/// PIN-encrypted node-id record, so a joiner who types the host's LAN IP can
-/// pair where multicast is blocked. Dropping the returned [`UnicastListener`]
-/// withdraws it. Runs alongside the DNS-SD advertisement (see `crate::lan::unicast`).
+/// derived from the record keypair ([`side_channel_port`]) serving its own
+/// encrypted copy of the PIN node-id payload, so a joiner who types the host's
+/// LAN IP can pair where multicast is blocked. Dropping the returned
+/// [`UnicastListener`] withdraws it. Runs alongside the DNS-SD advertisement
+/// (see `crate::lan::unicast`).
 pub async fn unicast_advertise_pin_record(
     keys: &Keys,
     node_id: &EndpointId,

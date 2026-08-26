@@ -860,8 +860,8 @@ impl App {
 
     /// Open the card-setup screen.
     ///
-    /// Unlike the quick pairing this replaced, card setup hands over this
-    /// device's signed card, so it needs an identity to exist: a no-op before
+    /// Card setup hands over this device's signed card, so it needs an identity
+    /// to exist: a no-op before
     /// setup is finished, and the entry point is hidden until then.
     pub(crate) fn open_card_setup(&mut self) {
         if self.self_card.is_none() {
@@ -938,7 +938,7 @@ impl App {
         match self.signal_channel {
             SignalChannel::LanThenNostr => (
                 "How the devices find each other",
-                "The other device is looked for on the local network first (Bonjour/DNS-SD, with traffic direct between the devices and no relay involved). If nothing answers there, the search falls back to public Nostr relays, which works when the two devices are on different networks. Only an encrypted record holding a temporary connection id is ever published, and this applies to trading cards and to clipboard sessions alike.",
+                "The dialing device looks on the local network first (Bonjour/DNS-SD) and queries public Nostr relays only if nothing answers there. The hosting device publishes on both in parallel, so use --lan-only when the app must avoid contacting external servers. The payload contains only an encrypted temporary connection id; a clipboard-session Nostr event still exposes the host and intended peer application public keys as metadata. This applies to trading cards and clipboard sessions alike.",
             ),
             SignalChannel::LanOnly => (
                 "Local network only",
@@ -946,7 +946,7 @@ impl App {
             ),
             SignalChannel::NostrOnly => (
                 "Relays only",
-                "The local network is not searched at all, for trading cards or for clipboard sessions: the encrypted record is published to public Nostr relays, so the other device can be anywhere with internet access. The record holds only a temporary connection id, and the connection still goes direct between the devices when they can reach each other.",
+                "The local network is not searched at all, for trading cards or for clipboard sessions: the rendezvous record is published to public Nostr relays, so the other device can be anywhere with internet access. Its payload contains only an encrypted temporary connection id; a clipboard-session event still exposes the host and intended peer application public keys as metadata. The connection goes direct when the devices can reach each other.",
             ),
         }
     }

@@ -169,9 +169,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     })?;
 
-    // One heartbeat covers all periodic UI work: peek expiry, the flash and
-    // PIN countdowns, "seen Xm ago" labels, and the device picker's 30 s
-    // auto-refresh (all state-derived inside tick + sync).
+    // One heartbeat covers all periodic UI work: peek expiry plus the flash
+    // and PIN countdowns (all state-derived inside tick + sync).
     let heartbeat = slint::Timer::default();
     heartbeat.start(
         slint::TimerMode::Repeated,

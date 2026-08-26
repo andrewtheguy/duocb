@@ -17,12 +17,12 @@
 //! The PAKE password is the Argon2id-stretched PIN material
 //! ([`crate::pin::derive_auth_key_material`], bucket-independent). SPAKE2's guarantee is the
 //! point: no message reveals anything offline-testable about the password.
-//! A party that does not hold the PIN learns, per handshake, only whether its **one** guess per
-//! slot was right — and each guess costs it a full Argon2id derivation. Combined with the
-//! one-claim-per-PIN rule and the 60-second rotation, a wrong-PIN counterparty is limited to a few
-//! online guesses against a ~35-bit code. (The public rendezvous *record* remains an offline
-//! surface by nature — its lookup key must be derivable from the PIN — which Argon2id and the
-//! short TTL mitigate; see `crate::pin_record`.)
+//! A party that does not hold the PIN learns, per handshake, only whether its one guessed PIN was
+//! right — the dialer uses that same guess in every slot — and each connection costs it a full
+//! Argon2id derivation. A successful claimant consumes the setup session; failed connections are
+//! not an attempt rate limit. The public rendezvous *record* remains an offline surface by nature
+//! — its lookup key must be derivable from the PIN — which Argon2id and the short TTL mitigate;
+//! see `crate::pin_record`.
 //!
 //! **Slots.** The listener honors the current and previous rotations' PINs (its recent-PIN cache),
 //! but a PAKE commits each side to a single password per instance, so the handshake runs

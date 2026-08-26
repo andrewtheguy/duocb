@@ -5,16 +5,21 @@ duocb separates two concerns that deliberately use different keys:
 | Layer | Key lifetime | Purpose |
 |---|---|---|
 | Application identity | Persistent per installation | Signed identity cards, local trust, configure-mode wire authentication, Nostr authorship |
-| iroh endpoint | Ephemeral per logical session | QUIC/TLS endpoint identity, signaling target, connection establishment |
+| iroh transport | Fixed for a runtime; device-persistent on iOS | QUIC/TLS endpoint identity, signaling target, connection establishment |
 
 The application key is never used as an iroh secret key. The iroh key never
-determines local trust.
+determines local trust. Every endpoint a runtime binds uses the same iroh key,
+so its node id stays fixed across session tasks. The desktop creates that key
+once per process; iOS stores a this-device-only key bound to
+`identifierForVendor`, so its node id also survives relaunches.
 
 ## Workspace boundaries
 
 - `duocb-core`: portable identity/card types, protocol framing, Nostr
   signaling, PIN support, and the headless tokio runtime.
 - `duocb`: Slint desktop app, local config, and clipboard access.
+- `duocb-ffi`: C ABI over the core runtime and setup helpers for the sibling
+  iOS app; it owns no persistence or trust policy.
 
 The Slint event loop and tokio runtime communicate only with `UiCommand` and
 `NetEvent` channels.
@@ -51,8 +56,8 @@ parsing stays clock-free and deterministic:
 
 Whether a card is *current* is a separate decision, made against the local
 clock only where trust is acted on, and it checks **both** edges:
-`not_before <= now < not_after`, with a five-minute skew grace on the opening
-edge only. The end alone would not do: a device whose clock is set far in the
+`not_before <= now + 300 seconds` and `now < not_after`. The five-minute skew
+grace applies only to the opening edge. The end alone would not do: a device whose clock is set far in the
 past never reaches any card's `not_after`, so it would honour every card ever
 issued, including ones that lapsed years ago. The signed start makes such a
 device reject the card as *not yet valid* — a state the UI reports separately
@@ -68,15 +73,16 @@ lapsed before signing anything, and closes with a dedicated code so the dialer
 can say precisely what is wrong; the dialer refuses symmetrically before
 dialing. A host also stops publishing hosting records to peers whose cards have
 lapsed. Recovery is manual and identical to first-time pairing: the owner hands
-over a fresh card. A device re-signs its own card once it is within seven days
-of expiry.
+over a fresh card. Both apps re-sign their own card at launch once it is within
+seven days of expiry; the desktop also checks immediately before copying or
+trading it.
 
 Expired cards still parse. Config load runs through the same parser and may not
 fail because trust aged out — an expired peer stays listed and marked expired
-rather than vanishing.
-Every trusted-device row carries the expiry date read straight off the card, so
-the deadline is visible before it bites; a countdown is added inside the last
-seven days and the date is reported again in every refusal message.
+rather than vanishing. The desktop always shows the signed expiry date and adds
+a countdown inside the last seven days. iOS shows the date while a card is
+current and marks a lapsed row `expired`; both apps distinguish that state from
+a not-yet-valid clock warning.
 
 Each local peer entry is the full verified card, so the saved name is bound to
 the public key. Trust is local, capped at 128 unique public keys, and only ever
@@ -105,33 +111,36 @@ pairing slot the chosen device is coming for.
 
 ## Configure-mode signaling
 
-Starting a configure-mode server creates an iroh endpoint with a fresh
-session-scoped key. For the peer the session is with, the host publishes one
+Starting a configure-mode server binds an iroh endpoint with the runtime's
+existing transport key. For the peer the session is with, the host publishes one
 pairwise hosting record (`hosting_record`): NIP-44 ciphertext of
 `{version, node_id}` from the host's application key to exactly that peer's,
 under a label that is a SHA-256 over a domain plus the **ordered** host/peer
-public keys. Only a device holding both keys can derive the label, and only the
-addressed peer can read the content.
+public keys. Anyone who knows both public keys can derive the deterministic
+label; it is an addressing mechanism, not a secret. Only the addressed peer can
+read the content.
 
 The record is carried on two transports, which differ only in how the label is
 expressed and how long a copy survives:
 
 | | Label | Payload | Lifetime |
 |---|---|---|---|
-| Nostr relays | `d` tag of a kind `30385` parameterized replaceable event, plus a `p` recipient tag | event content | NIP-40 expiry, five minutes; refreshed every 120 s while listening |
+| Nostr relays | `d` tag of a kind `30385` parameterized replaceable event, plus the public event author and `p` recipient keys | encrypted event content | NIP-40 expiry, five minutes; refreshed every 120 s while listening |
 | Local network | DNS-SD instance under `_duocb-host._udp.local.` | `e` TXT attribute, with real SRV/A/AAAA data alongside | until withdrawn; re-registered only when the endpoint's direct addresses change |
 
-The two labels use different domain separators, so one pairing produces
-unrelated identifiers on the two transports and neither a relay operator nor a
-LAN neighbour can link a device across them. The LAN copy additionally carries
-dialable addresses, so a local hit needs no further address lookup; the relay
-copy is a bare node id the endpoint's own discovery resolves.
+The two labels use different domain separators, so their strings cannot be
+matched directly. This is not an unlinkability boundary: anyone who knows both
+application public keys can derive both labels, and a Nostr hosting event
+exposes those keys as its author and public `p` tag. The LAN copy additionally
+carries dialable addresses, so a local hit needs no further address lookup; the
+relay copy is a bare node id the endpoint's own discovery resolves.
 
-Which transports are in play is the launch-time `SignalChannel` choice — the
-same one card setup uses, and the same table of channels and endpoint gates
+Which transports are in play is the session's `SignalChannel` choice — fixed at
+desktop launch and read from Settings when an iOS session starts. Card setup
+uses the same choice and the same table of channels and endpoint gates
 ([below](#rendezvous-channels)). The roles are asymmetric in the same way: the
-host publishes on every enabled channel because it cannot know where the joiner
-will look, and only the joiner falls back, sequentially, LAN first. A host also
+host publishes on every enabled channel because it cannot know where the dialer
+will look, and only the dialer falls back, sequentially, LAN first. A host also
 stops publishing once the peer's card lapses, on both transports.
 
 The dialing half waits as patiently as the hosting half: until it has connected
@@ -145,8 +154,9 @@ hosting now?” The subsequent wire handshake proves who is on the connection.
 
 ## Configure-mode authentication
 
-Wire protocol version 3 removes token authentication. The dialer opens one
-bidirectional QUIC stream:
+Wire protocol version 4 uses mutual application-key proofs in configure mode
+and a SPAKE2 PAKE for card setup. The dialer opens one bidirectional QUIC
+stream:
 
 ```text
 C → S  KeyRequest   {client application pubkey, nonce_c}
@@ -220,11 +230,12 @@ D→L  CardOffer         {card_d}     # concurrent, independent half-streams:
 L→D  CardOffer         {card_l}     # the order shown here is illustrative only
 ```
 
-No frame reveals anything offline-testable about the PIN: a wrong-PIN
-counterparty learns only that its one guess per slot missed, and each guess
-costs it a full Argon2id derivation. Combined with the one-claim-per-PIN rule
-and the 60-second rotation, guessing is confined to a few online tries against
-a ~35-bit code.
+No frame reveals anything offline-testable about the PIN: the dialer uses the
+same guessed PIN in both slots, learns only whether that guess matched either
+recent host PIN, and pays a full Argon2id derivation for it. The ~35-bit code
+rotates every 60 seconds; the host honors the current and immediately previous
+codes so setup can cross a rotation. The first successful claim ends the setup
+session, but failed connections are not described as a rate limit.
 
 Only the four PIN frames are turn-taking. Both offers are written immediately
 once the PIN is accepted, so neither `CardOffer` waits on the other and their
@@ -245,18 +256,20 @@ The session is one-shot: it carries no clipboard traffic (the session task holds
 no clipboard channel at all) and ends as soon as the cards have crossed. One PIN
 admits one device — the pair claim refuses a second, and a device still dialing
 when the exchange finishes is answered with a BUSY close rather than left
-waiting. Nothing but the imported card is persisted: no PIN, iroh key, or
-session survives.
+waiting. Card setup persists no PIN or session state. The iroh transport key has
+an independent lifetime: one desktop process or, on iOS, the device-bound
+Keychain item.
 
 ### Rendezvous channels
 
 Both of duocb's rendezvous records — the card-setup PIN record (`pin_record`,
 keyed by the `(pin, bucket)` public key) and the pairwise hosting record
-(`hosting_record`, keyed by a pair of application keys) — are the same NIP-44
-ciphertext of the host's current node id wherever they travel. What differs is
-where they are put and looked for, chosen once at launch by `SignalChannel` and
-applied to **both** flows, so the two can never disagree about which transports
-exist:
+(`hosting_record`, keyed by a pair of application keys) — carry a NIP-44-
+encrypted payload whose only connection datum is the host's current node id.
+Each transport encrypts its own copy, and the two record types use different
+keys and envelopes. `SignalChannel` selects where each flow puts and looks for
+its record. The desktop fixes the choice at launch; iOS reads its Settings
+value when each session starts:
 
 | Channel | Host publishes | Dialer looks | Endpoint gate |
 |---|---|---|---|
@@ -273,8 +286,9 @@ The two roles are deliberately asymmetric. The host publishes on *every* enabled
 channel — it cannot know which one the dialer will reach it on, and a record
 only helps if it is already in place. The dialer is the one that falls back, and
 it does so sequentially rather than racing: the local lookup answers in well
-under a second when the other device is there, so the common case never touches
-a relay. A LAN error is logged and treated like a miss; an error surfaces only
+under a second when the other device is there, so a local hit avoids a relay
+lookup by the dialer. The default host has still published to the relays in
+parallel. A LAN error is logged and treated like a miss; an error surfaces only
 when nothing was found on any enabled channel.
 
 Only the default channel needs both stacks, which is why it gates on
@@ -284,8 +298,9 @@ builds a relay-less endpoint (no third-party server at all); `NostrOnly`
 requires the relay before it can publish, and its record carries no direct
 addresses, so the dialer's own discovery resolves the node id.
 
-The channel is part of a session's identity key, so switching it mints a fresh
-endpoint rather than reusing one bound for the old transport stack.
+The channel is part of the runtime's logical session key. Changing it resets
+the session's transient claim/PIN memory and binds a new endpoint with the
+appropriate transport stack, while retaining the runtime's iroh node id.
 
 Publishing to public relays widens who can *fetch* a record, so it rests
 entirely on the PIN: the lookup key is Argon2id-derived, the payload is only a
@@ -300,9 +315,9 @@ a recovered PIN is useless once its window (and one claim) is gone.
 
 The PIN proves possession of a short code, not an identity. The PAKE stops a
 stranger from grinding it out of the handshake, but anyone who reads,
-shoulder-surfs, or offline-grinds it from the public rendezvous record inside
-its 60-second window can complete the handshake and offer a card of their
-choosing — PIN-keyed cryptography is transparent to a PIN holder. The human
+shoulder-surfs, or offline-grinds it from the public rendezvous record while
+the host still honors that PIN can complete the handshake and offer a card of
+their choosing — PIN-keyed cryptography is transparent to a PIN holder. The human
 pairing-code comparison is what catches that, because each device computes its
 half of the code from its *own* key locally — that part never crossed the
 network.
@@ -312,14 +327,13 @@ network.
   holds two separate PIN-authenticated connections and offers its own card each
   way; device A then renders `sort(fp(A), fp(X₁))` while device B renders
   `sort(fp(B), fp(X₂))`. Making those screens agree requires `fp(X₁) = fp(B)`
-  and `fp(X₂) = fp(A)` — two second preimages against fixed 2^80 targets. A
-  "session code" *hashing* both devices' keys would instead let the interposer
-  vary both of its own keys and hunt for a collision between two
-  freely-grindable sets: a birthday problem at 2^40 for the same displayed
-  length. Nothing here commits either side to a key before it learns the
-  other's, so there is no commitment step that would make a combined digest
-  safe — concatenation is what keeps a single shared code at full strength.
-  (Signal's safety numbers use the same construction.)
+  and `fp(X₂) = fp(A)` — two second preimages against fixed 2^80 targets. The
+  expected work remains on the order of 2^80, not 2^160. A combined 160-bit
+  digest would let the interposer vary both of its keys in a collision-style
+  search with a similar generic 2^80 work factor; an 80-bit combined digest
+  would fall to roughly 2^40. Concatenation is chosen because each half remains
+  attributable to one key and is the same fingerprint the apps show elsewhere,
+  not because displaying 160 bits implies 160-bit attack work.
 - **One comparison suffices.** The check is symmetric by construction: the two
   screens either render the identical code or they do not, and a mismatch
   anywhere in the ten groups exposes the interposer on both sides at once.
@@ -328,17 +342,17 @@ network.
   trusting it; only Import writes to the trusted list.
 - **Bounded blast radius.** A card-setup connection carries no clipboard content,
   so a card slipped past an inattentive user grants only what any imported card
-  grants: the ability to be dialed as a trusted peer, which still requires the
-  mutual application-key handshake and the victim choosing to Join.
+  grants: the ability to complete the mutual application-key handshake when the
+  user later selects that device and presses Connect.
 
 ## Runtime commands and events
 
 Key commands:
 
-- `StartServer::Key { KeyIdentity, peer_public_key, channel }`
-- `Connect::Key { KeyIdentity, peer_public_key, channel }`
-- `StartServer::CardSetup { self_card, channel, relays }`
-- `Connect::CardSetup { canonical_pin, self_card, target_ip, channel, relays }`
+- `UiCommand::StartServer { mode: ServerMode::Key { identity, peer_public_key, channel } }`
+- `UiCommand::Connect { spec: DialSpec::Key { identity, peer_public_key, channel } }`
+- `UiCommand::StartServer { mode: ServerMode::CardSetup { self_card, channel, relays } }`
+- `UiCommand::Connect { spec: DialSpec::CardSetup { canonical_pin, self_card, target_ip, channel, relays } }`
 
 and the card-setup event `NetEvent::PeerCardReceived(IdentityCard)`.
 
@@ -349,11 +363,12 @@ whether it is trusted.
 
 ## Persistence and bounds
 
-Desktop config stores the application private key, optional signed self-card
-short name and permanent suffix, and signed peer cards. Loading is strict:
-invalid or legacy data is an error, not a migration or silent drop. Files are
-owner-only, protected by a sibling process-lifetime lock, and atomically
-replaced through a flushed temporary file.
+Desktop config stores the application private key, permanent suffix, optional
+short name and matching signed self-card, and signed peer cards. Loading is
+strict: malformed or unsupported data is an error, not a migration or silent
+drop. A sibling process-lifetime lock protects the config, and saves atomically
+replace it through a flushed temporary file. Config-related files are
+owner-only on Unix; Windows relies on the per-user configuration directory.
 
 Clipboard content is never persisted. Inbox retention is five items in memory;
 wire clipboard frames are capped at 1 MiB.
@@ -376,8 +391,10 @@ wire clipboard frames are capped at 1 MiB.
   record can only misdirect a dial; the wire handshake still has to prove the
   trusted application key, so a wrong target fails closed.
 - A hosting record's label is stable for the life of a pairing, so an observer
-  on either transport can see *that* two devices pair repeatedly, and roughly
-  when. It reveals neither device's identity, and the two transports use
-  separate labels for the same pair.
+  can link repeated sessions and their timing. A LAN observer sees a
+  pseudonymous label and direct addresses. A Nostr relay additionally sees the
+  host and intended peer application public keys as the event author and public
+  `p` tag. The transport labels differ, but someone who knows both keys can
+  derive and correlate them.
 - iroh and relay infrastructure can observe connection/event metadata even
   though payloads are encrypted.

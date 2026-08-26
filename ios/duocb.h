@@ -70,7 +70,7 @@
  *
  * "channel" chooses where the rendezvous records are put and looked for, and
  * governs card setup and clipboard sessions alike:
- *   lan_then_nostr  (default) local network first, nostr relays as fallback
+ *   lan_then_nostr  (default) host publishes on both; dialer tries LAN first
  *   lan_only        no third-party server at all — works fully offline
  *   nostr_only      relays only; no mDNS query, no side-channel listener
  * The desktop fixes this at launch (--lan-only / --nostr-only); iOS picks it
@@ -173,6 +173,8 @@ int duocb_create_identity_card(const char *private_key,
                                const char *suffix,
                                char *out_buf,
                                size_t out_len);
+/* Verifies the signature and signed validity-window shape, but does not read
+ * the clock. Use duocb_identity_card_info to determine current usability. */
 int duocb_validate_identity_card(const char *card,
                                  char *err_buf,
                                  size_t err_len);
@@ -246,14 +248,17 @@ int duocb_query_conn_path(const DuocbHandle *handle);
 /* card_host only: mint a fresh PIN now, invalidating every earlier one. */
 int duocb_refresh_pin(const DuocbHandle *handle);
 /* End the session but keep the handle: a host stops serving, a joiner hangs
- * up. The runtime survives, so duocb_reconnect can resume the same pairing. */
+ * up. This clears the logical session's transient claim/PIN memory while the
+ * runtime and its iroh node id survive. */
 int duocb_disconnect(const DuocbHandle *handle);
 
 /* 1 = runtime alive, 0 = runtime ended, -1 = NULL handle. */
 int duocb_is_running(const DuocbHandle *handle);
-/* Re-issue the handle's session command on its still-running runtime, reusing
- * the session identity so an already-paired peer recognizes the reconnect. A
- * fresh duocb_start would mint a new identity, which such a peer refuses.
+/* Re-issue the handle's session command on its still-running runtime. If the
+ * prior task ended on its own, matching claim/PIN memory is retained and the
+ * target is resolved again. After duocb_disconnect it is a fresh logical
+ * session with the same runtime node id. A new duocb_start uses the supplied
+ * iroh_secret again but starts with empty transient session memory.
  * 0 = requested, -1 = NULL handle, -2 = runtime unavailable (stop and restart). */
 int duocb_reconnect(const DuocbHandle *handle);
 /* Graceful shutdown and free. NULL is a safe no-op; the handle must not be

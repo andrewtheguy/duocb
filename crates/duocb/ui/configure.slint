@@ -318,7 +318,7 @@ export component HomeScreen inherits ScrollView {
         Rectangle { vertical-stretch: 1; }
 
         // Card setup hands over this device's signed card, so it needs an
-        // identity to exist first — unlike the old quick pairing, it is offered
+        // identity to exist first, so it is offered
         // only from the configured hub.
         if UiState.configure-step == ConfigureStep.ready: WideButton {
             text: "🔗 Trade cards over the network";

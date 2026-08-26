@@ -59,9 +59,10 @@ async fn connect_client(relays: &[String]) -> Result<Client> {
     Ok(client)
 }
 
-/// Publish the host's current iroh endpoint privately for the one trusted peer
+/// Publish the host's current iroh endpoint encrypted for the one trusted peer
 /// this session is hosting for — the relay copy of the record `crate::lan`
-/// advertises over DNS-SD.
+/// advertises over DNS-SD. The node id is private, but the signed event exposes
+/// the host public key and its public `p` recipient tag to the relays.
 pub async fn publish_hosting(
     identity: &Identity,
     peer: PublicKey,
@@ -135,9 +136,9 @@ fn pin_kind() -> Kind {
     Kind::from_u16(PIN_KIND_U16)
 }
 
-/// Publish the card-setup rendezvous record — the same encrypted node-id record
-/// the LAN backends carry (see `crate::pin_record`) — to the relays, signed by
-/// (and addressed under) the `(pin, bucket)`-derived keypair.
+/// Publish an independently encrypted copy of the card-setup node-id payload
+/// that the LAN backends carry (see `crate::pin_record`) to the relays, signed
+/// by (and addressed under) the `(pin, bucket)`-derived keypair.
 ///
 /// This is the fallback path that lets two devices on different networks trade
 /// cards. It puts the record where anyone can fetch it, so its secrecy rests
@@ -194,4 +195,3 @@ pub async fn lookup_pin_record(
     }
     Ok(None)
 }
-
