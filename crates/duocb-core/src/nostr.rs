@@ -1,4 +1,4 @@
-//! Nostr signaling: the relay transport for pairwise hosting records
+//! Nostr signaling: the relay carrier for pairwise hosting records
 //! (`crate::hosting_record`) and for the card-setup PIN rendezvous
 //! (`crate::pin_record`). Both records also travel over the local network — see
 //! `crate::lan` — and this module carries the copy that reaches a peer on
@@ -13,6 +13,7 @@ use nostr_sdk::prelude::*;
 
 use crate::auth::Identity;
 use crate::hosting_record;
+use crate::transport::TransportAddr;
 
 pub const DEFAULT_NOSTR_RELAYS: &[&str] = &[
     "wss://nos.lol",
@@ -59,19 +60,19 @@ async fn connect_client(relays: &[String]) -> Result<Client> {
     Ok(client)
 }
 
-/// Publish the host's current iroh endpoint encrypted for the one trusted peer
-/// this session is hosting for — the relay copy of the record `crate::lan`
-/// advertises over DNS-SD. The node id is private, but the signed event exposes
+/// Publish the host's current transport address encrypted for the one trusted
+/// peer this session is hosting for — the relay copy of the record `crate::lan`
+/// advertises over DNS-SD. The address is private, but the signed event exposes
 /// the host public key and its public `p` recipient tag to the relays.
 pub async fn publish_hosting(
     identity: &Identity,
     peer: PublicKey,
-    node_id: &EndpointId,
+    addr: &TransportAddr,
     relays: &[String],
 ) -> Result<()> {
     // Encrypted before a relay is contacted, so a bad record never costs a
     // connection that then has to be torn down again.
-    let content = hosting_record::encrypt(identity, peer, node_id)?;
+    let content = hosting_record::encrypt(identity, peer, addr)?;
     let event = EventBuilder::new(hosting_kind(), content)
         .tags([
             Tag::identifier(hosting_record::nostr_dtag(identity.public_key(), peer)),
@@ -87,7 +88,7 @@ pub async fn publish_hosting(
     Ok(())
 }
 
-/// Resolve a selected trusted peer's current iroh endpoint.
+/// Resolve a selected trusted peer's current transport address.
 ///
 /// A record that is present but unreadable — bad signature, addressed to
 /// someone else, malformed — is reported as `Ok(None)`, the same as no record
@@ -97,7 +98,7 @@ pub async fn lookup_hosting(
     identity: &Identity,
     peer: PublicKey,
     relays: &[String],
-) -> Result<Option<EndpointId>> {
+) -> Result<Option<TransportAddr>> {
     let client = connect_client(relays).await?;
     let filter = Filter::new()
         .kind(hosting_kind())

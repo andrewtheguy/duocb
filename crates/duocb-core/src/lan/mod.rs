@@ -1,10 +1,10 @@
-//! LAN transports for duocb's two encrypted rendezvous records — the
-//! card-setup PIN record (`crate::pin_record`) and the pairwise hosting record
-//! that points a trusted peer at a live clipboard session
-//! (`crate::hosting_record`). Both are the NIP-44 ciphertext of the host's
-//! current node id under a service instance label the looking device derives
-//! for itself, so a record is found by deriving its label — from the typed PIN,
-//! or from the pair of application keys — and never by naming a device.
+//! LAN carriers for duocb's two encrypted rendezvous records — the card-setup
+//! PIN record (`crate::pin_record`, an iroh node id) and the pairwise hosting
+//! record that points a trusted peer at a live clipboard session
+//! (`crate::hosting_record`, a transport-tagged address). Both are NIP-44
+//! ciphertext under a service instance label the looking device derives for
+//! itself, so a record is found by deriving its label — from the typed PIN, or
+//! from the pair of application keys — and never by naming a device.
 //!
 //! The two records differ only in what their label and key are derived from,
 //! which is why they share one DNS-SD backend under separate service types:
@@ -37,6 +37,7 @@ use sha2::{Digest, Sha256};
 
 use crate::auth::Identity;
 use crate::hosting_record;
+use crate::transport::TransportAddr;
 
 pub use unicast::UnicastListener;
 
@@ -89,23 +90,43 @@ fn side_channel_port(keys: &Keys) -> u16 {
     EPHEMERAL_START + (u16::from_be_bytes([digest[0], digest[1]]) % EPHEMERAL_LEN)
 }
 
-/// A resolved LAN rendezvous hit: the decrypted node id plus the direct socket
+/// A resolved LAN rendezvous hit: the decrypted payload plus the direct socket
 /// addresses reassembled from the DNS-SD records (A/AAAA + SRV port, `p6` TXT
 /// override for the v6 socket).
-pub struct LanFound {
-    pub node_id: EndpointId,
+///
+/// The payload type is what the record carries: a bare [`EndpointId`] for the
+/// card-setup PIN record, a [`TransportAddr`] for the pairwise hosting record,
+/// which is not iroh's to assume.
+pub struct LanFound<P = EndpointId> {
+    pub payload: P,
     pub addrs: Vec<SocketAddr>,
 }
 
-impl LanFound {
-    /// The dial target: the node id with every resolved direct address
-    /// attached, so the connect needs no LAN address lookup.
+/// Attach every resolved direct address to a node id, so the connect needs no
+/// LAN address lookup — which iOS does not have (see the crate's iOS notes).
+fn dial_target(node_id: EndpointId, addrs: &[SocketAddr]) -> EndpointAddr {
+    let mut addr = EndpointAddr::new(node_id);
+    for a in addrs {
+        addr = addr.with_ip_addr(*a);
+    }
+    addr
+}
+
+impl LanFound<EndpointId> {
+    /// The dial target for a PIN record.
     pub fn endpoint_addr(&self) -> EndpointAddr {
-        let mut addr = EndpointAddr::new(self.node_id);
-        for a in &self.addrs {
-            addr = addr.with_ip_addr(*a);
-        }
-        addr
+        dial_target(self.payload, &self.addrs)
+    }
+}
+
+impl LanFound<TransportAddr> {
+    /// The dial target when the record names the iroh transport, `None` when it
+    /// names one this build does not speak.
+    pub fn endpoint_addr(&self) -> Option<EndpointAddr> {
+        Some(dial_target(
+            crate::transport::iroh_quic::endpoint_id(&self.payload)?,
+            &self.addrs,
+        ))
     }
 }
 
@@ -152,17 +173,22 @@ pub async fn dnssd_lookup_pin_record(candidates: &[Keys]) -> Result<Option<LanFo
     .await
 }
 
-/// Advertise this host's current node id on the local network for exactly one
-/// trusted peer, so that peer can find a live clipboard session without any
-/// relay. The active session holds only this selected peer's advertisement; the
-/// label and ciphertext are pair-specific, so another peer cannot use it.
+/// Advertise this host's current transport address on the local network for
+/// exactly one trusted peer, so that peer can find a live clipboard session
+/// without any relay. The active session holds only this selected peer's
+/// advertisement; the label and ciphertext are pair-specific, so another peer
+/// cannot use it.
+///
+/// `addr` is the encrypted payload — whatever transport is hosting, named by
+/// itself. `addrs` is the DNS-SD SRV/A/AAAA data, which is how the record is
+/// reached on this network and is the same either way.
 pub async fn dnssd_advertise_hosting(
     identity: &Identity,
     peer: PublicKey,
-    node_id: &EndpointId,
+    addr: &TransportAddr,
     addrs: &[SocketAddr],
 ) -> Result<LanAdvert> {
-    let content = hosting_record::encrypt(identity, peer, node_id)?;
+    let content = hosting_record::encrypt(identity, peer, addr)?;
     dnssd::advertise(
         HOSTING_SERVICE_TYPE,
         &hosting_record::lan_instance(identity.public_key(), peer),
@@ -174,14 +200,15 @@ pub async fn dnssd_advertise_hosting(
 }
 
 /// Look for `host`'s hosting record on the local network, addressed to this
-/// identity. Returns the decrypted node id **and** the host's direct socket
-/// addresses; `Ok(None)` when nothing answered within the browse window — the
-/// peer is not hosting, or the two devices are not on the same network. The
-/// connection is still authenticated by the mutual application-key handshake.
+/// identity. Returns the decrypted transport address **and** the host's direct
+/// socket addresses; `Ok(None)` when nothing answered within the browse window
+/// — the peer is not hosting, or the two devices are not on the same network.
+/// The connection is still authenticated by the mutual application-key
+/// handshake.
 pub async fn dnssd_lookup_hosting(
     identity: &Identity,
     host: PublicKey,
-) -> Result<Option<LanFound>> {
+) -> Result<Option<LanFound<TransportAddr>>> {
     let wanted = hosting_record::lan_instance(host, identity.public_key());
     dnssd::lookup(HOSTING_SERVICE_TYPE, |instance, content| {
         (instance == wanted).then(|| hosting_record::decrypt(identity, host, content))?
@@ -290,6 +317,28 @@ mod tests {
             "TXT attribute too long: {}",
             TXT_KEY.len() + content.len()
         );
+    }
+
+    /// The hosting record's payload is the transport's own address text, so
+    /// its size is a transport's business too: a LAN advertisement has one TXT
+    /// attribute to fit it into.
+    #[test]
+    fn a_hosting_record_fits_one_txt_attribute() {
+        let host = Identity::generate();
+        let peer = Identity::generate();
+        let node_id = iroh::SecretKey::generate().public();
+        for addr in [
+            crate::transport::iroh_quic::rendezvous_addr(&node_id),
+            crate::transport::dummy::rendezvous_addr("192.168.1.9:7801".parse().unwrap()),
+        ] {
+            let content = hosting_record::encrypt(&host, peer.public_key(), &addr).unwrap();
+            assert!(
+                TXT_KEY.len() + content.len() < 254,
+                "TXT attribute too long for {}: {}",
+                addr.kind(),
+                TXT_KEY.len() + content.len()
+            );
+        }
     }
 
     #[test]

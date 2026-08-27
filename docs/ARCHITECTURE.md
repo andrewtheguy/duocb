@@ -1,11 +1,18 @@
 # duocb architecture
 
-duocb separates two concerns that deliberately use different keys:
+duocb is a wire protocol between two devices that hold each other's signed
+identity card. **iroh is how the bytes get there — the transport duocb ships
+with today, not something the protocol is built out of.** The layers above it
+(identity, trust, authentication, framing, clipboard messages) name no
+transport at all, and `crates/duocb-core/src/transport/` states what one has to
+supply; see [the transport layer](#the-transport-layer).
+
+It separates two concerns that deliberately use different keys:
 
 | Layer | Key lifetime | Purpose |
 |---|---|---|
 | Application identity | Persistent per installation | Signed identity cards, local trust, configure-mode wire authentication, Nostr authorship |
-| iroh transport | Fixed for a runtime; device-persistent on iOS | QUIC/TLS endpoint identity, signaling target, connection establishment |
+| Session transport (iroh today) | Fixed for a runtime; device-persistent on iOS | QUIC/TLS endpoint identity, signaling target, connection establishment |
 
 The application key is never used as an iroh secret key. The iroh key never
 determines local trust. Every endpoint a runtime binds uses the same iroh key,
@@ -13,10 +20,107 @@ so its node id stays fixed across session tasks. The desktop creates that key
 once per process; iOS stores a this-device-only key bound to
 `identifierForVendor`, so its node id also survives relaunches.
 
+## The transport layer
+
+Sessions are carried, not defined, by their transport, so the transport is the
+part most likely to change — and the split is enforced by where the code lives
+rather than by intent:
+
+- `duocb_core::transport` — the contract: what a transport must provide, as a
+  `SessionTransport` trait plus the two generic entry points
+  (`authenticate_dialer`, `authenticate_listener`) a transport is plugged into.
+- `duocb_core::transport::iroh_quic` — the implementation the apps run on.
+- `duocb_core::transport::dummy` — plain TCP, host and port, for tests and
+  demos. It carries complete sessions, which is how the boundary stays honest:
+  if something iroh-shaped leaked upward, the TCP tests would stop compiling or
+  passing.
+
+### What a transport must provide
+
+| Requirement | Why | Under iroh |
+|---|---|---|
+| One reliable, ordered, bidirectional byte channel per session | The handshake runs on it first, then `ClipMsg` frames flow both ways for the life of the connection. Framing is length-prefixed and self-delimiting, so message boundaries need not survive — and the two directions need not even come from one socket | One QUIC bidirectional stream |
+| A stable id for each end, labelled identically by both | Both ids are signed into the auth transcript, binding the application-key proofs to this connection | Node ids, authenticated by QUIC/TLS |
+| Somewhere to point a dial | Finding the peer is rendezvous, not transport (see [below](#configure-mode-signaling)); the transport is handed the result | A `TransportAddr` of kind `iroh` — a node id — inside the encrypted hosting record |
+| Confidentiality — required of any shipping transport | duocb adds no encryption of its own above the transport — clipboard frames are plain JSON inside it, so a transport without it carries the clipboard in the clear. The TCP test transport omits it deliberately and is therefore restricted to tests and demos | QUIC/TLS |
+
+Optional, and what a transport loses by omitting it: connection close codes
+(the runtime turns iroh's into precise "untrusted key" / "expired card" /
+"already paired" wording, and without them a refusal reads as a dropped
+connection), path introspection (the connection-path button), and NAT
+traversal with relay fallback (reachability beyond one network). None of them
+affect whether a session is correct or safe.
+
+### What a transport does not decide
+
+Identity and trust. A duocb installation *is* its application key; the
+transport key is a separate, shorter-lived thing and its node id is never a
+credential. The transport's endpoint ids only channel-bind a handshake that
+authenticates the application keys on its own — which is why the TCP demo, with
+no cryptography whatsoever, still refuses an untrusted application key, and why
+a session over it still ends up bound to the two keys the user chose.
+
+What the binding is *worth*, though, is the transport's contribution: iroh's
+ids are proven public keys, so a peer cannot claim one it does not hold, and
+both ends necessarily agree on the pair even across NAT and relays. The TCP
+demo's ids are socket addresses, so they bind a session to an address pair and
+no further — and anything that rewrites addresses leaves the two ends signing
+different transcripts, which fails the handshake instead of quietly proceeding.
+
+### Where the line falls in the code
+
+- Transport-specific: `net/endpoint.rs` (binding, discovery, relays, path
+  reporting), the session tasks in `net/runtime.rs` — which are what mint a
+  `TransportAddr` for the record and read one back into a dial — and the
+  card-setup `pin_record`, which still names an iroh node id (it is a LAN-only
+  trade that bootstraps trust, not a session rendezvous).
+- Transport-free: `protocol` (framing and messages), `key_auth` (the
+  configure-mode mutual handshake), `auth` (identities and cards),
+  `card_exchange`, `net::session_role`, the pairwise `hosting_record` and the
+  two carriers that move it (`lan`, `nostr`), and everything in the apps above
+  them.
+
+### Adding a second transport
+
+1. Implement `SessionTransport` for it: a `KIND` name, two half-channels and
+   two ids.
+2. Render its address into the rendezvous record and read it back —
+   `hosting_record` encrypts a `TransportAddr`, which is the transport's `KIND`
+   plus its own address text, so this is a pair of conversions
+   (`iroh_quic::rendezvous_addr`/`endpoint_id`,
+   `dummy::rendezvous_addr`/`socket_addr`) and no new record. Both carriers,
+   DNS-SD and the nostr relays, move the payload without reading it, and a
+   record naming a transport the looking device does not speak is a miss.
+3. Decide the endpoint lifecycle — who binds, what "ready" means, how a session
+   task is torn down — which is what `EndpointReadiness` answers for iroh.
+4. Optionally map its close codes and path reporting into `NetEvent`s so the UI
+   keeps its diagnostics.
+
+The dummy transport does (1) and (2): it publishes a `tcp` address in the same
+encrypted pairwise record the app publishes its node id in, so its `lan` mode
+below finds a peer over mDNS with no address typed anywhere. What keeps it a
+demo rather than something shippable is the transport itself — TCP encrypts
+nothing, and its ids are addresses (see [above](#what-a-transport-does-not-decide)).
+Steps (3) and (4) are the app's, not the contract's, and are the reason the
+runtime still binds iroh endpoints specifically.
+
+To see a session run on it:
+
+```sh
+cargo run -p duocb-core --example dummy_transport          # both peers, loopback
+cargo run -p duocb-core --example dummy_transport -- --uni # two one-way sockets
+cargo test -p duocb-core --test dummy_transport
+
+# two processes that find each other through the encrypted hosting record over
+# mDNS — no addresses typed. Each prints its npub; give each the other's.
+DUOCB_PEER_NPUB=<other npub> cargo run -p duocb-core --example dummy_transport -- lan
+```
+
 ## Workspace boundaries
 
-- `duocb-core`: portable identity/card types, protocol framing, Nostr
-  signaling, PIN support, and the headless tokio runtime.
+- `duocb-core`: portable identity/card types, protocol framing, the transport
+  contract and its iroh implementation, Nostr signaling, PIN support, and the
+  headless tokio runtime.
 - `duocb`: Slint desktop app, local config, and clipboard access.
 - `duocb-ffi`: C ABI over the core runtime and setup helpers for the sibling
   iOS app; it owns no persistence or trust policy.
@@ -114,7 +218,9 @@ pairing slot the chosen device is coming for.
 Starting a configure-mode server binds an iroh endpoint with the runtime's
 existing transport key. For the peer the session is with, the host publishes one
 pairwise hosting record (`hosting_record`): NIP-44 ciphertext of
-`{version, node_id}` from the host's application key to exactly that peer's,
+`{version, transport, address}` — the name of the transport that minted the
+address and that transport's own address text, `iroh` and a node id today —
+from the host's application key to exactly that peer's,
 under a label that is a SHA-256 over a domain plus the **ordered** host/peer
 public keys. Anyone who knows both public keys can derive the deterministic
 label; it is an addressing mechanism, not a secret. Only the addressed peer can
@@ -134,6 +240,11 @@ application public keys can derive both labels, and a Nostr hosting event
 exposes those keys as its author and public `p` tag. The LAN copy additionally
 carries dialable addresses, so a local hit needs no further address lookup; the
 relay copy is a bare node id the endpoint's own discovery resolves.
+
+Neither carrier parses the payload — a record whose `transport` this build does
+not speak decrypts, is logged, and counts as a miss, which is what lets the TCP
+demo transport publish a `host:port` through the same record and the same two
+carriers.
 
 Which transports are in play is the session's `SignalChannel` choice — fixed at
 desktop launch and read from Settings when an iOS session starts. Card setup
@@ -155,8 +266,10 @@ hosting now?” The subsequent wire handshake proves who is on the connection.
 ## Configure-mode authentication
 
 Wire protocol version 4 uses mutual application-key proofs in configure mode
-and a SPAKE2 PAKE for card setup. The dialer opens one bidirectional QUIC
-stream:
+and a SPAKE2 PAKE for card setup. Both live in transport-free modules
+(`key_auth` and `pin_auth`): they take a byte stream in each direction and the
+two endpoint ids the transport reports, and nothing else. The dialer opens the
+session's one bidirectional stream:
 
 ```text
 C → S  KeyRequest   {client application pubkey, nonce_c}
@@ -176,13 +289,16 @@ client application key
 server application key
 nonce_c
 nonce_s
-client iroh node id
-server iroh node id
+client transport endpoint id
+server transport endpoint id
 ```
 
-The iroh ids come from the QUIC/TLS-authenticated connection, binding the proof
-to this transport without treating the transport key as the persistent
-identity. Nonces and roles prevent replay/reflection.
+The endpoint ids are whatever the transport calls its two ends — iroh node ids
+today, taken from the QUIC/TLS-authenticated connection. Signing them binds the
+proof to this connection without treating the transport key as the persistent
+identity; how much that binding is worth is the transport's contribution, not
+the handshake's (see [the transport layer](#the-transport-layer)). Nonces and
+roles prevent replay/reflection.
 
 The server's one-peer claim stores the stable application public key in
 configure mode. A reconnect may present a new iroh node id if it proves the same

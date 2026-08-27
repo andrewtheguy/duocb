@@ -2,7 +2,8 @@
 //! records — see the module docs in `super`. The contract is the same for
 //! either: advertise `<instance>.<service type>` with the ciphertext in the `e`
 //! TXT attribute and real SRV/A/AAAA data, and resolve an instance the caller
-//! recognizes back into [`LanFound`] (node id + dialable direct addresses).
+//! recognizes back into [`LanFound`] (the record's payload + dialable direct
+//! addresses).
 //!
 //! Nothing here knows what an instance label means or how its content is keyed.
 //! The caller supplies the label to advertise, and on lookup a `decode` closure
@@ -37,7 +38,6 @@ mod desktop {
     use std::sync::OnceLock;
 
     use anyhow::{Context, Result, anyhow};
-    use iroh::EndpointId;
     use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 
     use super::super::{
@@ -111,12 +111,14 @@ mod desktop {
 
     /// Browse `service_type` until `decode` accepts an instance or the window
     /// closes. `decode` receives the bare instance label and the `e` TXT content
-    /// and returns the node id when it recognizes and can read the record; every
-    /// other instance on the network is skipped.
-    pub(in crate::lan) async fn lookup(
+    /// and returns the record's payload when it recognizes and can read it;
+    /// every other instance on the network is skipped. The payload type is the
+    /// caller's — a node id for the PIN record, a transport address for the
+    /// hosting record — and this browse never looks inside it.
+    pub(in crate::lan) async fn lookup<P>(
         service_type: &str,
-        decode: impl Fn(&str, &str) -> Option<EndpointId>,
-    ) -> Result<Option<LanFound>> {
+        decode: impl Fn(&str, &str) -> Option<P>,
+    ) -> Result<Option<LanFound<P>>> {
         // A lookup-private daemon (see `daemon` docs); shut down at the end.
         let daemon =
             ServiceDaemon::new().map_err(|e| anyhow!("starting the DNS-SD browser: {e}"))?;
@@ -144,7 +146,7 @@ mod desktop {
             let Some(content) = info.get_property_val_str(TXT_KEY) else {
                 continue;
             };
-            let Some(node_id) = decode(instance, content) else {
+            let Some(payload) = decode(instance, content) else {
                 continue;
             };
             let port6 = info
@@ -156,7 +158,7 @@ mod desktop {
                 .map(|scoped| scoped.to_ip_addr())
                 .collect();
             break Some(LanFound {
-                node_id,
+                payload,
                 addrs: assemble_addrs(&ips, info.get_port(), port6),
             });
         };
@@ -203,7 +205,7 @@ mod desktop {
             let _ = host.kill();
             let _ = host.wait();
             let found = found.unwrap().expect("daemon-registered record on LAN");
-            assert_eq!(found.node_id, node_id);
+            assert_eq!(found.payload, node_id);
             assert!(
                 found.addrs.iter().all(|a| a.port() == 4433),
                 "addrs should carry the SRV port: {:?}",
@@ -223,7 +225,7 @@ mod desktop {
             let candidates = pin_record::candidate_keys(&pin).await.unwrap();
             let found = crate::lan::dnssd_lookup_pin_record(&candidates).await.unwrap();
             match found {
-                Some(f) => println!("FOUND node_id={} addrs={:?}", f.node_id, f.addrs),
+                Some(f) => println!("FOUND node_id={} addrs={:?}", f.payload, f.addrs),
                 None => println!("MISS"),
             }
         }
@@ -276,7 +278,7 @@ mod desktop {
                 .await
                 .unwrap()
                 .expect("record on LAN");
-            assert_eq!(found.node_id, node_id);
+            assert_eq!(found.payload, node_id);
             assert!(
                 found.addrs.contains(&addr),
                 "resolved addrs {:?} missing {addr}",
@@ -295,10 +297,11 @@ mod desktop {
             let peer = crate::auth::Identity::generate();
             let stranger = crate::auth::Identity::generate();
             let node_id = iroh::SecretKey::generate().public();
+            let hosting = crate::transport::iroh_quic::rendezvous_addr(&node_id);
             let addr = SocketAddr::from(([127, 0, 0, 1], 4434));
 
             let _advert =
-                crate::lan::dnssd_advertise_hosting(&host, peer.public_key(), &node_id, &[addr])
+                crate::lan::dnssd_advertise_hosting(&host, peer.public_key(), &hosting, &[addr])
                     .await
                     .unwrap();
 
@@ -306,7 +309,11 @@ mod desktop {
                 .await
                 .unwrap()
                 .expect("the addressed peer resolves the record");
-            assert_eq!(found.node_id, node_id);
+            assert_eq!(found.payload, hosting);
+            assert_eq!(
+                crate::transport::iroh_quic::endpoint_id(&found.payload),
+                Some(node_id)
+            );
             assert!(
                 found.addrs.contains(&addr),
                 "resolved addrs {:?} missing {addr}",
@@ -343,7 +350,6 @@ mod ios {
     use std::time::{Duration, Instant};
 
     use anyhow::{Context, Result, bail, ensure};
-    use iroh::EndpointId;
 
     use super::super::{
         LOOKUP_TIMEOUT, LanFound, TXT_KEY, TXT_KEY_PORT6, assemble_addrs, split_ports,
@@ -677,10 +683,10 @@ mod ios {
     /// world. Instead [`Browse`] carries the blocking state across successive
     /// `spawn_blocking` calls and hands resolved answers back, and `decode`
     /// judges them here on the async side.
-    pub(in crate::lan) async fn lookup(
+    pub(in crate::lan) async fn lookup<P>(
         service_type: &str,
-        decode: impl Fn(&str, &str) -> Option<EndpointId>,
-    ) -> Result<Option<LanFound>> {
+        decode: impl Fn(&str, &str) -> Option<P>,
+    ) -> Result<Option<LanFound<P>>> {
         let deadline = Instant::now() + LOOKUP_TIMEOUT;
         // The browse stops early so `resolve_addresses` below still has a window
         // to work in; both phases share the one LOOKUP_TIMEOUT budget.
@@ -707,7 +713,7 @@ mod ios {
             // Instances `decode` rejects are simply other duocb devices'
             // records on the same network — keep pumping.
             let recognized = answers.into_iter().find_map(|answer| {
-                decode(&answer.instance, &answer.content).map(|node_id| (node_id, answer))
+                decode(&answer.instance, &answer.content).map(|payload| (payload, answer))
             });
             if let Some(hit) = recognized {
                 break hit;
@@ -716,7 +722,7 @@ mod ios {
         // Cancels the browse and every outstanding resolve.
         drop(browse);
         let (
-            node_id,
+            payload,
             Answer {
                 host,
                 srv_port,
@@ -733,11 +739,11 @@ mod ios {
         if addrs.is_empty() {
             // A record without a dialable address is useless here: iroh's own
             // mDNS lookup is compiled out on iOS, so there is nothing else to
-            // resolve the bare node id against on a LAN-only channel.
+            // resolve a bare node id against on a LAN-only channel.
             log::warn!("DNS-SD record resolved without dialable addresses");
             return Ok(None);
         }
-        Ok(Some(LanFound { node_id, addrs }))
+        Ok(Some(LanFound { payload, addrs }))
     }
 
     /// Instances the browse has reported as present, in arrival order.
