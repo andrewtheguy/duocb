@@ -42,7 +42,7 @@ rather than by intent:
 | One reliable, ordered, bidirectional byte channel per session | The handshake runs on it first, then `ClipMsg` frames flow both ways for the life of the connection. Framing is length-prefixed and self-delimiting, so message boundaries need not survive — and the two directions need not even come from one socket | One QUIC bidirectional stream |
 | A stable id for each end, labelled identically by both | Both ids are signed into the auth transcript, binding the application-key proofs to this connection | Node ids, authenticated by QUIC/TLS |
 | Somewhere to point a dial | Finding the peer is rendezvous, not transport (see [below](#configure-mode-signaling)); the transport is handed the result | A `TransportAddr` of kind `iroh` — a node id — inside the encrypted hosting record |
-| Confidentiality | duocb adds no encryption of its own above the transport — clipboard frames are plain JSON inside it | QUIC/TLS |
+| Confidentiality — required of any shipping transport | duocb adds no encryption of its own above the transport — clipboard frames are plain JSON inside it, so a transport without it carries the clipboard in the clear. The TCP test transport omits it deliberately and is therefore restricted to tests and demos | QUIC/TLS |
 
 Optional, and what a transport loses by omitting it: connection close codes
 (the runtime turns iroh's into precise "untrusted key" / "expired card" /

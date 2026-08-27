@@ -20,7 +20,10 @@
 //! address at all: the hosting half publishes its `host:port` in the encrypted
 //! pairwise hosting record over DNS-SD, exactly where the app publishes its
 //! iroh node id, and the dialing half looks that record up by the pair of
-//! application keys and dials what it says.
+//! application keys and dials what it says. Both processes have to be on **this
+//! machine**: what the host advertises is a loopback address, because picking
+//! the interface a peer can actually reach is a transport's job and this one
+//! does not do it.
 //!
 //! ```sh
 //! # both peers in one process, over loopback: bidirectional, then two one-way sockets
@@ -33,7 +36,7 @@
 //! DUOCB_PEER_NPUB=<other npub> cargo run -p duocb-core --example dummy_transport -- \
 //!     peer 127.0.0.1:7801 127.0.0.1:7802 [--uni]
 //!
-//! # two processes that find each other over mDNS — no addresses typed
+//! # two processes on THIS machine that find each other over mDNS — no addresses typed
 //! DUOCB_PEER_NPUB=<other npub> cargo run -p duocb-core --example dummy_transport -- lan
 //! ```
 //!
@@ -162,15 +165,21 @@ async fn in_process_unidirectional() -> Result<()> {
 /// keys, NIP-44 encrypted to the one peer it is for. The only difference is
 /// what the record says: `tcp:host:port` here, an iroh node id there. Neither
 /// the DNS-SD carrier nor anything else on the network can read it.
+///
+/// Same-machine only: the advertised address is loopback (see below), so a peer
+/// on another host would resolve the record and then dial itself. Reaching a
+/// peer across a network means choosing an address it can actually use, which
+/// is transport work this demo leaves out — iroh's answer to it is discovery,
+/// hole punching and relays.
 async fn lan_peer(identity: Identity, peer_key: nostr_sdk::PublicKey) -> Result<()> {
     let text = format!("hello from {}", identity.to_npub());
     match session_role(identity.public_key(), peer_key) {
         SessionRole::Host => {
             let listener = TcpListener::bind("0.0.0.0:0").await.context("binding")?;
             let bound = listener.local_addr()?;
-            // What the peer will dial. The advertised address has to be one the
-            // peer can reach, so an ephemeral loopback/LAN port is resolved to
-            // a concrete address here rather than advertised as 0.0.0.0.
+            // What the peer will dial. `0.0.0.0` is not dialable, so the
+            // ephemeral port is advertised against a concrete address — the
+            // loopback one, which is what limits this mode to one machine.
             let reachable = SocketAddr::from(([127, 0, 0, 1], bound.port()));
             let addr = dummy::rendezvous_addr(reachable);
             println!("this key hosts — listening on {bound}, advertising {addr:?} over mDNS");

@@ -74,24 +74,35 @@ pub fn socket_addr(addr: &TransportAddr) -> Option<SocketAddr> {
     addr.address_of(KIND)?.trim().parse().ok()
 }
 
-/// How long [`TcpSession::dial`] and [`UniTcpSession::connect`] keep retrying a
-/// refused connection. Both peers of a demo are usually started at once, so the
-/// dialing half may be ready first; a real transport waits for a rendezvous
-/// record instead.
+/// How long [`TcpSession::dial`] and [`UniTcpSession::connect`] spend bringing a
+/// connection up: retries of a refused dial, a single unanswered dial, and the
+/// inbound half of [`UniTcpSession::connect`] all share this one deadline. Both
+/// peers of a demo are usually started at once, so one half may be ready first;
+/// a real transport waits for a rendezvous record instead.
+///
+/// It is a deadline and not just a retry budget because a dropped SYN does not
+/// come back as a refusal — a filtered port leaves `connect` waiting on the
+/// operating system's own timeout, which is minutes. A test or demo that cannot
+/// reach its peer has to fail, not hang.
 pub const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 
 async fn dial_with_retry(peer: SocketAddr) -> Result<TcpStream> {
     let deadline = tokio::time::Instant::now() + DIAL_TIMEOUT;
     loop {
-        match TcpStream::connect(peer).await {
-            Ok(stream) => return Ok(stream),
-            Err(error) if tokio::time::Instant::now() < deadline => {
+        // Bound the attempt itself, not only the gap between attempts.
+        match tokio::time::timeout_at(deadline, TcpStream::connect(peer)).await {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(error)) if tokio::time::Instant::now() < deadline => {
                 log::debug!("dummy transport: {peer} not listening yet ({error}); retrying");
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 return Err(anyhow::Error::new(error).context(format!("connecting to {peer}")));
             }
+            Err(_) => anyhow::bail!(
+                "connecting to {peer} timed out after {}s",
+                DIAL_TIMEOUT.as_secs()
+            ),
         }
     }
 }
@@ -192,14 +203,22 @@ impl UniTcpSession {
     /// call this symmetrically; which of them then takes the dialing half of
     /// the *handshake* is a separate question, answered by
     /// [`crate::net::session_role`] from the application keys.
+    ///
+    /// Both halves are bounded by [`DIAL_TIMEOUT`]. The inbound one needs its
+    /// own bound: a peer that binds its port and then goes away answers the
+    /// outbound dial, so the accept would be the only thing left waiting, with
+    /// nothing to end it.
     pub async fn connect(listener: TcpListener, peer_listen: SocketAddr) -> Result<Self> {
         let local_listen = listener.local_addr().context("local listen address")?;
         let (inbound, outbound) = tokio::try_join!(
             async {
-                listener
-                    .accept()
-                    .await
-                    .context("accepting the peer's inbound connection")
+                match tokio::time::timeout(DIAL_TIMEOUT, listener.accept()).await {
+                    Ok(accepted) => accepted.context("accepting the peer's inbound connection"),
+                    Err(_) => anyhow::bail!(
+                        "the peer did not connect to {local_listen} within {}s",
+                        DIAL_TIMEOUT.as_secs()
+                    ),
+                }
             },
             dial_with_retry(peer_listen),
         )?;
