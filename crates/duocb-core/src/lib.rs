@@ -17,7 +17,7 @@ pub use iroh;
 
 pub mod auth;
 pub mod card_exchange;
-mod hosting_record;
+pub mod hosting_record;
 pub mod identity;
 pub mod key_auth;
 pub mod lan;

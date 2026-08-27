@@ -18,9 +18,28 @@
 //! where a session's stream comes from.
 
 use anyhow::{Context, Result};
+use iroh::EndpointId;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 
-use super::{Role, SessionTransport};
+use super::{Role, SessionTransport, TransportAddr};
+
+/// The name iroh addresses carry in a rendezvous record.
+pub const KIND: &str = "iroh";
+
+/// The rendezvous payload for this transport: the host's current node id, as
+/// text. The endpoint's own discovery (relays, pkarr, mDNS) turns it back into
+/// paths, and a LAN record additionally carries direct socket addresses beside
+/// it in the DNS-SD SRV/A/AAAA data.
+pub fn rendezvous_addr(id: &EndpointId) -> TransportAddr {
+    TransportAddr::new(KIND, id.to_string())
+}
+
+/// The node id in a rendezvous record, or `None` when the record was minted by
+/// another transport or does not parse. Both cases are misses: this build
+/// cannot dial that record.
+pub fn endpoint_id(addr: &TransportAddr) -> Option<EndpointId> {
+    addr.address_of(KIND)?.trim().parse().ok()
+}
 
 /// An established iroh connection, ready to give up its session stream.
 ///
@@ -51,6 +70,8 @@ impl IrohSession {
 }
 
 impl SessionTransport for IrohSession {
+    const KIND: &'static str = KIND;
+
     type Send = SendStream;
     type Recv = RecvStream;
 

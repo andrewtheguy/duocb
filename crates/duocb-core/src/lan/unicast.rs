@@ -172,7 +172,7 @@ async fn fetch_and_decrypt(addr: SocketAddr, candidates: &[Keys]) -> Option<LanF
     };
     candidates.iter().find_map(|keys| {
         pin_record::decrypt_pin_payload(keys, &record.e).map(|node_id| LanFound {
-            node_id,
+            payload: node_id,
             addrs: record.addrs.clone(),
         })
     })
@@ -210,7 +210,7 @@ mod tests {
             .await
             .unwrap()
             .expect("the just-advertised record must resolve");
-        assert_eq!(found.node_id, node_id);
+        assert_eq!(found.payload, node_id);
         assert_eq!(found.addrs, addrs);
     }
 

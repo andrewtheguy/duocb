@@ -24,10 +24,12 @@
 //!    side cannot observe) makes the handshake fail, by design.
 //! 3. **Somewhere to point a dial.** Getting from "the peer I picked" to an
 //!    address is rendezvous, not transport, and duocb keeps the two apart: the
-//!    encrypted hosting record (`hosting_record`) carries the host's
+//!    encrypted hosting record ([`crate::hosting_record`]) carries the host's
 //!    current transport address over DNS-SD or Nostr, and the transport is
-//!    handed the result. Today that payload is an iroh node id, which is the
-//!    one place a second transport would need a second payload shape.
+//!    handed the result. The payload is a [`TransportAddr`] — the transport's
+//!    own name plus its own address text — so a second transport needs a
+//!    [`SessionTransport::KIND`] and a pair of conversions, not a second
+//!    record.
 //!
 //! # What a transport does *not* provide
 //!
@@ -46,11 +48,16 @@
 //! # What is transport-specific in this crate
 //!
 //! Under iroh today: [`crate::net::endpoint`] (binding endpoints, discovery,
-//! relays, connection paths), the session tasks in [`crate::net::runtime`], and
-//! the `EndpointId` payload inside the rendezvous records (`hosting_record`,
-//! [`crate::lan`], [`crate::nostr`]). Transport-free:
+//! relays, connection paths) and the session tasks in [`crate::net::runtime`],
+//! which are what turn a [`TransportAddr`] back into a dial. Transport-free:
 //! [`crate::protocol`], [`crate::key_auth`], [`crate::auth`],
-//! [`crate::card_exchange`] and [`crate::net::session_role`].
+//! [`crate::card_exchange`], [`crate::net::session_role`], and the pairwise
+//! rendezvous record ([`crate::hosting_record`]) with the two carriers that
+//! move it ([`crate::lan`], [`crate::nostr`]).
+//!
+//! The card-setup PIN rendezvous (`pin_record`) is deliberately not in that
+//! list: it is a LAN-only card trade that exists to bootstrap trust, and it
+//! still names an iroh node id.
 //!
 //! # Optional extras a transport may add
 //!
@@ -65,6 +72,49 @@ pub mod iroh_quic;
 use anyhow::Result;
 use std::future::Future;
 use tokio::io::{AsyncRead, AsyncWrite};
+
+/// Where to reach a peer, as a rendezvous record carries it: the name of the
+/// transport that minted the address, and that transport's own address text.
+///
+/// This is the whole of what [`crate::hosting_record`] encrypts, and the reason
+/// rendezvous is not iroh-shaped: the carriers (DNS-SD, nostr relays) move an
+/// opaque `(kind, address)` pair, and only the transport that recognizes `kind`
+/// knows how to read `address`. A record naming a transport this build does not
+/// speak reads as a miss, exactly like a record that is not there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransportAddr {
+    kind: String,
+    address: String,
+}
+
+impl TransportAddr {
+    /// Mint an address for `kind` — normally [`SessionTransport::KIND`], via
+    /// the transport's own helper (`iroh_quic::rendezvous_addr`,
+    /// `dummy::rendezvous_addr`).
+    pub fn new(kind: impl Into<String>, address: impl Into<String>) -> Self {
+        Self {
+            kind: kind.into(),
+            address: address.into(),
+        }
+    }
+
+    /// The transport that minted this address.
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    /// The address text, in whatever form that transport uses.
+    pub fn address(&self) -> &str {
+        &self.address
+    }
+
+    /// The address text if this record was minted by `kind`, else `None`. The
+    /// kind check is what keeps one transport from trying to parse another's
+    /// address.
+    pub fn address_of(&self, kind: &str) -> Option<&str> {
+        (self.kind == kind).then_some(self.address.as_str())
+    }
+}
 
 /// Which half of a session an end runs. It decides only who opens the stream
 /// and who proves itself first; both sides send and receive once the session is
@@ -82,6 +132,12 @@ pub enum Role {
 /// connection: a `SessionTransport` value means the two devices have found each
 /// other and a connection exists, not that either has been authenticated.
 pub trait SessionTransport: Sized {
+    /// The name this transport puts in a rendezvous record
+    /// ([`TransportAddr::kind`]). Short, stable, and unique across the
+    /// transports a build speaks — it is what tells a looking device whether it
+    /// can read the address at all.
+    const KIND: &'static str;
+
     /// The write half of the session's byte channel.
     type Send: AsyncWrite + Unpin + Send;
     /// The read half of the session's byte channel.

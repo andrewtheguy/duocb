@@ -1385,6 +1385,11 @@ fn channel_readiness(channel: SignalChannel) -> EndpointReadiness {
 /// A LAN hit carries the host's direct addresses (DNS-SD SRV/A/AAAA), so the
 /// dial needs no further address lookup; the relay record carries a bare node
 /// id, resolved by the endpoint's own discovery.
+///
+/// Either hit may name a transport this build does not speak — the record
+/// carries a `(transport, address)` pair, not an iroh node id. That reads as a
+/// miss here: it is logged, the search continues on the next channel, and the
+/// user is told the peer is not hosting anything this device can dial.
 async fn resolve_hosting(
     identity: &KeyIdentity,
     peer: nostr_sdk::PublicKey,
@@ -1394,7 +1399,13 @@ async fn resolve_hosting(
 
     if channel.lan() {
         match crate::lan::dnssd_lookup_hosting(&identity.identity, peer).await {
-            Ok(Some(found)) => return Ok(found.endpoint_addr()),
+            Ok(Some(found)) => match found.endpoint_addr() {
+                Some(addr) => return Ok(addr),
+                None => log::warn!(
+                    "Ignoring a local hosting record for the {:?} transport, which this build does not speak",
+                    found.payload.kind()
+                ),
+            },
             Ok(None) => log::info!("The selected peer is not hosting on the local network"),
             Err(e) => {
                 let e = e.context("LAN hosting lookup failed");
@@ -1409,7 +1420,13 @@ async fn resolve_hosting(
             log::info!("Falling back to the nostr hosting record for the selected peer");
         }
         match crate::nostr::lookup_hosting(&identity.identity, peer, &identity.relays).await {
-            Ok(Some(id)) => return Ok(EndpointAddr::new(id)),
+            Ok(Some(addr)) => match crate::transport::iroh_quic::endpoint_id(&addr) {
+                Some(id) => return Ok(EndpointAddr::new(id)),
+                None => log::warn!(
+                    "Ignoring a relayed hosting record for the {:?} transport, which this build does not speak",
+                    addr.kind()
+                ),
+            },
             Ok(None) => {
                 log::info!("The selected peer has no hosting record on the relays");
                 first_error = None;
@@ -1458,7 +1475,10 @@ async fn run_hosting_publisher(
     events: EventSender,
     cancel: CancellationToken,
 ) {
-    let node_id = endpoint.id();
+    // What the record says: this transport's name and this endpoint's address
+    // under it. The endpoint's node id is fixed for the process, so the payload
+    // is minted once and republished unchanged.
+    let hosting_addr = crate::transport::iroh_quic::rendezvous_addr(&endpoint.id());
     // Held for as long as the record should stand: dropping it withdraws the
     // DNS-SD advertisement.
     let mut advert: Option<crate::lan::LanAdvert> = None;
@@ -1515,7 +1535,7 @@ async fn run_hosting_publisher(
                     match crate::lan::dnssd_advertise_hosting(
                         &identity.identity,
                         peer_public_key,
-                        &node_id,
+                        &hosting_addr,
                         &addrs,
                     )
                     .await
@@ -1543,7 +1563,7 @@ async fn run_hosting_publisher(
                 match crate::nostr::publish_hosting(
                     &identity.identity,
                     peer_public_key,
-                    &node_id,
+                    &hosting_addr,
                     &identity.relays,
                 )
                 .await

@@ -47,10 +47,32 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 
-use super::SessionTransport;
+use super::{SessionTransport, TransportAddr};
 use crate::protocol::{
     ClipMsg, MAX_CLIP_MESSAGE_SIZE, decode_clip_msg, encode_clip_msg, read_length_prefixed,
 };
+
+/// The name TCP addresses carry in a rendezvous record.
+pub const KIND: &str = "tcp";
+
+/// The rendezvous payload for this transport: the `host:port` a peer should
+/// connect to, as text.
+///
+/// This is all step 2 of a port amounts to — a transport names itself and
+/// renders its own address, and [`crate::hosting_record`] carries the pair
+/// encrypted to exactly one trusted peer over whichever carrier is available
+/// ([`crate::lan`] over DNS-SD, [`crate::nostr`] over relays). A dialer that
+/// reads the record back with [`socket_addr`] needs no address on its command
+/// line.
+pub fn rendezvous_addr(addr: SocketAddr) -> TransportAddr {
+    TransportAddr::new(KIND, addr.to_string())
+}
+
+/// The socket address in a rendezvous record, or `None` when the record was
+/// minted by another transport or does not parse — both of them misses.
+pub fn socket_addr(addr: &TransportAddr) -> Option<SocketAddr> {
+    addr.address_of(KIND)?.trim().parse().ok()
+}
 
 /// How long [`TcpSession::dial`] and [`UniTcpSession::connect`] keep retrying a
 /// refused connection. Both peers of a demo are usually started at once, so the
@@ -90,6 +112,16 @@ impl TcpSession {
         Self::from_stream(dial_with_retry(peer).await?)
     }
 
+    /// Dial the address a rendezvous record named. Fails when the record was
+    /// minted by a different transport — the same "nothing here I can dial"
+    /// the shipping runtime reports for a record it cannot read.
+    pub async fn dial_record(addr: &TransportAddr) -> Result<Self> {
+        let peer = socket_addr(addr).with_context(|| {
+            format!("hosting record names the {:?} transport, not TCP", addr.kind())
+        })?;
+        Self::dial(peer).await
+    }
+
     /// Accept one connection. This end takes the listening half.
     pub async fn accept(listener: &TcpListener) -> Result<Self> {
         let (stream, _) = listener.accept().await.context("accepting a TCP session")?;
@@ -118,6 +150,8 @@ impl TcpSession {
 }
 
 impl SessionTransport for TcpSession {
+    const KIND: &'static str = KIND;
+
     type Send = OwnedWriteHalf;
     type Recv = OwnedReadHalf;
 
@@ -195,6 +229,8 @@ impl UniTcpSession {
 }
 
 impl SessionTransport for UniTcpSession {
+    const KIND: &'static str = KIND;
+
     type Send = OwnedWriteHalf;
     type Recv = OwnedReadHalf;
 

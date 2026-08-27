@@ -6,15 +6,19 @@
 //! direction and a pair of endpoint labels both sides agree on. Nothing here
 //! binds an iroh endpoint, resolves a node id, or touches a relay; the code
 //! being exercised is the same `key_auth`/`protocol` code the shipping runtime
-//! runs.
+//! runs — down to the encrypted pairwise hosting record the peers find each
+//! other with, which carries a TCP address here and an iroh node id in the app.
 
 use std::net::SocketAddr;
 
 use anyhow::Result;
 use duocb_core::auth::Identity;
 use duocb_core::net::{SessionRole, session_role};
-use duocb_core::transport::dummy::{TcpSession, UniTcpSession, recv_item, send_item};
-use duocb_core::transport::{SessionTransport, authenticate_dialer, authenticate_listener};
+use duocb_core::hosting_record;
+use duocb_core::transport::dummy::{self, TcpSession, UniTcpSession, recv_item, send_item};
+use duocb_core::transport::{
+    SessionTransport, TransportAddr, authenticate_dialer, authenticate_listener,
+};
 use tokio::net::TcpListener;
 
 async fn loopback_listener() -> (TcpListener, SocketAddr) {
@@ -201,4 +205,96 @@ async fn both_ends_label_the_connection_identically() {
     assert_eq!(dialing.peer_id(), accepted.local_id());
     assert_eq!(dialing.local_id(), accepted.peer_id());
     assert_eq!(dialing.peer_id(), format!("tcp:{addr}"));
+}
+
+/// Rendezvous, the second half of a port: a peer is picked by application key,
+/// and the encrypted pairwise hosting record is what turns that into somewhere
+/// to dial. The record carries `(transport, address)`, so the TCP transport
+/// puts a `host:port` in it and the dialer reads it back out — no address on a
+/// command line, and not one line of iroh involved.
+///
+/// The carrier here is a channel standing in for DNS-SD or a nostr relay; both
+/// of those move the same ciphertext (`lan::dnssd_advertise_hosting`,
+/// `nostr::publish_hosting`), and neither can read it.
+#[tokio::test(flavor = "multi_thread")]
+async fn peers_find_each_other_through_a_pairwise_hosting_record() {
+    let host = Identity::generate();
+    let joiner = Identity::generate();
+    let (host_key, joiner_key) = (host.public_key(), joiner.public_key());
+    let (listener, addr) = loopback_listener().await;
+    let (publish, published) = tokio::sync::oneshot::channel();
+
+    let hosting = tokio::spawn(async move {
+        // What the runtime's hosting publisher does, for its own transport.
+        let content = hosting_record::encrypt(&host, joiner_key, &dummy::rendezvous_addr(addr))
+            .expect("encrypting the hosting record");
+        publish.send(content).expect("carrier");
+
+        let transport = TcpSession::accept(&listener).await.expect("accept");
+        let (mut send, mut recv, peer) = authenticate_listener(transport, &host, only(joiner_key))
+            .await
+            .expect("listener handshake");
+        assert_eq!(peer, joiner_key);
+        let text = recv_item(&mut recv).await.expect("receive");
+        send_item(&mut send, &format!("echo: {text}"))
+            .await
+            .expect("send");
+    });
+
+    let content = published.await.expect("record published");
+    let found = hosting_record::decrypt(&joiner, host_key, &content).expect("the record decrypts");
+    assert_eq!(found, dummy::rendezvous_addr(addr));
+    // The record names a transport; reading it as another one is refused by the
+    // name rather than by a parse of somebody else's address text.
+    assert_eq!(duocb_core::transport::iroh_quic::endpoint_id(&found), None);
+
+    let transport = TcpSession::dial_record(&found).await.expect("dial");
+    let (mut send, mut recv) = authenticate_dialer(transport, &joiner, host_key)
+        .await
+        .expect("dialer handshake");
+    send_item(&mut send, "found by rendezvous").await.expect("send");
+    assert_eq!(
+        recv_item(&mut recv).await.expect("receive"),
+        "echo: found by rendezvous"
+    );
+    hosting.await.expect("hosting task");
+}
+
+/// The record is addressed to one peer and names one transport, and both of
+/// those are checked before anything is dialed: a device the record is not for
+/// reads nothing at all, and a device that reads it but does not speak the
+/// named transport gets a miss instead of a bad dial.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hosting_record_is_readable_only_by_its_peer_and_its_transport() {
+    let host = Identity::generate();
+    let joiner = Identity::generate();
+    let stranger = Identity::generate();
+    let addr: SocketAddr = "127.0.0.1:7801".parse().unwrap();
+
+    let content =
+        hosting_record::encrypt(&host, joiner.public_key(), &dummy::rendezvous_addr(addr)).unwrap();
+    assert!(
+        !content.contains("7801"),
+        "the carrier must not see the address"
+    );
+    assert_eq!(
+        hosting_record::decrypt(&stranger, host.public_key(), &content),
+        None,
+        "a record addressed to someone else is not readable"
+    );
+
+    let found = hosting_record::decrypt(&joiner, host.public_key(), &content).unwrap();
+    assert_eq!(dummy::socket_addr(&found), Some(addr));
+
+    // A record from a transport this build does not speak decrypts fine and is
+    // still undialable — the kind is what says so.
+    let exotic = TransportAddr::new("bluetooth", "AA:BB:CC:DD:EE:FF");
+    let content = hosting_record::encrypt(&host, joiner.public_key(), &exotic).unwrap();
+    let found = hosting_record::decrypt(&joiner, host.public_key(), &content).unwrap();
+    assert_eq!(dummy::socket_addr(&found), None);
+    let error = match TcpSession::dial_record(&found).await {
+        Ok(_) => panic!("nothing here TCP can dial"),
+        Err(error) => format!("{error:#}"),
+    };
+    assert!(error.contains("bluetooth"), "the error names the transport: {error}");
 }

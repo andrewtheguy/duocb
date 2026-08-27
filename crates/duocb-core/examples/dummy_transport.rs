@@ -16,6 +16,12 @@
 //!   port, dials the other's, then writes only to the socket it opened and
 //!   reads only from the socket it accepted.
 //!
+//! …and rendezvous on top of them (`lan`), where neither peer is told an
+//! address at all: the hosting half publishes its `host:port` in the encrypted
+//! pairwise hosting record over DNS-SD, exactly where the app publishes its
+//! iroh node id, and the dialing half looks that record up by the pair of
+//! application keys and dials what it says.
+//!
 //! ```sh
 //! # both peers in one process, over loopback: bidirectional, then two one-way sockets
 //! cargo run -p duocb-core --example dummy_transport
@@ -26,6 +32,9 @@
 //! # two processes. Each prints its npub; give each the other's.
 //! DUOCB_PEER_NPUB=<other npub> cargo run -p duocb-core --example dummy_transport -- \
 //!     peer 127.0.0.1:7801 127.0.0.1:7802 [--uni]
+//!
+//! # two processes that find each other over mDNS — no addresses typed
+//! DUOCB_PEER_NPUB=<other npub> cargo run -p duocb-core --example dummy_transport -- lan
 //! ```
 //!
 //! Which peer listens and which dials is not a flag: `session_role` derives it
@@ -42,7 +51,7 @@ use std::net::SocketAddr;
 use anyhow::{Context, Result};
 use duocb_core::auth::Identity;
 use duocb_core::net::{SessionRole, session_role};
-use duocb_core::transport::dummy::{TcpSession, UniTcpSession, recv_item, send_item};
+use duocb_core::transport::dummy::{self, TcpSession, UniTcpSession, recv_item, send_item};
 use duocb_core::transport::{SessionTransport, authenticate_dialer, authenticate_listener};
 use tokio::net::TcpListener;
 
@@ -145,8 +154,59 @@ async fn in_process_unidirectional() -> Result<()> {
     Ok(())
 }
 
-/// One side of a two-process run.
-async fn one_peer(bind: SocketAddr, peer_addr: SocketAddr, uni: bool) -> Result<()> {
+/// One side of a two-process run that uses no addresses at all: the peers are
+/// found through the encrypted pairwise hosting record on the local network.
+///
+/// This is the same rendezvous the app runs — `lan::dnssd_advertise_hosting`
+/// and `lan::dnssd_lookup_hosting`, one record per ordered pair of application
+/// keys, NIP-44 encrypted to the one peer it is for. The only difference is
+/// what the record says: `tcp:host:port` here, an iroh node id there. Neither
+/// the DNS-SD carrier nor anything else on the network can read it.
+async fn lan_peer(identity: Identity, peer_key: nostr_sdk::PublicKey) -> Result<()> {
+    let text = format!("hello from {}", identity.to_npub());
+    match session_role(identity.public_key(), peer_key) {
+        SessionRole::Host => {
+            let listener = TcpListener::bind("0.0.0.0:0").await.context("binding")?;
+            let bound = listener.local_addr()?;
+            // What the peer will dial. The advertised address has to be one the
+            // peer can reach, so an ephemeral loopback/LAN port is resolved to
+            // a concrete address here rather than advertised as 0.0.0.0.
+            let reachable = SocketAddr::from(([127, 0, 0, 1], bound.port()));
+            let addr = dummy::rendezvous_addr(reachable);
+            println!("this key hosts — listening on {bound}, advertising {addr:?} over mDNS");
+            // Dropping the advert withdraws the record, so it is held for the
+            // whole session.
+            let _advert = duocb_core::lan::dnssd_advertise_hosting(
+                &identity,
+                peer_key,
+                &addr,
+                &[reachable],
+            )
+            .await
+            .context("advertising the hosting record")?;
+            let transport = TcpSession::accept(&listener).await?;
+            session("peer", &identity, transport, peer_key, &text).await?;
+        }
+        SessionRole::Dial => {
+            println!("this key dials — looking for the peer's hosting record on mDNS");
+            let found = duocb_core::lan::dnssd_lookup_hosting(&identity, peer_key)
+                .await
+                .context("looking up the hosting record")?
+                .context("the peer is not hosting on this network")?;
+            println!(
+                "found {:?} (direct addrs {:?})",
+                found.payload, found.addrs
+            );
+            let transport = TcpSession::dial_record(&found.payload).await?;
+            session("peer", &identity, transport, peer_key, &text).await?;
+        }
+    }
+    Ok(())
+}
+
+/// The identity and trusted peer both two-process modes run as: an `nsec` from
+/// the environment or a fresh one, and the peer's `npub`.
+fn peer_identity() -> Result<(Identity, nostr_sdk::PublicKey)> {
     let identity = match std::env::var("DUOCB_NSEC") {
         Ok(nsec) => Identity::parse_nsec(&nsec).context("invalid DUOCB_NSEC")?,
         Err(_) => Identity::generate(),
@@ -158,7 +218,12 @@ async fn one_peer(bind: SocketAddr, peer_addr: SocketAddr, uni: bool) -> Result<
             .context("DUOCB_PEER_NPUB is required (the other process prints its npub)")?,
     )
     .context("invalid DUOCB_PEER_NPUB")?;
+    Ok((identity, peer_key))
+}
 
+/// One side of a two-process run.
+async fn one_peer(bind: SocketAddr, peer_addr: SocketAddr, uni: bool) -> Result<()> {
+    let (identity, peer_key) = peer_identity()?;
     let text = format!("hello from {}", identity.to_npub());
     if uni {
         let listener = TcpListener::bind(bind).await.context("binding")?;
@@ -195,11 +260,16 @@ async fn main() -> Result<()> {
             in_process_bidirectional().await?;
             in_process_unidirectional().await?;
         }
+        [mode] if *mode == "lan" => {
+            let (identity, peer_key) = peer_identity()?;
+            lan_peer(identity, peer_key).await?;
+        }
         [mode, bind, peer_addr] if *mode == "peer" => {
             one_peer(bind.parse()?, peer_addr.parse()?, uni).await?;
         }
         _ => anyhow::bail!(
-            "usage: dummy_transport [--uni] | dummy_transport peer <bind-addr> <peer-addr> [--uni]"
+            "usage: dummy_transport [--uni] | dummy_transport peer <bind-addr> <peer-addr> \
+             [--uni] | dummy_transport lan"
         ),
     }
     Ok(())

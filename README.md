@@ -74,7 +74,8 @@ punching and a relay fallback when a direct path cannot be made. That is the
 transport duocb ships with, not what duocb is made of — identity, trust, the
 handshake and the clipboard protocol are all written without reference to it,
 and the core crate carries a plain-TCP transport used by tests and a runnable
-example to keep that boundary real. See
+example to keep that boundary real, right down to finding a peer through the
+same encrypted hosting record the app uses. See
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#the-transport-layer) if you are
 looking at carrying duocb over something else.
 
@@ -97,7 +98,8 @@ When a session starts, the hosting device publishes a NIP-44 encrypted hosting
 record addressed to that one peer on every enabled channel — by default both
 the local network over Bonjour/DNS-SD *and* Nostr relays, since the host cannot
 know which way the other device will look (the flags below narrow that to one).
-The record carries only the current iroh node id. The dialing device looks on
+The record carries only where to reach the host — the name of the transport in
+use and its address under it, which today means the current iroh node id. The dialing device looks on
 the local network first and falls back to the relays if nothing answers there,
 so a local hit avoids a relay lookup on the dialing side and devices on
 different networks can still find each other. The default host still publishes

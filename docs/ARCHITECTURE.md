@@ -41,7 +41,7 @@ rather than by intent:
 |---|---|---|
 | One reliable, ordered, bidirectional byte channel per session | The handshake runs on it first, then `ClipMsg` frames flow both ways for the life of the connection. Framing is length-prefixed and self-delimiting, so message boundaries need not survive — and the two directions need not even come from one socket | One QUIC bidirectional stream |
 | A stable id for each end, labelled identically by both | Both ids are signed into the auth transcript, binding the application-key proofs to this connection | Node ids, authenticated by QUIC/TLS |
-| Somewhere to point a dial | Finding the peer is rendezvous, not transport (see [below](#configure-mode-signaling)); the transport is handed the result | An `EndpointId` inside the encrypted hosting record |
+| Somewhere to point a dial | Finding the peer is rendezvous, not transport (see [below](#configure-mode-signaling)); the transport is handed the result | A `TransportAddr` of kind `iroh` — a node id — inside the encrypted hosting record |
 | Confidentiality | duocb adds no encryption of its own above the transport — clipboard frames are plain JSON inside it | QUIC/TLS |
 
 Optional, and what a transport loses by omitting it: connection close codes
@@ -70,32 +70,50 @@ different transcripts, which fails the handshake instead of quietly proceeding.
 ### Where the line falls in the code
 
 - Transport-specific: `net/endpoint.rs` (binding, discovery, relays, path
-  reporting), the session tasks in `net/runtime.rs`, and the `EndpointId`
-  payload carried inside the rendezvous records (`hosting_record`, `lan`,
-  `nostr`, `pin_record`).
+  reporting), the session tasks in `net/runtime.rs` — which are what mint a
+  `TransportAddr` for the record and read one back into a dial — and the
+  card-setup `pin_record`, which still names an iroh node id (it is a LAN-only
+  trade that bootstraps trust, not a session rendezvous).
 - Transport-free: `protocol` (framing and messages), `key_auth` (the
   configure-mode mutual handshake), `auth` (identities and cards),
-  `card_exchange`, `net::session_role`, and everything in the apps above them.
+  `card_exchange`, `net::session_role`, the pairwise `hosting_record` and the
+  two carriers that move it (`lan`, `nostr`), and everything in the apps above
+  them.
 
 ### Adding a second transport
 
-1. Implement `SessionTransport` for it: two half-channels and two ids.
-2. Give the rendezvous records a payload shape for its address. Today
-   `hosting_record` (and the card-setup `pin_record`) encrypt an iroh node id;
-   this is the one place a second transport needs a second payload.
+1. Implement `SessionTransport` for it: a `KIND` name, two half-channels and
+   two ids.
+2. Render its address into the rendezvous record and read it back —
+   `hosting_record` encrypts a `TransportAddr`, which is the transport's `KIND`
+   plus its own address text, so this is a pair of conversions
+   (`iroh_quic::rendezvous_addr`/`endpoint_id`,
+   `dummy::rendezvous_addr`/`socket_addr`) and no new record. Both carriers,
+   DNS-SD and the nostr relays, move the payload without reading it, and a
+   record naming a transport the looking device does not speak is a miss.
 3. Decide the endpoint lifecycle — who binds, what "ready" means, how a session
    task is torn down — which is what `EndpointReadiness` answers for iroh.
 4. Optionally map its close codes and path reporting into `NetEvent`s so the UI
    keeps its diagnostics.
 
-The dummy transport does (1) and deliberately skips (2): its "rendezvous" is an
-address typed on the command line, which is what makes it a demo and not a
-transport anyone could ship. To see a session run on it:
+The dummy transport does (1) and (2): it publishes a `tcp` address in the same
+encrypted pairwise record the app publishes its node id in, so its `lan` mode
+below finds a peer over mDNS with no address typed anywhere. What keeps it a
+demo rather than something shippable is the transport itself — TCP encrypts
+nothing, and its ids are addresses (see [above](#what-a-transport-does-not-decide)).
+Steps (3) and (4) are the app's, not the contract's, and are the reason the
+runtime still binds iroh endpoints specifically.
+
+To see a session run on it:
 
 ```sh
 cargo run -p duocb-core --example dummy_transport          # both peers, loopback
 cargo run -p duocb-core --example dummy_transport -- --uni # two one-way sockets
 cargo test -p duocb-core --test dummy_transport
+
+# two processes that find each other through the encrypted hosting record over
+# mDNS — no addresses typed. Each prints its npub; give each the other's.
+DUOCB_PEER_NPUB=<other npub> cargo run -p duocb-core --example dummy_transport -- lan
 ```
 
 ## Workspace boundaries
@@ -200,8 +218,9 @@ pairing slot the chosen device is coming for.
 Starting a configure-mode server binds an iroh endpoint with the runtime's
 existing transport key. For the peer the session is with, the host publishes one
 pairwise hosting record (`hosting_record`): NIP-44 ciphertext of
-`{version, node_id}` — the transport address, an iroh node id today — from the
-host's application key to exactly that peer's,
+`{version, transport, address}` — the name of the transport that minted the
+address and that transport's own address text, `iroh` and a node id today —
+from the host's application key to exactly that peer's,
 under a label that is a SHA-256 over a domain plus the **ordered** host/peer
 public keys. Anyone who knows both public keys can derive the deterministic
 label; it is an addressing mechanism, not a secret. Only the addressed peer can
@@ -221,6 +240,11 @@ application public keys can derive both labels, and a Nostr hosting event
 exposes those keys as its author and public `p` tag. The LAN copy additionally
 carries dialable addresses, so a local hit needs no further address lookup; the
 relay copy is a bare node id the endpoint's own discovery resolves.
+
+Neither carrier parses the payload — a record whose `transport` this build does
+not speak decrypts, is logged, and counts as a miss, which is what lets the TCP
+demo transport publish a `host:port` through the same record and the same two
+carriers.
 
 Which transports are in play is the session's `SignalChannel` choice — fixed at
 desktop launch and read from Settings when an iOS session starts. Card setup
