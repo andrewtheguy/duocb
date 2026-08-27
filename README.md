@@ -26,7 +26,7 @@ copy and paste them.
 ### Configure mode
 
 Every duocb installation generates its own permanent application keypair. This
-key is separate from iroh's transport key:
+key is separate from the transport key iroh uses:
 
 - The application private key signs the device's portable identity card and
   authenticates the duocb wire handshake. It never expires: it is minted once
@@ -39,8 +39,8 @@ key is separate from iroh's transport key:
   not make an old card valid again; the card just reads as not yet valid. The final name is
   `<short-name>_<permanent-random-suffix>`; the suffix is minted once per
   installation and stays stable across renames and identity resets.
-- The iroh key creates the QUIC endpoint and node id. It is used for signaling
-  and transport establishment, never as the saved duocb identity. A running
+- The transport key creates the QUIC endpoint and node id. It is used for
+  signaling and connection establishment, never as the saved duocb identity. A running
   app presents one node id for its whole life. The desktop mints the key fresh
   on every launch, because a config directory can be copied between machines
   and two live endpoints with one node id would shadow each other; iOS keeps
@@ -66,6 +66,17 @@ renewed or removed deliberately. The apps re-sign their own cards at launch
 once fewer than seven days remain; the desktop also checks immediately before
 copying or trading its card. A renewal uses the same key, so the public key,
 fingerprint and pairing code do not change.
+
+### The transport
+
+Connections run over [iroh](https://www.iroh.computer/): QUIC, with hole
+punching and a relay fallback when a direct path cannot be made. That is the
+transport duocb ships with, not what duocb is made of — identity, trust, the
+handshake and the clipboard protocol are all written without reference to it,
+and the core crate carries a plain-TCP transport used by tests and a runnable
+example to keep that boundary real. See
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#the-transport-layer) if you are
+looking at carrying duocb over something else.
 
 ### Who hosts
 
@@ -229,7 +240,8 @@ outbox are never persisted.
   matches, but nothing is written to the trusted list until a person presses
   Import.
 - The application-key handshake authenticates configured peers independently
-  of the iroh transport key.
+  of the transport key, and duocb relies on the transport (QUIC/TLS under iroh)
+  for confidentiality of the session itself.
 - Pairwise hosting records are encrypted to the intended trusted peer.
 - Trust is local only: the trusted-peer list never leaves the device, so a lost
   config is re-paired by re-importing each peer's card.
@@ -239,7 +251,6 @@ outbox are never persisted.
 - Clipboard items are UTF-8 text capped at 1 MiB.
 - A session links exactly the one device you picked: the host signals to that
   peer alone and refuses any other, even a trusted one. Configure mode pins the
-  stable application identity while allowing its later iroh transport id to
-  change.
+  stable application identity while allowing its later transport id to change.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for protocol details.

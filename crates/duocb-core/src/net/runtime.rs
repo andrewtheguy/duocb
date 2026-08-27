@@ -12,14 +12,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use iroh::{EndpointAddr, EndpointId};
-use rand::RngCore as _;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::auth::{Identity, IdentityCard, unix_now, verify_auth_signature};
+use crate::auth::{Identity, IdentityCard, unix_now};
 use crate::net::endpoint::{
     EndpointReadiness, connect_to_server, connection_paths, create_client_endpoint,
     create_server_endpoint, watch_connection_paths,
@@ -28,12 +26,11 @@ use crate::net::{
     ConnStatus, DialSpec, EventSender, KeyIdentity, NetEvent, ServerMode, SignalChannel, UiCommand,
 };
 use crate::protocol::{
-    AuthRequest, AuthResponse, ClipBody, ClipMsg, KeyChallenge, KeyProof,
-    MAX_CLIP_MESSAGE_SIZE, MAX_CONTROL_MESSAGE_SIZE, decode_auth_request,
-    decode_auth_response, decode_clip_msg, decode_key_challenge, decode_key_proof,
-    encode_auth_request, encode_auth_response, encode_clip_msg, encode_key_challenge,
-    encode_key_proof, read_length_prefixed,
+    AuthRequest, ClipBody, ClipMsg, MAX_CLIP_MESSAGE_SIZE, MAX_CONTROL_MESSAGE_SIZE,
+    decode_auth_request, decode_clip_msg, encode_clip_msg, read_length_prefixed,
 };
+use crate::transport::SessionTransport;
+use crate::transport::iroh_quic::IrohSession;
 
 /// Retain only the PIN passwords from the sender's current and previous rotation buckets for
 /// in-band authentication. Sized to the PAKE's slot count so every retained PIN gets a slot in
@@ -1924,40 +1921,12 @@ fn auth_close_reason(conn: &iroh::endpoint::Connection) -> Option<String> {
     }
 }
 
-fn random_nonce() -> String {
-    let mut nonce = [0u8; 32];
-    rand::rng().fill_bytes(&mut nonce);
-    URL_SAFE_NO_PAD.encode(nonce)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn key_auth_transcript(
-    role: &str,
-    client_key: nostr_sdk::PublicKey,
-    server_key: nostr_sdk::PublicKey,
-    client_nonce: &str,
-    server_nonce: &str,
-    client_node: EndpointId,
-    server_node: EndpointId,
-) -> Vec<u8> {
-    fn field(output: &mut Vec<u8>, value: &[u8]) {
-        output.extend_from_slice(&(value.len() as u32).to_be_bytes());
-        output.extend_from_slice(value);
-    }
-
-    let mut transcript = Vec::with_capacity(256);
-    transcript.extend_from_slice(&crate::protocol::DUOCB_PROTO_VERSION.to_be_bytes());
-    field(&mut transcript, role.as_bytes());
-    field(&mut transcript, client_key.as_bytes());
-    field(&mut transcript, server_key.as_bytes());
-    field(&mut transcript, client_nonce.as_bytes());
-    field(&mut transcript, server_nonce.as_bytes());
-    field(&mut transcript, client_node.to_string().as_bytes());
-    field(&mut transcript, server_node.to_string().as_bytes());
-    transcript
-}
-
 /// Mutual configure-mode authentication using the persistent application key.
+///
+/// The handshake itself is [`crate::key_auth`] and knows nothing about iroh.
+/// What this adds is the iroh-specific frame around it: the session stream,
+/// the deadline, and the close-code translation that turns a peer's refusal
+/// into wording a user can act on.
 async fn auth_as_dialer_key(
     conn: &iroh::endpoint::Connection,
     identity: &Identity,
@@ -1965,53 +1934,18 @@ async fn auth_as_dialer_key(
     own_node: EndpointId,
 ) -> Result<Bi> {
     let handshake = async {
-        let (mut send, mut recv) = conn.open_bi().await.context("opening session stream")?;
-        let client_nonce = random_nonce();
-        let request = AuthRequest::key(identity.public_key().to_hex(), &client_nonce);
-        send.write_all(&encode_auth_request(&request)?).await?;
-
-        let challenge_bytes =
-            read_length_prefixed(&mut recv, MAX_CONTROL_MESSAGE_SIZE).await?;
-        let challenge =
-            decode_key_challenge(&challenge_bytes).context("invalid key-auth challenge")?;
-        let server_key = nostr_sdk::PublicKey::parse(&challenge.public_key)
-            .context("listener supplied an invalid application key")?;
-        if server_key != expected_peer {
-            anyhow::bail!("listener application key does not match the selected peer");
-        }
-        let listener_transcript = key_auth_transcript(
-            "listener",
-            identity.public_key(),
-            server_key,
-            &client_nonce,
-            &challenge.nonce,
-            own_node,
-            conn.remote_id(),
-        );
-        verify_auth_signature(server_key, &listener_transcript, &challenge.proof)?;
-
-        let dialer_transcript = key_auth_transcript(
-            "dialer",
-            identity.public_key(),
-            server_key,
-            &client_nonce,
-            &challenge.nonce,
-            own_node,
-            conn.remote_id(),
-        );
-        let proof = KeyProof::new(identity.sign_auth(&dialer_transcript));
-        send.write_all(&encode_key_proof(&proof)?).await?;
-
-        let response_bytes =
-            read_length_prefixed(&mut recv, MAX_CONTROL_MESSAGE_SIZE).await?;
-        let response =
-            decode_auth_response(&response_bytes).context("invalid key-auth response")?;
-        if !response.accepted {
-            anyhow::bail!(
-                "authentication rejected: {}",
-                response.reason.unwrap_or_else(|| "unknown reason".into())
-            );
-        }
+        let session = IrohSession::dialer(conn.clone(), own_node);
+        let (local_id, peer_id) = (session.local_id(), session.peer_id());
+        let (mut send, mut recv) = session.session_stream().await?;
+        crate::key_auth::dialer_handshake(
+            &mut send,
+            &mut recv,
+            identity,
+            expected_peer,
+            &local_id,
+            &peer_id,
+        )
+        .await?;
         Ok::<Bi, anyhow::Error>((send, recv))
     };
     match tokio::time::timeout(AUTH_TIMEOUT, handshake).await {
@@ -2090,10 +2024,9 @@ async fn auth_as_listener(
         claimed.application_key.is_some() || claimed.node_id != Some(remote_id)
     });
     let auth_result = tokio::time::timeout(AUTH_TIMEOUT, async {
-        let (mut send, mut recv) = conn
-            .accept_bi()
-            .await
-            .context("Failed to accept session stream")?;
+        let (mut send, mut recv) = IrohSession::listener(conn.clone(), own_id)
+            .session_stream()
+            .await?;
 
         let request_bytes = read_length_prefixed(&mut recv, MAX_CONTROL_MESSAGE_SIZE)
             .await
@@ -2108,62 +2041,41 @@ async fn auth_as_listener(
                     identity,
                     peer_public_key,
                 } = key_auth.ok_or_else(|| anyhow::anyhow!("listener is not in key-auth mode"))?;
-                let client_key = nostr_sdk::PublicKey::parse(&public_key)
-                    .context("dialer application key is invalid")?;
-                // Every trust check runs before this side signs anything: an
-                // untrusted, lapsed or unasked-for dialer never gets a proof of
-                // our identity.
-                let Some(card) = identity.peer(client_key) else {
-                    anyhow::bail!("dialer application key is not locally trusted");
-                };
-                if client_key != peer_public_key {
-                    anyhow::bail!(
-                        "dialer is not the device this session is connecting to"
-                    );
-                }
-                if !card.is_valid_at(unix_now()) {
-                    return Err(expired_card_error(card));
-                }
-                if existing.as_ref().is_some_and(|claimed| {
-                    claimed.application_key != Some(client_key)
-                }) {
-                    anyhow::bail!("already paired with another application identity");
-                }
-                let server_nonce = random_nonce();
-                let listener_transcript = key_auth_transcript(
-                    "listener",
-                    client_key,
-                    identity.identity.public_key(),
+                // The handshake is transport-free (`crate::key_auth`); the two
+                // closures are where this host's policy lives. `admit` runs
+                // before anything is signed, so an untrusted, lapsed or
+                // unasked-for dialer never gets a proof of our identity, and
+                // `commit` runs after its proof verifies but before acceptance
+                // goes out, so a race loser is rejected in-band.
+                let client_key = crate::key_auth::listener_handshake(
+                    &mut send,
+                    &mut recv,
+                    &identity.identity,
+                    &public_key,
                     &client_nonce,
-                    &server_nonce,
-                    remote_id,
-                    own_id,
-                );
-                let challenge = KeyChallenge::new(
-                    identity.identity.public_key().to_hex(),
-                    &server_nonce,
-                    identity.identity.sign_auth(&listener_transcript),
-                );
-                send.write_all(&encode_key_challenge(&challenge)?).await?;
-                let proof_bytes =
-                    read_length_prefixed(&mut recv, MAX_CONTROL_MESSAGE_SIZE).await?;
-                let proof =
-                    decode_key_proof(&proof_bytes).context("invalid dialer key proof")?;
-                let dialer_transcript = key_auth_transcript(
-                    "dialer",
-                    client_key,
-                    identity.identity.public_key(),
-                    &client_nonce,
-                    &server_nonce,
-                    remote_id,
-                    own_id,
-                );
-                verify_auth_signature(client_key, &dialer_transcript, &proof.proof)?;
-                if !claim.commit_key(client_key, remote_id) {
-                    anyhow::bail!("another application identity paired first");
-                }
-                let response = AuthResponse::accepted();
-                send.write_all(&encode_auth_response(&response)?).await?;
+                    &remote_id.to_string(),
+                    &own_id.to_string(),
+                    |client_key| {
+                        let Some(card) = identity.peer(client_key) else {
+                            anyhow::bail!("dialer application key is not locally trusted");
+                        };
+                        if client_key != peer_public_key {
+                            anyhow::bail!("dialer is not the device this session is connecting to");
+                        }
+                        if !card.is_valid_at(unix_now()) {
+                            return Err(expired_card_error(card));
+                        }
+                        if existing
+                            .as_ref()
+                            .is_some_and(|claimed| claimed.application_key != Some(client_key))
+                        {
+                            anyhow::bail!("already paired with another application identity");
+                        }
+                        Ok(())
+                    },
+                    |client_key| claim.commit_key(client_key, remote_id),
+                )
+                .await?;
                 Ok::<_, anyhow::Error>((send, recv, Some(client_key)))
             }
             AuthRequest::Pin { pakes, .. } => {
