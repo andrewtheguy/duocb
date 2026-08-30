@@ -1,5 +1,11 @@
 //! Strict, local-first configure-mode persistence.
 //!
+//! Persisted state is split by sensitivity. The application identity key lives
+//! in the OS credential store (see [`crate::keychain`]); the JSON file below
+//! holds only the public remainder — device suffix, chosen name, and the signed
+//! cards. Both halves are keyed by the same config path, so the `--config`
+//! instances used for same-machine E2E runs stay fully independent.
+//!
 //! The config is a machine-managed JSON file, not meant for hand editing. duocb
 //! holds an exclusive OS lock on a sibling `<config>.lock` file for the whole
 //! session, which stops a second local instance from claiming the same identity
@@ -14,16 +20,20 @@ use std::fs::{File, OpenOptions, TryLockError};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-/// Bumped to 4 with the removal of Nostr peer-list backups: a version-3 config
-/// carries `directory_channel` and the backup bookkeeping, which `deny_unknown_fields`
+/// Bumped to 5 with the move of the identity key into the OS credential store:
+/// a version-4 config still carries `identity_secret`, which `deny_unknown_fields`
 /// now rejects. Failing the version check up front beats a confusing field error.
-pub const CONFIG_VERSION: u32 = 4;
+pub const CONFIG_VERSION: u32 = 5;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub version: u32,
-    /// Persistent application identity, encoded as NIP-19 `nsec`.
+    /// Persistent application identity, encoded as NIP-19 `nsec`. Skipped by
+    /// serde in both directions: [`ConfigLock::load`] fills it from the OS
+    /// credential store and [`ConfigLock::save`] writes it back there, so the
+    /// key is never part of the JSON on disk.
+    #[serde(skip)]
     pub identity_secret: String,
     /// Permanent random suffix appended to the user-chosen short name.
     pub device_suffix: String,
@@ -133,23 +143,34 @@ impl ConfigLock {
         &self.path
     }
 
+    /// Credential-store account for this instance's identity key. The config
+    /// path is the natural key: it is what makes two `--config` instances
+    /// distinct in every other respect too.
+    fn account(&self) -> String {
+        self.path.display().to_string()
+    }
+
     fn temp_path(&self) -> PathBuf {
         sibling_path(&self.path, ".tmp")
     }
 
-    /// Read the current config path. A missing file is a first launch; any
+    /// Read the current config path, pairing it with the identity key held in
+    /// the OS credential store. A missing file is a first launch; any
     /// unreadable or malformed file is an error so startup cannot silently
     /// replace broken persisted state with defaults.
     pub fn load(&self) -> Result<Config> {
         let content = match std::fs::read_to_string(&self.path) {
-            Ok(content) => content,
+            // No config file means no identity yet: mint one, and leave the
+            // credential store alone until something is actually saved. Any
+            // credential left over from a deleted config is replaced then.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
+            Ok(content) => content,
             Err(e) => {
                 return Err(e)
                     .with_context(|| format!("reading config {}", self.path.display()));
             }
         };
-        let config: Config = serde_json::from_str(&content)
+        let mut config: Config = serde_json::from_str(&content)
             .with_context(|| format!("parsing config {}", self.path.display()))?;
         if config.version != CONFIG_VERSION {
             anyhow::bail!(
@@ -158,6 +179,20 @@ impl ConfigLock {
                 config.version
             );
         }
+        // A saved config always had its key written to the credential store
+        // first, so a missing credential here is real loss — a config copied
+        // from another machine or user, or an emptied keyring — not a first
+        // launch. Say so rather than silently minting a new identity, which
+        // would strand every peer that already trusts the old one.
+        config.identity_secret = crate::keychain::load_identity(&self.account())?.with_context(
+            || {
+                format!(
+                    "config {} has no identity key in the OS credential store \
+                     (the config and its key are stored separately, and the key does not travel with the file)",
+                    self.path.display()
+                )
+            },
+        )?;
         let identity = duocb_core::auth::Identity::parse_nsec(&config.identity_secret)
             .with_context(|| format!("config {} has an invalid identity key", self.path.display()))?;
         if !duocb_core::identity::is_valid_suffix(&config.device_suffix) {
@@ -214,10 +249,17 @@ impl ConfigLock {
         Ok(config)
     }
 
-    /// Persist the config by flushing complete new content to a sibling temp
+    /// Persist the config: the identity key to the OS credential store, then
+    /// the public remainder by flushing complete new content to a sibling temp
     /// file and atomically replacing the config path with it. The stable sibling
     /// lock remains held while the JSON inode changes.
+    ///
+    /// The credential goes first so the two can only ever fall out of step in
+    /// the recoverable direction — a key with no config reads as a first
+    /// launch, whereas a config with no key is a hard startup error.
     pub fn save(&self, cfg: &Config) -> Result<()> {
+        crate::keychain::save_identity(&self.account(), &cfg.identity_secret)?;
+
         let content = serde_json::to_string_pretty(cfg).context("serializing config")?;
 
         let temp = self.temp_path();
@@ -250,8 +292,9 @@ fn restrict_to_owner(_file: &File) -> Result<()> {
 }
 
 /// Truncate-write `bytes` to `path` (creating it), owner-only and flushed to
-/// disk. Permissions are set while the file is still empty so the credential it
-/// will hold is never briefly group/world-readable.
+/// disk. The identity key lives in the credential store rather than here, but
+/// the trusted-peer list is still nobody else's business; permissions are set
+/// while the file is still empty so it is never briefly group/world-readable.
 fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut file = OpenOptions::new()
         .write(true)
@@ -271,11 +314,15 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// A directory unique to each caller. Tests run in parallel and each cleans
-    /// up its own directory, so a process-wide atomic counter (not a timestamp,
-    /// which can collide within the same nanosecond) keeps them isolated.
+    /// A directory unique to each caller, plus the per-process test setup every
+    /// case here needs. Tests run in parallel and each cleans up its own
+    /// directory, so a process-wide atomic counter (not a timestamp, which can
+    /// collide within the same nanosecond) keeps them isolated; the mock
+    /// credential store keeps their saves out of the developer's real keyring.
     fn temp_dir() -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
+
+        crate::keychain::init_mock_store();
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         std::env::temp_dir().join(format!(
             "duocb-config-test-{}-{}",
@@ -447,8 +494,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A config from before the key moved out of the file. `deny_unknown_fields`
+    /// rejects the now-skipped `identity_secret`, so it never loads and its
+    /// plaintext key is never adopted.
     #[test]
-    fn key_config_without_suffix_is_not_migrated() {
+    fn in_file_key_config_is_not_migrated() {
         let dir = temp_dir();
         let path = dir.join("config.json");
         let identity = duocb_core::auth::Identity::generate();
@@ -456,7 +506,7 @@ mod tests {
         std::fs::write(
             &path,
             format!(
-                r#"{{"version":1,"identity_secret":"{}","my_name":null,"self_card":null,"peers":[]}}"#,
+                r#"{{"version":4,"identity_secret":"{}","device_suffix":"a7B2c3D4","my_name":null,"self_card":null,"peers":[]}}"#,
                 identity.to_nsec()
             ),
         )
@@ -465,11 +515,88 @@ mod tests {
         let lock = acquire_lock(&path).expect("lock");
         let error = lock
             .load()
-            .expect_err("key configs without device_suffix must be rejected");
+            .expect_err("configs carrying the key in the file must be rejected");
         assert!(
             error
                 .to_string()
                 .contains(&format!("parsing config {}", path.display()))
+        );
+
+        drop(lock);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The whole point of the split: the key must not be recoverable from the
+    /// file, and the file must still describe the same identity after a reload.
+    #[test]
+    fn the_identity_key_never_reaches_the_config_file() {
+        let dir = temp_dir();
+        let path = dir.join("config.json");
+
+        let lock = acquire_lock(&path).expect("lock");
+        let saved = configured("desktop");
+        let nsec = saved.identity_secret.clone();
+        lock.save(&saved).expect("save");
+
+        let on_disk = std::fs::read_to_string(&path).expect("read config");
+        assert!(
+            !on_disk.contains(&nsec) && !on_disk.contains("identity_secret"),
+            "the config file must carry neither the key nor a field for it: {on_disk}"
+        );
+        assert_eq!(
+            crate::keychain::load_identity(&path.display().to_string()).unwrap(),
+            Some(nsec.clone()),
+            "the key belongs in the credential store"
+        );
+        assert_eq!(lock.load().expect("load").identity_secret, nsec);
+
+        drop(lock);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Two `--config` instances on one machine each own an identity, so they
+    /// must not share one credential.
+    #[test]
+    fn each_config_path_owns_its_own_credential() {
+        let dir = temp_dir();
+        let (first_path, second_path) = (dir.join("peer1.json"), dir.join("peer2.json"));
+
+        let first = acquire_lock(&first_path).expect("first lock");
+        let second = acquire_lock(&second_path).expect("second lock");
+        first.save(&configured("peer-one")).expect("save first");
+        second.save(&configured("peer-two")).expect("save second");
+
+        assert_ne!(
+            first.load().unwrap().identity_secret,
+            second.load().unwrap().identity_secret
+        );
+
+        drop(first);
+        drop(second);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A config file that arrived without its credential — copied from another
+    /// machine or user, or left behind by an emptied keyring — must fail loudly
+    /// instead of quietly minting a new identity nobody trusts.
+    #[test]
+    fn a_config_without_its_credential_is_an_error() {
+        let dir = temp_dir();
+        let path = dir.join("config.json");
+
+        let lock = acquire_lock(&path).expect("lock");
+        lock.save(&configured("desktop")).expect("save");
+        keyring_core::Entry::new("duocb", &path.display().to_string())
+            .expect("entry")
+            .delete_credential()
+            .expect("drop the credential");
+
+        let error = lock.load().expect_err("a keyless config must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("has no identity key in the OS credential store"),
+            "error should name the missing credential: {error:#}"
         );
 
         drop(lock);

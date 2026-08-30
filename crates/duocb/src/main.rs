@@ -6,6 +6,7 @@
 mod app;
 mod clipboard;
 mod config;
+mod keychain;
 
 slint::include_modules!();
 
@@ -114,6 +115,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     .init();
 
     let cli = parse_cli()?;
+    // Before anything reads or writes the config: the identity key lives in the
+    // OS credential store, so the store has to be installed as the process
+    // default first.
+    keychain::init_store()?;
     let config_path = config::resolve_path(cli.config)?;
     // The lock is held (and moved into the app) until the GUI exits. A second
     // process may run only with another explicit config path, which gives

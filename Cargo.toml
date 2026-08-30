@@ -68,6 +68,17 @@ tokio = { version = "1", default-features = false, features = [
 tokio-util = "0.7"
 parking_lot = "0.12"
 
+# Credential storage. The application identity key lives in the OS credential
+# store, never in the config file: Keychain on macOS, Credential Manager on
+# Windows, and the Secret Service (gnome-keyring, KWallet, …) on Linux.
+# keyring-core is the portable API; each backend is a separate store crate
+# declared only for the target that can use it. The Linux backend talks to
+# libdbus, so a Linux build needs the libdbus-1 development headers.
+keyring-core = "1"
+apple-native-keyring-store = { version = "1", features = ["keychain"] }
+dbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust"] }
+windows-native-keyring-store = "1"
+
 # Serialization / misc
 crc32fast = "1"
 serde = { version = "1", features = ["derive"] }
