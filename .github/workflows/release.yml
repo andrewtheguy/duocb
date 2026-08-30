@@ -250,9 +250,44 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: gh run cancel ${{ github.run_id }}
 
+  # The libduocb.so the sibling Android app (../duocb-android) loads, pinned by
+  # URL + sha256 in its gradle.properties. Built from the duocb-ffi cdylib for
+  # arm64-v8a with cargo-ndk against the runner's preinstalled NDK; see
+  # build-android.sh.
+  build-android:
+    needs: setup
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-ndk and the Android target
+        run: |
+          rustup target add aarch64-linux-android
+          cargo install cargo-ndk --locked
+
+      - name: Build libduocb.so + zip
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
+        run: ./build-android.sh release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-android
+          path: dist/android/libduocb-android.zip
+
+      # Stop the sibling platform jobs; see build-linux.
+      - name: Cancel the rest of the run on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: gh run cancel ${{ github.run_id }}
+
   publish-release:
-    needs: [setup, build-linux, build-macos, build-ios, build-windows]
-    if: always() && needs.setup.result == 'success' && needs.build-linux.result == 'success' && needs.build-macos.result == 'success' && needs.build-ios.result == 'success' && (needs.build-windows.result == 'success' || needs.build-windows.result == 'skipped')
+    needs: [setup, build-linux, build-macos, build-ios, build-android, build-windows]
+    if: always() && needs.setup.result == 'success' && needs.build-linux.result == 'success' && needs.build-macos.result == 'success' && needs.build-ios.result == 'success' && needs.build-android.result == 'success' && (needs.build-windows.result == 'success' || needs.build-windows.result == 'skipped')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4

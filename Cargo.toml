@@ -79,6 +79,13 @@ apple-native-keyring-store = { version = "1", features = ["keychain"] }
 dbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust"] }
 windows-native-keyring-store = "1"
 
+# Android only: the JNI bridge behind the `duocb-android` app, logcat output
+# for `log` (stderr is discarded on Android), and the JVM/context registration
+# iroh's Android DNS and interface discovery reach through `ndk-context`.
+jni = "0.21"
+android_logger = "0.15"
+ndk-context = "0.1"
+
 # Serialization / misc
 crc32fast = "1"
 serde = { version = "1", features = ["derive"] }

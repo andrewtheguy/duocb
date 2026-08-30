@@ -1,4 +1,6 @@
-//! C FFI surface for the iOS app (`aarch64-apple-ios`).
+//! The mobile FFI: a C surface for the iOS app (`aarch64-apple-ios`, this
+//! file) and a JNI surface for the Android app (`android.rs`, over the same
+//! handle).
 //!
 //! A thin translation layer over [`duocb_core::net`] and nothing more: it
 //! parses a JSON config into a [`UiCommand`], drains [`NetEvent`]s back out as
@@ -8,8 +10,8 @@
 //! it must not be made without the user comparing the pairing code from
 //! [`duocb_pairing_code`] across both screens (see `duocb_core::card_exchange`).
 //!
-//! The app links `libduocb.xcframework` (containing `libduocb.a` slices) and
-//! drives a session with:
+//! The iOS app links `libduocb.xcframework` (containing `libduocb.a` slices)
+//! and drives a session with:
 //!
 //! 1. [`duocb_start`] — parse the config, spawn the networking runtime, issue
 //!    the role's initial command, and return an opaque handle. At most **one**
@@ -78,8 +80,21 @@
 //! mDNS address lookup is compiled out on iOS; see
 //! `duocb_core::net::endpoint::with_mdns_lookup`.
 //!
+//! # Local network on Android
+//!
+//! Android has no multicast entitlement, so it keeps the desktop core intact:
+//! both the DNS-SD responder (mdns-sd) and iroh's own mDNS address lookup run
+//! in-process. What Android does gate is *receiving* multicast on Wi-Fi — the
+//! driver filters it unless the app holds a `WifiManager.MulticastLock` — so
+//! the app acquires one for the life of every session. Everything about
+//! persistence is the same as on iOS, with the Android Keystore in the
+//! Keychain's place.
+//!
 //! The workspace builds with `panic = "abort"` in release, so a Rust panic
 //! terminates the process rather than unwinding across the C boundary.
+
+#[cfg(target_os = "android")]
+mod android;
 
 use std::ffi::{CStr, c_char, c_int};
 use std::ptr;
@@ -103,7 +118,8 @@ static RUNNING: AtomicBool = AtomicBool::new(false);
 /// The iroh key this process presents, fixed by the first [`duocb_start`].
 static IROH_SECRET: OnceLock<iroh::SecretKey> = OnceLock::new();
 
-/// Opaque handle owned by the Swift side. Freed by [`duocb_stop`].
+/// Opaque handle owned by the app side (a pointer in Swift, a `jlong` in
+/// Kotlin). Freed by [`duocb_stop`] / `DuocbNative.stop`.
 pub struct DuocbHandle {
     runtime: tokio::runtime::Runtime,
     cmd_tx: tokio::sync::mpsc::UnboundedSender<UiCommand>,
@@ -118,6 +134,74 @@ pub struct DuocbHandle {
     session_cmd: UiCommand,
     /// What [`duocb_disconnect`] sends: hosts stop serving, joiners hang up.
     disconnect_cmd: UiCommand,
+}
+
+/// The session operations both FFI surfaces expose, so the C and JNI entry
+/// points are each one argument conversion around the same body.
+impl DuocbHandle {
+    /// The next pending event as JSON: one retained by [`Self::retain_event`]
+    /// first, then the queue. `None` when nothing is pending.
+    fn take_event(&self) -> Option<String> {
+        if let Some(json) = self.pending.lock().unwrap().take() {
+            return Some(json);
+        }
+        let events = self.events.lock().unwrap();
+        events.try_recv().ok().map(|event| event_json(&event))
+    }
+
+    /// Put an event back for the next [`Self::take_event`] — the C surface's
+    /// remedy for a caller buffer it did not fit.
+    fn retain_event(&self, json: String) {
+        *self.pending.lock().unwrap() = Some(json);
+    }
+
+    fn send(&self, cmd: UiCommand) {
+        let _ = self.cmd_tx.send(cmd);
+    }
+
+    fn send_clipboard(&self, text: String) {
+        self.send(UiCommand::SendClipboard { text });
+    }
+
+    fn refresh_pin(&self) {
+        self.send(UiCommand::RefreshPin);
+    }
+
+    fn query_conn_path(&self) {
+        self.send(UiCommand::QueryConnPath);
+    }
+
+    /// End the logical session but keep the runtime: hosts stop serving,
+    /// joiners hang up.
+    fn disconnect(&self) {
+        self.send(self.disconnect_cmd.clone());
+    }
+
+    fn is_running(&self) -> bool {
+        !self.task.is_finished()
+    }
+
+    /// Re-issue the session command on the still-running runtime. `false` when
+    /// the runtime is gone — stop and start afresh.
+    fn reconnect(&self) -> bool {
+        self.is_running() && self.cmd_tx.send(self.session_cmd.clone()).is_ok()
+    }
+
+    /// Graceful shutdown: **blocks** until the runtime task ends or 5 s pass,
+    /// then releases the process-wide session slot.
+    fn shutdown(self) {
+        let DuocbHandle {
+            runtime,
+            cmd_tx,
+            task,
+            ..
+        } = self;
+        let _ = cmd_tx.send(UiCommand::Shutdown);
+        let _ =
+            runtime.block_on(async { tokio::time::timeout(Duration::from_secs(5), task).await });
+        runtime.shutdown_background();
+        RUNNING.store(false, Ordering::Release);
+    }
 }
 
 #[derive(Deserialize)]
@@ -204,15 +288,36 @@ enum Role {
     CardJoin,
 }
 
+/// What `log` shows unless `RUST_LOG` says otherwise.
+const DEFAULT_LOG_FILTER: &str = "duocb=info,duocb_core=info,iroh=warn,nostr_sdk=warn";
+
 /// Route Rust `log` output to stderr (visible in Xcode's console and the
 /// unified log). Idempotent; honors `RUST_LOG` when set.
 #[unsafe(no_mangle)]
 pub extern "C" fn duocb_init_logging() {
-    let _ = env_logger::Builder::from_env(
-        env_logger::Env::default()
-            .default_filter_or("duocb=info,duocb_core=info,iroh=warn,nostr_sdk=warn"),
-    )
-    .try_init();
+    init_logging();
+}
+
+/// Route `log` to the platform's sink: stderr everywhere but Android, which
+/// discards stderr and gets logcat (tag `duocb`) instead. Idempotent.
+fn init_logging() {
+    #[cfg(target_os = "android")]
+    {
+        let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| DEFAULT_LOG_FILTER.to_string());
+        android_logger::init_once(
+            android_logger::Config::default()
+                .with_max_level(log::LevelFilter::Trace)
+                .with_tag("duocb")
+                .with_filter(android_logger::FilterBuilder::new().parse(&filter).build()),
+        );
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = env_logger::Builder::from_env(
+            env_logger::Env::default().default_filter_or(DEFAULT_LOG_FILTER),
+        )
+        .try_init();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -750,21 +855,25 @@ pub unsafe extern "C" fn duocb_start(
         write_cstr(err_buf, err_len, "config_json is NULL or not UTF-8");
         return ptr::null_mut();
     };
-    if RUNNING
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        write_cstr(err_buf, err_len, "a duocb session is already running");
-        return ptr::null_mut();
-    }
-    match start_inner(json) {
+    match start_session(json) {
         Ok(handle) => Box::into_raw(Box::new(handle)),
         Err(msg) => {
-            RUNNING.store(false, Ordering::Release);
             write_cstr(err_buf, err_len, &msg);
             ptr::null_mut()
         }
     }
+}
+
+/// Claim the process's one session slot and start a session from the config
+/// JSON; on failure the slot is released again. Shared by both FFI surfaces.
+fn start_session(json: &str) -> Result<DuocbHandle, String> {
+    if RUNNING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err("a duocb session is already running".into());
+    }
+    start_inner(json).inspect_err(|_| RUNNING.store(false, Ordering::Release))
 }
 
 fn start_inner(json: &str) -> Result<DuocbHandle, String> {
@@ -779,7 +888,7 @@ fn start_inner(json: &str) -> Result<DuocbHandle, String> {
         .map_err(|e| format!("failed to build tokio runtime: {e}"))?;
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
     let (event_tx, event_rx) = std::sync::mpsc::channel();
-    // No waker: Swift polls duocb_next_event on a timer.
+    // No waker: the app polls duocb_next_event / DuocbNative.nextEvent on a timer.
     let events = EventSender::new(event_tx, None);
     let task = runtime.spawn(duocb_core::net::runtime::net_main(cmd_rx, events, secret));
 
@@ -1010,21 +1119,13 @@ pub unsafe extern "C" fn duocb_next_event(
         return -1;
     }
     let handle = unsafe { &*handle };
-    let mut pending = handle.pending.lock().unwrap();
-    let json = match pending.take() {
-        Some(json) => json,
-        None => {
-            let events = handle.events.lock().unwrap();
-            match events.try_recv() {
-                Ok(event) => event_json(&event),
-                Err(_) => return 0,
-            }
-        }
+    let Some(json) = handle.take_event() else {
+        return 0;
     };
     if write_cstr(out_buf, out_len, &json) {
         1
     } else {
-        *pending = Some(json);
+        handle.retain_event(json);
         -2
     }
 }
@@ -1045,10 +1146,7 @@ pub unsafe extern "C" fn duocb_send_clipboard(
     let Some(text) = (unsafe { cstr_arg(text) }) else {
         return -1;
     };
-    let handle = unsafe { &*handle };
-    let _ = handle.cmd_tx.send(UiCommand::SendClipboard {
-        text: text.to_string(),
-    });
+    unsafe { &*handle }.send_clipboard(text.to_string());
     0
 }
 
@@ -1065,8 +1163,7 @@ pub unsafe extern "C" fn duocb_refresh_pin(handle: *const DuocbHandle) -> c_int 
     if handle.is_null() {
         return -1;
     }
-    let handle = unsafe { &*handle };
-    let _ = handle.cmd_tx.send(UiCommand::RefreshPin);
+    unsafe { &*handle }.refresh_pin();
     0
 }
 
@@ -1080,8 +1177,7 @@ pub unsafe extern "C" fn duocb_query_conn_path(handle: *const DuocbHandle) -> c_
     if handle.is_null() {
         return -1;
     }
-    let handle = unsafe { &*handle };
-    let _ = handle.cmd_tx.send(UiCommand::QueryConnPath);
+    unsafe { &*handle }.query_conn_path();
     0
 }
 
@@ -1097,8 +1193,7 @@ pub unsafe extern "C" fn duocb_disconnect(handle: *const DuocbHandle) -> c_int {
     if handle.is_null() {
         return -1;
     }
-    let handle = unsafe { &*handle };
-    let _ = handle.cmd_tx.send(handle.disconnect_cmd.clone());
+    unsafe { &*handle }.disconnect();
     0
 }
 
@@ -1111,8 +1206,7 @@ pub unsafe extern "C" fn duocb_is_running(handle: *const DuocbHandle) -> c_int {
     if handle.is_null() {
         return -1;
     }
-    let handle = unsafe { &*handle };
-    if handle.task.is_finished() { 0 } else { 1 }
+    if unsafe { &*handle }.is_running() { 1 } else { 0 }
 }
 
 /// Re-issue the session command this handle was started with on its
@@ -1132,11 +1226,7 @@ pub unsafe extern "C" fn duocb_reconnect(handle: *const DuocbHandle) -> c_int {
     if handle.is_null() {
         return -1;
     }
-    let handle = unsafe { &*handle };
-    if handle.task.is_finished() || handle.cmd_tx.send(handle.session_cmd.clone()).is_err() {
-        return -2;
-    }
-    0
+    if unsafe { &*handle }.reconnect() { 0 } else { -2 }
 }
 
 /// Stop the session (graceful shutdown, bounded wait) and free the handle.
@@ -1154,19 +1244,10 @@ pub unsafe extern "C" fn duocb_stop(handle: *mut DuocbHandle) {
     if handle.is_null() {
         return;
     }
-    let DuocbHandle {
-        runtime,
-        cmd_tx,
-        task,
-        ..
-    } = *unsafe { Box::from_raw(handle) };
-    let _ = cmd_tx.send(UiCommand::Shutdown);
-    let _ = runtime.block_on(async { tokio::time::timeout(Duration::from_secs(5), task).await });
-    runtime.shutdown_background();
-    RUNNING.store(false, Ordering::Release);
+    unsafe { Box::from_raw(handle) }.shutdown();
 }
 
-/// Serialize a [`NetEvent`] for the Swift side.
+/// Serialize a [`NetEvent`] for the app side.
 fn event_json(event: &NetEvent) -> String {
     use serde_json::json;
     let value = match event {
