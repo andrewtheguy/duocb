@@ -14,6 +14,8 @@ arboard.workspace = true
 # workspace inheritance can only add to the workspace's ["full"] set.
 tokio = { version = "1", default-features = false, features = ["sync"] }
 
+keyring-core.workspace = true
+
 crc32fast.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -22,6 +24,18 @@ log.workspace = true
 env_logger.workspace = true
 dirs.workspace = true
 jiff.workspace = true
+
+# The identity key's home on each desktop platform. Declared per target so a
+# build only pulls the backend it can actually reach (see the workspace
+# manifest for the trust model).
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+dbus-secret-service-keyring-store.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-native-keyring-store.workspace = true
 
 [build-dependencies]
 slint-build.workspace = true

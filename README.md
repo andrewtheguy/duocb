@@ -30,7 +30,10 @@ key is separate from the transport key iroh uses:
 
 - The application private key signs the device's portable identity card and
   authenticates the duocb wire handshake. It never expires: it is minted once
-  and kept until the user resets the identity.
+  and kept until the user resets the identity. It is stored in the operating
+  system's credential store — Keychain on macOS, Credential Manager on Windows,
+  Secret Service (gnome-keyring, KWallet, …) on Linux, Keychain on iOS — and
+  never in duocb's own config file.
 - The signed identity card contains the final device name, application public
   key, and a mandatory validity window (`not_before`/`not_after`, like an X.509
   certificate). A device honours a card only while its own clock is inside
@@ -176,7 +179,10 @@ cargo run
 ```
 
 On Linux, Slint needs the usual Wayland/X11, fontconfig, and OpenGL development
-libraries. The release binary is `target/release/duocb`.
+libraries, and the credential store backend needs the libdbus-1 development
+headers (`libdbus-1-dev` on Debian/Ubuntu, `dbus-devel` on Fedora). The release
+binary is `target/release/duocb`. Running it needs a Secret Service provider on
+the session bus; every mainstream desktop starts one.
 
 For two instances on one machine, use separate config paths:
 
@@ -190,13 +196,14 @@ Each process holds an exclusive sibling `<config>.lock`; `-c` aliases
 
 ## Configuration
 
-The machine-managed config lives under the platform user config directory. Its
-shape is:
+Persisted state is split in two. The identity key goes to the OS credential
+store under service `duocb`, with the config path as the account name so
+`--config` instances stay independent. Everything else is a machine-managed
+JSON file under the platform user config directory:
 
 ```json
 {
-  "version": 4,
-  "identity_secret": "nsec1…",
+  "version": 5,
   "device_suffix": "a7B2c3D4",
   "my_name": "mac-book",
   "self_card": "{ signed Nostr event JSON }",
@@ -204,12 +211,25 @@ shape is:
 }
 ```
 
+The two halves travel together or not at all: a config file whose credential is
+missing — copied from another machine or user, or left behind by a cleared
+keyring — never turns into a silently new identity. Back up the key with **Back
+up private key** instead of copying the file.
+
 Malformed keys, cards, duplicates, mismatched self-cards, unexpected fields,
-and oversized peer lists are startup errors. An *expired* card is not:
+and oversized peer lists stop startup. An *expired* card does not:
 it loads and is shown as expired, so lapsed trust is visible rather than
-silently dropped. Saves use a temporary file and atomic rename; on Unix the
-config-related files are restricted to the owner. Clipboard text, inbox, and
-outbox are never persisted.
+silently dropped.
+
+A config that will not load — for any of those reasons, or because its
+credential is gone — is not a silent exit. duocb opens a window naming the path,
+showing why the load failed, and offering to reset: the unreadable file is moved
+aside to `<config>.broken` and the device starts over with a freshly minted
+identity, which means trading cards with every peer again. Quitting that window
+leaves the config exactly as it was, so the choice to lose an identity is always
+deliberate. Saves write the credential first, then the file via a
+temporary file and atomic rename; on Unix the config-related files are
+restricted to the owner. Clipboard text, inbox, and outbox are never persisted.
 
 ## Security notes
 
@@ -247,6 +267,11 @@ outbox are never persisted.
 - Pairwise hosting records are encrypted to the intended trusted peer.
 - Trust is local only: the trusted-peer list never leaves the device, so a lost
   config is re-paired by re-importing each peer's card.
+- The application private key is held by the OS credential store, so it is
+  readable only by the logged-in user and — on macOS, iOS, and Linux — stays
+  encrypted while the session is locked. duocb keeps no copy on disk, and there
+  is no file fallback: if no credential store can be reached, duocb refuses to
+  start rather than quietly writing the key out in the clear.
 - Nostr hosting events expose the host and intended peer application public
   keys as event metadata even though the node-id payload is encrypted. Relays
   and iroh infrastructure may also observe timing and connection metadata.

@@ -143,6 +143,8 @@ mod self_card_tests {
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
+        // Saves reach the OS credential store; tests use an in-memory one.
+        crate::keychain::init_mock_store();
         let lock = crate::config::acquire_lock(&path).unwrap();
         let config = crate::config::Config::default();
         (
@@ -1325,6 +1327,8 @@ pub(crate) mod card_setup_tests {
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
+        // Saves reach the OS credential store; tests use an in-memory one.
+        crate::keychain::init_mock_store();
         let lock = crate::config::acquire_lock(&path).unwrap();
         let mut app = App::new(
             lock,
@@ -1431,6 +1435,8 @@ pub(crate) mod card_setup_tests {
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
+        // Saves reach the OS credential store; tests use an in-memory one.
+        crate::keychain::init_mock_store();
         let lock = crate::config::acquire_lock(&path).unwrap();
         let mut app = App::new(
             lock,

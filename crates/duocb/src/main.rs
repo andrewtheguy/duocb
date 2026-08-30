@@ -6,6 +6,8 @@
 mod app;
 mod clipboard;
 mod config;
+mod keychain;
+mod recovery;
 
 slint::include_modules!();
 
@@ -84,9 +86,9 @@ fn parse_args(args: impl Iterator<Item = std::ffi::OsString>) -> Result<Cli, Box
 /// `font-family` takes a single name (no fallback lists), so the per-OS
 /// choice lives here; an empty UI font leaves the renderer's default.
 /// `DUOCB_UI_FONT` overrides the UI family (useful on Linux, where the
-/// default is whatever fontconfig considers sans).
-fn set_platform_fonts(ui: &MainWindow) {
-    use slint::ComponentHandle;
+/// default is whatever fontconfig considers sans). Shared with the recovery
+/// window, which is a second top-level window with the same need.
+fn platform_fonts() -> (String, &'static str) {
     let (ui_font, mono_font) = if cfg!(target_os = "macos") {
         // ".SF NS" is the hidden family name of the San Francisco system
         // font and resolves reliably through the platform font database.
@@ -96,8 +98,17 @@ fn set_platform_fonts(ui: &MainWindow) {
     } else {
         ("", "monospace")
     };
+    (
+        std::env::var("DUOCB_UI_FONT").unwrap_or_else(|_| ui_font.to_string()),
+        mono_font,
+    )
+}
+
+/// Apply [`platform_fonts`] and the other once-at-startup UI constants.
+fn set_platform_fonts(ui: &MainWindow) {
+    use slint::ComponentHandle;
+    let (ui_font, mono_font) = platform_fonts();
     let state = ui.global::<UiState>();
-    let ui_font = std::env::var("DUOCB_UI_FONT").unwrap_or_else(|_| ui_font.to_string());
     state.set_ui_font(ui_font.into());
     state.set_mono_font(mono_font.into());
     // The command-modifier label for shortcut hints: ⌘ on macOS, Ctrl elsewhere
@@ -114,14 +125,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     .init();
 
     let cli = parse_cli()?;
+    // Before anything reads or writes the config: the identity key lives in the
+    // OS credential store, so the store has to be installed as the process
+    // default first.
+    keychain::init_store()?;
     let config_path = config::resolve_path(cli.config)?;
     // The lock is held (and moved into the app) until the GUI exits. A second
     // process may run only with another explicit config path, which gives
     // same-machine E2E tests isolated state.
     let config_lock = config::acquire_lock(&config_path)?;
     // Load before initializing the UI or networking so invalid persisted state
-    // terminates startup without starting any application services.
-    let config = config_lock.load()?;
+    // never reaches a running app. It still never does — but a config that will
+    // not load ends in the recovery window rather than in an exit code, since
+    // the only way out of it (throwing the identity away) is the user's call,
+    // and an exit code is invisible on a GUI build anyway.
+    let config = match config_lock.load() {
+        Ok(config) => config,
+        Err(error) => {
+            log::error!("config {} did not load: {error:#}", config_path.display());
+            match recovery::recover(&config_lock, &error)? {
+                Some(config) => config,
+                // Quit rather than lose the identity: the config is left
+                // exactly as it was found.
+                None => return Ok(()),
+            }
+        }
+    };
 
     let ui = MainWindow::new()?;
     set_platform_fonts(&ui);
