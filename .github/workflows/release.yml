@@ -267,9 +267,9 @@ jobs:
           rustup target add aarch64-linux-android
           cargo install cargo-ndk --locked
 
+      # The runner exports ANDROID_NDK_ROOT for its preinstalled NDK, which both
+      # cargo-ndk and the script read; nothing to point at by hand.
       - name: Build libduocb.so + zip
-        env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
         run: ./build-android.sh release
 
       - uses: actions/upload-artifact@v4
