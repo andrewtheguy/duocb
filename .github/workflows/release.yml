@@ -5,6 +5,8 @@ on:
 
 permissions:
   contents: write
+  # `gh run cancel` in the build jobs' failure step.
+  actions: write
 
 jobs:
   setup:
@@ -103,6 +105,7 @@ jobs:
             libxkbcommon-dev libwayland-dev \
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
             libfontconfig1-dev \
+            libdbus-1-dev \
             file desktop-file-utils patchelf squashfs-tools
 
       - name: Build Release
@@ -127,6 +130,16 @@ jobs:
         with:
           name: release-${{ matrix.suffix }}
           path: target/release/duocb-${{ matrix.suffix }}.AppImage
+
+      # Every platform artifact is required to publish, so one failed build
+      # already doomed the release: stop the sibling platform jobs rather than
+      # let them burn runner minutes on a run that cannot finish.
+      - name: Cancel the rest of the run on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: gh run cancel ${{ github.run_id }}
 
   build-macos:
     needs: setup
@@ -157,6 +170,14 @@ jobs:
         with:
           name: release-macos-arm64
           path: target/release/duocb-macos-arm64.dmg
+
+      # Stop the sibling platform jobs; see build-linux.
+      - name: Cancel the rest of the run on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: gh run cancel ${{ github.run_id }}
 
   build-windows:
     needs: setup
@@ -189,6 +210,14 @@ jobs:
           name: release-windows-amd64
           path: target/release/duocb-windows-amd64.msi
 
+      # Stop the sibling platform jobs; see build-linux.
+      - name: Cancel the rest of the run on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: gh run cancel ${{ github.run_id }}
+
   # The libduocb.xcframework the sibling iOS app (../duocb-ios) links, pinned
   # by URL + checksum in its Swift package. Built from the duocb-ffi staticlib
   # for both Apple arm64 slices; see build-ios.sh.
@@ -212,6 +241,14 @@ jobs:
         with:
           name: release-ios
           path: dist/ios/libduocb-ios.xcframework.zip
+
+      # Stop the sibling platform jobs; see build-linux.
+      - name: Cancel the rest of the run on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: gh run cancel ${{ github.run_id }}
 
   publish-release:
     needs: [setup, build-linux, build-macos, build-ios, build-windows]
