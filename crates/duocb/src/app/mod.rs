@@ -119,6 +119,13 @@ pub(crate) struct App {
     /// The last item successfully sent, shown above the inbox so the receiver
     /// can compare its size/CRC against what arrived.
     pub(crate) outbox: Option<ClipItem>,
+    /// Which peer's clipboard content the two boxes above hold, by hex
+    /// application public key. They outlive the session that filled them (only
+    /// Clear empties them), so they have to be scoped: starting a session with
+    /// a different device — or untrusting this one — empties both rather than
+    /// showing one peer's content in another's panel. `None` when both are
+    /// empty.
+    pub(crate) box_peer: Option<String>,
     /// Text handed to the runtime, promoted to `outbox` once the send is
     /// confirmed by `NetEvent::ItemSent` (so a rejected/oversize send never
     /// shows up as sent).
@@ -305,6 +312,7 @@ impl App {
             conn_path: None,
             inbox: Vec::new(),
             outbox: None,
+            box_peer: None,
             pending_outbox: None,
             sent_flash: None,
             copied_flash: None,
@@ -407,8 +415,10 @@ impl App {
                 if status == ConnStatus::Idle {
                     // Session ended (stopped, or failed fatally): reset the
                     // presentation state. The inbox and outbox are kept — items
-                    // are only discarded via the explicit Clear button; a
-                    // never-confirmed pending send is dropped.
+                    // are only discarded via the explicit Clear button, or by
+                    // the next session with a *different* peer (see
+                    // `start_clipboard_session`); a never-confirmed pending
+                    // send is dropped.
                     self.session_active = false;
                     self.node_id = None;
                     self.host_lan_ip = None;
@@ -660,6 +670,7 @@ impl App {
         self.self_card = None;
         self.peers.clear();
         self.selected_peer = None;
+        self.clear_peer_boxes();
         self.in_private_key.clear();
         self.in_peer_card.clear();
         self.save_configure_config();
@@ -780,8 +791,22 @@ impl App {
             if self.selected_peer.as_deref() == Some(public_key) {
                 self.selected_peer = None;
             }
+            // Untrusting a device drops the content traded with it.
+            if self.box_peer.as_deref() == Some(public_key) {
+                self.clear_peer_boxes();
+            }
             self.save_configure_config();
         }
+    }
+
+    /// Drop every clipboard item held for a peer, along with any unconfirmed
+    /// send. Called when the boxes change hands (a session with a different
+    /// device) or when the peer they belong to is gone.
+    pub(crate) fn clear_peer_boxes(&mut self) {
+        self.inbox.clear();
+        self.outbox = None;
+        self.pending_outbox = None;
+        self.box_peer = None;
     }
 
     /// Whether the "sent ✓" flash should currently show.
@@ -1150,7 +1175,16 @@ impl App {
             });
             return false;
         }
-        self.session_peer = Some(peer.name().to_string());
+        let peer_name = peer.name().to_string();
+        let peer_key = peer.public_key().to_hex();
+        // The boxes belong to one pair. Items from an earlier session with a
+        // different device are dropped here rather than shown in this peer's
+        // panel (where Copy/Send would hand them to the wrong device).
+        if self.box_peer.as_deref() != Some(peer_key.as_str()) {
+            self.clear_peer_boxes();
+        }
+        self.box_peer = Some(peer_key);
+        self.session_peer = Some(peer_name);
         self.session_active = true;
         self.session_hosting = matches!(plan, SessionPlan::Host(_));
         self.net.send(match plan {
@@ -1874,6 +1908,81 @@ pub(crate) mod card_setup_tests {
             row.contains(&expected),
             "row {row:?} must show the fingerprint {expected:?}"
         );
+        cleanup(app, path);
+    }
+}
+
+/// The inbox and outbox belong to one pair. They outlive the session that
+/// filled them, so the checks that matter are the ones that stop one device's
+/// clipboard content from turning up in another device's panel.
+#[cfg(test)]
+mod clip_box_tests {
+    use super::card_setup_tests::{cleanup, configured_app, peer_card};
+    use super::*;
+
+    /// Fill both boxes as a finished session with `peer` would have.
+    fn traded_with(app: &mut App, peer: &IdentityCard) {
+        app.peers.push(peer.clone());
+        app.selected_peer = Some(peer.public_key().to_hex());
+        assert!(app.start_clipboard_session(), "the fixture peer is current");
+        app.apply_event(NetEvent::ItemReceived {
+            text: "from the peer".into(),
+            pulled: false,
+        });
+        app.pending_outbox = Some("to the peer".into());
+        app.apply_event(NetEvent::ItemSent);
+        app.apply_event(NetEvent::Status(ConnStatus::Idle));
+        assert_eq!(app.inbox.len(), 1);
+        assert!(app.outbox.is_some());
+    }
+
+    /// Connecting to a second device empties both boxes: its panel must not
+    /// show — or offer to Copy and re-send — what the first device traded.
+    #[test]
+    fn a_session_with_another_peer_starts_with_empty_boxes() {
+        let (mut app, path) = configured_app();
+        let first = peer_card("laptop", 0);
+        traded_with(&mut app, &first);
+
+        let second = peer_card("phone", 0);
+        app.peers.push(second.clone());
+        app.selected_peer = Some(second.public_key().to_hex());
+        assert!(app.start_clipboard_session());
+
+        assert!(app.inbox.is_empty(), "the first peer's items are gone");
+        assert!(app.outbox.is_none(), "and so is what was sent to it");
+        assert_eq!(app.box_peer, Some(second.public_key().to_hex()));
+        cleanup(app, path);
+    }
+
+    /// Reconnecting to the *same* device keeps its items — a dropped link and a
+    /// Retry are one conversation, not two.
+    #[test]
+    fn reconnecting_to_the_same_peer_keeps_its_items() {
+        let (mut app, path) = configured_app();
+        let peer = peer_card("laptop", 0);
+        traded_with(&mut app, &peer);
+
+        assert!(app.start_clipboard_session());
+
+        assert_eq!(app.inbox.len(), 1, "the same peer's items survive");
+        assert!(app.outbox.is_some());
+        cleanup(app, path);
+    }
+
+    /// Untrusting a device drops what was traded with it, so it cannot come
+    /// back on the next session with someone else.
+    #[test]
+    fn removing_the_peer_drops_its_items() {
+        let (mut app, path) = configured_app();
+        let peer = peer_card("laptop", 0);
+        traded_with(&mut app, &peer);
+
+        app.remove_peer(&peer.public_key().to_hex());
+
+        assert!(app.inbox.is_empty());
+        assert!(app.outbox.is_none());
+        assert!(app.box_peer.is_none());
         cleanup(app, path);
     }
 }
