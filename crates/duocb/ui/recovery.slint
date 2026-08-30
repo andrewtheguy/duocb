@@ -1,0 +1,141 @@
+// The startup recovery window, shown in place of the app when the config at
+// the resolved path will not load. A config duocb cannot read used to end the
+// process before any window existed — one line of stderr, and nothing at all
+// on a GUI-subsystem Windows build. This window names the path, shows why the
+// load failed, and offers the only repair available at that point, so throwing
+// the identity away stays the user's decision, taken with the reason in front
+// of them.
+
+import { Theme } from "theme.slint";
+import { Button, Palette, ScrollView } from "std-widgets.slint";
+
+export component ConfigRecoveryWindow inherits Window {
+    title: "duocb — configuration";
+    icon: @image-url("../icons/icon.png");
+    preferred-width: 520px;
+    preferred-height: 440px;
+    min-width: 400px;
+    min-height: 340px;
+    default-font-family: root.ui-font;
+
+    // Fonts are chosen per platform on the Rust side, as in the main window.
+    in property <string> ui-font;
+    in property <string> mono-font: "monospace";
+    /// The config path that failed to load.
+    in property <string> config-path;
+    /// The full error chain — from the failed load, or from a reset that then
+    /// failed itself.
+    in property <string> details;
+    /// Where a reset moves the unreadable file.
+    in property <string> backup-path;
+
+    callback reset();
+    callback quit();
+
+    forward-focus: keys;
+    keys := FocusScope {
+        key-pressed(event) => {
+            if (event.text == Key.Return) {
+                root.reset();
+                return accept;
+            }
+            if (event.text == Key.Escape) {
+                root.quit();
+                return accept;
+            }
+            return reject;
+        }
+
+        VerticalLayout {
+            padding: Theme.pad-l;
+            spacing: Theme.pad-m;
+
+            Text {
+                text: "duocb can't read its configuration";
+                font-size: Theme.font-title;
+                font-weight: 700;
+                wrap: word-wrap;
+            }
+
+            VerticalLayout {
+                spacing: Theme.pad-xs;
+                Text {
+                    text: "Nothing has been changed. This is the file that would not load:";
+                    font-size: Theme.font-body;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: root.config-path;
+                    font-family: root.mono-font;
+                    font-size: Theme.font-body;
+                    wrap: char-wrap;
+                }
+            }
+
+            Rectangle {
+                background: Theme.err.with-alpha(0.15);
+                border-radius: Theme.radius;
+                // Hug the message, up to a cap: a one-line parse error should
+                // not open as a wall of red, and a long chain scrolls instead
+                // of pushing the buttons off the window.
+                height: min(details-text.preferred-height + 2 * Theme.pad-m, 240px);
+                // The chain can be long, so it scrolls rather than clipping;
+                // the viewport is pinned to the box's own width so the text
+                // wraps into it instead of scrolling sideways.
+                details-view := ScrollView {
+                    x: Theme.pad-m;
+                    y: Theme.pad-m;
+                    width: parent.width - 2 * Theme.pad-m;
+                    height: parent.height - 2 * Theme.pad-m;
+                    viewport-width: self.width;
+                    viewport-height: max(self.height, details-text.preferred-height);
+                    horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
+                    mouse-drag-pan-enabled: true;
+                    details-text := Text {
+                        width: details-view.width;
+                        text: root.details;
+                        color: Theme.err;
+                        font-family: root.mono-font;
+                        font-size: Theme.font-small;
+                        wrap: word-wrap;
+                        vertical-alignment: top;
+                    }
+                }
+            }
+
+            VerticalLayout {
+                spacing: Theme.pad-xs;
+                Text {
+                    text: "Resetting starts this device over with a new identity: the trusted "
+                        + "devices and signed card in that file are discarded, and each peer "
+                        + "has to trade cards with it again. A saved private key can be "
+                        + "restored from the setup screen afterwards.";
+                    font-size: Theme.font-body;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: "The unreadable file is kept as " + root.backup-path + ".";
+                    font-size: Theme.font-small;
+                    opacity: Theme.weak-opacity;
+                    wrap: char-wrap;
+                }
+            }
+
+            // Keeps the buttons on the bottom edge whatever the window height.
+            Rectangle { vertical-stretch: 1; }
+
+            HorizontalLayout {
+                spacing: Theme.pad-s;
+                alignment: end;
+                Button {
+                    text: "Reset configuration (Enter)";
+                    clicked => { root.reset(); }
+                }
+                Button {
+                    text: "Quit (Esc)";
+                    clicked => { root.quit(); }
+                }
+            }
+        }
+    }
+}

@@ -154,6 +154,12 @@ impl ConfigLock {
         sibling_path(&self.path, ".tmp")
     }
 
+    /// Where [`Self::reset`] moves a config it is discarding. Public so the
+    /// startup recovery window can name the file before the user commits.
+    pub fn broken_path(&self) -> PathBuf {
+        sibling_path(&self.path, ".broken")
+    }
+
     /// Read the current config path, pairing it with the identity key held in
     /// the OS credential store. A missing file is a first launch; any
     /// unreadable or malformed file is an error so startup cannot silently
@@ -273,6 +279,37 @@ impl ConfigLock {
             )
         })?;
         Ok(())
+    }
+
+    /// Discard a config that will not load and start this installation over:
+    /// the unreadable file is moved aside to `<config>.broken`, and a freshly
+    /// minted identity is saved in its place.
+    ///
+    /// Destructive by definition — the new identity replaces the old one in the
+    /// credential store, so every peer that trusted this device has to pair
+    /// with it again. It is reached only through the startup recovery window,
+    /// which says exactly that before the user commits. The old file is moved
+    /// rather than deleted so the peer cards in it can still be read out by
+    /// hand.
+    pub fn reset(&self) -> Result<Config> {
+        match std::fs::rename(&self.path, self.broken_path()) {
+            Ok(()) => {}
+            // Nothing to move aside: the load failed on the credential half of
+            // the split, or the file disappeared in between.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "moving the unreadable config {} aside to {}",
+                        self.path.display(),
+                        self.broken_path().display()
+                    )
+                });
+            }
+        }
+        let config = Config::default();
+        self.save(&config)?;
+        Ok(config)
     }
 }
 
@@ -598,6 +635,63 @@ mod tests {
                 .contains("has no identity key in the OS credential store"),
             "error should name the missing credential: {error:#}"
         );
+
+        drop(lock);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The startup recovery window's repair: the unreadable file is moved
+    /// aside (so its peer cards can still be salvaged by hand) and replaced by
+    /// a working config with a brand-new identity.
+    #[test]
+    fn reset_moves_the_unreadable_config_aside_and_starts_over() {
+        let dir = temp_dir();
+        let path = dir.join("config.json");
+
+        let lock = acquire_lock(&path).expect("lock");
+        lock.save(&configured("desktop")).expect("save");
+        let before = lock.load().expect("load").identity_secret;
+        std::fs::write(&path, b"{ not valid json").unwrap();
+        assert!(lock.load().is_err(), "the corrupted config must not load");
+
+        let fresh = lock.reset().expect("reset");
+        assert_eq!(
+            std::fs::read_to_string(lock.broken_path()).unwrap(),
+            "{ not valid json",
+            "the unreadable file must be kept, not deleted"
+        );
+        assert_ne!(fresh.identity_secret, before, "a reset mints a new identity");
+        assert!(fresh.self_card.is_none());
+
+        let loaded = lock.load().expect("the replacement config loads");
+        assert_eq!(loaded.identity_secret, fresh.identity_secret);
+
+        drop(lock);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A config whose credential went missing has a readable file, but there is
+    /// still nothing to load: reset must work from that side of the split too.
+    #[test]
+    fn reset_recovers_a_config_whose_credential_is_gone() {
+        let dir = temp_dir();
+        let path = dir.join("config.json");
+
+        let lock = acquire_lock(&path).expect("lock");
+        lock.save(&configured("desktop")).expect("save");
+        keyring_core::Entry::new("duocb", &path.display().to_string())
+            .expect("entry")
+            .delete_credential()
+            .expect("drop the credential");
+        assert!(lock.load().is_err(), "a keyless config must not load");
+
+        let fresh = lock.reset().expect("reset");
+        assert_eq!(
+            crate::keychain::load_identity(&path.display().to_string()).unwrap(),
+            Some(fresh.identity_secret.clone()),
+            "the new identity must be back in the credential store"
+        );
+        assert!(lock.load().is_ok());
 
         drop(lock);
         let _ = std::fs::remove_dir_all(dir);

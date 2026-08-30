@@ -213,13 +213,21 @@ JSON file under the platform user config directory:
 
 The two halves travel together or not at all: a config file whose credential is
 missing — copied from another machine or user, or left behind by a cleared
-keyring — is a startup error rather than a silently new identity. Back up the
-key with **Back up private key** instead of copying the file.
+keyring — never turns into a silently new identity. Back up the key with **Back
+up private key** instead of copying the file.
 
 Malformed keys, cards, duplicates, mismatched self-cards, unexpected fields,
-and oversized peer lists are startup errors. An *expired* card is not:
+and oversized peer lists stop startup. An *expired* card does not:
 it loads and is shown as expired, so lapsed trust is visible rather than
-silently dropped. Saves write the credential first, then the file via a
+silently dropped.
+
+A config that will not load — for any of those reasons, or because its
+credential is gone — is not a silent exit. duocb opens a window naming the path,
+showing why the load failed, and offering to reset: the unreadable file is moved
+aside to `<config>.broken` and the device starts over with a freshly minted
+identity, which means trading cards with every peer again. Quitting that window
+leaves the config exactly as it was, so the choice to lose an identity is always
+deliberate. Saves write the credential first, then the file via a
 temporary file and atomic rename; on Unix the config-related files are
 restricted to the owner. Clipboard text, inbox, and outbox are never persisted.
 

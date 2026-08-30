@@ -9,9 +9,11 @@ import { HomeScreen } from "configure.slint";
 import { CardSetupScreen, CardPairingScreen, CardConfirmScreen } from "card_setup.slint";
 import { ConnectionScreen } from "connection.slint";
 import { ResetIdentityModal, ConnPathModal } from "modals.slint";
+import { ConfigRecoveryWindow } from "recovery.slint";
 
-// Everything the Rust side needs by name.
-export { UiState, Actions, Screen, ConfigureStep, PeerRow, ClipRow, PathRow }
+// Everything the Rust side needs by name. The recovery window is a second
+// top-level window, shown on its own when the config will not load.
+export { UiState, Actions, Screen, ConfigureStep, PeerRow, ClipRow, PathRow, ConfigRecoveryWindow }
 
 export component MainWindow inherits Window {
     title: "duocb";
