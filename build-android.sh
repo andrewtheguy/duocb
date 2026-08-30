@@ -30,17 +30,18 @@
 # and cargo-ndk works natively.
 #
 # Usage:
-#   ./build-android.sh            # release build (default), arm64-v8a
+#   ./build-android.sh            # release build (default), arm64-v8a + x86_64
 #   ./build-android.sh debug      # debug build (faster compile, huge .so)
-#   ABIS="arm64-v8a x86_64" ./build-android.sh   # override the ABI list
+#   ABIS="arm64-v8a" ./build-android.sh          # override the ABI list
 #   DUOCB_NDK_SYSROOT=~/ndk-sysroot ./build-android.sh   # no-NDK host
 #
 set -euo pipefail
 
 PROFILE="${1:-release}"
 # arm64-v8a is every current phone, the arm64 Android VM and the Apple-silicon
-# emulator used for development; x86_64 is the Intel-host emulator.
-ABIS="${ABIS:-arm64-v8a}"
+# emulator used for development; x86_64 is the Intel-host emulator and x86_64
+# Android VMs.
+ABIS="${ABIS:-arm64-v8a x86_64}"
 # Minimum Android API level the .so links against (must be <= the app's
 # minSdk). 29 = Android 10.
 ANDROID_API="${ANDROID_API:-29}"

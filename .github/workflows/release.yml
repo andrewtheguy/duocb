@@ -252,8 +252,8 @@ jobs:
 
   # The libduocb.so the sibling Android app (../duocb-android) loads, pinned by
   # URL + sha256 in its gradle.properties. Built from the duocb-ffi cdylib for
-  # arm64-v8a with cargo-ndk against the runner's preinstalled NDK; see
-  # build-android.sh.
+  # arm64-v8a and x86_64 with cargo-ndk against the runner's preinstalled NDK;
+  # see build-android.sh.
   build-android:
     needs: setup
     runs-on: ubuntu-latest
@@ -262,9 +262,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install cargo-ndk and the Android target
+      - name: Install cargo-ndk and the Android targets
         run: |
-          rustup target add aarch64-linux-android
+          rustup target add aarch64-linux-android x86_64-linux-android
           cargo install cargo-ndk --locked
 
       # The runner exports ANDROID_NDK_ROOT for its preinstalled NDK, which both
