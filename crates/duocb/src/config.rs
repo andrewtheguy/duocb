@@ -20,9 +20,12 @@ use std::fs::{File, OpenOptions, TryLockError};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-/// Bumped to 5 with the move of the identity key into the OS credential store:
-/// a version-4 config still carries `identity_secret`, which `deny_unknown_fields`
-/// now rejects. Failing the version check up front beats a confusing field error.
+/// Bumped to 5 with the move of the identity key into the OS credential store.
+/// A version-4 config never reaches the version check in [`ConfigLock::load`]:
+/// it still carries `identity_secret`, which `deny_unknown_fields` rejects while
+/// parsing, so it fails as a malformed config (see the
+/// `in_file_key_config_is_not_migrated` test). The check covers the version
+/// mismatches that do parse.
 pub const CONFIG_VERSION: u32 = 5;
 
 #[derive(Serialize, Deserialize)]

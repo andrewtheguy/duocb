@@ -101,8 +101,12 @@ mod tests {
 
     /// Round-trips a throwaway key through the *real* platform store.
     /// `#[ignore]` because it writes to the developer's Keychain / Credential
-    /// Manager and, on Linux, needs an unlocked Secret Service session — run it
-    /// deliberately with `cargo test -p duocb -- --ignored live_credential`.
+    /// Manager and, on Linux, needs an unlocked Secret Service session.
+    ///
+    /// Run it on its own — `cargo test -p duocb -- --ignored live_credential` —
+    /// and never under `--include-ignored`: [`init_store`] replaces the
+    /// process-wide default store, so sharing a run with the mock-backed config
+    /// tests would point their saves at the real credential store.
     #[test]
     #[ignore]
     fn live_credential_store_round_trip() {
