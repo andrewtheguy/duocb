@@ -32,8 +32,8 @@ key is separate from the transport key iroh uses:
   authenticates the duocb wire handshake. It never expires: it is minted once
   and kept until the user resets the identity. It is stored in the operating
   system's credential store — Keychain on macOS, Credential Manager on Windows,
-  Secret Service (gnome-keyring, KWallet, …) on Linux, Keychain on iOS — and
-  never in duocb's own config file.
+  Secret Service (gnome-keyring, KWallet, …) on Linux, Keychain on iOS, an
+  Android Keystore-wrapped store on Android — and never in duocb's own config file.
 - The signed identity card contains the final device name, application public
   key, and a mandatory validity window (`not_before`/`not_after`, like an X.509
   certificate). A device honours a card only while its own clock is inside
@@ -47,8 +47,9 @@ key is separate from the transport key iroh uses:
   app presents one node id for its whole life. The desktop mints the key fresh
   on every launch, because a config directory can be copied between machines
   and two live endpoints with one node id would shadow each other; iOS keeps
-  it in the Keychain (this-device-only, bound to `identifierForVendor`), where
-  it cannot be cloned by accident, so the node id also survives relaunches.
+  it in the Keychain (this-device-only, bound to `identifierForVendor`) and
+  Android in its backup-excluded private storage, where it cannot be cloned by
+  accident, so on both the node id also survives relaunches.
 
 Pairing is mutual. On each device:
 
@@ -268,7 +269,7 @@ restricted to the owner. Clipboard text, inbox, and outbox are never persisted.
 - Trust is local only: the trusted-peer list never leaves the device, so a lost
   config is re-paired by re-importing each peer's card.
 - The application private key is held by the OS credential store, so it is
-  readable only by the logged-in user and — on macOS, iOS, and Linux — stays
+  readable only by the logged-in user and — on macOS, iOS, Android, and Linux — stays
   encrypted while the session is locked. duocb keeps no copy on disk, and there
   is no file fallback: if no credential store can be reached, duocb refuses to
   start rather than quietly writing the key out in the clear.

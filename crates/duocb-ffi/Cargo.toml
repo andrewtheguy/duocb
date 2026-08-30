@@ -4,11 +4,12 @@ version.workspace = true
 edition.workspace = true
 description.workspace = true
 
-# `name = "duocb"` so the static archive is `libduocb.a`, the name the iOS
-# Xcode project (../duocb-ios) links against.
+# `name = "duocb"` so the archive is `libduocb.a` (linked by the iOS project,
+# ../duocb-ios) and the shared object is `libduocb.so` (loaded by the Android
+# app, ../duocb-android, through the JNI surface in src/android.rs).
 [lib]
 name = "duocb"
-crate-type = ["staticlib"]
+crate-type = ["staticlib", "cdylib"]
 
 [dependencies]
 duocb-core.workspace = true
@@ -17,4 +18,13 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 log.workspace = true
+
+# Everywhere but Android, `log` output goes to stderr (Xcode's console, the
+# unified log). Android discards stderr, so it goes to logcat instead.
+[target.'cfg(not(target_os = "android"))'.dependencies]
 env_logger.workspace = true
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni.workspace = true
+android_logger.workspace = true
+ndk-context.workspace = true
